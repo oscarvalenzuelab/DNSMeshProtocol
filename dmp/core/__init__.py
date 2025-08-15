@@ -1,0 +1,1 @@
+"""Core DMP protocol implementation"""
