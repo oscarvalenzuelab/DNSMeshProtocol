@@ -77,12 +77,27 @@ The protocol assumes:
 - **Traffic analysis.** Message timing, approximate size (chunk
   count), and the existence of a `(sender, recipient)` relationship
   are all visible to anyone who watches the mesh domain's DNS.
-- **Username ownership.** Identity records at
-  `id-{sha256(username)[:16]}.{domain}` are publish-append. A
-  squatter who publishes first has a valid self-signed record; a
+- **Username ownership under the shared mesh domain.** Identity
+  records at `id-{sha256(username)[:16]}.{domain}` are publish-append.
+  A squatter who publishes first has a valid self-signed record; a
   later legitimate publisher adds a second record. `dmp identity
   fetch` refuses `--add` when multiple valid records exist and
-  prints fingerprints for out-of-band verification.
+  prints fingerprints for out-of-band verification. For real
+  squat resistance, publish under a DNS zone you control and use
+  zone-anchored addresses — see below.
+
+## Zone-anchored identity (recommended for real deployments)
+
+Passing `--identity-domain alice.example.com` at `dmp init` switches
+identity publishing from the hash-based path under the shared mesh
+domain to `dmp.alice.example.com`. Addresses take the form
+`alice@alice.example.com`. Because only the owner of
+`alice.example.com` can write records in that zone, squatting requires
+compromising DNS for that zone — the same trust model email has had
+for decades. The inner record body still carries the username, and
+`dmp identity fetch` rejects records whose internal username doesn't
+match the address (so a zone owner can't publish
+`dmp.alice.example.com` with a body naming someone else).
 
 ## Known limits
 

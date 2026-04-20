@@ -57,6 +57,12 @@ class CLIConfig:
     # attacker who captures the public identity has to do a per-user
     # offline brute force rather than a single rainbow table.
     kdf_salt: str = ""
+    # Optional DNS zone under which the user publishes / queries identity
+    # records. When set, identity publish writes `dmp.<identity_domain>`
+    # and `dmp identity fetch <user>@<host>` resolves addresses in this
+    # shape. Leaving this empty falls back to the hash-based name under
+    # the shared mesh `domain` (squat-prone, TOFU only).
+    identity_domain: str = ""
     # Each contact is {"pub": <x25519 hex>, "spk": <ed25519 hex or "">}.
     # `spk` may be empty for contacts added before Ed25519 pinning landed
     # (and for the `contacts add` shortcut that doesn't require a signing
@@ -90,6 +96,7 @@ class CLIConfig:
             dns_port=int(data.get("dns_port", 5353)),
             passphrase_file=data.get("passphrase_file"),
             kdf_salt=data.get("kdf_salt", ""),
+            identity_domain=data.get("identity_domain", ""),
             contacts=contacts,
         )
 
@@ -238,6 +245,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         # still derive different keys. 32 bytes is well above Argon2's
         # minimum (8) and matches our key length.
         kdf_salt=os.urandom(32).hex(),
+        identity_domain=(args.identity_domain or "").strip(),
     )
     cfg.save(path)
     print(f"wrote config to {path}")
@@ -264,19 +272,32 @@ def cmd_identity_show(args: argparse.Namespace) -> int:
 
 def cmd_identity_publish(args: argparse.Namespace) -> int:
     """Publish a signed identity record to DNS so contacts can resolve us."""
-    from dmp.core.identity import make_record, identity_domain
+    from dmp.core.identity import (
+        identity_domain,
+        make_record,
+        zone_anchored_identity_name,
+    )
 
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
     record = make_record(client.crypto, cfg.username)
     wire = record.sign(client.crypto)
-    name = identity_domain(cfg.username, cfg.domain)
+
+    if cfg.identity_domain:
+        # Zone-anchored: user controls <identity_domain>. Squat resistance
+        # comes from the DNS zone's access control, not from a hash.
+        name = zone_anchored_identity_name(cfg.identity_domain)
+        resolve_hint = f"dmp identity fetch {cfg.username}@{cfg.identity_domain}"
+    else:
+        name = identity_domain(cfg.username, cfg.domain)
+        resolve_hint = f"dmp identity fetch {cfg.username}"
+
     ok = client.writer.publish_txt_record(name, wire, ttl=args.ttl)
     if not ok:
         _die(2, "publish failed — see node logs")
     print(f"published identity to {name}")
-    print(f"  others can resolve you with: dmp identity fetch {cfg.username}")
+    print(f"  others can resolve you with: {resolve_hint}")
     return 0
 
 
@@ -305,15 +326,38 @@ def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
 
 
 def cmd_identity_fetch(args: argparse.Namespace) -> int:
-    """Resolve an identity record from DNS and optionally add it as a contact."""
+    """Resolve an identity record from DNS and optionally add it as a contact.
+
+    Two address forms:
+      - `alice@alice.example.com`  — zone-anchored; queries
+        `dmp.alice.example.com`. Squat resistance relies on DNS zone
+        control.
+      - `alice`                    — legacy / TOFU; queries
+        `id-{sha256(alice)[:16]}.<domain>` where <domain> is either
+        `--domain` or the config's mesh domain.
+    """
     import hashlib
-    from dmp.core.identity import IdentityRecord, identity_domain
+    from dmp.core.identity import (
+        IdentityRecord,
+        identity_domain,
+        parse_address,
+        zone_anchored_identity_name,
+    )
 
     cfg = CLIConfig.load(_config_path())
     # Fetch is read-only — no passphrase needed. Build a minimal reader path
     # without going through _make_client (which loads the identity key).
     reader = _DnsReader(cfg.dns_host, cfg.dns_port)
-    name = identity_domain(args.username, args.domain or cfg.domain)
+
+    parsed_addr = parse_address(args.username)
+    if parsed_addr is not None:
+        user, host = parsed_addr
+        resolved_username = user
+        name = zone_anchored_identity_name(host)
+    else:
+        resolved_username = args.username
+        name = identity_domain(args.username, args.domain or cfg.domain)
+
     records = reader.query_txt_record(name)
     if not records:
         _die(2, f"no identity record at {name}")
@@ -385,15 +429,26 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         print(f"published at:       {identity.ts}")
 
     if args.add:
-        if identity.username in cfg.contacts:
-            print(f"(contact `{identity.username}` already exists — not overwriting)")
+        # For zone-anchored fetches, require the record's internal
+        # username to match the left half of the address so an attacker
+        # can't publish a record named "bob" at `dmp.alice.example.com`
+        # and have it stored under "bob" in alice's contact list.
+        if parsed_addr is not None and identity.username != resolved_username:
+            _die(
+                2,
+                f"record at {name} carries username {identity.username!r}, "
+                f"not {resolved_username!r} as the address implied",
+            )
+        contact_key = identity.username
+        if contact_key in cfg.contacts:
+            print(f"(contact `{contact_key}` already exists — not overwriting)")
         else:
-            cfg.contacts[identity.username] = {
+            cfg.contacts[contact_key] = {
                 "pub": identity.x25519_pk.hex(),
                 "spk": identity.ed25519_spk.hex(),
             }
             cfg.save(_config_path())
-            print(f"added contact {identity.username} (pinned signing key)")
+            print(f"added contact {contact_key} (pinned signing key)")
     return 0
 
 
@@ -523,6 +578,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--http-token", help="optional bearer token for the HTTP API")
     p_init.add_argument("--dns-host", help="DNS resolver host (default: system)")
     p_init.add_argument("--dns-port", type=int, default=5353)
+    p_init.add_argument(
+        "--identity-domain",
+        default="",
+        help="DNS zone you control (e.g. alice.example.com). Identity records "
+             "go to dmp.<zone>; senders resolve you via <user>@<zone>. "
+             "Real squat resistance comes from controlling this zone.",
+    )
     p_init.add_argument("--force", action="store_true", help="overwrite existing config")
     p_init.set_defaults(func=cmd_init)
 

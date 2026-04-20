@@ -177,6 +177,70 @@ class TestIdentityPublishFetch:
             cli.main(["identity", "fetch", "nobody"])
         assert exc.value.code == 2
 
+    def test_zone_anchored_publish_and_fetch(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """Identity published under a user-controlled zone resolves via
+        `user@host` addresses instead of the hash-based shared-mesh name."""
+        # alice initializes with her own zone; publish goes to dmp.alice.example.com
+        cli.main([
+            "init", "alice",
+            "--endpoint", "http://x",
+            "--identity-domain", "alice.example.com",
+        ])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        cli.main(["identity", "publish"])
+        out = capsys.readouterr().out
+        assert "published identity to dmp.alice.example.com" in out
+        assert "alice@alice.example.com" in out
+
+        # Bob fetches via the zone-anchored address.
+        bob_home = config_home.parent / "bob-zone"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(["init", "bob", "--endpoint", "http://x"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+        capsys.readouterr()
+
+        cli.main(["identity", "fetch", "alice@alice.example.com", "--add"])
+        out = capsys.readouterr().out
+        assert "added contact alice" in out
+
+        cli.main(["contacts", "list"])
+        assert "alice" in capsys.readouterr().out
+
+    def test_zone_anchored_fetch_rejects_username_mismatch(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """An attacker who controls `alice.example.com` can't publish an
+        identity record carrying username="bob" and have it stored as bob
+        in a fetcher's contact list. The address's user part must match
+        the record's username field."""
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.identity import (
+            make_record,
+            zone_anchored_identity_name,
+        )
+
+        # Skip normal publish — craft a record with mismatched username
+        # directly and drop it in the shared store.
+        attacker_crypto = DMPCrypto()
+        record = make_record(attacker_crypto, "bob")  # record says "bob"
+        wire = record.sign(attacker_crypto)
+        shared_store.publish_txt_record(
+            zone_anchored_identity_name("alice.example.com"),  # but at alice's zone
+            wire,
+        )
+
+        # carol tries `dmp identity fetch alice@alice.example.com --add`.
+        cli.main(["init", "carol", "--endpoint", "http://x"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "carol-pass")
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["identity", "fetch", "alice@alice.example.com", "--add"])
+        assert exc.value.code == 2
+
     def test_fetch_refuses_ambiguous_without_fingerprint(
         self, config_home, shared_store, monkeypatch, capsys
     ):
