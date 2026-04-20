@@ -1,4 +1,9 @@
-"""Message chunking and reassembly with Reed-Solomon error correction"""
+"""Message chunking and reassembly with per-chunk Reed-Solomon error correction.
+
+Each chunk is independently protected by Reed-Solomon bytes. This provides bit-error
+correction within a chunk but does NOT provide erasure coding across chunks — a lost
+chunk still kills the message. True cross-chunk erasure coding is future work.
+"""
 
 import hashlib
 from typing import List, Optional, Dict, Tuple
@@ -16,7 +21,7 @@ class ChunkInfo:
     total_chunks: int
     data: bytes
     checksum: bytes
-    
+
     def verify_checksum(self) -> bool:
         """Verify chunk integrity"""
         calculated = hashlib.sha256(self.data).digest()[:8]
@@ -24,234 +29,147 @@ class ChunkInfo:
 
 
 class MessageChunker:
-    """Split messages into DNS-compatible chunks with error correction"""
-    
-    # Conservative chunk size for DNS TXT records
-    MAX_CHUNK_SIZE = 240
-    
-    # Reed-Solomon parameters
-    RS_SYMBOLS = 32  # Number of error correction symbols per chunk
+    """Split messages into DNS-compatible chunks with per-chunk error correction.
+
+    Wire format per chunk: checksum(8 bytes) + rs_encoded_payload
+    rs_encoded_payload = RSCodec.encode(raw_data) when ECC is enabled, else raw_data.
+    reedsolo handles variable-length encode/decode internally, so no padding games.
+    """
+
+    # Max bytes of raw message data per chunk (before RS + checksum overhead)
+    DATA_PER_CHUNK = 200
+    MAX_CHUNK_SIZE = DATA_PER_CHUNK  # back-compat alias
+    # Reed-Solomon parameters — 32 parity bytes corrects up to 16 byte-errors per chunk
+    RS_SYMBOLS = 32
     RS_CODEC = reedsolo.RSCodec(RS_SYMBOLS)
-    
+
     def __init__(self, enable_error_correction: bool = True):
-        """Initialize chunker with optional error correction"""
         self.enable_error_correction = enable_error_correction
-    
+
     def chunk_message(
         self,
         message: DMPMessage,
-        include_redundancy: bool = True
+        include_redundancy: bool = True,
     ) -> List[Tuple[int, bytes]]:
+        """Split a message into chunks with per-chunk ECC.
+
+        Returns list of (chunk_number, chunk_wire_bytes).
+        Mutates message.header.total_chunks.
         """
-        Split a message into chunks with error correction.
-        Returns list of (chunk_number, chunk_data) tuples.
-        """
-        # Serialize the complete message
-        message_bytes = message.to_bytes()
-        
-        # Add error correction if enabled
-        if self.enable_error_correction and include_redundancy:
-            chunks_with_ecc = self._add_error_correction(message_bytes)
-        else:
-            chunks_with_ecc = message_bytes
-        
-        # Split into chunks
-        chunks = []
-        chunk_size = self.MAX_CHUNK_SIZE
-        total_chunks = (len(chunks_with_ecc) + chunk_size - 1) // chunk_size
-        
-        for i in range(0, len(chunks_with_ecc), chunk_size):
-            chunk_data = chunks_with_ecc[i:i + chunk_size]
-            chunk_number = i // chunk_size
-            
-            # Add checksum for integrity verification
-            checksum = hashlib.sha256(chunk_data).digest()[:8]
-            chunk_with_checksum = checksum + chunk_data
-            
-            chunks.append((chunk_number, chunk_with_checksum))
-        
-        # Update message header with chunk count
-        message.header.total_chunks = len(chunks)
-        
+        use_ecc = self.enable_error_correction and include_redundancy
+
+        # Chunk the raw message bytes first, then compute total_chunks, then
+        # re-serialize so the header-in-chunks reflects the final total_chunks.
+        raw = message.to_bytes()
+        data_size = self.DATA_PER_CHUNK
+        total = max(1, (len(raw) + data_size - 1) // data_size)
+        message.header.total_chunks = total
+
+        # Re-serialize once header.total_chunks is stable. If chunk count shifts
+        # because of the header-size change, re-chunk one more time (at most).
+        raw = message.to_bytes()
+        new_total = max(1, (len(raw) + data_size - 1) // data_size)
+        if new_total != total:
+            message.header.total_chunks = new_total
+            raw = message.to_bytes()
+            total = new_total
+
+        chunks: List[Tuple[int, bytes]] = []
+        for chunk_num in range(total):
+            offset = chunk_num * data_size
+            piece = raw[offset:offset + data_size]
+            encoded = bytes(self.RS_CODEC.encode(piece)) if use_ecc else piece
+            checksum = hashlib.sha256(encoded).digest()[:8]
+            chunks.append((chunk_num, checksum + encoded))
+
         return chunks
-    
-    def _add_error_correction(self, data: bytes) -> bytes:
-        """Add Reed-Solomon error correction to data"""
-        # Process data in blocks that fit Reed-Solomon constraints
-        block_size = 223  # Maximum block size for RS(255, 223)
-        encoded_blocks = []
-        
-        for i in range(0, len(data), block_size):
-            block = data[i:i + block_size]
-            # Pad if necessary
-            if len(block) < block_size:
-                block = block + b'\x00' * (block_size - len(block))
-            
-            # Encode with Reed-Solomon
-            encoded = self.RS_CODEC.encode(block)
-            encoded_blocks.append(encoded)
-        
-        return b''.join(encoded_blocks)
-    
-    def _remove_error_correction(self, data: bytes) -> bytes:
-        """Remove Reed-Solomon error correction and recover data"""
-        # Calculate block size including ECC symbols
-        block_size = 223 + self.RS_SYMBOLS
-        decoded_blocks = []
-        
-        for i in range(0, len(data), block_size):
-            block = data[i:i + block_size]
-            
-            try:
-                # Decode with error correction
-                decoded = self.RS_CODEC.decode(block)[0]
-                decoded_blocks.append(decoded)
-            except reedsolo.ReedSolomonError:
-                # If decoding fails, use the data as-is (minus ECC)
-                decoded_blocks.append(block[:223])
-        
-        result = b''.join(decoded_blocks)
-        # Remove padding
-        return result.rstrip(b'\x00')
-    
-    def create_message_chunks(
-        self,
-        message: DMPMessage
-    ) -> List[DMPMessage]:
+
+    def create_message_chunks(self, message: DMPMessage) -> List[DMPMessage]:
         """Create chunk messages from a complete message"""
         chunks = self.chunk_message(message)
-        chunk_messages = []
-        
-        for chunk_num, chunk_data in chunks:
-            chunk_msg = message.create_chunk(chunk_num, chunk_data)
-            chunk_msg.header.total_chunks = len(chunks)
-            chunk_messages.append(chunk_msg)
-        
-        return chunk_messages
+        return [
+            message.create_chunk(chunk_num, chunk_data)
+            for chunk_num, chunk_data in chunks
+        ]
 
 
 class MessageAssembler:
-    """Reassemble messages from chunks with error recovery"""
-    
+    """Reassemble messages from chunks with per-chunk error recovery."""
+
     def __init__(self, enable_error_correction: bool = True):
-        """Initialize assembler"""
         self.enable_error_correction = enable_error_correction
         self.pending_messages: Dict[bytes, Dict[int, bytes]] = {}
         self.message_metadata: Dict[bytes, DMPHeader] = {}
-    
+
     def add_chunk(
         self,
         message_id: bytes,
         chunk_number: int,
         chunk_data: bytes,
         total_chunks: int,
-        header: Optional[DMPHeader] = None
+        header: Optional[DMPHeader] = None,
     ) -> Optional[bytes]:
-        """
-        Add a chunk to the assembly buffer.
-        Returns complete message bytes if all chunks are received.
-        """
-        # Verify chunk data first
-        if len(chunk_data) <= 8:  # Must have checksum
-            return None  # Invalid chunk
-        
+        """Add a chunk; return full message bytes when complete, else None."""
+        if total_chunks <= 0:
+            return None
+        if chunk_number < 0 or chunk_number >= total_chunks:
+            return None
+        if len(chunk_data) <= 8:
+            return None
+
         checksum = chunk_data[:8]
-        data = chunk_data[8:]
-        
-        # Verify checksum
-        calculated = hashlib.sha256(data).digest()[:8]
-        if calculated != checksum:
-            return None  # Corrupted chunk
-        
-        # Initialize storage for this message if needed (only after validation)
-        if message_id not in self.pending_messages:
-            self.pending_messages[message_id] = {}
-            if header:
-                self.message_metadata[message_id] = header
-        
-        # Store valid chunk
-        self.pending_messages[message_id][chunk_number] = data
-        
-        # Check if we have all chunks
-        if len(self.pending_messages[message_id]) == total_chunks:
+        encoded = chunk_data[8:]
+        if hashlib.sha256(encoded).digest()[:8] != checksum:
+            return None
+
+        if self.enable_error_correction:
+            try:
+                data = bytes(MessageChunker.RS_CODEC.decode(encoded)[0])
+            except reedsolo.ReedSolomonError:
+                return None
+        else:
+            data = encoded
+
+        bucket = self.pending_messages.setdefault(message_id, {})
+        if header is not None and message_id not in self.message_metadata:
+            self.message_metadata[message_id] = header
+        bucket[chunk_number] = data
+
+        if len(bucket) == total_chunks:
             return self._assemble_message(message_id, total_chunks)
-        
         return None
-    
+
     def _assemble_message(
         self,
         message_id: bytes,
-        total_chunks: int
+        total_chunks: int,
     ) -> Optional[bytes]:
-        """Assemble complete message from chunks"""
         chunks = self.pending_messages.get(message_id, {})
-        
-        # Verify we have all chunks
-        if len(chunks) != total_chunks:
+        if set(chunks.keys()) != set(range(total_chunks)):
             return None
-        
-        # Sort chunks by number and concatenate
-        sorted_chunks = [chunks[i] for i in range(total_chunks)]
-        combined_data = b''.join(sorted_chunks)
-        
-        # Remove error correction if enabled
-        if self.enable_error_correction:
-            chunker = MessageChunker(enable_error_correction=True)
-            try:
-                message_data = chunker._remove_error_correction(combined_data)
-            except Exception:
-                # Fallback to raw data if ECC fails
-                message_data = combined_data
-        else:
-            message_data = combined_data
-        
-        # Clean up
+        message_data = b''.join(chunks[i] for i in range(total_chunks))
         del self.pending_messages[message_id]
-        if message_id in self.message_metadata:
-            del self.message_metadata[message_id]
-        
+        self.message_metadata.pop(message_id, None)
         return message_data
-    
-    def get_missing_chunks(
-        self,
-        message_id: bytes,
-        total_chunks: int
-    ) -> List[int]:
-        """Get list of missing chunk numbers for a message"""
-        if message_id not in self.pending_messages:
-            return list(range(total_chunks))
-        
-        received = set(self.pending_messages[message_id].keys())
-        all_chunks = set(range(total_chunks))
-        missing = all_chunks - received
-        
-        return sorted(list(missing))
-    
-    def get_assembly_progress(
-        self,
-        message_id: bytes,
-        total_chunks: int
-    ) -> float:
-        """Get assembly progress as percentage (0.0 to 1.0)"""
-        if message_id not in self.pending_messages:
+
+    def get_missing_chunks(self, message_id: bytes, total_chunks: int) -> List[int]:
+        received = set(self.pending_messages.get(message_id, {}).keys())
+        return sorted(set(range(total_chunks)) - received)
+
+    def get_assembly_progress(self, message_id: bytes, total_chunks: int) -> float:
+        if total_chunks <= 0:
             return 0.0
-        
-        received = len(self.pending_messages[message_id])
+        received = len(self.pending_messages.get(message_id, {}))
         return received / total_chunks
-    
-    def cleanup_expired(self, current_time: int, ttl: int = 300):
-        """Remove expired partial messages"""
-        expired = []
-        
-        for message_id, header in self.message_metadata.items():
-            if current_time > (header.timestamp + ttl):
-                expired.append(message_id)
-        
-        for message_id in expired:
-            if message_id in self.pending_messages:
-                del self.pending_messages[message_id]
-            if message_id in self.message_metadata:
-                del self.message_metadata[message_id]
+
+    def cleanup_expired(self, current_time: int, ttl: int = 300) -> None:
+        expired = [
+            mid for mid, hdr in self.message_metadata.items()
+            if current_time > (hdr.timestamp + ttl)
+        ]
+        for mid in expired:
+            self.pending_messages.pop(mid, None)
+            self.message_metadata.pop(mid, None)
 
 
 class ChunkRouter:

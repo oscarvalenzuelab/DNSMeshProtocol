@@ -193,25 +193,31 @@ class TestMessageAssembler:
         assert message_id not in assembler.pending_messages
     
     def test_assembly_with_error_correction(self):
-        """Test assembly with Reed-Solomon error correction"""
+        """Per-chunk Reed-Solomon repairs bit errors within a chunk."""
+        import hashlib
+
         chunker = MessageChunker(enable_error_correction=True)
         assembler = MessageAssembler(enable_error_correction=True)
-        
-        # Use a simple test to verify ECC works
-        test_data = b'Test data for ECC'
-        
-        # Add ECC
-        with_ecc = chunker._add_error_correction(test_data)
-        assert len(with_ecc) > len(test_data)  # ECC adds data
-        
-        # Remove ECC
-        recovered = chunker._remove_error_correction(with_ecc)
-        assert test_data in recovered  # Original data should be present
-        
-        # For full message test, just verify chunking and assembly complete
-        original = DMPMessage(payload=b'Simple test')
+
+        original = DMPMessage(
+            header=DMPHeader(message_id=uuid.uuid4().bytes),
+            payload=b'ECC protected payload content',
+        )
         chunks = chunker.chunk_message(original, include_redundancy=True)
-        
+        assert len(chunks) >= 1
+
+        # Corrupt a few bytes in the first chunk's RS-encoded body. RS_SYMBOLS=32
+        # means up to 16 byte-errors per chunk are recoverable. Flip 4 bytes.
+        chunk_num, chunk_bytes = chunks[0]
+        checksum = chunk_bytes[:8]
+        body = bytearray(chunk_bytes[8:])
+        for i in range(4):
+            body[i] ^= 0xFF
+        # Recompute checksum so assembler doesn't reject at the outer integrity check;
+        # RS must still repair the body. This isolates the ECC-repair path.
+        new_checksum = hashlib.sha256(bytes(body)).digest()[:8]
+        chunks[0] = (chunk_num, new_checksum + bytes(body))
+
         result = None
         for chunk_num, chunk_data in chunks:
             result = assembler.add_chunk(
@@ -219,12 +225,12 @@ class TestMessageAssembler:
                 chunk_num,
                 chunk_data,
                 len(chunks),
-                original.header
+                original.header,
             )
-        
-        # Just verify we got something back
+
         assert result is not None
-        assert len(result) > 0
+        reassembled = DMPMessage.from_bytes(result)
+        assert reassembled.payload == original.payload
     
     def test_cleanup_expired(self):
         """Test cleanup of expired partial messages"""

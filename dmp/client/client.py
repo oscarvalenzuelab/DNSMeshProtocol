@@ -92,14 +92,13 @@ class DMPClient:
         
         contact = self.contacts[recipient_username]
         
-        # Create message
+        import hashlib
+        recipient_id = hashlib.sha256(contact.public_key_bytes).digest()
         msg = DMPMessage(
             header=DMPHeader(
                 message_type=MessageType.DATA,
                 sender_id=self.user_id,
-                recipient_id=DMPCrypto.derive_user_id(
-                    DMPCrypto.from_private_bytes(contact.public_key_bytes).public_key
-                )
+                recipient_id=recipient_id,
             ),
             payload=message.encode('utf-8')
         )

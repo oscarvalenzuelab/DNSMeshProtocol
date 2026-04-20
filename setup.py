@@ -24,13 +24,15 @@ setup(
     ],
     license="AGPL-3.0",
     python_requires=">=3.8",
-    url="https://github.com/ovalenzu/DNSMeshProtocol",
+    url="https://github.com/oscarvalenzuelab/DNSMeshProtocol",
     install_requires=[
         "cryptography>=41.0.0",
         "dnspython>=2.4.0",
         "reedsolo>=1.7.0",
         "pyyaml>=6.0",
         "asyncio-throttle>=1.0.0",
+        "requests>=2.28.0",
+        "boto3>=1.26.0",
     ],
     extras_require={
         "dev": [
