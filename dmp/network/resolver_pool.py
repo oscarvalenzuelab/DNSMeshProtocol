@@ -40,6 +40,7 @@ happen — preserving the "true missing record" behavior.
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 import threading
 import time
@@ -81,9 +82,11 @@ class ResolverPool(DNSRecordReader):
     Parameters
     ----------
     hosts:
-        List of resolver IP addresses (or hostnames resolvable by the
-        system stub) to query, in priority order. An empty list is
-        rejected.
+        List of resolver IP literals (v4 or v6) to query, in priority
+        order. Hostnames are NOT accepted — resolving them at startup
+        would reintroduce the DNS-ordering problem the pool exists to
+        solve. An empty list is rejected, as is any entry that is not
+        a valid IP literal.
     port:
         UDP/TCP port for every upstream. Defaults to 53.
     timeout:
@@ -112,10 +115,19 @@ class ResolverPool(DNSRecordReader):
 
     # Transport-level faults: the resolver is unreachable, slow, or
     # otherwise misbehaving. These DO count against its health.
+    #
+    # We deliberately do NOT catch the base `dns.exception.DNSException`
+    # here. That class is the parent of name-syntax errors like
+    # `dns.name.LabelTooLong` and `dns.name.EmptyLabel`, which describe
+    # a bug in the *caller's* query name, not resolver health. Swallowing
+    # them would let one malformed lookup poison every upstream into
+    # cooldown. Unexpected DNS exceptions propagate to the caller so the
+    # bug surfaces rather than silently degrading the pool; if a new
+    # exception turns out to be a real transport fault, we add it here
+    # explicitly after observing it.
     _TRANSPORT_ERRORS = (
         dns.resolver.NoNameservers,
         dns.exception.Timeout,
-        dns.exception.DNSException,
         socket.timeout,
         OSError,
     )
@@ -133,6 +145,20 @@ class ResolverPool(DNSRecordReader):
             raise ValueError("ResolverPool requires at least one host")
         if failure_threshold < 1:
             raise ValueError("failure_threshold must be >= 1")
+
+        # `dns.resolver.Resolver.nameservers` accepts IP literals only.
+        # Reject hostnames at construction time with a clear message
+        # rather than failing later inside dnspython — and rather than
+        # resolving them via the system stub, which would reintroduce
+        # the DNS-ordering problem this pool exists to solve.
+        for host in hosts:
+            try:
+                ipaddress.ip_address(host)
+            except ValueError as exc:
+                raise ValueError(
+                    f"ResolverPool host {host!r} is not a valid IPv4 or "
+                    f"IPv6 literal; hostnames are not accepted"
+                ) from exc
 
         self._port = port
         self._cooldown_seconds = cooldown_seconds
@@ -180,13 +206,10 @@ class ResolverPool(DNSRecordReader):
             except self._TRANSPORT_ERRORS:
                 self._mark_failure(state)
                 continue
-            except Exception:
-                # Any other surprise (e.g. a backend bug) still
-                # counts as a transport failure rather than bubbling
-                # up to the caller, since the reader contract
-                # promises `None` on unreachable.
-                self._mark_failure(state)
-                continue
+            # Any other exception (e.g. `dns.name.LabelTooLong` from a
+            # malformed query name, or a genuine caller-side bug)
+            # propagates up. Blanket-catching here would let one bad
+            # lookup demote every upstream into cooldown.
 
             records: List[str] = []
             for rdata in answers:

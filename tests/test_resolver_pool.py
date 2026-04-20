@@ -4,6 +4,7 @@ import socket
 from unittest.mock import patch
 
 import dns.exception
+import dns.name
 import dns.resolver
 import pytest
 
@@ -75,6 +76,27 @@ class TestResolverPoolConstruction:
         # custom port; we reach in through the private state for this
         # one assertion since the public surface doesn't expose it.
         assert pool._states[0].resolver.port == 5353
+
+    def test_constructor_rejects_non_ip_host(self):
+        """Hostnames are not accepted — dnspython requires IP literals.
+
+        Resolving the hostname up front would reintroduce the very DNS
+        ordering problem the pool exists to solve, so we narrow the
+        contract and fail fast with a clear message.
+        """
+        with pytest.raises(ValueError, match="not a valid IPv4 or IPv6 literal"):
+            ResolverPool(["dns.google"])
+
+    def test_constructor_accepts_ipv6_literal(self):
+        """IPv6 literals are valid upstreams and must not be rejected."""
+        pool = ResolverPool(["2001:4860:4860::8888"])
+        assert pool.snapshot()[0]["host"] == "2001:4860:4860::8888"
+        assert pool._states[0].resolver.nameservers == ["2001:4860:4860::8888"]
+
+    def test_constructor_rejects_non_ip_host_in_second_position(self):
+        """Every entry is validated, not just the first."""
+        with pytest.raises(ValueError, match="not a valid IPv4 or IPv6 literal"):
+            ResolverPool(["1.1.1.1", "dns.google"])
 
 
 # ---------------------------------------------------------------------
@@ -211,6 +233,54 @@ class TestResolverPoolQuery:
             mock_resolve.side_effect = _route_by_nameserver(routes)
             pool = ResolverPool(["1.1.1.1", "9.9.9.9"])
             assert pool.query_txt_record("x.example.com") == ["ok"]
+
+    def test_malformed_name_does_not_demote_resolvers(self):
+        """A caller-side error (bad query name) must not poison the pool.
+
+        `dns.name.LabelTooLong` and friends describe a bug in the
+        caller's input, not resolver health. Blanket-catching them
+        would let a single malformed lookup put every upstream into
+        cooldown. The exception must propagate, and every resolver's
+        `consecutive_failures` must stay at zero.
+        """
+
+        def boom(n, t):
+            raise dns.name.LabelTooLong()
+
+        routes = {"1.1.1.1": boom, "9.9.9.9": boom}
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], failure_threshold=1)
+            with pytest.raises(dns.name.LabelTooLong):
+                pool.query_txt_record("x" * 64 + ".example.com")
+
+        # The exception propagated before any health bookkeeping ran,
+        # so every resolver is still healthy with zero failures. In
+        # particular, only the primary even got the call — the
+        # secondary must not have been touched.
+        for snap in pool.snapshot():
+            assert snap["consecutive_failures"] == 0
+        assert pool.healthy_hosts() == ["1.1.1.1", "9.9.9.9"]
+
+    def test_empty_label_name_does_not_demote_resolvers(self):
+        """Same contract for `dns.name.EmptyLabel` — also caller-side."""
+
+        def boom(n, t):
+            raise dns.name.EmptyLabel()
+
+        routes = {"1.1.1.1": boom, "9.9.9.9": boom}
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], failure_threshold=1)
+            with pytest.raises(dns.name.EmptyLabel):
+                pool.query_txt_record("..example.com")
+
+        for snap in pool.snapshot():
+            assert snap["consecutive_failures"] == 0
 
     def test_primary_generic_os_error_fails_over(self):
         """A connection-refused or similar transport error still demotes."""
