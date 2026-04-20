@@ -1,140 +1,362 @@
-"""Simple DMP Client implementation"""
+"""DMP client: encrypt, chunk, publish, poll, verify, decrypt."""
 
-import os
+from __future__ import annotations
+
+import hashlib
+import random
 import time
-import json
-from typing import Dict, List, Optional, Tuple
+import uuid
 from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
-from dmp.core.message import DMPMessage, DMPHeader, MessageType, DMPIdentity
-from dmp.core.crypto import DMPCrypto, MessageEncryption
-from dmp.core.chunking import MessageChunker, MessageAssembler
-from dmp.core.dns import DNSOperations, DNSChunkManager, DNSEncoder, DMPDNSRecord
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+
+from dmp.core.chunking import MessageAssembler, MessageChunker
+from dmp.core.crypto import DMPCrypto, EncryptedMessage, MessageEncryption
+from dmp.core.dns import DMPDNSRecord
+from dmp.core.manifest import ReplayCache, SlotManifest
+from dmp.core.message import DMPHeader, DMPIdentity, DMPMessage, MessageType
+from dmp.network.base import DNSRecordReader, DNSRecordStore, DNSRecordWriter
+from dmp.network.memory import InMemoryDNSStore
+
+
+SLOT_COUNT = 10
+DEFAULT_TTL_SECONDS = 300
 
 
 @dataclass
 class Contact:
-    """Contact information for a user"""
+    """Recipient identity needed for encryption + addressing."""
+
     username: str
-    public_key_bytes: bytes
+    public_key_bytes: bytes   # X25519 encryption pubkey
     domain: str
 
 
+@dataclass
+class InboxMessage:
+    """One decrypted message returned by receive_messages."""
+
+    sender_signing_pk: bytes  # 32-byte Ed25519 pubkey of the sender
+    plaintext: bytes
+    timestamp: int
+    msg_id: bytes
+
+
 class DMPClient:
-    """Simple DMP client for sending and receiving messages"""
-    
-    def __init__(self, username: str, passphrase: str, domain: str = "mesh.local"):
-        """Initialize client with username and passphrase"""
+    """Send and receive end-to-end encrypted messages over DNS TXT records.
+
+    The client speaks to a DNSRecordWriter (to publish) and a DNSRecordReader
+    (to poll). For local testing or single-process demos, pass a single
+    DNSRecordStore via `store`; the client uses it for both sides. In
+    production, pass a writer that talks to an authoritative DNS API and a
+    reader that uses a recursive resolver.
+
+    Addressing (all on a shared mesh `domain`):
+      slot-{N}.mb-{recipient_hash12}.{domain}   -- signed manifest (10 slots)
+      chunk-{NNNN}-{msg_key}.{domain}           -- chunks by per-message key
+
+    msg_key = sha256(msg_id + recipient_id + sender_spk)[:12] so sender and
+    recipient derive the same chunk path without the recipient needing to
+    know the sender's X25519 public key in advance.
+    """
+
+    def __init__(
+        self,
+        username: str,
+        passphrase: str,
+        *,
+        domain: str = "mesh.local",
+        store: Optional[DNSRecordStore] = None,
+        writer: Optional[DNSRecordWriter] = None,
+        reader: Optional[DNSRecordReader] = None,
+    ):
+        if store is not None:
+            if writer is None:
+                writer = store
+            if reader is None:
+                reader = store
+        if writer is None or reader is None:
+            # Default to an in-memory store for tests / demos
+            default = InMemoryDNSStore()
+            writer = writer or default
+            reader = reader or default
+        self.writer: DNSRecordWriter = writer
+        self.reader: DNSRecordReader = reader
+
         self.username = username
         self.domain = domain
-        
-        # Initialize crypto with deterministic key from passphrase
         self.crypto = DMPCrypto.from_passphrase(passphrase)
-        self.user_id = self.crypto.derive_user_id(self.crypto.public_key)
-        
-        # Initialize components
+        self.user_id = hashlib.sha256(self.crypto.get_public_key_bytes()).digest()
+
         self.chunker = MessageChunker(enable_error_correction=True)
         self.assembler = MessageAssembler(enable_error_correction=True)
-        self.dns_ops = DNSOperations()
-        self.chunk_manager = DNSChunkManager(self.dns_ops)
         self.encryption = MessageEncryption(self.crypto)
-        
-        # Storage
+        self.replay_cache = ReplayCache()
+
         self.contacts: Dict[str, Contact] = {}
-        self.messages: List[Tuple[str, bytes, int]] = []  # (sender, message, timestamp)
-        
-        # Create identity
+
         self.identity = DMPIdentity(
             username=username,
             public_key=self.crypto.get_public_key_bytes(),
-            signature=self.crypto.sign_data(username.encode())
-        )
-    
-    def publish_identity(self) -> bool:
-        """Publish identity to DNS (simulated)"""
-        domain = DNSEncoder.encode_identity_domain(self.username, self.domain)
-        record = DMPDNSRecord(
-            version=1,
-            record_type='identity',
-            data=self.identity.public_key,
+            signature=self.crypto.sign_data(username.encode("utf-8")),
             metadata={
-                'username': self.username,
-                'created': self.identity.created_at
-            }
+                "signing_pk": self.crypto.get_signing_public_key_bytes().hex(),
+            },
         )
-        
-        # In real implementation, this would publish to DNS
-        print(f"Publishing identity to {domain}")
-        print(f"  Public key: {self.identity.public_key.hex()[:16]}...")
-        return True
-    
-    def add_contact(self, username: str, public_key_hex: str) -> bool:
-        """Add a contact with their public key"""
+
+    # ---- addressing helpers ------------------------------------------------
+
+    @staticmethod
+    def _hash12(b: bytes) -> str:
+        return hashlib.sha256(b).hexdigest()[:12]
+
+    def _slot_domain(self, recipient_id: bytes, slot: int) -> str:
+        return f"slot-{slot}.mb-{self._hash12(recipient_id)}.{self.domain}"
+
+    @staticmethod
+    def _msg_key(msg_id: bytes, recipient_id: bytes, sender_spk: bytes) -> str:
+        return hashlib.sha256(msg_id + recipient_id + sender_spk).hexdigest()[:12]
+
+    def _chunk_domain(self, msg_key: str, chunk_num: int) -> str:
+        return f"chunk-{chunk_num:04d}-{msg_key}.{self.domain}"
+
+    # ---- contacts ----------------------------------------------------------
+
+    def add_contact(
+        self,
+        username: str,
+        public_key_hex: str,
+        domain: Optional[str] = None,
+    ) -> bool:
         try:
             public_key_bytes = bytes.fromhex(public_key_hex)
-            contact = Contact(
-                username=username,
-                public_key_bytes=public_key_bytes,
-                domain=self.domain
-            )
-            self.contacts[username] = contact
-            print(f"Added contact: {username}")
-            return True
-        except Exception as e:
-            print(f"Failed to add contact: {e}")
+        except ValueError:
             return False
-    
-    def send_message(self, recipient_username: str, message: str) -> bool:
-        """Send a message to a recipient"""
-        if recipient_username not in self.contacts:
-            print(f"Unknown recipient: {recipient_username}")
+        if len(public_key_bytes) != 32:
             return False
-        
-        contact = self.contacts[recipient_username]
-        
-        import hashlib
-        recipient_id = hashlib.sha256(contact.public_key_bytes).digest()
-        msg = DMPMessage(
-            header=DMPHeader(
-                message_type=MessageType.DATA,
-                sender_id=self.user_id,
-                recipient_id=recipient_id,
-            ),
-            payload=message.encode('utf-8')
+        self.contacts[username] = Contact(
+            username=username,
+            public_key_bytes=public_key_bytes,
+            domain=domain or self.domain,
         )
-        
-        # Chunk the message
-        chunks = self.chunker.chunk_message(msg)
-        
-        print(f"Sending message to {recipient_username}:")
-        print(f"  Message: {message}")
-        print(f"  Chunks: {len(chunks)}")
-        
-        # Simulate sending chunks (in real implementation, would use DNS)
-        for chunk_num, chunk_data in chunks:
-            domain = DNSEncoder.encode_chunk_domain(
-                f"{chunk_num:04d}",
-                msg.header.message_id,
-                contact.domain
-            )
-            print(f"  Chunk {chunk_num}: {domain} ({len(chunk_data)} bytes)")
-        
         return True
-    
-    def receive_messages(self) -> List[Tuple[str, str]]:
-        """Check for new messages (simulated)"""
-        # In real implementation, would poll DNS mailbox
-        return []
-    
+
+    # ---- identity ----------------------------------------------------------
+
     def get_public_key_hex(self) -> str:
-        """Get own public key as hex string"""
         return self.crypto.get_public_key_bytes().hex()
-    
+
+    def get_signing_public_key_hex(self) -> str:
+        return self.crypto.get_signing_public_key_bytes().hex()
+
     def get_user_info(self) -> dict:
-        """Get user information"""
         return {
-            'username': self.username,
-            'domain': self.domain,
-            'public_key': self.get_public_key_hex(),
-            'user_id': self.user_id.hex()
+            "username": self.username,
+            "domain": self.domain,
+            "public_key": self.get_public_key_hex(),
+            "signing_public_key": self.get_signing_public_key_hex(),
+            "user_id": self.user_id.hex(),
         }
+
+    # ---- send --------------------------------------------------------------
+
+    def send_message(
+        self,
+        recipient_username: str,
+        message: str,
+        *,
+        ttl: int = DEFAULT_TTL_SECONDS,
+    ) -> bool:
+        contact = self.contacts.get(recipient_username)
+        if contact is None:
+            return False
+
+        recipient_id = hashlib.sha256(contact.public_key_bytes).digest()
+        msg_id = uuid.uuid4().bytes
+        now = int(time.time())
+
+        header = DMPHeader(
+            version=1,
+            message_type=MessageType.DATA,
+            message_id=msg_id,
+            sender_id=self.user_id,
+            recipient_id=recipient_id,
+            total_chunks=1,  # placeholder; chunker updates this
+            chunk_number=0,
+            timestamp=now,
+            ttl=ttl,
+        )
+
+        try:
+            recipient_pubkey = X25519PublicKey.from_public_bytes(
+                contact.public_key_bytes
+            )
+        except Exception:
+            return False
+
+        # Encrypt once, with AAD bound to a canonical header subset that excludes
+        # total_chunks (unknown until after chunking). Everything else that
+        # matters — sender_id, recipient_id, msg_id, timestamp, ttl — is bound.
+        aad_header = DMPHeader(
+            version=header.version,
+            message_type=header.message_type,
+            message_id=header.message_id,
+            sender_id=header.sender_id,
+            recipient_id=header.recipient_id,
+            total_chunks=0,  # sentinel so AAD is stable regardless of chunk count
+            chunk_number=0,
+            timestamp=header.timestamp,
+            ttl=header.ttl,
+        )
+        aad_bytes = aad_header.to_bytes()
+        encrypted = self.encryption.encrypt_with_header(
+            message.encode("utf-8"),
+            recipient_pubkey,
+            aad_bytes,
+        )
+
+        outer = DMPMessage(header=header, payload=encrypted.to_bytes())
+        chunks = self.chunker.chunk_message(outer)
+        total_chunks = len(chunks)
+
+        sender_spk = self.crypto.get_signing_public_key_bytes()
+        msg_key = self._msg_key(msg_id, recipient_id, sender_spk)
+
+        # Publish chunks
+        for chunk_num, chunk_bytes in chunks:
+            record = DMPDNSRecord(
+                version=1,
+                record_type="chunk",
+                data=chunk_bytes,
+                metadata={"chunk": chunk_num, "msg_key": msg_key},
+            )
+            ok = self.writer.publish_txt_record(
+                self._chunk_domain(msg_key, chunk_num),
+                record.to_txt_record(),
+                ttl=ttl,
+            )
+            if not ok:
+                return False
+
+        # Publish signed manifest at a random slot
+        manifest = SlotManifest(
+            msg_id=msg_id,
+            sender_spk=sender_spk,
+            recipient_id=recipient_id,
+            total_chunks=total_chunks,
+            ts=now,
+            exp=now + ttl,
+        )
+        slot_record = manifest.sign(self.crypto)
+        slot = random.randint(0, SLOT_COUNT - 1)
+        return self.writer.publish_txt_record(
+            self._slot_domain(recipient_id, slot),
+            slot_record,
+            ttl=ttl,
+        )
+
+    # ---- receive -----------------------------------------------------------
+
+    def receive_messages(self) -> List[InboxMessage]:
+        """Poll all mailbox slots; verify and decrypt any fresh messages.
+
+        Returns the list of newly-delivered messages. Replay-cache rejections
+        and signature failures are silently skipped.
+        """
+        results: List[InboxMessage] = []
+        for slot in range(SLOT_COUNT):
+            slot_domain = self._slot_domain(self.user_id, slot)
+            records = self.reader.query_txt_record(slot_domain)
+            if not records:
+                continue
+            for record in records:
+                parsed = SlotManifest.parse_and_verify(record)
+                if parsed is None:
+                    continue
+                manifest, _ = parsed
+                if manifest.recipient_id != self.user_id:
+                    continue
+                if manifest.is_expired():
+                    continue
+                if not self.replay_cache.check_and_record(
+                    manifest.sender_spk, manifest.msg_id, manifest.exp
+                ):
+                    continue
+                decoded = self._fetch_and_decrypt(manifest)
+                if decoded is not None:
+                    plaintext, ts, msg_id = decoded
+                    results.append(InboxMessage(
+                        sender_signing_pk=manifest.sender_spk,
+                        plaintext=plaintext,
+                        timestamp=ts,
+                        msg_id=msg_id,
+                    ))
+        return results
+
+    def _fetch_and_decrypt(
+        self,
+        manifest: SlotManifest,
+    ) -> Optional[Tuple[bytes, int, bytes]]:
+        """Return (plaintext, timestamp, msg_id) or None if assembly/decrypt fails."""
+        msg_key = self._msg_key(
+            manifest.msg_id, manifest.recipient_id, manifest.sender_spk
+        )
+
+        assembled: Optional[bytes] = None
+        for chunk_num in range(manifest.total_chunks):
+            records = self.reader.query_txt_record(
+                self._chunk_domain(msg_key, chunk_num)
+            )
+            if not records:
+                return None
+            dmp_record: Optional[DMPDNSRecord] = None
+            for txt in records:
+                if txt.startswith("v=dmp"):
+                    try:
+                        dmp_record = DMPDNSRecord.from_txt_record(txt)
+                        break
+                    except Exception:
+                        continue
+            if dmp_record is None or dmp_record.record_type != "chunk":
+                return None
+            chunk_bytes = dmp_record.data
+            assembled = self.assembler.add_chunk(
+                message_id=manifest.msg_id,
+                chunk_number=chunk_num,
+                chunk_data=chunk_bytes,
+                total_chunks=manifest.total_chunks,
+            )
+
+        if assembled is None:
+            return None
+
+        try:
+            outer = DMPMessage.from_bytes(assembled)
+        except ValueError:
+            return None
+
+        try:
+            encrypted = EncryptedMessage.from_bytes(outer.payload)
+        except ValueError:
+            return None
+
+        # Rebuild the same AAD the sender bound at encrypt time.
+        aad_header = DMPHeader(
+            version=outer.header.version,
+            message_type=outer.header.message_type,
+            message_id=outer.header.message_id,
+            sender_id=outer.header.sender_id,
+            recipient_id=outer.header.recipient_id,
+            total_chunks=0,
+            chunk_number=0,
+            timestamp=outer.header.timestamp,
+            ttl=outer.header.ttl,
+        )
+        try:
+            plaintext = self.encryption.decrypt_with_header(
+                encrypted, aad_header.to_bytes()
+            )
+        except Exception:
+            return None
+        return plaintext, outer.header.timestamp, outer.header.message_id
