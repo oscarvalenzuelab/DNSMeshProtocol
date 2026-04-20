@@ -198,17 +198,26 @@ class DMPCrypto:
     def decrypt_message(
         self,
         encrypted_msg: EncryptedMessage,
-        associated_data: Optional[bytes] = None
+        associated_data: Optional[bytes] = None,
+        *,
+        private_key: Optional[X25519PrivateKey] = None,
     ) -> bytes:
-        """Decrypt message using private key"""
-        
+        """Decrypt message using our long-term private key, or an override.
+
+        `private_key=X` lets the caller ECDH with a one-time prekey sk instead
+        of the long-term identity key. Used by the X3DH-style forward-secrecy
+        path — see `dmp.core.prekeys` and `dmp.client.client.receive_messages`.
+        """
+
+        decrypt_key = private_key if private_key is not None else self.private_key
+
         # Reconstruct ephemeral public key
         ephemeral_public = X25519PublicKey.from_public_bytes(
             encrypted_msg.ephemeral_public_key
         )
-        
+
         # Perform ECDH key exchange
-        shared_secret = self.private_key.exchange(ephemeral_public)
+        shared_secret = decrypt_key.exchange(ephemeral_public)
         
         # Derive decryption key using HKDF (same as encryption)
         hkdf = HKDF(
@@ -352,9 +361,16 @@ class MessageEncryption:
         self,
         encrypted_msg: EncryptedMessage,
         header_aad: bytes,
+        *,
+        private_key: Optional[X25519PrivateKey] = None,
     ) -> bytes:
-        """Decrypt a header-AAD ciphertext; raises InvalidTag on header mutation."""
+        """Decrypt a header-AAD ciphertext; raises InvalidTag on header mutation.
+
+        `private_key` routes ECDH through a one-time prekey sk (forward
+        secrecy). When None, the instance's long-term private key is used.
+        """
         return self.crypto.decrypt_message(
             encrypted_msg=encrypted_msg,
             associated_data=header_aad,
+            private_key=private_key,
         )

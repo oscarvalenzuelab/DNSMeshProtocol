@@ -6,9 +6,14 @@ Decentralized peer-to-peer messaging that tunnels encrypted messages through DNS
 
 ## What you get
 
-- **End-to-end encryption.** X25519 ECDH + ChaCha20-Poly1305 with an
-  ephemeral sender keypair per message. *Not* forward-secret against
-  recipient key compromise — see [SECURITY.md](SECURITY.md).
+- **End-to-end encryption with forward secrecy.** X25519 ECDH +
+  ChaCha20-Poly1305 with an ephemeral sender keypair per message.
+  When the recipient has published signed one-time prekeys
+  (`dmp identity refresh-prekeys`), ECDH runs against a prekey that
+  the recipient deletes after decrypt — so a later leak of the
+  long-term X25519 key cannot recover past messages. Fallback to the
+  long-term key when no prekey pool is available; no FS for that
+  message. See [SECURITY.md](SECURITY.md) for the full model.
 - **Sender authentication pinned to contacts.** Every slot manifest is
   Ed25519-signed; on receive, the `sender_spk` must match a signing key
   already pinned in the contact list. Unknown-sender manifests are dropped.

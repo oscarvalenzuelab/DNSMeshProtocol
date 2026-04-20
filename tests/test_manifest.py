@@ -17,6 +17,7 @@ def _make_manifest(sender: DMPCrypto, recipient: DMPCrypto, now: int) -> SlotMan
         recipient_id=hashlib.sha256(recipient.get_public_key_bytes()).digest(),
         total_chunks=4,
         data_chunks=3,
+        prekey_id=0,
         ts=now,
         exp=now + 300,
     )
@@ -85,6 +86,7 @@ class TestSlotManifest:
             recipient_id=b'\x01' * 32,
             total_chunks=1,
             data_chunks=1,
+            prekey_id=0,
             ts=now - 1000,
             exp=now - 500,
         )

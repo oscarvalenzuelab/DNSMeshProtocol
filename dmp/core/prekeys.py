@@ -1,0 +1,285 @@
+"""X3DH-style one-time prekeys for forward secrecy.
+
+Without prekeys, DMP's sender-ephemeral / recipient-long-term ECDH design
+means anyone who later captures the recipient's long-term X25519 key can
+decrypt all past stored ciphertexts — no forward secrecy.
+
+With prekeys, the recipient publishes a pool of single-use X25519
+keypairs signed by their Ed25519 identity. Senders pick an unused
+prekey, use it in ECDH instead of the long-term key, and the recipient
+deletes the matching prekey_sk after the first successful decrypt. Once
+deleted, compromise of the long-term key does not decrypt that past
+message — that is the forward-secrecy property.
+
+This is not the full Signal X3DH: there is no pre-agreement ratchet, no
+post-compromise security, and collisions between two senders choosing
+the same prekey will lose the later sender's message. It is also
+best-effort: a process crash between decrypt and deletion leaves the sk
+on disk. The real win is the rotation model — refresh frequently, old
+sks go away, past traffic becomes undecodable to anyone without the
+session ciphertext.
+
+Wire format (one TXT record per prekey, all at the same RRset name):
+
+    prekeys.id-<username_hash12>.<domain>  IN TXT  "v=dmp1;t=prekey;d=<b64>"
+
+body = prekey_id(4) || x25519_pub(32) || exp(8)   =  44 bytes
+sig  = Ed25519 signature over body                =  64 bytes
+total                                             = 108 bytes
+base64                                            = 144 chars
+prefix `v=dmp1;t=prekey;d=`                       =  18 chars
+wire                                              = 162 chars (fits one TXT string)
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import os
+import secrets
+import sqlite3
+import time
+from dataclasses import dataclass
+from threading import RLock
+from typing import List, Optional, Tuple
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey, X25519PublicKey,
+)
+
+from dmp.core.crypto import DMPCrypto
+
+
+RECORD_PREFIX = "v=dmp1;t=prekey;d="
+_BODY_LEN = 4 + 32 + 8        # prekey_id + pub + exp = 44
+_SIG_LEN = 64
+_WIRE_LEN = _BODY_LEN + _SIG_LEN   # 108 bytes
+
+
+def prekey_rrset_name(username: str, base_domain: str) -> str:
+    """DNS name at which a user's prekey pool is published.
+
+    Matches the identity-record hashing scheme so callers don't need to
+    juggle two different label formats.
+    """
+    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:12]
+    return f"prekeys.id-{username_hash}.{base_domain.rstrip('.')}"
+
+
+@dataclass
+class Prekey:
+    """A single one-time prekey record (public side)."""
+
+    prekey_id: int              # 4-byte unsigned, unique within an identity's pool
+    public_key: bytes           # 32-byte X25519 pub
+    exp: int                    # unix seconds after which recipient may drop
+
+    def to_body_bytes(self) -> bytes:
+        if not (0 <= self.prekey_id < (1 << 32)):
+            raise ValueError("prekey_id out of range")
+        if len(self.public_key) != 32:
+            raise ValueError("public_key must be 32 bytes")
+        return (
+            self.prekey_id.to_bytes(4, "big")
+            + self.public_key
+            + self.exp.to_bytes(8, "big")
+        )
+
+    @classmethod
+    def from_body_bytes(cls, body: bytes) -> "Prekey":
+        if len(body) != _BODY_LEN:
+            raise ValueError(f"prekey body must be {_BODY_LEN} bytes, got {len(body)}")
+        return cls(
+            prekey_id=int.from_bytes(body[0:4], "big"),
+            public_key=body[4:36],
+            exp=int.from_bytes(body[36:44], "big"),
+        )
+
+    def sign(self, identity_crypto: DMPCrypto) -> str:
+        body = self.to_body_bytes()
+        sig = identity_crypto.sign_data(body)
+        return f"{RECORD_PREFIX}{base64.b64encode(body + sig).decode('ascii')}"
+
+    @classmethod
+    def parse_and_verify(
+        cls, record: str, expected_signer_spk: bytes
+    ) -> Optional["Prekey"]:
+        """Parse and verify a prekey TXT record.
+
+        Returns the Prekey on success, None if malformed or signature fails
+        against `expected_signer_spk`. Caller is responsible for supplying
+        the right Ed25519 key — prekey records do not self-identify the
+        signer (unlike SlotManifest).
+        """
+        if not record.startswith(RECORD_PREFIX):
+            return None
+        try:
+            wire = base64.b64decode(record[len(RECORD_PREFIX):])
+        except Exception:
+            return None
+        if len(wire) != _WIRE_LEN:
+            return None
+        body, sig = wire[:_BODY_LEN], wire[_BODY_LEN:]
+        try:
+            pk = cls.from_body_bytes(body)
+        except ValueError:
+            return None
+        if not DMPCrypto.verify_signature(body, sig, expected_signer_spk):
+            return None
+        return pk
+
+    def is_expired(self, now: Optional[int] = None) -> bool:
+        now = int(time.time()) if now is None else now
+        return now > self.exp
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS prekeys (
+    prekey_id INTEGER PRIMARY KEY,
+    private_key BLOB NOT NULL,
+    public_key BLOB NOT NULL,
+    exp INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prekeys_exp ON prekeys(exp);
+"""
+
+
+class PrekeyStore:
+    """Local, sqlite-backed store of one-time prekey *private* keys.
+
+    Thread-safe via a per-store RLock. Opening the same db_path twice in
+    one process hands out two independent connections; that's fine because
+    sqlite itself handles cross-connection locking.
+
+    The prekey_sk rows are the forward-secrecy secret. Protect the sqlite
+    file with the same filesystem perms as the identity passphrase file
+    (the CLI's `_make_client` wires them both out of `$DMP_CONFIG_HOME`).
+    """
+
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        parent = os.path.dirname(db_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        self._lock = RLock()
+        self._conn = sqlite3.connect(
+            db_path, isolation_level=None, check_same_thread=False
+        )
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.executescript(_SCHEMA)
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self) -> "PrekeyStore":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    # ---- generation --------------------------------------------------------
+
+    def generate_pool(
+        self,
+        count: int,
+        ttl_seconds: int,
+    ) -> List[Tuple[Prekey, X25519PrivateKey]]:
+        """Generate `count` fresh prekeys and persist the private halves.
+
+        Returns the (Prekey, X25519PrivateKey) list so the caller can
+        immediately sign and publish the public side. The prekey_id is a
+        32-bit random value; collisions with existing rows are retried.
+        """
+        now = int(time.time())
+        exp = now + ttl_seconds
+        out: List[Tuple[Prekey, X25519PrivateKey]] = []
+        with self._lock:
+            for _ in range(count):
+                # Random prekey_id, retry on collision.
+                for _retry in range(10):
+                    pid = secrets.randbits(32)
+                    exists = self._conn.execute(
+                        "SELECT 1 FROM prekeys WHERE prekey_id = ?", (pid,)
+                    ).fetchone()
+                    if not exists:
+                        break
+                else:
+                    raise RuntimeError("could not allocate unique prekey_id")
+
+                sk = X25519PrivateKey.generate()
+                sk_bytes = sk.private_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PrivateFormat.Raw,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+                pk_bytes = sk.public_key().public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw,
+                )
+
+                self._conn.execute(
+                    "INSERT INTO prekeys "
+                    "(prekey_id, private_key, public_key, exp, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (pid, sk_bytes, pk_bytes, exp, now),
+                )
+                out.append((Prekey(prekey_id=pid, public_key=pk_bytes, exp=exp), sk))
+        return out
+
+    # ---- lookup + consumption ---------------------------------------------
+
+    def get_private_key(self, prekey_id: int) -> Optional[X25519PrivateKey]:
+        """Return the sk for a given prekey_id, or None if absent / expired."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT private_key FROM prekeys WHERE prekey_id = ? AND exp > ?",
+                (prekey_id, int(time.time())),
+            ).fetchone()
+        if row is None:
+            return None
+        return X25519PrivateKey.from_private_bytes(row[0])
+
+    def consume(self, prekey_id: int) -> bool:
+        """Delete the sk for this prekey_id. Returns True if something was deleted.
+
+        Called by the recipient right after a successful decrypt; once the
+        row is gone, a later leak of the long-term X25519 key cannot
+        recover the same session key.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM prekeys WHERE prekey_id = ?", (prekey_id,)
+            )
+            return cur.rowcount > 0
+
+    # ---- bookkeeping -------------------------------------------------------
+
+    def count_live(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM prekeys WHERE exp > ?",
+                (int(time.time()),),
+            ).fetchone()
+        return int(row[0])
+
+    def cleanup_expired(self) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM prekeys WHERE exp <= ?", (int(time.time()),)
+            )
+            return cur.rowcount
+
+    def list_live_ids(self) -> List[int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT prekey_id FROM prekeys WHERE exp > ? ORDER BY prekey_id",
+                (int(time.time()),),
+            ).fetchall()
+        return [int(r[0]) for r in rows]

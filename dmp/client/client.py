@@ -15,8 +15,9 @@ from dmp.core import erasure
 from dmp.core.chunking import MessageAssembler, MessageChunker
 from dmp.core.crypto import DMPCrypto, EncryptedMessage, MessageEncryption
 from dmp.core.dns import DMPDNSRecord
-from dmp.core.manifest import ReplayCache, SlotManifest
+from dmp.core.manifest import NO_PREKEY, ReplayCache, SlotManifest
 from dmp.core.message import DMPHeader, DMPIdentity, DMPMessage, MessageType
+from dmp.core.prekeys import Prekey, PrekeyStore, prekey_rrset_name
 from dmp.network.base import DNSRecordReader, DNSRecordStore, DNSRecordWriter
 from dmp.network.memory import InMemoryDNSStore
 
@@ -82,6 +83,7 @@ class DMPClient:
         reader: Optional[DNSRecordReader] = None,
         replay_cache_path: Optional[str] = None,
         kdf_salt: Optional[bytes] = None,
+        prekey_store_path: Optional[str] = None,
     ):
         if store is not None:
             if writer is None:
@@ -105,6 +107,13 @@ class DMPClient:
         self.assembler = MessageAssembler(enable_error_correction=True)
         self.encryption = MessageEncryption(self.crypto)
         self.replay_cache = ReplayCache(persist_path=replay_cache_path)
+
+        # Prekey store: holds one-time X25519 prekey *private* halves so the
+        # receive path can look them up by prekey_id and consume after decrypt.
+        # If no path is provided we get an ephemeral in-memory store via
+        # sqlite's :memory: — useful for tests but it drops on process exit,
+        # so a CLI deployment should always pass a path.
+        self.prekey_store = PrekeyStore(prekey_store_path or ":memory:")
 
         self.contacts: Dict[str, Contact] = {}
 
@@ -179,6 +188,44 @@ class DMPClient:
         """Signing keys we've pinned; used to filter incoming manifests."""
         return {c.signing_key_bytes for c in self.contacts.values() if c.signing_key_bytes}
 
+    def _pick_recipient_prekey(
+        self, contact: "Contact"
+    ) -> Tuple[int, Optional[bytes]]:
+        """Fetch a fresh prekey from DNS and return (prekey_id, x25519_pub).
+
+        Returns (0, None) when:
+          - contact has no pinned Ed25519 key (can't verify prekey signatures)
+          - no valid, unexpired prekey records are published
+          - the pool DNS fetch fails for any other reason
+
+        In those cases the caller falls back to the recipient's long-term
+        X25519 key (no forward secrecy for this message). A pinned contact
+        with a live prekey pool gets real FS: the recipient consumes the
+        prekey_sk after decrypt, so a later leak of their long-term X25519
+        key does not recover that message's session key.
+        """
+        if not contact.signing_key_bytes:
+            return (0, None)
+        name = prekey_rrset_name(contact.username, contact.domain)
+        try:
+            records = self.reader.query_txt_record(name)
+        except Exception:
+            return (0, None)
+        if not records:
+            return (0, None)
+        verified: List[Prekey] = []
+        for txt in records:
+            pk = Prekey.parse_and_verify(txt, contact.signing_key_bytes)
+            if pk is None:
+                continue
+            if pk.is_expired():
+                continue
+            verified.append(pk)
+        if not verified:
+            return (0, None)
+        chosen = random.choice(verified)
+        return (chosen.prekey_id, chosen.public_key)
+
     # ---- identity ----------------------------------------------------------
 
     def get_public_key_hex(self) -> str:
@@ -195,6 +242,25 @@ class DMPClient:
             "signing_public_key": self.get_signing_public_key_hex(),
             "user_id": self.user_id.hex(),
         }
+
+    # ---- prekeys -----------------------------------------------------------
+
+    def refresh_prekeys(self, count: int = 50, ttl_seconds: int = 86_400) -> int:
+        """Generate `count` new one-time prekeys, sign them, publish as an RRset.
+
+        Call this periodically so senders always find a live pool. Previous
+        prekey *records* in DNS stay until they expire; previous prekey
+        *private keys* in the local store stay until cleanup_expired runs.
+        Returns the number successfully published.
+        """
+        pool = self.prekey_store.generate_pool(count=count, ttl_seconds=ttl_seconds)
+        name = prekey_rrset_name(self.username, self.domain)
+        published = 0
+        for prekey, _sk in pool:
+            wire = prekey.sign(self.crypto)
+            if self.writer.publish_txt_record(name, wire, ttl=ttl_seconds):
+                published += 1
+        return published
 
     # ---- send --------------------------------------------------------------
 
@@ -225,12 +291,24 @@ class DMPClient:
             ttl=ttl,
         )
 
-        try:
-            recipient_pubkey = X25519PublicKey.from_public_bytes(
-                contact.public_key_bytes
-            )
-        except Exception:
-            return False
+        # Pick a recipient prekey for forward-secrecy if one is available;
+        # fall back to the long-term X25519 key if none is reachable. The
+        # recipient signs prekeys with their Ed25519 identity, so we need
+        # the pinned signing key to verify — unpinned contacts get
+        # long-term ECDH only (no FS).
+        prekey_id, prekey_pub = self._pick_recipient_prekey(contact)
+        if prekey_pub is not None:
+            try:
+                recipient_pubkey = X25519PublicKey.from_public_bytes(prekey_pub)
+            except Exception:
+                return False
+        else:
+            try:
+                recipient_pubkey = X25519PublicKey.from_public_bytes(
+                    contact.public_key_bytes
+                )
+            except Exception:
+                return False
 
         # Encrypt once, with AAD bound to a canonical header subset that excludes
         # total_chunks (unknown until after chunking). Everything else that
@@ -294,6 +372,7 @@ class DMPClient:
             recipient_id=recipient_id,
             total_chunks=total_chunks,
             data_chunks=data_chunks,
+            prekey_id=prekey_id,
             ts=now,
             exp=now + ttl,
         )
@@ -447,10 +526,27 @@ class DMPClient:
             timestamp=outer.header.timestamp,
             ttl=outer.header.ttl,
         )
+        # Prekey-based ECDH path for forward secrecy. When manifest.prekey_id
+        # is nonzero, look up the matching one-time X25519 private key in the
+        # local store and use it for decrypt instead of our long-term key.
+        # On successful decrypt we consume the prekey_sk so a later long-term
+        # key leak cannot recover this message's session.
+        prekey_private = None
+        if manifest.prekey_id != NO_PREKEY:
+            prekey_private = self.prekey_store.get_private_key(manifest.prekey_id)
+            if prekey_private is None:
+                # Prekey was deleted or expired — we can't decrypt this
+                # message. That's a delivery failure, not a security failure.
+                return None
         try:
             plaintext = self.encryption.decrypt_with_header(
-                encrypted, aad_header.to_bytes()
+                encrypted, aad_header.to_bytes(), private_key=prekey_private
             )
         except Exception:
             return None
+        if manifest.prekey_id != NO_PREKEY:
+            # One-time use: delete the sk now so future compromise can't
+            # decrypt the stored ciphertext. Best effort — a crash between
+            # decrypt and consume leaves the row on disk.
+            self.prekey_store.consume(manifest.prekey_id)
         return plaintext, outer.header.timestamp, outer.header.message_id

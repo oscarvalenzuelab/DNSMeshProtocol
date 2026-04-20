@@ -198,6 +198,118 @@ class TestSendReceive:
         assert len(inbox) == 1
         assert inbox[0].plaintext == b"first contact"
 
+    def test_prekey_forward_secrecy_roundtrip(self):
+        """When bob publishes prekeys and alice has pinned his signing key,
+        the message uses a one-time prekey for ECDH and bob's store consumes
+        the sk after decrypt. A later leak of bob's long-term X25519 key
+        cannot recover that session's plaintext.
+        """
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+
+        # Pin both directions with signing keys so prekey verification works.
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+
+        # Bob refreshes prekeys → a pool of one-time X25519 keys lands in DNS.
+        published = bob.refresh_prekeys(count=5, ttl_seconds=3600)
+        assert published == 5
+        assert bob.prekey_store.count_live() == 5
+
+        assert alice.send_message("bob", "FS-protected payload")
+
+        # Find the manifest → prekey_id should be nonzero (FS path taken).
+        from dmp.core.manifest import NO_PREKEY, SlotManifest
+        manifest = None
+        for name in store.list_names():
+            if not name.startswith("slot-"):
+                continue
+            for value in store.query_txt_record(name) or []:
+                parsed = SlotManifest.parse_and_verify(value)
+                if parsed and parsed[0].recipient_id == bob.user_id:
+                    manifest = parsed[0]
+                    break
+            if manifest:
+                break
+        assert manifest is not None
+        assert manifest.prekey_id != NO_PREKEY
+        used_id = manifest.prekey_id
+        assert bob.prekey_store.get_private_key(used_id) is not None
+
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"FS-protected payload"
+
+        # Consumed after decrypt — FS property: even if bob's long-term X25519
+        # private key leaks now, this message's session key can't be recovered
+        # because the prekey sk is gone.
+        assert bob.prekey_store.get_private_key(used_id) is None
+        assert bob.prekey_store.count_live() == 4
+
+    def test_fallback_to_long_term_when_no_prekeys(self):
+        """Without a pinned signing key for bob, alice falls back to his
+        long-term X25519 key (no FS) rather than failing to send."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        # NOTE: no signing_key_hex — alice can't verify any prekey signature.
+        alice.add_contact("bob", bob.get_public_key_hex())
+
+        # Bob publishes prekeys, but alice won't verify them without the pin.
+        bob.refresh_prekeys(count=3, ttl_seconds=3600)
+
+        assert alice.send_message("bob", "long-term path")
+
+        from dmp.core.manifest import NO_PREKEY, SlotManifest
+        manifest = None
+        for name in store.list_names():
+            if not name.startswith("slot-"):
+                continue
+            for value in store.query_txt_record(name) or []:
+                parsed = SlotManifest.parse_and_verify(value)
+                if parsed and parsed[0].recipient_id == bob.user_id:
+                    manifest = parsed[0]
+                    break
+            if manifest:
+                break
+        assert manifest is not None
+        assert manifest.prekey_id == NO_PREKEY
+
+        # Bob still decrypts fine via the long-term key path.
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"long-term path"
+
+    def test_prekey_deleted_before_decrypt_drops_message(self):
+        """If bob's prekey_sk is wiped (e.g. refresh rotated it out) before
+        he polls, the ciphertext is undeliverable — the FS property working
+        in the other direction."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        bob.refresh_prekeys(count=2, ttl_seconds=3600)
+        assert alice.send_message("bob", "undecodable after wipe")
+
+        # Wipe bob's prekey store before he polls.
+        for pid in bob.prekey_store.list_live_ids():
+            bob.prekey_store.consume(pid)
+        assert bob.receive_messages() == []
+
     def test_lost_chunks_recover_via_erasure(self):
         """Dropping up to (n-k) chunks before bob polls still delivers.
 
@@ -336,6 +448,7 @@ class TestSendReceive:
             recipient_id=real_manifest.recipient_id,
             total_chunks=real_manifest.total_chunks,
             data_chunks=real_manifest.data_chunks,
+            prekey_id=0,
             ts=real_manifest.ts,
             exp=real_manifest.exp,
         )
@@ -421,6 +534,7 @@ class TestSendReceive:
                 recipient_id=bob_recipient_id,
                 total_chunks=99,  # points to chunks that don't exist
                 data_chunks=99,
+                prekey_id=0,
                 ts=int(time.time()),
                 exp=int(time.time()) + 300,
             ).sign(eve.crypto)
@@ -454,6 +568,7 @@ class TestSendReceive:
             recipient_id=bob_recipient_id,
             total_chunks=1,
             data_chunks=1,
+            prekey_id=0,
             ts=int(time.time()),
             exp=int(time.time()) + 300,
         )
