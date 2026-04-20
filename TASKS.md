@@ -16,33 +16,7 @@ work queue.
 
 ## Active
 
-### M1.1 — `ResolverPool` class with failover
-
-| Field | Value |
-|---|---|
-| **ID** | `M1.1` |
-| **Status** | `pending` |
-| **Owner** | — |
-| **Depends on** | — |
-| **Blocks** | `M1.2`, `M1.4` |
-| **Estimated effort** | 2 days |
-| **Touch zones** | `dmp/network/resolver_pool.py` (new), `dmp/network/base.py` (add reader interface tweaks if needed), `tests/test_resolver_pool.py` (new) |
-
-**Acceptance criteria:**
-
-- [ ] New `dmp.network.resolver_pool.ResolverPool` implements
-      `DNSRecordReader`.
-- [ ] Constructor takes a list of resolver hosts + an optional port
-      (default 53).
-- [ ] On `query_txt_record`, tries resolvers in priority order, failing
-      over on `NXDOMAIN` / `NoAnswer` / socket timeout / transport error.
-- [ ] Tracks per-resolver health: successful queries refresh a "good"
-      timestamp; consecutive failures demote the resolver to the back
-      of the queue for a cooldown window (60 s default).
-- [ ] Tests cover: all-good happy path, first-resolver-down failover,
-      all-resolvers-down returns `None`, cooldown promotion back to
-      primary after success.
-- [ ] `docs/guide/cli.md` updated if the CLI surface changes.
+### M1.1 — `ResolverPool` class with failover — DONE (→ see Done section)
 
 ---
 
@@ -125,4 +99,6 @@ These come from `ROADMAP.md`. Pull only after M1 sprint closes.
 
 ## Done
 
-*(Tasks migrate here on merge. Format: `<TASK-ID>` — one-line summary — commit `<sha>`.)*
+- **M1.1** — `ResolverPool` with per-host health tracking, oracle-based
+  demotion, and cooldown-as-preference fallback — commits `7cb8d7f`
+  through `12376a4` (6 Codex review rounds, final clean pass).

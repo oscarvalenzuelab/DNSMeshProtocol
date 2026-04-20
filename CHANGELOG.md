@@ -7,6 +7,33 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added (M1 — resolver resilience, partial)
+
+- `dmp.network.resolver_pool.ResolverPool`: a `DNSRecordReader` that wraps
+  multiple upstream resolvers (IP literals only) with per-host health
+  tracking and priority-ordered failover. Addresses ROADMAP milestone
+  M1.1. Semantics refined through six Codex review rounds:
+  - NXDOMAIN and NoAnswer on their own don't demote a resolver (they're
+    legitimate answers, not health failures).
+  - But when a later resolver returns a valid TXT for the same query,
+    every earlier resolver that claimed NXDOMAIN is retroactively
+    demoted — oracle-based demotion proves the earlier ones wrong.
+  - When every resolver returns NXDOMAIN (no oracle fires), the streak
+    counter resets for each — a genuine not-found is itself a healthy
+    response and shouldn't compose with a later unrelated timeout into
+    a spurious "consecutive" demotion.
+  - Cooldown is a priority signal, not a ban: demoted resolvers still
+    get queried in a fallback tier if the preferred tier is exhausted,
+    so transient failures across all upstreams don't blackhole lookups.
+  - Only specific network/transport exceptions (NoNameservers, Timeout,
+    socket.timeout, OSError) count as health failures. Caller-side
+    errors (malformed names) propagate.
+  - 36 tests covering construction validation (IPv4/IPv6 literal parsing,
+    rejection of hostnames), each failure mode, oracle demotion with 1
+    and N demoted peers, cooldown semantics, promotion after recovery,
+    and multi-threshold streak behavior.
+
+
 ### Added (onboarding + TLS)
 
 - `dmp.core.identity.IdentityRecord`: signed, binary-encoded DMP identity
