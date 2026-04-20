@@ -55,10 +55,14 @@ The protocol assumes:
    (atomic rename) but a crash mid-purge will keep an expired entry one
    cycle longer than intended. The persisted cache is sized-bounded only
    by the message TTL, not by an explicit cap.
-2. **Slot squatting DoS.** Signed manifests prevent impersonation but not
-   denial-of-service: an attacker can publish their own valid manifest
-   in every mailbox slot and block real messages until expiry. Real slot
-   leasing with per-slot priority / allowlists is future work.
+2. **Slot DoS surface narrowed but not eliminated.** Mailbox slots now
+   have append (RRset) semantics, so an attacker can *add* manifests
+   but cannot *evict* legitimate ones. Signed manifests ensure forged
+   entries fail verification. What remains: a volumetric attacker can
+   still fill the sqlite store with valid-but-irrelevant manifests until
+   disk is full. HTTP rate limiting and a per-name RRset size cap are
+   future work; for now, operators should run the HTTP API with a
+   bearer token (`DMP_HTTP_TOKEN`) and a reverse proxy rate limit.
 3. **Cross-chunk erasure coding is missing.** Reed-Solomon is per-chunk
    only; it repairs bit errors inside a received chunk but a lost chunk
    still kills the message. Real RS(k,n) across chunks is future work.

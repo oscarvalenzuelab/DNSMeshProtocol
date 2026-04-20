@@ -60,9 +60,14 @@ class SqliteMailboxStore(DNSRecordStore):
         now = int(time.time())
         expires = now + int(ttl)
         with self._lock:
-            # Replace any prior record at this name, matching the RRset-style
-            # semantics the other writers (Cloudflare, Route53 UPSERT) use.
-            self._conn.execute("DELETE FROM records WHERE name = ?", (name,))
+            # Append semantics. DNS natively supports multiple TXT records at
+            # one name (an RRset); the prior "replace all" behavior let an
+            # attacker who could reach the publish endpoint wipe other
+            # senders' manifests out of a recipient's mailbox slot. With
+            # append, an attacker can *add* records but cannot *remove*
+            # legitimate ones. The PRIMARY KEY (name, value) means an honest
+            # duplicate republish refreshes the TTL without growing the row
+            # set.
             self._conn.execute(
                 "INSERT OR REPLACE INTO records "
                 "(name, value, ttl, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",

@@ -20,8 +20,17 @@ class InMemoryDNSStore(DNSRecordStore):
         self._records: Dict[str, List[str]] = {}
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
+        """Append to the RRset at `name`. Duplicates are collapsed.
+
+        DNS allows multiple TXT records at one name (an RRset). A publish at
+        an already-occupied name ADDS to the set rather than replacing it,
+        so an attacker who reaches the publish endpoint can add records but
+        cannot evict legitimate ones. Identical re-publishes are idempotent.
+        """
         with self._lock:
-            self._records[name] = [value]
+            values = self._records.setdefault(name, [])
+            if value not in values:
+                values.append(value)
         return True
 
     def delete_txt_record(self, name: str, value: Optional[str] = None) -> bool:

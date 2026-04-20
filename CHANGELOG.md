@@ -49,6 +49,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `MessageEncryption.encrypt_with_header` / `decrypt_with_header` bind
   the full canonical `DMPHeader` bytes as AEAD AAD.
 
+### Security
+
+- Mailbox slots now use DNS-native append (RRset) semantics. Previously
+  the node's stores (SqliteMailboxStore and InMemoryDNSStore) replaced
+  the value at a name on every `publish_txt_record`; this let anyone
+  who could reach the publish endpoint wipe other senders' manifests
+  out of a recipient's slot. With append, an attacker can add entries
+  but cannot evict legitimate ones — signature verification still
+  filters their junk on the recipient side. Regression test
+  `test_slot_squatting_attacker_cannot_evict_real_messages`.
+
 ### Changed
 
 - `MessageChunker` switched from whole-message Reed-Solomon to **per-chunk**

@@ -144,6 +144,53 @@ class TestSendReceive:
         payloads = sorted(m.plaintext for m in inbox)
         assert payloads == [b"from-alice", b"from-eve"]
 
+    def test_slot_squatting_attacker_cannot_evict_real_messages(self):
+        """An attacker who blasts junk into every slot cannot block delivery.
+
+        Under the old replace-the-RRset semantics, a single publish at each
+        of the 10 slot names wiped out any legitimate manifest waiting there.
+        With append semantics a real manifest survives alongside the junk,
+        and the receive loop filters on signature + replay-cache — so bob
+        still gets alice's message even after eve sprays all 10 slots.
+        """
+        import hashlib
+        import uuid
+        from dmp.core.manifest import SlotManifest
+
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+        eve = DMPClient("eve", "eve-pass", domain="mesh.test", store=store)
+
+        # Alice legitimately sends, chunks and manifest land in the store.
+        assert alice.send_message("bob", "survive the squat")
+
+        # Eve publishes a valid (but irrelevant) manifest into every one of
+        # bob's mailbox slots. She can sign with her own key and her
+        # manifests pass verification, but they address a different msg_id
+        # so bob's fetch-and-decrypt fails and nothing is delivered from them.
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        mb_hash = hashlib.sha256(bob_recipient_id).hexdigest()[:12]
+        for slot in range(10):
+            junk = SlotManifest(
+                msg_id=uuid.uuid4().bytes,
+                sender_spk=eve.crypto.get_signing_public_key_bytes(),
+                recipient_id=bob_recipient_id,
+                total_chunks=99,  # points to chunks that don't exist
+                ts=int(time.time()),
+                exp=int(time.time()) + 300,
+            ).sign(eve.crypto)
+            store.publish_txt_record(
+                f"slot-{slot}.mb-{mb_hash}.mesh.test", junk
+            )
+
+        # Bob polls — he sees both alice's real manifest and eve's junk at
+        # each slot. Alice's message still comes through.
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"survive the squat"
+
     def test_signed_manifest_rejects_impersonation(self):
         """An attacker forging a manifest in a victim's slot is caught."""
         import hashlib
