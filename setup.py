@@ -44,4 +44,9 @@ setup(
             "pylint>=2.17.0",
         ]
     },
+    entry_points={
+        "console_scripts": [
+            "dmp = dmp.cli:main",
+        ],
+    },
 )
