@@ -1,0 +1,49 @@
+# Version control
+.git/
+.gitignore
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Virtual envs
+venv/
+.venv/
+env/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Tests and local-only docs — not needed in the container
+tests/
+.claude/
+.context/
+
+# Local notes / config
+CLAUDE.md
+TODO.md
+NOTES.md
+info.txt
+*.log
+*.db
+*.sqlite
+
+# Docker itself
+Dockerfile
+docker-compose.yml
+.dockerignore
