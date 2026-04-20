@@ -20,8 +20,9 @@ Decentralized peer-to-peer messaging that tunnels encrypted messages through DNS
 - **Replay protection.** Per-recipient `(sender_spk, msg_id)` cache
   rejects re-publications within its TTL window.
 - **Per-chunk Reed-Solomon** (32 parity bytes per chunk) for bit-error
-  repair within a received chunk. No cross-chunk erasure: a lost chunk
-  still fails the message.
+  repair within a received chunk, plus **cross-chunk erasure coding** so
+  any k-of-n chunks reconstruct the message (~30% redundancy by default).
+  Chunk loss up to n-k is fully recoverable.
 - **Pluggable transport.** Any `DNSRecordWriter` / `DNSRecordReader` works — in-memory for tests, sqlite for nodes, Cloudflare/Route53/BIND for production.
 - **Self-contained node.** One Python process serves UDP DNS + HTTP submissions from a persistent sqlite store, with a TTL cleanup worker.
 - **Docker-first deploy.** `docker compose up` gives you a running node with persistence.

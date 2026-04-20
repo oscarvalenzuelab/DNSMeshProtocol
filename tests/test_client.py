@@ -198,6 +198,94 @@ class TestSendReceive:
         assert len(inbox) == 1
         assert inbox[0].plaintext == b"first contact"
 
+    def test_lost_chunks_recover_via_erasure(self):
+        """Dropping up to (n-k) chunks before bob polls still delivers.
+
+        This is the promise erasure coding is supposed to deliver. Each
+        message is split into k data blocks + parity blocks; any k of n
+        chunks reconstruct. Here we delete all *parity* chunks and show
+        the k remaining data chunks deliver. Then a separate message
+        where we delete some data chunks and rely on parity to fill in.
+        """
+        import hashlib
+
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+
+        # Send a message big enough to get multiple chunks (k >= 4).
+        payload = b"A" * 800  # k≈7, n≈10 with 30% redundancy
+        assert alice.send_message("bob", payload.decode())
+
+        # Find the manifest, extract msg_key and chunk count.
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        from dmp.core.manifest import SlotManifest
+        manifest = None
+        for name in store.list_names():
+            if not name.startswith("slot-"):
+                continue
+            for value in store.query_txt_record(name) or []:
+                parsed = SlotManifest.parse_and_verify(value)
+                if parsed and parsed[0].recipient_id == bob_recipient_id:
+                    manifest = parsed[0]
+                    break
+            if manifest:
+                break
+        assert manifest is not None
+        assert manifest.total_chunks > manifest.data_chunks  # parity exists
+
+        # Delete the parity chunks. Bob should still be able to reconstruct.
+        msg_key = alice._msg_key(
+            manifest.msg_id, manifest.recipient_id, manifest.sender_spk
+        )
+        for chunk_num in range(manifest.data_chunks, manifest.total_chunks):
+            store.delete_txt_record(alice._chunk_domain(msg_key, chunk_num))
+
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == payload
+
+    def test_lost_data_chunks_recover_via_parity(self):
+        """Dropping data chunks but keeping parity still delivers."""
+        import hashlib
+
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+        payload = b"B" * 800
+        assert alice.send_message("bob", payload.decode())
+
+        # Find the manifest.
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        from dmp.core.manifest import SlotManifest
+        manifest = None
+        for name in store.list_names():
+            if not name.startswith("slot-"):
+                continue
+            for value in store.query_txt_record(name) or []:
+                parsed = SlotManifest.parse_and_verify(value)
+                if parsed and parsed[0].recipient_id == bob_recipient_id:
+                    manifest = parsed[0]
+                    break
+            if manifest:
+                break
+        assert manifest is not None
+
+        # Delete enough data chunks that we need parity to reconstruct.
+        # Keep (total - data) = parity chunks, plus (data - parity) data.
+        parity = manifest.total_chunks - manifest.data_chunks
+        msg_key = alice._msg_key(
+            manifest.msg_id, manifest.recipient_id, manifest.sender_spk
+        )
+        for chunk_num in range(parity):  # delete the first `parity` data chunks
+            store.delete_txt_record(alice._chunk_domain(msg_key, chunk_num))
+
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == payload
+
     def test_forged_manifest_msg_id_rejected(self):
         """A sender who puts one msg_id in the manifest and a different one
         in the inner header is caught by the cross-check on receive.
@@ -247,6 +335,7 @@ class TestSendReceive:
             sender_spk=real_manifest.sender_spk,
             recipient_id=real_manifest.recipient_id,
             total_chunks=real_manifest.total_chunks,
+            data_chunks=real_manifest.data_chunks,
             ts=real_manifest.ts,
             exp=real_manifest.exp,
         )
@@ -331,6 +420,7 @@ class TestSendReceive:
                 sender_spk=eve.crypto.get_signing_public_key_bytes(),
                 recipient_id=bob_recipient_id,
                 total_chunks=99,  # points to chunks that don't exist
+                data_chunks=99,
                 ts=int(time.time()),
                 exp=int(time.time()) + 300,
             ).sign(eve.crypto)
@@ -363,6 +453,7 @@ class TestSendReceive:
             sender_spk=alice.crypto.get_signing_public_key_bytes(),  # claims alice
             recipient_id=bob_recipient_id,
             total_chunks=1,
+            data_chunks=1,
             ts=int(time.time()),
             exp=int(time.time()) + 300,
         )

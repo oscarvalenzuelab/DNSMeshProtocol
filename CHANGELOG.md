@@ -26,6 +26,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `DMP_NODE_HOSTNAME=... docker compose -f docker-compose.yml -f
   docker-compose.prod.yml up -d`.
 
+### Added (erasure coding)
+
+- `dmp.core.erasure`: cross-chunk Reed-Solomon erasure coding via zfec.
+  Plaintext is length-prefixed, padded to k data blocks, and zfec
+  generates n-k parity blocks. Any k of n received blocks reconstruct.
+  k is chosen adaptively per message based on size; n-k is ~30% of k
+  (minimum one parity block). New regression tests:
+  `test_lost_chunks_recover_via_erasure` and
+  `test_lost_data_chunks_recover_via_parity` prove chunks can be
+  deleted from the store and the message still delivers.
+- `SlotManifest` gains a `data_chunks` field (k). Wire size grows from
+  164 to 168 bytes; still fits one 255-byte DNS TXT string.
+- `MessageChunker.wrap_block` / `unwrap_block`: public per-block
+  primitives used by the erasure layer and exposed for callers that
+  want explicit control over the per-chunk RS wrapper.
+- New dependency: `zfec>=1.5.7`.
+
 ### Changed (security defaults)
 
 - HTTP API and UDP DNS rate limits are now **on by default** with

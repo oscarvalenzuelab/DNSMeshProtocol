@@ -50,6 +50,47 @@ class MessageChunker:
     def __init__(self, enable_error_correction: bool = True):
         self.enable_error_correction = enable_error_correction
 
+    def wrap_block(self, block: bytes) -> bytes:
+        """Per-chunk wrapping: one DATA_PER_CHUNK-byte block → wire bytes.
+
+        Wire layout: sha256(block)[:8] || RS_encode(block). The checksum
+        covers the *decoded* block so the receiver can run RS decode first
+        and validate the repair. Used by the cross-chunk erasure layer in
+        `dmp.core.erasure`, which feeds one erasure share per block.
+        """
+        if len(block) != self.DATA_PER_CHUNK:
+            raise ValueError(
+                f"block must be exactly {self.DATA_PER_CHUNK} bytes; got {len(block)}"
+            )
+        encoded = bytes(self.RS_CODEC.encode(block)) if self.enable_error_correction else block
+        checksum = hashlib.sha256(block).digest()[:8]
+        return checksum + encoded
+
+    def unwrap_block(self, wire: bytes) -> Optional[bytes]:
+        """Inverse of `wrap_block`. Returns the block or None on unrecoverable
+        corruption. Same order-of-operations as `MessageAssembler.add_chunk`:
+        RS decode first, then checksum verify."""
+        if len(wire) <= 8:
+            return None
+        checksum = wire[:8]
+        encoded = wire[8:]
+        if self.enable_error_correction:
+            try:
+                block = bytes(MessageChunker.RS_CODEC.decode(encoded)[0])
+            except reedsolo.ReedSolomonError:
+                return None
+        else:
+            block = encoded
+        if hashlib.sha256(block).digest()[:8] != checksum:
+            return None
+        if len(block) != self.DATA_PER_CHUNK:
+            # Legacy caller (chunk_message) can produce a short final block.
+            # The erasure layer always uses DATA_PER_CHUNK-sized blocks, so
+            # length mismatch there signals corruption; here we just return
+            # what we got and let the caller decide.
+            pass
+        return block
+
     def chunk_message(
         self,
         message: DMPMessage,

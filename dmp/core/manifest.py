@@ -13,13 +13,17 @@ Wire format (compact binary to fit in one 255-byte DNS TXT string):
 
     v=dmp1;t=manifest;d=<b64(body || sig)>
 
-body = msg_id(16) || sender_spk(32) || recipient_id(32) || total_chunks(4) ||
-       ts(8) || exp(8)                                              =  100 bytes
+body = msg_id(16) || sender_spk(32) || recipient_id(32) ||
+       total_chunks(4) || data_chunks(4) || ts(8) || exp(8)        =  104 bytes
 sig  = Ed25519 signature over `body`                                =   64 bytes
-total                                                               =  164 bytes
-base64                                                              =  220 chars
+total                                                               =  168 bytes
+base64                                                              =  224 chars
 prefix `v=dmp1;t=manifest;d=`                                       =   20 chars
-wire total                                                          =  240 chars  (fits)
+wire total                                                          =  244 chars  (fits)
+
+`data_chunks` is the erasure threshold k: the recipient needs any k of the
+total_chunks to reconstruct the message. When the sender disables erasure
+(single-chunk legacy flow), data_chunks == total_chunks.
 """
 
 from __future__ import annotations
@@ -35,9 +39,9 @@ from dmp.core.crypto import DMPCrypto
 
 
 RECORD_PREFIX = "v=dmp1;t=manifest;d="
-_BODY_LEN = 16 + 32 + 32 + 4 + 8 + 8   # 100 bytes
+_BODY_LEN = 16 + 32 + 32 + 4 + 4 + 8 + 8   # 104 bytes (adds data_chunks)
 _SIG_LEN = 64
-_WIRE_LEN = _BODY_LEN + _SIG_LEN        # 164 bytes
+_WIRE_LEN = _BODY_LEN + _SIG_LEN            # 168 bytes
 DEFAULT_MANIFEST_TTL = 300
 
 
@@ -52,7 +56,8 @@ class SlotManifest:
     msg_id: bytes            # 16 bytes
     sender_spk: bytes        # 32-byte Ed25519 signing public key of the sender
     recipient_id: bytes      # 32-byte sha256 of recipient's X25519 pubkey
-    total_chunks: int
+    total_chunks: int        # n — chunks actually published
+    data_chunks: int         # k — chunks needed to reconstruct (erasure threshold)
     ts: int                  # unix seconds when the sender published
     exp: int                 # unix seconds after which recipient should drop
 
@@ -64,11 +69,14 @@ class SlotManifest:
             raise ValueError("sender_spk must be 32 bytes")
         if len(self.recipient_id) != 32:
             raise ValueError("recipient_id must be 32 bytes")
+        if self.data_chunks <= 0 or self.data_chunks > self.total_chunks:
+            raise ValueError("data_chunks must be in 1..total_chunks")
         return (
             self.msg_id
             + self.sender_spk
             + self.recipient_id
             + self.total_chunks.to_bytes(4, "big")
+            + self.data_chunks.to_bytes(4, "big")
             + self.ts.to_bytes(8, "big")
             + self.exp.to_bytes(8, "big")
         )
@@ -77,13 +85,18 @@ class SlotManifest:
     def from_body_bytes(cls, body: bytes) -> "SlotManifest":
         if len(body) != _BODY_LEN:
             raise ValueError(f"manifest body must be {_BODY_LEN} bytes, got {len(body)}")
+        total_chunks = int.from_bytes(body[80:84], "big")
+        data_chunks = int.from_bytes(body[84:88], "big")
+        if data_chunks <= 0 or data_chunks > total_chunks:
+            raise ValueError("data_chunks out of range")
         return cls(
             msg_id=body[0:16],
             sender_spk=body[16:48],
             recipient_id=body[48:80],
-            total_chunks=int.from_bytes(body[80:84], "big"),
-            ts=int.from_bytes(body[84:92], "big"),
-            exp=int.from_bytes(body[92:100], "big"),
+            total_chunks=total_chunks,
+            data_chunks=data_chunks,
+            ts=int.from_bytes(body[88:96], "big"),
+            exp=int.from_bytes(body[96:104], "big"),
         )
 
     def sign(self, sender_crypto: DMPCrypto) -> str:
