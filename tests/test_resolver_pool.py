@@ -101,6 +101,82 @@ class TestResolverPoolConstruction:
             ResolverPool(["1.1.1.1", "dns.google"])
 
 
+class TestResolverPoolPerHostPorts:
+    """`hosts=` accepts `(ip, port)` tuples so each upstream can carry
+    its own port (M1.5). Bare IPs still inherit the pool-wide `port=`
+    default for back-compat."""
+
+    def test_tuple_entries_apply_per_host_ports(self):
+        """Two `(ip, port)` tuples each produce a resolver on its own port."""
+        pool = ResolverPool([("1.2.3.4", 53), ("5.6.7.8", 5353)])
+        assert pool._states[0].host == "1.2.3.4"
+        assert pool._states[0].resolver.port == 53
+        assert pool._states[1].host == "5.6.7.8"
+        assert pool._states[1].resolver.port == 5353
+
+    def test_mixed_bare_and_tuple_with_custom_default_port(self):
+        """A bare entry inherits `port=` default; the tuple overrides it.
+
+        The mixed shape is the common case when a caller wants to
+        override the port for only one upstream: the rest of the pool
+        keeps the pool-wide default.
+        """
+        pool = ResolverPool(["1.2.3.4", ("5.6.7.8", 5353)], port=5300)
+        # Bare entry picked up the pool-wide default.
+        assert pool._states[0].host == "1.2.3.4"
+        assert pool._states[0].resolver.port == 5300
+        # Tuple entry carries its own explicit port.
+        assert pool._states[1].host == "5.6.7.8"
+        assert pool._states[1].resolver.port == 5353
+
+    def test_tuple_entries_preserve_insertion_order(self):
+        """Priority-by-insertion-order must survive the tuple shape."""
+        pool = ResolverPool([("1.1.1.1", 53), ("9.9.9.9", 5353)])
+        hosts = [s["host"] for s in pool.snapshot()]
+        assert hosts == ["1.1.1.1", "9.9.9.9"]
+
+    def test_tuple_with_hostname_is_rejected(self):
+        """IP-literal-only policy applies inside tuples too."""
+        with pytest.raises(ValueError, match="not a valid IPv4 or IPv6 literal"):
+            ResolverPool([("dns.google", 53)])
+
+    def test_tuple_with_non_string_host_is_rejected(self):
+        """A tuple whose first element isn't a string is a programming error."""
+        with pytest.raises(ValueError, match="must be a string IP literal"):
+            ResolverPool([(123, 53)])  # type: ignore[list-item]
+
+    def test_tuple_with_non_int_port_is_rejected(self):
+        with pytest.raises(ValueError, match="port must be an int"):
+            ResolverPool([("1.1.1.1", "53")])  # type: ignore[list-item]
+
+    def test_tuple_with_bool_port_is_rejected(self):
+        """`True` is an int subclass — reject it explicitly so callers
+        don't accidentally end up on port 1."""
+        with pytest.raises(ValueError, match="port must be an int"):
+            ResolverPool([("1.1.1.1", True)])  # type: ignore[list-item]
+
+    def test_tuple_with_port_out_of_range_is_rejected(self):
+        with pytest.raises(ValueError, match="out of range"):
+            ResolverPool([("1.1.1.1", 0)])
+        with pytest.raises(ValueError, match="out of range"):
+            ResolverPool([("1.1.1.1", 70000)])
+
+    def test_tuple_of_wrong_arity_is_rejected(self):
+        with pytest.raises(ValueError, match="must be .*ip, port"):
+            ResolverPool([("1.1.1.1", 53, "extra")])  # type: ignore[list-item]
+
+    def test_non_string_non_tuple_entry_rejected(self):
+        """Future-proofing: exotic inputs shouldn't silently coerce."""
+        with pytest.raises(ValueError, match="must be a string IP literal"):
+            ResolverPool([12345])  # type: ignore[list-item]
+
+    def test_tuple_ipv6_literal_with_port(self):
+        """IPv6 literal inside a tuple is accepted; no bracket syntax needed."""
+        pool = ResolverPool([("2001:4860:4860::8888", 5353)])
+        assert pool._states[0].host == "2001:4860:4860::8888"
+        assert pool._states[0].resolver.port == 5353
+
+
 # ---------------------------------------------------------------------
 # Happy path + failover
 # ---------------------------------------------------------------------
