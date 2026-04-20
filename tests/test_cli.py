@@ -499,6 +499,26 @@ class TestDnsResolvers:
             )
         assert exc.value.code == 1
 
+    def test_load_tolerates_scalar_dns_resolvers_in_config(self, config_home):
+        """A hand-edited config with `dns_resolvers: "1.2.3.4"` (scalar
+        instead of list) must not explode into single characters.
+
+        The naive `[str(r) for r in raw]` comprehension iterates a
+        string char-by-char, yielding `["1", ".", "2", ...]`, which
+        then fails validation deep inside ResolverPool. Wrap the scalar
+        up front so the loader treats it as a one-element list.
+        """
+        # Init a valid config first so the file exists.
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cfg_path = config_home / "config.yaml"
+        data = yaml.safe_load(cfg_path.read_text())
+        # Simulate the hand-edit: YAML scalar, not a list.
+        data["dns_resolvers"] = "1.2.3.4"
+        cfg_path.write_text(yaml.safe_dump(data, sort_keys=True))
+
+        cfg = cli.CLIConfig.load(cfg_path)
+        assert cfg.dns_resolvers == ["1.2.3.4"]
+
     def test_make_client_uses_resolver_pool_when_list_set(
         self, config_home, monkeypatch
     ):
