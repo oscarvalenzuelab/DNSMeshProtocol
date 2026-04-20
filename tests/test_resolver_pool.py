@@ -1166,6 +1166,37 @@ class TestResolverPoolDiscover:
 
         assert [s["host"] for s in pool.snapshot()] == ["1.1.1.1"]
 
+    def test_noanswer_probe_rejects_resolver(self):
+        """NoAnswer on the TXT probe means "this resolver won't serve TXT."
+
+        `google.com` TXT resolves cleanly on every major public
+        resolver; a NoAnswer here is a strong signal the resolver is
+        policy-filtering or stripping TXT records. Keeping it would
+        make every DMP read through it return empty, so drop it at
+        discovery time.
+
+        NXDOMAIN is treated differently (see
+        `test_nxdomain_probe_counts_as_responding`) because it's a
+        weirder split-horizon case rather than a clean
+        "wouldn't-serve-TXT" signal.
+        """
+
+        def router(self, name, rdtype="A", *args, **kwargs):
+            host = self.nameservers[0]
+            if host == "1.1.1.1":
+                raise dns.resolver.NoAnswer()
+            if host == "9.9.9.9":
+                return _answer("ok")
+            raise AssertionError(f"unexpected {host!r}")
+
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True, side_effect=router
+        ):
+            pool = ResolverPool.discover(["1.1.1.1", "9.9.9.9"], timeout=0.5)
+
+        # Only the resolver that actually served the probe made it in.
+        assert [s["host"] for s in pool.snapshot()] == ["9.9.9.9"]
+
     def test_returns_working_resolverpool_instance(self):
         """Successful discovery returns a fully wired ResolverPool."""
 

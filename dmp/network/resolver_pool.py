@@ -548,12 +548,25 @@ class ResolverPool(DNSRecordReader):
                 # Resolver is unreachable, too slow, or otherwise
                 # misbehaving — drop it from the pool.
                 continue
-            except cls._NAME_NOT_FOUND_ERRORS:
-                # Unexpected for a name with stable TXT everywhere, but
-                # a resolver that authoritatively says "no such record"
-                # IS still responding healthily — keep it. The real
-                # query surface in production isn't `google.com`; what
-                # we're testing is reachability and basic behavior.
+            except dns.resolver.NoAnswer:
+                # NoAnswer means "the name exists, but not for this
+                # rdtype" — for a probe against `google.com` TXT, the
+                # probe name is precisely chosen to have stable TXT
+                # records on every major public resolver. A NoAnswer
+                # here means this resolver is stripping or filtering
+                # TXT answers (policy filter, captive-portal rewriter,
+                # buggy middlebox). Every DMP read through that
+                # resolver would come back empty, so reject it.
+                continue
+            except dns.resolver.NXDOMAIN:
+                # A resolver that authoritatively says "no such record"
+                # for `google.com` is a weird split-horizon / lying
+                # case, but it IS still responding healthily to DNS —
+                # we keep it in the pool so the normal query path's
+                # oracle-demotion logic can catch real misbehavior
+                # against the *actual* DMP query surface in production.
+                # NoAnswer above is stricter because it's a clean
+                # "wouldn't serve TXT" signal.
                 pass
             except dns.exception.DNSException:
                 # Any other dnspython error (malformed response,
