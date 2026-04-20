@@ -38,6 +38,7 @@ def shared_store(monkeypatch):
 
     def fake_make_client(config, passphrase):
         from dmp.cli import _config_path
+
         replay_path = str(_config_path().parent / "replay_cache.json")
         client = DMPClient(
             config.username,
@@ -69,8 +70,9 @@ def shared_store(monkeypatch):
 
 class TestInitAndIdentity:
     def test_init_writes_config(self, config_home, capsys):
-        rc = cli.main(["init", "alice", "--domain", "mesh.test",
-                       "--endpoint", "http://node:8053"])
+        rc = cli.main(
+            ["init", "alice", "--domain", "mesh.test", "--endpoint", "http://node:8053"]
+        )
         assert rc == 0
         cfg = yaml.safe_load((config_home / "config.yaml").read_text())
         assert cfg["username"] == "alice"
@@ -79,7 +81,9 @@ class TestInitAndIdentity:
         # Per-identity random salt: 32 bytes = 64 hex chars.
         assert len(cfg["kdf_salt"]) == 64
 
-    def test_init_generates_unique_salts_per_identity(self, config_home, tmp_path, monkeypatch):
+    def test_init_generates_unique_salts_per_identity(
+        self, config_home, tmp_path, monkeypatch
+    ):
         """Two independent `dmp init` runs must produce distinct salts."""
         cli.main(["init", "alice", "--endpoint", "http://x"])
         first = yaml.safe_load((config_home / "config.yaml").read_text())["kdf_salt"]
@@ -104,7 +108,9 @@ class TestInitAndIdentity:
         cfg = yaml.safe_load((config_home / "config.yaml").read_text())
         assert cfg["username"] == "bob"
 
-    def test_identity_show_prints_keys(self, config_home, shared_store, monkeypatch, capsys):
+    def test_identity_show_prints_keys(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "pw")
         rc = cli.main(["identity", "show"])
@@ -121,6 +127,7 @@ class TestInitAndIdentity:
         cli.main(["identity", "show", "--json"])
         out = capsys.readouterr().out
         import json
+
         parsed = json.loads(out)
         assert parsed["username"] == "alice"
         assert len(parsed["public_key"]) == 64  # 32 bytes hex
@@ -129,7 +136,9 @@ class TestInitAndIdentity:
 class TestIdentityPublishFetch:
     """`dmp identity publish` + `dmp identity fetch` + `--add`."""
 
-    def test_publish_then_fetch_roundtrip(self, config_home, shared_store, monkeypatch, capsys):
+    def test_publish_then_fetch_roundtrip(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         """alice publishes, a second invocation as bob can fetch and add her."""
         # Alice sets up + publishes.
         cli.main(["init", "alice", "--endpoint", "http://x"])
@@ -147,11 +156,14 @@ class TestIdentityPublishFetch:
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         cli.main(["identity", "fetch", "alice", "--json"])
         import json
+
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["username"] == "alice"
         assert len(parsed["public_key"]) == 64  # hex
 
-    def test_fetch_add_stores_contact(self, config_home, shared_store, monkeypatch, capsys):
+    def test_fetch_add_stores_contact(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         cli.main(["identity", "publish"])
@@ -170,7 +182,9 @@ class TestIdentityPublishFetch:
         cli.main(["contacts", "list"])
         assert "alice" in capsys.readouterr().out
 
-    def test_fetch_missing_identity_errors(self, config_home, shared_store, monkeypatch):
+    def test_fetch_missing_identity_errors(
+        self, config_home, shared_store, monkeypatch
+    ):
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         with pytest.raises(SystemExit) as exc:
@@ -183,11 +197,16 @@ class TestIdentityPublishFetch:
         """Identity published under a user-controlled zone resolves via
         `user@host` addresses instead of the hash-based shared-mesh name."""
         # alice initializes with her own zone; publish goes to dmp.alice.example.com
-        cli.main([
-            "init", "alice",
-            "--endpoint", "http://x",
-            "--identity-domain", "alice.example.com",
-        ])
+        cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--identity-domain",
+                "alice.example.com",
+            ]
+        )
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         cli.main(["identity", "publish"])
@@ -306,7 +325,9 @@ class TestContacts:
 
 
 class TestSendRecv:
-    def test_send_and_recv_roundtrip(self, config_home, shared_store, monkeypatch, capsys):
+    def test_send_and_recv_roundtrip(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         # Set up alice's config.
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
@@ -326,7 +347,9 @@ class TestSendRecv:
         out = capsys.readouterr().out
         assert "hello from cli" in out
 
-    def test_send_unknown_recipient_errors(self, config_home, shared_store, monkeypatch):
+    def test_send_unknown_recipient_errors(
+        self, config_home, shared_store, monkeypatch
+    ):
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "pw")
         with pytest.raises(SystemExit) as exc:
@@ -339,7 +362,9 @@ class TestSendRecv:
         cli.main(["recv"])
         assert "no new messages" in capsys.readouterr().out
 
-    def test_recv_twice_is_idempotent(self, config_home, shared_store, monkeypatch, capsys):
+    def test_recv_twice_is_idempotent(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         """Persistent replay cache: second `dmp recv` in a fresh process
         doesn't re-deliver what was already delivered."""
         cli.main(["init", "alice", "--endpoint", "http://x"])
@@ -375,3 +400,109 @@ class TestLoadWithoutConfig:
         # Don't init; config doesn't exist.
         with pytest.raises(FileNotFoundError):
             cli.main(["identity", "show"])
+
+
+class TestResolversCommand:
+    """`dmp resolvers discover` + `dmp resolvers list`.
+
+    Network probes are mocked out via a stub ResolverPool that returns
+    a fixed host list, so the tests run offline and deterministically.
+    """
+
+    def _stub_discover(self, monkeypatch, hosts):
+        """Replace ResolverPool.discover with one that returns a stub pool."""
+        from dmp.network.resolver_pool import ResolverPool
+
+        class _StubPool:
+            def snapshot(self):
+                return [{"host": h} for h in hosts]
+
+        def fake_discover(candidates, timeout=2.0):
+            if not hosts:
+                raise ValueError(
+                    "ResolverPool.discover: no candidates answered "
+                    f"within {timeout}s"
+                )
+            return _StubPool()
+
+        # Patch the symbol the CLI imported, not just ResolverPool itself.
+        monkeypatch.setattr(cli.ResolverPool, "discover", staticmethod(fake_discover))
+
+    def test_discover_prints_working_list(self, config_home, monkeypatch, capsys):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9"])
+
+        rc = cli.main(["resolvers", "discover"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "discovered 2 working resolver(s)" in out
+        assert "1.1.1.1" in out
+        assert "9.9.9.9" in out
+
+    def test_discover_without_save_does_not_touch_config(
+        self, config_home, monkeypatch, capsys
+    ):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        cfg_path = config_home / "config.yaml"
+        before = yaml.safe_load(cfg_path.read_text())
+        assert before.get("dns_resolvers", []) == []
+
+        self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9"])
+        cli.main(["resolvers", "discover"])
+
+        after = yaml.safe_load(cfg_path.read_text())
+        assert after.get("dns_resolvers", []) == []
+
+    def test_discover_with_save_writes_config(self, config_home, monkeypatch, capsys):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9", "8.8.8.8"])
+
+        rc = cli.main(["resolvers", "discover", "--save"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "saved 3 resolvers" in out
+
+        cfg = yaml.safe_load((config_home / "config.yaml").read_text())
+        assert cfg["dns_resolvers"] == ["1.1.1.1", "9.9.9.9", "8.8.8.8"]
+
+    def test_discover_save_then_list_shows_them(self, config_home, monkeypatch, capsys):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9"])
+        cli.main(["resolvers", "discover", "--save"])
+        capsys.readouterr()
+
+        cli.main(["resolvers", "list"])
+        out = capsys.readouterr().out
+        assert "1.1.1.1" in out
+        assert "9.9.9.9" in out
+
+    def test_list_without_saved_resolvers_prints_hint(self, config_home, capsys):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        cli.main(["resolvers", "list"])
+        out = capsys.readouterr().out
+        assert "no dns_resolvers configured" in out
+
+    def test_discover_save_without_config_errors(
+        self, config_home, monkeypatch, capsys
+    ):
+        """`--save` on a fresh machine (no `dmp init` yet) fails cleanly."""
+        self._stub_discover(monkeypatch, ["1.1.1.1"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["resolvers", "discover", "--save"])
+        assert exc.value.code == 1
+
+    def test_discover_all_failures_exits_with_network_error(
+        self, config_home, monkeypatch
+    ):
+        """Every probe failed -> ResolverPool.discover raises ValueError,
+        CLI surfaces it as exit code 2 (network/backend error)."""
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        self._stub_discover(monkeypatch, [])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["resolvers", "discover"])
+        assert exc.value.code == 2

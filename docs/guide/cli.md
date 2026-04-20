@@ -93,6 +93,55 @@ replay cache, fetches chunks, runs cross-chunk erasure decode, and
 decrypts. Messages that pass all checks are printed; everything else
 is silently dropped.
 
+### `dmp resolvers`
+
+Manage the upstream DNS resolver list the client uses to read chunks,
+manifests, and identity records.
+
+| Subcommand | Purpose |
+|---|---|
+| `dmp resolvers discover [--save] [--timeout S]` | Probe well-known public resolvers (Google, Cloudflare, Quad9, OpenDNS — 8 IPv4 hosts total) and print the working set |
+| `dmp resolvers list` | Print the currently configured `dns_resolvers` |
+
+`discover` sends a cheap TXT query for a stable well-known name to
+each candidate with a `--timeout` (default 2.0 s) budget. Resolvers
+that don't answer within that window are dropped. If every candidate
+fails, the command exits with code 2 rather than writing an empty
+list that would break every future query.
+
+Without `--save`, discover is a read-only diagnostic — useful on a
+captive or restricted network to sanity-check which upstreams are
+reachable. With `--save`, the working list is written to
+`config.yaml` as `dns_resolvers`. Once M1.2 lands, the normal read
+path wires a multi-resolver `ResolverPool` over that list instead of
+the single `--dns-host` upstream, so `dmp send` / `dmp recv` benefit
+automatically.
+
+Example:
+
+```
+$ dmp resolvers discover
+discovered 4 working resolver(s):
+  1.1.1.1
+  8.8.8.8
+  9.9.9.9
+  208.67.222.222
+
+$ dmp resolvers discover --save
+discovered 4 working resolver(s):
+  1.1.1.1
+  8.8.8.8
+  9.9.9.9
+  208.67.222.222
+saved 4 resolvers to /home/alice/.dmp/config.yaml
+
+$ dmp resolvers list
+1.1.1.1
+8.8.8.8
+9.9.9.9
+208.67.222.222
+```
+
 ### `dmp node`
 
 Convenience launcher for a foreground DMP node, reading config from

@@ -27,12 +27,13 @@ import os
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import yaml
 
 from dmp.client.client import DMPClient
 from dmp.network.base import DNSRecordReader, DNSRecordWriter
+from dmp.network.resolver_pool import ResolverPool, WELL_KNOWN_RESOLVERS
 
 
 # ----------------------------- config ----------------------------------------
@@ -46,11 +47,18 @@ CONFIG_FILENAME = "config.yaml"
 class CLIConfig:
     username: str = ""
     domain: str = "mesh.local"
-    endpoint: str = ""                          # HTTP API base URL of the node
+    endpoint: str = ""  # HTTP API base URL of the node
     http_token: Optional[str] = None
-    dns_host: Optional[str] = None              # host:port of the DNS resolver
+    dns_host: Optional[str] = None  # host:port of the DNS resolver
     dns_port: int = 5353
-    passphrase_file: Optional[str] = None       # alternative to DMP_PASSPHRASE
+    # Optional list of upstream DNS resolver IP literals. When set, the
+    # client wires a `ResolverPool` over them instead of the single-host
+    # `_DnsReader` path. Populated by `dmp resolvers discover --save`
+    # and (eventually, once M1.2 lands) by `dmp init --dns-resolvers`.
+    # Kept as a plain list of host strings (no ports yet) for simplicity;
+    # M1.2 may upgrade the format to `host[:port]`.
+    dns_resolvers: List[str] = field(default_factory=list)
+    passphrase_file: Optional[str] = None  # alternative to DMP_PASSPHRASE
     # 32 random bytes generated at `dmp init`, stored as hex. Combined with
     # the passphrase under Argon2id to derive the X25519 seed. Two users who
     # happen to share a passphrase still get independent identities; an
@@ -87,6 +95,11 @@ class CLIConfig:
                     "pub": value.get("pub", ""),
                     "spk": value.get("spk", ""),
                 }
+        raw_resolvers = data.get("dns_resolvers", []) or []
+        # Be generous in what we accept: a single-string config (legacy
+        # typo) shouldn't crash the loader.
+        if isinstance(raw_resolvers, str):
+            raw_resolvers = [raw_resolvers]
         return cls(
             username=data.get("username", ""),
             domain=data.get("domain", "mesh.local"),
@@ -94,6 +107,7 @@ class CLIConfig:
             http_token=data.get("http_token"),
             dns_host=data.get("dns_host"),
             dns_port=int(data.get("dns_port", 5353)),
+            dns_resolvers=[str(h) for h in raw_resolvers],
             passphrase_file=data.get("passphrase_file"),
             kdf_salt=data.get("kdf_salt", ""),
             identity_domain=data.get("identity_domain", ""),
@@ -112,7 +126,9 @@ class CLIConfig:
 
 def _config_path() -> Path:
     home = os.environ.get("DMP_CONFIG_HOME")
-    return Path(home) / CONFIG_FILENAME if home else DEFAULT_CONFIG_HOME / CONFIG_FILENAME
+    return (
+        Path(home) / CONFIG_FILENAME if home else DEFAULT_CONFIG_HOME / CONFIG_FILENAME
+    )
 
 
 def _load_passphrase(config: CLIConfig) -> str:
@@ -134,6 +150,7 @@ class _HttpWriter(DNSRecordWriter):
 
     def __init__(self, endpoint: str, token: Optional[str] = None):
         import requests
+
         self._requests = requests
         self._endpoint = endpoint.rstrip("/")
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -163,6 +180,7 @@ class _DnsReader(DNSRecordReader):
 
     def __init__(self, host: Optional[str], port: int = 5353):
         import dns.resolver
+
         self._resolver = dns.resolver.Resolver()
         if host:
             self._resolver.nameservers = [host]
@@ -172,6 +190,7 @@ class _DnsReader(DNSRecordReader):
 
     def query_txt_record(self, name: str):
         import dns.resolver
+
         try:
             answers = self._resolver.resolve(name, "TXT")
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
@@ -249,7 +268,9 @@ def cmd_init(args: argparse.Namespace) -> int:
     )
     cfg.save(path)
     print(f"wrote config to {path}")
-    print("Next: set DMP_PASSPHRASE or create a passphrase file, then `dmp identity show`.")
+    print(
+        "Next: set DMP_PASSPHRASE or create a passphrase file, then `dmp identity show`."
+    )
     print(
         "Keep this config file. If you lose the kdf_salt you cannot "
         "recover this identity even with the passphrase."
@@ -265,7 +286,13 @@ def cmd_identity_show(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(info, indent=2))
     else:
-        for key in ("username", "domain", "public_key", "signing_public_key", "user_id"):
+        for key in (
+            "username",
+            "domain",
+            "public_key",
+            "signing_public_key",
+            "user_id",
+        ):
             print(f"{key}: {info[key]}")
     return 0
 
@@ -321,7 +348,9 @@ def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
     print(f"published {published}/{args.count} prekeys to {name}")
     print(f"  local live prekey count: {client.prekey_store.count_live()}")
     if published < args.count:
-        print("  (note: some publishes were rejected — check node rate limits and caps)")
+        print(
+            "  (note: some publishes were rejected — check node rate limits and caps)"
+        )
     return 0
 
 
@@ -415,13 +444,18 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         identity = match
 
     if args.json:
-        print(json.dumps({
-            "username": identity.username,
-            "public_key": identity.x25519_pk.hex(),
-            "signing_public_key": identity.ed25519_spk.hex(),
-            "ts": identity.ts,
-            "dns_name": name,
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "username": identity.username,
+                    "public_key": identity.x25519_pk.hex(),
+                    "signing_public_key": identity.ed25519_spk.hex(),
+                    "ts": identity.ts,
+                    "dns_name": name,
+                },
+                indent=2,
+            )
+        )
     else:
         print(f"username:           {identity.username}")
         print(f"public_key:         {identity.x25519_pk.hex()}")
@@ -494,7 +528,9 @@ def cmd_contacts_add(args: argparse.Namespace) -> int:
 def cmd_contacts_list(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
     if not cfg.contacts:
-        print("(no contacts yet — `dmp contacts add <name> <pubkey_hex>` or `dmp identity fetch <user> --add`)")
+        print(
+            "(no contacts yet — `dmp contacts add <name> <pubkey_hex>` or `dmp identity fetch <user> --add`)"
+        )
         return 0
     width = max(len(n) for n in cfg.contacts)
     for name, entry in sorted(cfg.contacts.items()):
@@ -506,7 +542,10 @@ def cmd_contacts_list(args: argparse.Namespace) -> int:
 def cmd_send(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
     if args.recipient not in cfg.contacts:
-        _die(1, f"unknown contact `{args.recipient}` — add it first with `dmp contacts add`")
+        _die(
+            1,
+            f"unknown contact `{args.recipient}` — add it first with `dmp contacts add`",
+        )
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
     ok = client.send_message(args.recipient, args.message)
@@ -529,6 +568,7 @@ def cmd_recv(args: argparse.Namespace) -> int:
     # This requires the contact to match on the derived Ed25519 pubkey, which
     # is itself derived from their X25519 pubkey — cross-reference locally.
     from dmp.core.crypto import DMPCrypto
+
     known = {}
     for name, pubkey_hex in cfg.contacts.items():
         try:
@@ -548,6 +588,63 @@ def cmd_recv(args: argparse.Namespace) -> int:
         except UnicodeDecodeError:
             print(f"  (binary, {len(msg.plaintext)} bytes)")
         print()
+    return 0
+
+
+def cmd_resolvers_discover(args: argparse.Namespace) -> int:
+    """Probe WELL_KNOWN_RESOLVERS and print (or save) the working subset.
+
+    Without `--save`, this is a read-only diagnostic — useful on a
+    captive network to sanity-check which upstreams are reachable
+    before committing to them. With `--save`, the working list is
+    written to config as `dns_resolvers`; a subsequent `dmp resolvers
+    list` (and, once M1.2 lands, the normal client read path) will
+    pick it up.
+
+    If every candidate fails, `ResolverPool.discover` raises
+    ValueError. We surface that as exit code 2 (network/backend
+    error) rather than creating a useless empty pool.
+    """
+    try:
+        pool = ResolverPool.discover(WELL_KNOWN_RESOLVERS, timeout=args.timeout)
+    except ValueError as exc:
+        _die(2, f"resolver discovery failed: {exc}")
+
+    working = [snap["host"] for snap in pool.snapshot()]
+    print(f"discovered {len(working)} working resolver(s):")
+    for host in working:
+        print(f"  {host}")
+
+    if args.save:
+        # `dmp init` may not have run yet on a fresh machine; in that
+        # case there's no config to update and the user should init
+        # first. If the config does exist, we just set the new field
+        # (creating it if absent) and persist.
+        path = _config_path()
+        if not path.exists():
+            _die(
+                1,
+                f"no config at {path} — run `dmp init <username>` before "
+                f"`dmp resolvers discover --save`",
+            )
+        cfg = CLIConfig.load(path)
+        cfg.dns_resolvers = working
+        cfg.save(path)
+        print(f"saved {len(working)} resolvers to {path}")
+    return 0
+
+
+def cmd_resolvers_list(args: argparse.Namespace) -> int:
+    """Print the currently configured `dns_resolvers` list."""
+    cfg = CLIConfig.load(_config_path())
+    if not cfg.dns_resolvers:
+        print(
+            "(no dns_resolvers configured — run `dmp resolvers discover "
+            "--save` to populate)"
+        )
+        return 0
+    for host in cfg.dns_resolvers:
+        print(host)
     return 0
 
 
@@ -588,10 +685,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--identity-domain",
         default="",
         help="DNS zone you control (e.g. alice.example.com). Identity records "
-             "go to dmp.<zone>; senders resolve you via <user>@<zone>. "
-             "Real squat resistance comes from controlling this zone.",
+        "go to dmp.<zone>; senders resolve you via <user>@<zone>. "
+        "Real squat resistance comes from controlling this zone.",
     )
-    p_init.add_argument("--force", action="store_true", help="overwrite existing config")
+    p_init.add_argument(
+        "--force", action="store_true", help="overwrite existing config"
+    )
     p_init.set_defaults(func=cmd_init)
 
     # identity
@@ -605,7 +704,9 @@ def build_parser() -> argparse.ArgumentParser:
         "publish", help="publish a signed identity record to DNS"
     )
     p_id_pub.add_argument(
-        "--ttl", type=int, default=86400,
+        "--ttl",
+        type=int,
+        default=86400,
         help="TXT record TTL in seconds (default: 86400 = 1 day)",
     )
     p_id_pub.set_defaults(func=cmd_identity_publish)
@@ -615,12 +716,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="generate and publish a fresh pool of one-time X3DH prekeys",
     )
     p_id_pk.add_argument(
-        "--count", type=int, default=25,
+        "--count",
+        type=int,
+        default=25,
         help="number of prekeys to generate (default 25 — stays under a "
-             "default node HTTP burst so the full pool publishes in one shot)",
+        "default node HTTP burst so the full pool publishes in one shot)",
     )
     p_id_pk.add_argument(
-        "--ttl", type=int, default=86400,
+        "--ttl",
+        type=int,
+        default=86400,
         help="per-prekey TTL in seconds (default: 86400 = 1 day)",
     )
     p_id_pk.set_defaults(func=cmd_identity_refresh_prekeys)
@@ -634,7 +739,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="override the mesh domain (defaults to our own)",
     )
     p_id_fetch.add_argument(
-        "--add", action="store_true",
+        "--add",
+        action="store_true",
         help="save the resolved identity as a local contact",
     )
     p_id_fetch.add_argument(
@@ -642,7 +748,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="accept_fingerprint",
         default=None,
         help="when multiple identity records exist at this name, require "
-             "this 16-hex fingerprint to disambiguate (verify out-of-band first)",
+        "this 16-hex fingerprint to disambiguate (verify out-of-band first)",
     )
     p_id_fetch.add_argument("--json", action="store_true")
     p_id_fetch.set_defaults(func=cmd_identity_fetch)
@@ -657,8 +763,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--signing-key",
         default="",
         help="recipient's Ed25519 signing pubkey (64 hex) — pins identity; "
-             "without this, incoming manifests from this contact fall back "
-             "to TOFU",
+        "without this, incoming manifests from this contact fall back "
+        "to TOFU",
     )
     p_c_add.set_defaults(func=cmd_contacts_add)
     p_c_list = sub_c.add_parser("list", help="list contacts")
@@ -673,6 +779,30 @@ def build_parser() -> argparse.ArgumentParser:
     # recv
     p_r = sub.add_parser("recv", help="poll for new messages")
     p_r.set_defaults(func=cmd_recv)
+
+    # resolvers (discover / list public upstream DNS resolvers)
+    p_rv = sub.add_parser("resolvers", help="manage upstream DNS resolvers")
+    sub_rv = p_rv.add_subparsers(dest="sub", required=True)
+    p_rv_discover = sub_rv.add_parser(
+        "discover",
+        help="probe well-known public resolvers and print the working set",
+    )
+    p_rv_discover.add_argument(
+        "--save",
+        action="store_true",
+        help="persist the working resolvers to config as dns_resolvers",
+    )
+    p_rv_discover.add_argument(
+        "--timeout",
+        type=float,
+        default=2.0,
+        help="per-resolver probe timeout in seconds (default: 2.0)",
+    )
+    p_rv_discover.set_defaults(func=cmd_resolvers_discover)
+    p_rv_list = sub_rv.add_parser(
+        "list", help="print the currently configured dns_resolvers"
+    )
+    p_rv_list.set_defaults(func=cmd_resolvers_list)
 
     # node (convenience launcher)
     p_n = sub.add_parser("node", help="run a dmp node in the foreground")
