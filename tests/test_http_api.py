@@ -31,9 +31,7 @@ def api_store():
 @pytest.fixture
 def auth_api_store():
     store = InMemoryDNSStore()
-    api = DMPHttpApi(
-        store, host="127.0.0.1", port=_free_port(), bearer_token="s3cret"
-    )
+    api = DMPHttpApi(store, host="127.0.0.1", port=_free_port(), bearer_token="s3cret")
     api.start()
     try:
         yield api, store

@@ -34,7 +34,6 @@ from dmp.network.base import DNSRecordReader
 from dmp.server.metrics import REGISTRY
 from dmp.server.rate_limit import RateLimit, TokenBucketLimiter
 
-
 log = logging.getLogger(__name__)
 
 MAX_TXT_STRING = 255
@@ -199,7 +198,9 @@ class DMPDnsServer:
         self.port = port
         self.ttl = ttl
         self.rate_limiter = (
-            TokenBucketLimiter(rate_limit) if rate_limit and rate_limit.enabled else None
+            TokenBucketLimiter(rate_limit)
+            if rate_limit and rate_limit.enabled
+            else None
         )
         self.max_concurrency = int(max_concurrency)
         self._server: Optional[_ThreadingUDPServer] = None

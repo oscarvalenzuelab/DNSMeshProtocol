@@ -34,7 +34,6 @@ from dmp.network.base import DNSRecordReader, DNSRecordStore, DNSRecordWriter
 from dmp.server.metrics import REGISTRY
 from dmp.server.rate_limit import RateLimit, TokenBucketLimiter
 
-
 log = logging.getLogger(__name__)
 
 _NAME_PATH_RE = re.compile(r"^/v1/records/(?P<name>[^/]+)/?$")
@@ -46,8 +45,8 @@ MAX_BODY_BYTES = 16 * 1024
 # (and DMP_MAX_* env vars in DMPNode). Defaults chosen so a single writer
 # can't silently bloat the sqlite store through one legitimate-looking
 # series of publishes.
-DEFAULT_MAX_TTL = 86_400          # 1 day
-DEFAULT_MAX_VALUE_BYTES = 2_048   # ~8× a single 255-byte TXT string
+DEFAULT_MAX_TTL = 86_400  # 1 day
+DEFAULT_MAX_VALUE_BYTES = 2_048  # ~8× a single 255-byte TXT string
 DEFAULT_MAX_VALUES_PER_NAME = 64  # per-RRset cardinality cap on publish
 
 
@@ -209,7 +208,11 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         if max_rrset > 0:
             reader = self._reader()
             existing = reader.query_txt_record(name) if reader else None
-            if existing is not None and len(existing) >= max_rrset and value not in existing:
+            if (
+                existing is not None
+                and len(existing) >= max_rrset
+                and value not in existing
+            ):
                 self._send_json(
                     413,
                     {"error": f"RRset at {name} already holds {max_rrset} values"},
@@ -372,7 +375,9 @@ class DMPHttpApi:
         self.port = port
         self.bearer_token = bearer_token
         self.rate_limiter = (
-            TokenBucketLimiter(rate_limit) if rate_limit and rate_limit.enabled else None
+            TokenBucketLimiter(rate_limit)
+            if rate_limit and rate_limit.enabled
+            else None
         )
         self.max_ttl = int(max_ttl)
         self.max_value_bytes = int(max_value_bytes)

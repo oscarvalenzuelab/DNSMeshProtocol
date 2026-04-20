@@ -17,6 +17,7 @@ from dmp.core.dns import DNSEncoder
 @dataclass
 class ChunkInfo:
     """Information about a message chunk"""
+
     chunk_number: int
     total_chunks: int
     data: bytes
@@ -62,7 +63,11 @@ class MessageChunker:
             raise ValueError(
                 f"block must be exactly {self.DATA_PER_CHUNK} bytes; got {len(block)}"
             )
-        encoded = bytes(self.RS_CODEC.encode(block)) if self.enable_error_correction else block
+        encoded = (
+            bytes(self.RS_CODEC.encode(block))
+            if self.enable_error_correction
+            else block
+        )
         checksum = hashlib.sha256(block).digest()[:8]
         return checksum + encoded
 
@@ -122,7 +127,7 @@ class MessageChunker:
         chunks: List[Tuple[int, bytes]] = []
         for chunk_num in range(total):
             offset = chunk_num * data_size
-            piece = raw[offset:offset + data_size]
+            piece = raw[offset : offset + data_size]
             # The checksum covers the *decoded* data so the receiver can run
             # RS decode first and then verify against a clean reference.
             # Checksumming the RS-encoded body (earlier design) meant any bit
@@ -202,7 +207,7 @@ class MessageAssembler:
         chunks = self.pending_messages.get(message_id, {})
         if set(chunks.keys()) != set(range(total_chunks)):
             return None
-        message_data = b''.join(chunks[i] for i in range(total_chunks))
+        message_data = b"".join(chunks[i] for i in range(total_chunks))
         del self.pending_messages[message_id]
         self.message_metadata.pop(message_id, None)
         return message_data
@@ -219,7 +224,8 @@ class MessageAssembler:
 
     def cleanup_expired(self, current_time: int, ttl: int = 300) -> None:
         expired = [
-            mid for mid, hdr in self.message_metadata.items()
+            mid
+            for mid, hdr in self.message_metadata.items()
             if current_time > (hdr.timestamp + ttl)
         ]
         for mid in expired:
@@ -229,32 +235,24 @@ class MessageAssembler:
 
 class ChunkRouter:
     """Route chunks through the mesh network"""
-    
+
     def __init__(self):
         """Initialize chunk router"""
         self.seen_chunks: set = set()
         self.route_table: Dict[bytes, List[str]] = {}
-    
-    def should_forward_chunk(
-        self,
-        message_id: bytes,
-        chunk_number: int
-    ) -> bool:
+
+    def should_forward_chunk(self, message_id: bytes, chunk_number: int) -> bool:
         """Determine if a chunk should be forwarded"""
-        chunk_id = hashlib.sha256(
-            message_id + chunk_number.to_bytes(4, 'big')
-        ).digest()
-        
+        chunk_id = hashlib.sha256(message_id + chunk_number.to_bytes(4, "big")).digest()
+
         if chunk_id in self.seen_chunks:
             return False
-        
+
         self.seen_chunks.add(chunk_id)
         return True
-    
+
     def get_forward_destinations(
-        self,
-        recipient_id: bytes,
-        exclude_nodes: Optional[List[str]] = None
+        self, recipient_id: bytes, exclude_nodes: Optional[List[str]] = None
     ) -> List[str]:
         """Get list of nodes to forward chunk to"""
         if recipient_id in self.route_table:
@@ -262,19 +260,15 @@ class ChunkRouter:
             if exclude_nodes:
                 destinations = [d for d in destinations if d not in exclude_nodes]
             return destinations
-        
+
         # Default: return empty list (no known routes)
         return []
-    
-    def update_route(
-        self,
-        recipient_id: bytes,
-        node_address: str
-    ):
+
+    def update_route(self, recipient_id: bytes, node_address: str):
         """Update routing table with new route"""
         if recipient_id not in self.route_table:
             self.route_table[recipient_id] = []
-        
+
         if node_address not in self.route_table[recipient_id]:
             self.route_table[recipient_id].append(node_address)
             # Keep only the most recent routes

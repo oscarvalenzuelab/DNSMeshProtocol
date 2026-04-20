@@ -16,16 +16,17 @@ from dataclasses import dataclass
 from argon2.low_level import Type as Argon2Type, hash_secret_raw
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey, X25519PublicKey
+    X25519PrivateKey,
+    X25519PublicKey,
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey, Ed25519PublicKey
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
 )
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
-
 
 # Argon2id parameters for passphrase → 32-byte X25519 seed.
 # Tuned for ~20ms on a modern laptop. Still orders of magnitude more
@@ -41,32 +42,31 @@ ARGON2_HASH_LEN = 32
 @dataclass
 class EncryptedMessage:
     """Container for encrypted message data"""
+
     ephemeral_public_key: bytes  # 32 bytes
     ciphertext: bytes
     nonce: bytes  # 12 bytes
-    
+
     def to_bytes(self) -> bytes:
         """Serialize encrypted message"""
         return self.ephemeral_public_key + self.nonce + self.ciphertext
-    
+
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'EncryptedMessage':
+    def from_bytes(cls, data: bytes) -> "EncryptedMessage":
         """Deserialize encrypted message"""
         if len(data) < 44:  # 32 (key) + 12 (nonce) + min ciphertext
             raise ValueError("Invalid encrypted message: too short")
-        
+
         return cls(
-            ephemeral_public_key=data[:32],
-            nonce=data[32:44],
-            ciphertext=data[44:]
+            ephemeral_public_key=data[:32], nonce=data[32:44], ciphertext=data[44:]
         )
 
 
 class DMPCrypto:
     """Core cryptographic operations for DMP"""
-    
+
     # Domain separator for deriving the Ed25519 seed from the X25519 private key
-    ED25519_DOMAIN = b'DMP-v1-Ed25519-signing-key'
+    ED25519_DOMAIN = b"DMP-v1-Ed25519-signing-key"
 
     def __init__(self, private_key: Optional[X25519PrivateKey] = None):
         """Initialize crypto system with optional X25519 private key.
@@ -83,22 +83,22 @@ class DMPCrypto:
         ed_seed = hashlib.sha256(x25519_bytes + self.ED25519_DOMAIN).digest()
         self.signing_key = Ed25519PrivateKey.from_private_bytes(ed_seed)
         self.signing_public_key = self.signing_key.public_key()
-    
+
     @classmethod
     def generate_keypair(cls) -> Tuple[X25519PrivateKey, X25519PublicKey]:
         """Generate a new X25519 keypair"""
         private_key = X25519PrivateKey.generate()
         public_key = private_key.public_key()
         return private_key, public_key
-    
+
     @classmethod
-    def from_private_bytes(cls, private_bytes: bytes) -> 'DMPCrypto':
+    def from_private_bytes(cls, private_bytes: bytes) -> "DMPCrypto":
         """Create crypto instance from private key bytes"""
         if len(private_bytes) != 32:
             raise ValueError("Private key must be 32 bytes")
         private_key = X25519PrivateKey.from_private_bytes(private_bytes)
         return cls(private_key)
-    
+
     @classmethod
     def from_passphrase(
         cls,
@@ -135,66 +135,64 @@ class DMPCrypto:
             type=Argon2Type.ID,
         )
         return cls.from_private_bytes(key_material)
-    
+
     def get_public_key_bytes(self) -> bytes:
         """Get public key as bytes"""
         return self.public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
-    
+
     def get_private_key_bytes(self) -> bytes:
         """Get private key as bytes"""
         return self.private_key.private_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption()
+            encryption_algorithm=serialization.NoEncryption(),
         )
-    
+
     def encrypt_for_recipient(
         self,
         plaintext: bytes,
         recipient_public_key: X25519PublicKey,
-        associated_data: Optional[bytes] = None
+        associated_data: Optional[bytes] = None,
     ) -> EncryptedMessage:
         """Encrypt message for recipient using ECDH + ChaCha20-Poly1305"""
-        
+
         # Generate ephemeral keypair for this message
         ephemeral_private = X25519PrivateKey.generate()
         ephemeral_public = ephemeral_private.public_key()
-        
+
         # Perform ECDH key exchange
         shared_secret = ephemeral_private.exchange(recipient_public_key)
-        
+
         # Derive encryption key using HKDF
         hkdf = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=b'DMP-v1',
-            info=b'DMP-Message-Encryption',
-            backend=default_backend()
+            salt=b"DMP-v1",
+            info=b"DMP-Message-Encryption",
+            backend=default_backend(),
         )
         encryption_key = hkdf.derive(shared_secret)
-        
+
         # Generate random nonce
         nonce = os.urandom(12)
-        
+
         # Encrypt with ChaCha20-Poly1305
         cipher = ChaCha20Poly1305(encryption_key)
         ciphertext = cipher.encrypt(nonce, plaintext, associated_data)
-        
+
         # Package encrypted message
         ephemeral_public_bytes = ephemeral_public.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
-        
+
         return EncryptedMessage(
             ephemeral_public_key=ephemeral_public_bytes,
             ciphertext=ciphertext,
-            nonce=nonce
+            nonce=nonce,
         )
-    
+
     def decrypt_message(
         self,
         encrypted_msg: EncryptedMessage,
@@ -218,47 +216,44 @@ class DMPCrypto:
 
         # Perform ECDH key exchange
         shared_secret = decrypt_key.exchange(ephemeral_public)
-        
+
         # Derive decryption key using HKDF (same as encryption)
         hkdf = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=b'DMP-v1',
-            info=b'DMP-Message-Encryption',
-            backend=default_backend()
+            salt=b"DMP-v1",
+            info=b"DMP-Message-Encryption",
+            backend=default_backend(),
         )
         decryption_key = hkdf.derive(shared_secret)
-        
+
         # Decrypt with ChaCha20-Poly1305
         cipher = ChaCha20Poly1305(decryption_key)
         plaintext = cipher.decrypt(
-            encrypted_msg.nonce,
-            encrypted_msg.ciphertext,
-            associated_data
+            encrypted_msg.nonce, encrypted_msg.ciphertext, associated_data
         )
-        
+
         return plaintext
-    
+
     @staticmethod
     def generate_deterministic_nonce(
-        message_id: bytes,
-        chunk_number: int,
-        timestamp: int
+        message_id: bytes, chunk_number: int, timestamp: int
     ) -> bytes:
         """Generate deterministic nonce to prevent replay attacks"""
-        data = message_id + chunk_number.to_bytes(4, 'big') + timestamp.to_bytes(8, 'big')
+        data = (
+            message_id + chunk_number.to_bytes(4, "big") + timestamp.to_bytes(8, "big")
+        )
         hash_result = hashlib.sha256(data).digest()
         return hash_result[:12]  # Use first 12 bytes for nonce
-    
+
     @staticmethod
     def derive_user_id(public_key: X25519PublicKey) -> bytes:
         """Derive user ID from public key"""
         public_bytes = public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
         return hashlib.sha256(public_bytes).digest()
-    
+
     def get_signing_public_key_bytes(self) -> bytes:
         """Get Ed25519 signing public key as raw 32 bytes."""
         return self.signing_public_key.public_bytes(
@@ -320,7 +315,7 @@ class MessageEncryption:
         chunk_number: int = 0,
         timestamp: int = 0,
     ) -> EncryptedMessage:
-        associated_data = message_id + chunk_number.to_bytes(4, 'big')
+        associated_data = message_id + chunk_number.to_bytes(4, "big")
         return self.crypto.encrypt_for_recipient(
             plaintext=message,
             recipient_public_key=recipient_public_key,
@@ -333,7 +328,7 @@ class MessageEncryption:
         message_id: bytes,
         chunk_number: int = 0,
     ) -> bytes:
-        associated_data = message_id + chunk_number.to_bytes(4, 'big')
+        associated_data = message_id + chunk_number.to_bytes(4, "big")
         return self.crypto.decrypt_message(
             encrypted_msg=encrypted_msg,
             associated_data=associated_data,

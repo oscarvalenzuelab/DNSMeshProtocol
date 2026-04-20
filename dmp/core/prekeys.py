@@ -45,16 +45,16 @@ from typing import List, Optional, Tuple
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey, X25519PublicKey,
+    X25519PrivateKey,
+    X25519PublicKey,
 )
 
 from dmp.core.crypto import DMPCrypto
 
-
 RECORD_PREFIX = "v=dmp1;t=prekey;d="
-_BODY_LEN = 4 + 32 + 8        # prekey_id + pub + exp = 44
+_BODY_LEN = 4 + 32 + 8  # prekey_id + pub + exp = 44
 _SIG_LEN = 64
-_WIRE_LEN = _BODY_LEN + _SIG_LEN   # 108 bytes
+_WIRE_LEN = _BODY_LEN + _SIG_LEN  # 108 bytes
 
 
 def prekey_rrset_name(username: str, base_domain: str) -> str:
@@ -71,9 +71,9 @@ def prekey_rrset_name(username: str, base_domain: str) -> str:
 class Prekey:
     """A single one-time prekey record (public side)."""
 
-    prekey_id: int              # 4-byte unsigned, unique within an identity's pool
-    public_key: bytes           # 32-byte X25519 pub
-    exp: int                    # unix seconds after which recipient may drop
+    prekey_id: int  # 4-byte unsigned, unique within an identity's pool
+    public_key: bytes  # 32-byte X25519 pub
+    exp: int  # unix seconds after which recipient may drop
 
     def to_body_bytes(self) -> bytes:
         if not (0 <= self.prekey_id < (1 << 32)):
@@ -115,7 +115,7 @@ class Prekey:
         if not record.startswith(RECORD_PREFIX):
             return None
         try:
-            wire = base64.b64decode(record[len(RECORD_PREFIX):])
+            wire = base64.b64decode(record[len(RECORD_PREFIX) :])
         except Exception:
             return None
         if len(wire) != _WIRE_LEN:

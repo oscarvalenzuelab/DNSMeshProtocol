@@ -20,7 +20,6 @@ from typing import List, Optional
 
 from dmp.network.base import DNSRecordStore
 
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
     name       TEXT NOT NULL,
@@ -113,9 +112,7 @@ class SqliteMailboxStore(DNSRecordStore):
     def record_count(self, include_expired: bool = False) -> int:
         with self._lock:
             if include_expired:
-                row = self._conn.execute(
-                    "SELECT COUNT(*) FROM records"
-                ).fetchone()
+                row = self._conn.execute("SELECT COUNT(*) FROM records").fetchone()
             else:
                 row = self._conn.execute(
                     "SELECT COUNT(*) FROM records WHERE expires_at > ?",

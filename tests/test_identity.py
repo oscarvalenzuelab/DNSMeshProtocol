@@ -37,7 +37,7 @@ class TestIdentityRecord:
         rec = make_record(crypto, "alice")
         wire = rec.sign(crypto)
 
-        body_sig = bytearray(base64.b64decode(wire[len(RECORD_PREFIX):]))
+        body_sig = bytearray(base64.b64decode(wire[len(RECORD_PREFIX) :]))
         body_sig[1] ^= 0xFF  # flip a bit inside the username
         tampered = RECORD_PREFIX + base64.b64encode(bytes(body_sig)).decode("ascii")
         assert IdentityRecord.parse_and_verify(tampered) is None
@@ -103,13 +103,20 @@ class TestIdentityDomain:
 
 class TestZoneAnchoredIdentity:
     def test_zone_anchored_name_format(self):
-        assert zone_anchored_identity_name("alice.example.com") == "dmp.alice.example.com"
+        assert (
+            zone_anchored_identity_name("alice.example.com") == "dmp.alice.example.com"
+        )
 
     def test_zone_anchored_strips_trailing_dot(self):
-        assert zone_anchored_identity_name("alice.example.com.") == "dmp.alice.example.com"
+        assert (
+            zone_anchored_identity_name("alice.example.com.") == "dmp.alice.example.com"
+        )
 
     def test_parse_address_splits_user_and_host(self):
-        assert parse_address("alice@alice.example.com") == ("alice", "alice.example.com")
+        assert parse_address("alice@alice.example.com") == (
+            "alice",
+            "alice.example.com",
+        )
 
     def test_parse_address_strips_whitespace_and_dot(self):
         assert parse_address("  alice @ alice.example.com. ") == (

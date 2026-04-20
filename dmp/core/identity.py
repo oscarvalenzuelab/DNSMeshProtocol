@@ -33,7 +33,6 @@ from typing import Optional, Tuple
 
 from dmp.core.crypto import DMPCrypto
 
-
 RECORD_PREFIX = "v=dmp1;t=identity;d="
 _SIG_LEN = 64
 _X25519_LEN = 32
@@ -94,9 +93,9 @@ class IdentityRecord:
     """A signed claim that (username, x25519_pk, ed25519_spk) belong together."""
 
     username: str
-    x25519_pk: bytes       # 32-byte X25519 encryption pubkey
-    ed25519_spk: bytes     # 32-byte Ed25519 signing pubkey
-    ts: int                # unix seconds at publication
+    x25519_pk: bytes  # 32-byte X25519 encryption pubkey
+    ed25519_spk: bytes  # 32-byte Ed25519 signing pubkey
+    ts: int  # unix seconds at publication
 
     def to_body_bytes(self) -> bytes:
         name = self.username.encode("utf-8")
@@ -127,13 +126,13 @@ class IdentityRecord:
         if len(body) != expected:
             raise ValueError("identity body length mismatch")
         offset = 1
-        name = body[offset:offset + name_len].decode("utf-8")
+        name = body[offset : offset + name_len].decode("utf-8")
         offset += name_len
-        x25519_pk = body[offset:offset + _X25519_LEN]
+        x25519_pk = body[offset : offset + _X25519_LEN]
         offset += _X25519_LEN
-        ed25519_spk = body[offset:offset + _ED25519_LEN]
+        ed25519_spk = body[offset : offset + _ED25519_LEN]
         offset += _ED25519_LEN
-        ts = int.from_bytes(body[offset:offset + _TS_LEN], "big")
+        ts = int.from_bytes(body[offset : offset + _TS_LEN], "big")
         return cls(
             username=name,
             x25519_pk=x25519_pk,
@@ -158,7 +157,7 @@ class IdentityRecord:
         if not record.startswith(RECORD_PREFIX):
             return None
         try:
-            wire = base64.b64decode(record[len(RECORD_PREFIX):])
+            wire = base64.b64decode(record[len(RECORD_PREFIX) :])
         except Exception:
             return None
         if len(wire) < _SIG_LEN + 1:

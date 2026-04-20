@@ -12,7 +12,6 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
-
 _LABEL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _METRIC_NAME_RE = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
 LabelSet = Tuple[Tuple[str, str], ...]  # sorted tuple of (label, value) pairs
