@@ -20,6 +20,22 @@ Health model
 - Iteration is always in the original priority order; demotion is a
   *skip*, not a permanent reorder. This keeps the "primary comes back
   after cooldown" behavior the Milestone-1 spec asks for.
+
+NXDOMAIN/NoAnswer: the oracle rule
+----------------------------------
+A lone NXDOMAIN or NoAnswer is NOT a health failure on its own — the
+name might genuinely not exist, and demoting a resolver for
+authoritatively answering "no such record" would poison the pool on
+every absent-mailbox lookup.
+
+But "this resolver said NXDOMAIN while a later resolver returned a
+valid TXT for the same query" IS a health failure: the later
+resolver's success is an oracle that proves the earlier one was
+lying, stale, or censoring. So we buffer each not-found answer during
+a query, and only apply failure marks *retroactively* if a
+lower-priority resolver disproves them with a real answer. If every
+resolver says not-found, nobody disproved anybody, and no demotions
+happen — preserving the "true missing record" behavior.
 """
 
 from __future__ import annotations
@@ -83,12 +99,12 @@ class ResolverPool(DNSRecordReader):
     """
 
     # Name-not-found answers describe the *queried name*, not the
-    # resolver's health. A resolver that authoritatively replies "no
-    # such record" is behaving correctly; we should try the next
-    # upstream (another resolver might have a fresher view, or the
-    # record may live in a zone only some resolvers see) but we must
-    # NOT demote it — otherwise a single cache miss (e.g. a lookup for
-    # an absent mailbox) poisons the pool.
+    # resolver's health — in isolation. We defer the demotion decision
+    # until the whole query completes: if a later, lower-priority
+    # resolver returns a real answer for the same name, that serves as
+    # an oracle proving each earlier not-found response was wrong, and
+    # we retroactively demote those resolvers. If everyone agrees the
+    # name is absent, nobody gets demoted (see module docstring).
     _NAME_NOT_FOUND_ERRORS = (
         dns.resolver.NXDOMAIN,
         dns.resolver.NoAnswer,
@@ -142,15 +158,24 @@ class ResolverPool(DNSRecordReader):
         Returns the first non-empty TXT answer. If every upstream
         fails (or is in cooldown and all cooldowns have not yet
         elapsed), returns None.
+
+        Demotion uses a later-resolver oracle: NXDOMAIN/NoAnswer from
+        an earlier resolver is a health failure *only if* a
+        lower-priority resolver produces a real TXT answer for the
+        same query. Otherwise the name is presumed genuinely absent
+        and no health bookkeeping touches the not-found resolvers.
         """
+        tried_not_found: List[_HostState] = []
+
         for state in self._iter_eligible():
             try:
                 answers = state.resolver.resolve(name, "TXT")
             except self._NAME_NOT_FOUND_ERRORS:
-                # The resolver answered, just with "no such name /
-                # no such record." That's a normal query outcome, not
-                # a resolver fault — try the next upstream but leave
-                # this one's health untouched.
+                # Defer the health decision: if a later resolver
+                # returns a real record, this one was wrong and we'll
+                # demote it retroactively. If everyone agrees the name
+                # is missing, we leave it alone.
+                tried_not_found.append(state)
                 continue
             except self._TRANSPORT_ERRORS:
                 self._mark_failure(state)
@@ -170,9 +195,26 @@ class ResolverPool(DNSRecordReader):
                 records.append(
                     "".join(s.decode("utf-8", errors="replace") for s in rdata.strings)
                 )
-            self._mark_success(state)
-            return records if records else None
 
+            if records:
+                # Oracle fires: every earlier resolver that claimed
+                # the name was absent just got disproven. Mark each
+                # one unhealthy so subsequent queries skip them while
+                # in cooldown.
+                for lying_state in tried_not_found:
+                    self._mark_failure(lying_state)
+                self._mark_success(state)
+                return records
+
+            # Zero-length answer: treat like NoAnswer for this
+            # resolver (it didn't disprove the earlier ones) and
+            # continue looking. Its own health is unchanged.
+            tried_not_found.append(state)
+            continue
+
+        # Every resolver either returned not-found or a transport
+        # error. The not-found resolvers stay un-demoted — nothing
+        # oracled them.
         return None
 
     # ---------------------------------------------------------------
