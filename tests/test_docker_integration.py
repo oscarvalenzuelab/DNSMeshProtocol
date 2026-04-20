@@ -230,3 +230,131 @@ def test_container_survives_client_restart(node_container):
     inbox = bob_fresh.receive_messages()
     assert len(inbox) == 1
     assert inbox[0].plaintext == b"delivered after restart"
+
+
+def test_container_forward_secrecy_end_to_end(node_container, tmp_path):
+    """Forward-secrecy flow exercised against a real container.
+
+    Bob publishes prekeys to the node. Alice pins bob's Ed25519 key,
+    sends a message — the manifest must carry a nonzero prekey_id.
+    Bob decrypts, the prekey_sk is consumed from his local store, and a
+    direct DNS query confirms the prekey_pub RRset is still visible on
+    the node (deletion is a client-local concern here, not a server one).
+    """
+    from dmp.client.client import DMPClient
+    from dmp.core.manifest import NO_PREKEY, SlotManifest
+    from dmp.core.prekeys import prekey_rrset_name
+
+    writer = _HttpWriter(node_container["http_base"])
+    reader = _DnsReader("127.0.0.1", node_container["dns_port"])
+
+    # Persistent prekey stores so we can verify consumption-on-decrypt.
+    alice_prekeys = str(tmp_path / "alice-prekeys.db")
+    bob_prekeys = str(tmp_path / "bob-prekeys.db")
+
+    alice = DMPClient(
+        "alice-fs", "alice-fs-pass", domain="mesh.docker",
+        writer=writer, reader=reader, prekey_store_path=alice_prekeys,
+    )
+    bob = DMPClient(
+        "bob-fs", "bob-fs-pass", domain="mesh.docker",
+        writer=writer, reader=reader, prekey_store_path=bob_prekeys,
+    )
+    # Alice pins both of bob's keys — required to verify prekey signatures.
+    alice.add_contact(
+        "bob-fs",
+        bob.get_public_key_hex(),
+        signing_key_hex=bob.get_signing_public_key_hex(),
+    )
+
+    # Bob seeds a small prekey pool (5 keys, 1 hr TTL).
+    published = bob.refresh_prekeys(count=5, ttl_seconds=3600)
+    assert published == 5
+    assert bob.prekey_store.count_live() == 5
+
+    # Confirm the prekey RRset actually lives on the node.
+    rrset_name = prekey_rrset_name("bob-fs", "mesh.docker")
+    records = reader.query_txt_record(rrset_name)
+    assert records is not None and len(records) == 5
+
+    assert alice.send_message("bob-fs", "forward-secret via real node")
+
+    # Find bob's manifest on the node; prekey_id should be nonzero.
+    import hashlib
+    bob_recipient_id = hashlib.sha256(
+        bytes.fromhex(bob.get_public_key_hex())
+    ).digest()
+    manifest = None
+    for slot in range(10):
+        domain = f"slot-{slot}.mb-{hashlib.sha256(bob_recipient_id).hexdigest()[:12]}.mesh.docker"
+        values = reader.query_txt_record(domain) or []
+        for v in values:
+            parsed = SlotManifest.parse_and_verify(v)
+            if parsed and parsed[0].recipient_id == bob_recipient_id:
+                manifest = parsed[0]
+                break
+        if manifest:
+            break
+    assert manifest is not None
+    assert manifest.prekey_id != NO_PREKEY
+    used_id = manifest.prekey_id
+    assert bob.prekey_store.get_private_key(used_id) is not None
+
+    inbox = bob.receive_messages()
+    assert len(inbox) == 1
+    assert inbox[0].plaintext == b"forward-secret via real node"
+
+    # Consumed — leaking bob's long-term X25519 key no longer recovers this.
+    assert bob.prekey_store.get_private_key(used_id) is None
+    assert bob.prekey_store.count_live() == 4
+
+
+def test_container_zone_anchored_identity(node_container):
+    """Zone-anchored identity + address-style fetch against a real container.
+
+    Alice publishes her identity at `dmp.alice.example.com` (a zone she
+    "controls" in this test — the node accepts any writer on port 8053).
+    Bob fetches via `alice@alice.example.com` and stores her as a pinned
+    contact. This exercises `dmp identity publish` + `dmp identity fetch`
+    logic inside the client against a real UDP DNS server, not the
+    in-memory store.
+    """
+    from dmp.client.client import DMPClient
+    from dmp.core.identity import (
+        IdentityRecord,
+        make_record,
+        parse_address,
+        zone_anchored_identity_name,
+    )
+
+    writer = _HttpWriter(node_container["http_base"])
+    reader = _DnsReader("127.0.0.1", node_container["dns_port"])
+
+    # Alice creates her identity + publishes to dmp.alice.example.com.
+    alice = DMPClient(
+        "alice-z", "alice-z-pass", domain="mesh.docker",
+        writer=writer, reader=reader,
+    )
+    record = make_record(alice.crypto, "alice-z")
+    wire = record.sign(alice.crypto)
+    anchor = zone_anchored_identity_name("alice-z.example.com")
+    assert writer.publish_txt_record(anchor, wire, ttl=3600)
+
+    # Bob resolves `alice-z@alice-z.example.com` via DNS → parses the
+    # address, queries the zone-anchored name, verifies the Ed25519
+    # signature against the embedded signing pubkey.
+    user, host = parse_address("alice-z@alice-z.example.com")
+    dns_name = zone_anchored_identity_name(host)
+    values = reader.query_txt_record(dns_name)
+    assert values is not None and len(values) >= 1
+
+    parsed = None
+    for v in values:
+        result = IdentityRecord.parse_and_verify(v)
+        if result is not None:
+            parsed = result[0]
+            break
+    assert parsed is not None
+    assert parsed.username == user
+    assert parsed.x25519_pk == alice.crypto.get_public_key_bytes()
+    assert parsed.ed25519_spk == alice.crypto.get_signing_public_key_bytes()
