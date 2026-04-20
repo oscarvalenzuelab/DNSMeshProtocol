@@ -32,18 +32,50 @@ The protocol assumes:
 
 ## What's protected
 
-- **Confidentiality:** X25519 ECDH + ChaCha20-Poly1305, ephemeral key per
-  message. The node sees ciphertext, not plaintext.
-- **Forward secrecy:** compromise of a long-term X25519 private key does
-  not decrypt past messages (ephemeral keys are discarded).
-- **Header integrity:** AEAD AAD binds the canonical DMPHeader
-  (`sender_id`, `recipient_id`, `msg_id`, `timestamp`, `ttl`). Flipping
-  any of these fields breaks decryption.
-- **Sender authentication:** every slot manifest carries an Ed25519
-  signature over a binary body that names the sender. Forged manifests
-  fail verification.
+- **Confidentiality:** X25519 ECDH + ChaCha20-Poly1305. The sender
+  generates a fresh ephemeral keypair per message, which means two
+  messages to the same recipient don't share a session key and an
+  observer can't correlate them by key material. The node sees
+  ciphertext, not plaintext.
+- **Header integrity (partial):** AEAD AAD binds a canonical subset of
+  the `DMPHeader` — `version`, `message_type`, `message_id`, `sender_id`,
+  `recipient_id`, `timestamp`, `ttl`. Flipping any of these in transit
+  breaks decryption. `total_chunks` and `chunk_number` are NOT in AAD
+  (they're set after encryption and bound separately via the signed
+  manifest).
+- **Manifest integrity + binding:** every slot manifest carries an
+  Ed25519 signature over `(msg_id, sender_spk, recipient_id,
+  total_chunks, ts, exp)`. Forged manifests fail verification, and on
+  receive the client cross-checks `outer.header.message_id ==
+  manifest.msg_id` and `recipient_id == manifest.recipient_id` so a
+  legitimate sender can't lie about which message the manifest is for.
+- **Sender-identity binding to contacts:** a received manifest is
+  accepted only when its `sender_spk` matches a pinned signing key in
+  the recipient's contact list (see the unknown-sender section below
+  for TOFU / unpinned behavior).
 - **Replay:** a per-recipient `(sender_spk, msg_id)` cache rejects
   re-delivered manifests within its memory window.
+- **Freshness:** the inner header's `timestamp + ttl` is enforced on
+  receive. Stale messages are dropped.
+
+## What is NOT protected
+
+- **Forward secrecy.** This was previously overclaimed. The recipient
+  decrypts with their long-term X25519 private key, so compromise of
+  that key allows decryption of past stored ciphertexts. We do not
+  implement prekeys or a double ratchet.
+- **Post-compromise sender authentication.** If the sender's Ed25519
+  signing key leaks, an attacker can sign arbitrary future manifests
+  as that sender. There is no key rotation or revocation channel.
+- **Traffic analysis.** Message timing, approximate size (chunk
+  count), and the existence of a `(sender, recipient)` relationship
+  are all visible to anyone who watches the mesh domain's DNS.
+- **Username ownership.** Identity records at
+  `id-{sha256(username)[:16]}.{domain}` are publish-append. A
+  squatter who publishes first has a valid self-signed record; a
+  later legitimate publisher adds a second record. `dmp identity
+  fetch` refuses `--add` when multiple valid records exist and
+  prints fingerprints for out-of-band verification.
 
 ## Known limits
 
@@ -82,6 +114,14 @@ The protocol assumes:
    must front with nginx/caddy or run inside a trusted network.
 8. **`InMemoryDNSStore` is process-local.** It's a mock for tests; do not
    use it for anything exposed to real users.
+9. **Unbounded per-request threading.** Both the HTTP API and the UDP DNS
+   server use `ThreadingMixIn` and spawn a thread per request with no
+   concurrency ceiling. A socket flood can exhaust threads and memory
+   before the token-bucket rate limiter kicks in. Operators running a
+   public node should front it with a reverse proxy that imposes its
+   own connection cap (nginx `worker_connections`, Caddy defaults, a
+   dedicated DNS frontend for UDP). Moving to bounded worker pools or
+   async I/O is on the roadmap.
 
 ## Cryptographic primitives
 

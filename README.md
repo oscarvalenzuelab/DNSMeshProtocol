@@ -6,11 +6,22 @@ Decentralized peer-to-peer messaging that tunnels encrypted messages through DNS
 
 ## What you get
 
-- **End-to-end encryption.** X25519 ECDH + ChaCha20-Poly1305 with ephemeral per-message keys.
-- **Real sender authentication.** Every slot manifest is Ed25519-signed; impersonation fails verification.
-- **AEAD binds the full header.** `sender_id`, `recipient_id`, `msg_id`, `timestamp`, and `ttl` can't be mutated in transit without flipping decryption.
-- **Replay protection.** Per-recipient `(sender_spk, msg_id)` cache rejects re-publications.
-- **Per-chunk Reed-Solomon.** Bit errors within a chunk are recoverable; lost chunks still fail (cross-chunk erasure is future work).
+- **End-to-end encryption.** X25519 ECDH + ChaCha20-Poly1305 with an
+  ephemeral sender keypair per message. *Not* forward-secret against
+  recipient key compromise — see [SECURITY.md](SECURITY.md).
+- **Sender authentication pinned to contacts.** Every slot manifest is
+  Ed25519-signed; on receive, the `sender_spk` must match a signing key
+  already pinned in the contact list. Unknown-sender manifests are dropped.
+- **AEAD binds a canonical header subset** (`version`, `message_type`,
+  `msg_id`, `sender_id`, `recipient_id`, `timestamp`, `ttl`). On receive,
+  the decrypted inner header is cross-checked against the signed manifest
+  — mismatched `msg_id` or `recipient_id` is rejected, and stale
+  `timestamp + ttl` is dropped.
+- **Replay protection.** Per-recipient `(sender_spk, msg_id)` cache
+  rejects re-publications within its TTL window.
+- **Per-chunk Reed-Solomon** (32 parity bytes per chunk) for bit-error
+  repair within a received chunk. No cross-chunk erasure: a lost chunk
+  still fails the message.
 - **Pluggable transport.** Any `DNSRecordWriter` / `DNSRecordReader` works — in-memory for tests, sqlite for nodes, Cloudflare/Route53/BIND for production.
 - **Self-contained node.** One Python process serves UDP DNS + HTTP submissions from a persistent sqlite store, with a TTL cleanup worker.
 - **Docker-first deploy.** `docker compose up` gives you a running node with persistence.

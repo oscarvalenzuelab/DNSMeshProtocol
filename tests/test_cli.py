@@ -46,8 +46,13 @@ def shared_store(monkeypatch):
             store=store,
             replay_cache_path=replay_path,
         )
-        for name, pubkey in config.contacts.items():
-            client.add_contact(name, pubkey, domain=config.domain)
+        for name, entry in config.contacts.items():
+            client.add_contact(
+                name,
+                entry.get("pub", ""),
+                domain=config.domain,
+                signing_key_hex=entry.get("spk", ""),
+            )
         return client
 
     class _SharedStoreReader:
@@ -171,6 +176,48 @@ class TestIdentityPublishFetch:
         with pytest.raises(SystemExit) as exc:
             cli.main(["identity", "fetch", "nobody"])
         assert exc.value.code == 2
+
+    def test_fetch_refuses_ambiguous_without_fingerprint(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """Two valid identity records at the same name force manual choice.
+
+        An attacker who squats `id-{hash(alice)}.{domain}` before the real
+        alice publishes creates an RRset with two valid self-signed
+        records. Auto-picking the first one hands the attacker a win;
+        instead, fetch dumps fingerprints and requires --accept-fingerprint.
+        """
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.identity import identity_domain, make_record
+
+        # Real alice publishes her identity.
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        cli.main(["identity", "publish"])
+        capsys.readouterr()
+
+        # An attacker with a different keypair publishes another valid
+        # identity record for username "alice" at the same DNS name.
+        attacker = DMPCrypto()
+        squat = make_record(attacker, "alice").sign(attacker)
+        name = identity_domain("alice", "mesh.local")
+        shared_store.publish_txt_record(name, squat)
+
+        # Bob tries to fetch alice. Two records; auto-pick refused.
+        bob_home = config_home.parent / "bob-squat-home"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(["init", "bob", "--endpoint", "http://x"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["identity", "fetch", "alice", "--add"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "ambiguous" in err
+        assert "fingerprint=" in err
+        assert "--accept-fingerprint" in err
 
 
 class TestContacts:

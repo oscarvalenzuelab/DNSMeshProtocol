@@ -144,6 +144,159 @@ class TestSendReceive:
         payloads = sorted(m.plaintext for m in inbox)
         assert payloads == [b"from-alice", b"from-eve"]
 
+    def test_unknown_signer_dropped_when_contacts_pinned(self):
+        """Once alice has pinned bob's signing key, a manifest from a random
+        third party (eve) is dropped even if she correctly signs it and
+        addresses it to alice.
+
+        This closes the 'sender_spk is any Ed25519 key' gap flagged in the
+        codex audit — without pinning, the client accepts any valid signer
+        as "some sender"; with pinning, only the expected key is accepted.
+        """
+        import hashlib
+
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        eve = DMPClient("eve", "eve-pass", domain="mesh.test", store=store)
+
+        # alice pins bob (both keys). No pin for eve.
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        # eve sends a message to alice. eve has alice's pubkey (she
+        # queried DNS) but alice has NOT pinned eve, so on receive the
+        # manifest's sender_spk won't match any known contact.
+        eve.add_contact("alice", alice.get_public_key_hex())
+        assert eve.send_message("alice", "eve is not a contact")
+
+        # bob also sends. Alice should accept this one.
+        bob.add_contact("alice", alice.get_public_key_hex())
+        assert bob.send_message("alice", "bob is pinned")
+
+        inbox = alice.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"bob is pinned"
+        assert inbox[0].sender_signing_pk == bob.crypto.get_signing_public_key_bytes()
+
+    def test_tofu_delivery_when_no_contacts_pinned(self):
+        """Without any pinned signing keys, receive falls back to TOFU —
+        any signature-valid manifest for us is delivered. This keeps the
+        initial 'publish your identity, exchange keys, pin' workflow
+        working at all."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        # alice has no contacts at all — no pins yet.
+        bob.add_contact("alice", alice.get_public_key_hex())
+        assert bob.send_message("alice", "first contact")
+
+        inbox = alice.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"first contact"
+
+    def test_forged_manifest_msg_id_rejected(self):
+        """A sender who puts one msg_id in the manifest and a different one
+        in the inner header is caught by the cross-check on receive.
+
+        Without that check, a legitimate sender could lie about which
+        message the manifest describes and the client would surface the
+        lie as fact.
+        """
+        import hashlib
+        import uuid
+
+        from dmp.core.manifest import SlotManifest
+
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+        bob.add_contact("alice", alice.get_public_key_hex())
+
+        # alice sends normally so the chunks land with the *real* msg_id
+        # embedded in the inner header.
+        assert alice.send_message("bob", "real payload")
+
+        # Find alice's just-published manifest, rewrite it so the manifest's
+        # msg_id disagrees with the chunks' msg_id, then re-sign and
+        # republish at the same slot so bob sees the forged manifest too.
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        mb_hash = hashlib.sha256(bob_recipient_id).hexdigest()[:12]
+
+        forged_slot = None
+        real_manifest = None
+        for slot in range(10):
+            name = f"slot-{slot}.mb-{mb_hash}.mesh.test"
+            for value in store.query_txt_record(name) or []:
+                parsed = SlotManifest.parse_and_verify(value)
+                if parsed is None:
+                    continue
+                real_manifest = parsed[0]
+                forged_slot = name
+                break
+            if real_manifest is not None:
+                break
+        assert real_manifest is not None
+
+        forged = SlotManifest(
+            msg_id=uuid.uuid4().bytes,  # different msg_id
+            sender_spk=real_manifest.sender_spk,
+            recipient_id=real_manifest.recipient_id,
+            total_chunks=real_manifest.total_chunks,
+            ts=real_manifest.ts,
+            exp=real_manifest.exp,
+        )
+        store.publish_txt_record(forged_slot, forged.sign(alice.crypto))
+
+        # bob polls. The real manifest still delivers "real payload". The
+        # forged one points at chunks that don't exist (wrong msg_key) or
+        # at chunks whose inner header.message_id doesn't match the
+        # forged msg_id. Either way, the forged delivery fails. In both
+        # cases bob should NOT see two deliveries of the same plaintext.
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"real payload"
+
+    def test_expired_inner_header_dropped(self):
+        """A message whose inner-header ts+ttl is in the past is dropped.
+
+        Belt-and-suspenders with the manifest's own `exp` field: the
+        replay cache may not kick in if the entry was purged, and a
+        stale manifest could survive if TTL wasn't enforced on the inner
+        header too.
+        """
+        import hashlib
+        import time as _time
+
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+
+        # Push the wall clock forward so a 1-second TTL message goes stale
+        # before bob polls. Monkeypatch time.time used by is_expired().
+        _real = _time.time
+        sent_at = int(_real())
+        _time.time = lambda: sent_at  # freeze at send time
+
+        try:
+            assert alice.send_message("bob", "expires fast", ttl=1)
+        finally:
+            _time.time = _real
+
+        # Wait past the TTL. Sleep needs to push int(time.time()) strictly
+        # past exp; since exp = sent_at + 1 and int() truncates, 2.2 s is the
+        # smallest safe wait.
+        import time
+        time.sleep(2.2)
+        inbox = bob.receive_messages()
+        # Either the manifest expired (dropped by manifest.is_expired) or
+        # the inner header expired (dropped by the new cross-check) — both
+        # reach the same outcome: no delivery.
+        assert inbox == []
+
     def test_slot_squatting_attacker_cannot_evict_real_messages(self):
         """An attacker who blasts junk into every slot cannot block delivery.
 

@@ -26,6 +26,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `DMP_NODE_HOSTNAME=... docker compose -f docker-compose.yml -f
   docker-compose.prod.yml up -d`.
 
+### Changed (security defaults)
+
+- HTTP API and UDP DNS rate limits are now **on by default** with
+  conservative values: 5 req/s burst 20 for HTTP, 50 q/s burst 200
+  for DNS. Override with `DMP_HTTP_RATE`/`_BURST` and
+  `DMP_DNS_RATE`/`_BURST`.
+- New publish-side caps enforced in `DMPHttpApi`:
+  `DMP_MAX_TTL` (default 86400s / 1 day),
+  `DMP_MAX_VALUE_BYTES` (default 2048),
+  `DMP_MAX_VALUES_PER_NAME` (default 64 — cap on RRset cardinality).
+  Requests over the TTL or value cap return 400; requests that
+  would grow an RRset past the cap return 413. Re-publishing an
+  existing value is still idempotent.
+
 ### Added (ops hardening)
 
 - Deep `/health`: probes the store (`query_txt_record` on a sentinel name).
@@ -81,7 +95,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `signing_public_key`, deterministically derived from the X25519 private
   bytes via domain-separated SHA-256.
 - `MessageEncryption.encrypt_with_header` / `decrypt_with_header` bind
-  the full canonical `DMPHeader` bytes as AEAD AAD.
+  a canonical subset of the `DMPHeader` bytes as AEAD AAD —
+  `version`, `message_type`, `message_id`, `sender_id`, `recipient_id`,
+  `timestamp`, `ttl`. `total_chunks` and `chunk_number` are zeroed
+  before AEAD (they're unknown at encrypt time) and bound separately
+  via the signed manifest.
 
 ### Security
 

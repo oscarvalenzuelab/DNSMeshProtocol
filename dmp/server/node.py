@@ -44,7 +44,12 @@ from typing import Optional
 
 from dmp.server.cleanup import CleanupWorker
 from dmp.server.dns_server import DMPDnsServer
-from dmp.server.http_api import DMPHttpApi
+from dmp.server.http_api import (
+    DEFAULT_MAX_TTL,
+    DEFAULT_MAX_VALUE_BYTES,
+    DEFAULT_MAX_VALUES_PER_NAME,
+    DMPHttpApi,
+)
 from dmp.server.logging_config import configure_logging
 from dmp.server.metrics import REGISTRY
 from dmp.server.rate_limit import RateLimit
@@ -60,13 +65,19 @@ class DMPNodeConfig:
     dns_host: str = "0.0.0.0"
     dns_port: int = 5353
     dns_ttl: int = 60
-    dns_rate: float = 0.0   # 0 disables rate limiting
-    dns_burst: float = 0.0
+    # Conservative on-by-default DNS rate limit. Operators who need a
+    # busier public resolver can raise these via env vars.
+    dns_rate: float = 50.0
+    dns_burst: float = 200.0
     http_host: str = "0.0.0.0"
     http_port: int = 8053
     http_token: Optional[str] = None
-    http_rate: float = 0.0
-    http_burst: float = 0.0
+    http_rate: float = 5.0
+    http_burst: float = 20.0
+    # Resource caps on publish — see http_api.DEFAULT_MAX_*.
+    max_ttl: int = DEFAULT_MAX_TTL
+    max_value_bytes: int = DEFAULT_MAX_VALUE_BYTES
+    max_values_per_name: int = DEFAULT_MAX_VALUES_PER_NAME
     cleanup_interval: float = 60.0
     log_level: str = "INFO"
     log_format: str = "text"   # "text" or "json"
@@ -85,6 +96,13 @@ class DMPNodeConfig:
             http_token=os.environ.get("DMP_HTTP_TOKEN") or None,
             http_rate=float(os.environ.get("DMP_HTTP_RATE", cls.http_rate)),
             http_burst=float(os.environ.get("DMP_HTTP_BURST", cls.http_burst)),
+            max_ttl=int(os.environ.get("DMP_MAX_TTL", cls.max_ttl)),
+            max_value_bytes=int(
+                os.environ.get("DMP_MAX_VALUE_BYTES", cls.max_value_bytes)
+            ),
+            max_values_per_name=int(
+                os.environ.get("DMP_MAX_VALUES_PER_NAME", cls.max_values_per_name)
+            ),
             cleanup_interval=float(
                 os.environ.get("DMP_CLEANUP_INTERVAL", cls.cleanup_interval)
             ),
@@ -137,6 +155,9 @@ class DMPNode:
             host=self.config.http_host,
             port=self.config.http_port,
             bearer_token=self.config.http_token,
+            max_ttl=self.config.max_ttl,
+            max_value_bytes=self.config.max_value_bytes,
+            max_values_per_name=self.config.max_values_per_name,
             rate_limit=RateLimit(
                 rate_per_second=self.config.http_rate,
                 burst=self.config.http_burst,

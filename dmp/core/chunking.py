@@ -82,8 +82,13 @@ class MessageChunker:
         for chunk_num in range(total):
             offset = chunk_num * data_size
             piece = raw[offset:offset + data_size]
+            # The checksum covers the *decoded* data so the receiver can run
+            # RS decode first and then verify against a clean reference.
+            # Checksumming the RS-encoded body (earlier design) meant any bit
+            # flip tripped the checksum before RS had a chance to repair it,
+            # silently defeating the whole error-correction story.
+            checksum = hashlib.sha256(piece).digest()[:8]
             encoded = bytes(self.RS_CODEC.encode(piece)) if use_ecc else piece
-            checksum = hashlib.sha256(encoded).digest()[:8]
             chunks.append((chunk_num, checksum + encoded))
 
         return chunks
@@ -123,9 +128,11 @@ class MessageAssembler:
 
         checksum = chunk_data[:8]
         encoded = chunk_data[8:]
-        if hashlib.sha256(encoded).digest()[:8] != checksum:
-            return None
-
+        # Order matters: RS decode first so bit-flips in `encoded` get
+        # repaired, then the checksum validates that the repaired bytes
+        # match what the sender put in. Checking the checksum against the
+        # RS-encoded body would reject every corrupt chunk before RS could
+        # touch it.
         if self.enable_error_correction:
             try:
                 data = bytes(MessageChunker.RS_CODEC.decode(encoded)[0])
@@ -133,6 +140,9 @@ class MessageAssembler:
                 return None
         else:
             data = encoded
+
+        if hashlib.sha256(data).digest()[:8] != checksum:
+            return None
 
         bucket = self.pending_messages.setdefault(message_id, {})
         if header is not None and message_id not in self.message_metadata:

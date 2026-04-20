@@ -26,10 +26,19 @@ DEFAULT_TTL_SECONDS = 300
 
 @dataclass
 class Contact:
-    """Recipient identity needed for encryption + addressing."""
+    """A pinned identity for send/receive.
+
+    `public_key_bytes` is the 32-byte X25519 encryption pubkey; `signing_key_bytes`
+    is the 32-byte Ed25519 signing pubkey. Pinning both lets the client (a)
+    encrypt to the right recipient and (b) on receive, reject any manifest
+    whose `sender_spk` doesn't match a contact the user has explicitly
+    accepted. Older configs that predate the Ed25519 pin leave
+    `signing_key_bytes` empty and fall back to TOFU on first delivery.
+    """
 
     username: str
-    public_key_bytes: bytes   # X25519 encryption pubkey
+    public_key_bytes: bytes   # X25519 encryption pubkey (32 bytes)
+    signing_key_bytes: bytes  # Ed25519 signing pubkey (32 bytes); may be b'' for legacy contacts
     domain: str
 
 
@@ -130,19 +139,44 @@ class DMPClient:
         username: str,
         public_key_hex: str,
         domain: Optional[str] = None,
+        *,
+        signing_key_hex: str = "",
     ) -> bool:
+        """Pin a contact.
+
+        `signing_key_hex` is optional for back-compat with configs that
+        predate Ed25519 pinning. When empty, incoming manifests from any
+        signer will be accepted on first delivery (TOFU); when present,
+        only manifests whose `sender_spk` matches are delivered.
+        """
         try:
             public_key_bytes = bytes.fromhex(public_key_hex)
         except ValueError:
             return False
         if len(public_key_bytes) != 32:
             return False
+
+        if signing_key_hex:
+            try:
+                signing_key_bytes = bytes.fromhex(signing_key_hex)
+            except ValueError:
+                return False
+            if len(signing_key_bytes) != 32:
+                return False
+        else:
+            signing_key_bytes = b""
+
         self.contacts[username] = Contact(
             username=username,
             public_key_bytes=public_key_bytes,
+            signing_key_bytes=signing_key_bytes,
             domain=domain or self.domain,
         )
         return True
+
+    def _known_signing_keys(self) -> set[bytes]:
+        """Signing keys we've pinned; used to filter incoming manifests."""
+        return {c.signing_key_bytes for c in self.contacts.values() if c.signing_key_bytes}
 
     # ---- identity ----------------------------------------------------------
 
@@ -274,10 +308,15 @@ class DMPClient:
     def receive_messages(self) -> List[InboxMessage]:
         """Poll all mailbox slots; verify and decrypt any fresh messages.
 
-        Returns the list of newly-delivered messages. Replay-cache rejections
-        and signature failures are silently skipped.
+        Returns the list of newly-delivered messages. Replay-cache rejections,
+        signature failures, and manifests from un-pinned senders are silently
+        skipped. If the client has no pinned Ed25519 contacts at all, receive
+        falls back to TOFU and delivers any signature-valid manifest — useful
+        for fresh onboarding, but users should pin contacts before treating
+        delivered messages as authenticated.
         """
         results: List[InboxMessage] = []
+        known_spks = self._known_signing_keys()
         for slot in range(SLOT_COUNT):
             slot_domain = self._slot_domain(self.user_id, slot)
             records = self.reader.query_txt_record(slot_domain)
@@ -291,6 +330,10 @@ class DMPClient:
                 if manifest.recipient_id != self.user_id:
                     continue
                 if manifest.is_expired():
+                    continue
+                # If the user has pinned any signing keys, only accept
+                # manifests from those senders. Unknown signers are dropped.
+                if known_spks and manifest.sender_spk not in known_spks:
                     continue
                 # Check-only here; we record in the replay cache *after* we
                 # actually decode the message. Otherwise a transient DNS miss
@@ -360,6 +403,21 @@ class DMPClient:
         try:
             encrypted = EncryptedMessage.from_bytes(outer.payload)
         except ValueError:
+            return None
+
+        # Cross-check the inner header against the signed manifest. The AEAD
+        # proves the ciphertext+header came from someone holding the
+        # recipient's pubkey, and the manifest signature proves a specific
+        # sender put a claim at the slot — but without this check a
+        # legitimate sender could put a different msg_id / recipient_id
+        # inside the ciphertext than in the manifest and the client would
+        # happily surface the lie.
+        if outer.header.message_id != manifest.msg_id:
+            return None
+        if outer.header.recipient_id != manifest.recipient_id:
+            return None
+        # Freshness: drop messages whose inner header's ts+ttl has passed.
+        if outer.header.is_expired():
             return None
 
         # Rebuild the same AAD the sender bound at encrypt time.

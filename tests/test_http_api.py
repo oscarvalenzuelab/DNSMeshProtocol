@@ -108,6 +108,73 @@ class TestRecordsCrud:
         assert r.status_code == 400
 
 
+class TestResourceCaps:
+    def test_post_rejects_ttl_over_cap(self):
+        store = InMemoryDNSStore()
+        api = DMPHttpApi(store, host="127.0.0.1", port=_free_port(), max_ttl=300)
+        api.start()
+        try:
+            r = requests.post(
+                f"http://127.0.0.1:{api.port}/v1/records/x.example.com",
+                json={"value": "v", "ttl": 3600},
+                timeout=2,
+            )
+            assert r.status_code == 400
+            assert "ttl exceeds cap" in r.text
+        finally:
+            api.stop()
+
+    def test_post_rejects_oversized_value(self):
+        store = InMemoryDNSStore()
+        api = DMPHttpApi(
+            store, host="127.0.0.1", port=_free_port(), max_value_bytes=100
+        )
+        api.start()
+        try:
+            r = requests.post(
+                f"http://127.0.0.1:{api.port}/v1/records/x.example.com",
+                json={"value": "A" * 1000, "ttl": 60},
+                timeout=2,
+            )
+            assert r.status_code == 400
+            assert "value exceeds cap" in r.text
+        finally:
+            api.stop()
+
+    def test_post_rejects_rrset_past_cardinality_cap(self):
+        store = InMemoryDNSStore()
+        api = DMPHttpApi(
+            store, host="127.0.0.1", port=_free_port(), max_values_per_name=3
+        )
+        api.start()
+        try:
+            base = f"http://127.0.0.1:{api.port}"
+            # Fill the RRset up to the cap.
+            for i in range(3):
+                r = requests.post(
+                    f"{base}/v1/records/full.example.com",
+                    json={"value": f"v{i}", "ttl": 60},
+                    timeout=2,
+                )
+                assert r.status_code == 201
+            # Next distinct value is rejected.
+            r = requests.post(
+                f"{base}/v1/records/full.example.com",
+                json={"value": "v-overflow", "ttl": 60},
+                timeout=2,
+            )
+            assert r.status_code == 413
+            # Re-publishing an existing value is idempotent and NOT rejected.
+            r = requests.post(
+                f"{base}/v1/records/full.example.com",
+                json={"value": "v0", "ttl": 60},
+                timeout=2,
+            )
+            assert r.status_code == 201
+        finally:
+            api.stop()
+
+
 class TestAuth:
     def test_unauth_request_rejected(self, auth_api_store):
         api, _ = auth_api_store

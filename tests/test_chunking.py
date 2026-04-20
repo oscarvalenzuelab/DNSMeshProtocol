@@ -148,11 +148,11 @@ class TestMessageAssembler:
     
     def test_missing_chunks_detection(self):
         """Test detection of missing chunks"""
-        assembler = MessageAssembler()
+        # ECC=False so the handcrafted chunks don't have to be valid RS words.
+        assembler = MessageAssembler(enable_error_correction=False)
         message_id = uuid.uuid4().bytes
         total_chunks = 5
-        
-        # Add some but not all chunks
+
         import hashlib
         for i in [0, 2, 4]:  # Skip 1 and 3
             chunk_data = b'chunk' + str(i).encode()
@@ -161,14 +161,12 @@ class TestMessageAssembler:
                 message_id,
                 i,
                 checksum + chunk_data,
-                total_chunks
+                total_chunks,
             )
-        
-        # Check missing chunks
+
         missing = assembler.get_missing_chunks(message_id, total_chunks)
         assert missing == [1, 3]
-        
-        # Check progress
+
         progress = assembler.get_assembly_progress(message_id, total_chunks)
         assert progress == 0.6  # 3 out of 5
     
@@ -193,9 +191,14 @@ class TestMessageAssembler:
         assert message_id not in assembler.pending_messages
     
     def test_assembly_with_error_correction(self):
-        """Per-chunk Reed-Solomon repairs bit errors within a chunk."""
-        import hashlib
+        """Per-chunk Reed-Solomon repairs bit errors within a received chunk.
 
+        The wire-format checksum covers the DECODED data, not the RS-encoded
+        body, so RS decode runs first and any flipped bits in the body are
+        repaired before the checksum is verified. If this test ever starts
+        failing, the checksum/RS order in MessageAssembler.add_chunk has
+        regressed.
+        """
         chunker = MessageChunker(enable_error_correction=True)
         assembler = MessageAssembler(enable_error_correction=True)
 
@@ -206,17 +209,17 @@ class TestMessageAssembler:
         chunks = chunker.chunk_message(original, include_redundancy=True)
         assert len(chunks) >= 1
 
-        # Corrupt a few bytes in the first chunk's RS-encoded body. RS_SYMBOLS=32
-        # means up to 16 byte-errors per chunk are recoverable. Flip 4 bytes.
+        # Flip 4 bytes inside the first chunk's RS-encoded body. RS_SYMBOLS=32
+        # means up to 16 byte-errors per chunk are recoverable. Do NOT
+        # recompute the checksum — the whole point of this test is that RS
+        # repairs the body and the original checksum (over decoded data)
+        # still matches after repair.
         chunk_num, chunk_bytes = chunks[0]
         checksum = chunk_bytes[:8]
         body = bytearray(chunk_bytes[8:])
         for i in range(4):
             body[i] ^= 0xFF
-        # Recompute checksum so assembler doesn't reject at the outer integrity check;
-        # RS must still repair the body. This isolates the ECC-repair path.
-        new_checksum = hashlib.sha256(bytes(body)).digest()[:8]
-        chunks[0] = (chunk_num, new_checksum + bytes(body))
+        chunks[0] = (chunk_num, checksum + bytes(body))
 
         result = None
         for chunk_num, chunk_data in chunks:
@@ -231,36 +234,64 @@ class TestMessageAssembler:
         assert result is not None
         reassembled = DMPMessage.from_bytes(result)
         assert reassembled.payload == original.payload
+
+    def test_uncorrectable_corruption_is_rejected(self):
+        """Too many bit errors → RS decode fails → chunk dropped cleanly."""
+        chunker = MessageChunker(enable_error_correction=True)
+        assembler = MessageAssembler(enable_error_correction=True)
+
+        original = DMPMessage(
+            header=DMPHeader(message_id=uuid.uuid4().bytes),
+            payload=b'will not survive catastrophic corruption',
+        )
+        chunks = chunker.chunk_message(original, include_redundancy=True)
+        chunk_num, chunk_bytes = chunks[0]
+        checksum = chunk_bytes[:8]
+        body = bytearray(chunk_bytes[8:])
+        # Flip way more than RS_SYMBOLS/2 bytes; RS can't repair it.
+        for i in range(len(body)):
+            body[i] ^= 0xFF
+        chunks[0] = (chunk_num, checksum + bytes(body))
+
+        result = None
+        for chunk_num, chunk_data in chunks:
+            result = assembler.add_chunk(
+                original.header.message_id,
+                chunk_num,
+                chunk_data,
+                len(chunks),
+                original.header,
+            )
+        # Corrupted chunk gets dropped; message never completes.
+        assert result is None
     
     def test_cleanup_expired(self):
         """Test cleanup of expired partial messages"""
-        assembler = MessageAssembler()
-        
-        # Add a chunk with old timestamp
+        # ECC=False: we're crafting a bogus small chunk to exercise the TTL
+        # sweep, not testing RS. The chunk only needs to be accepted into
+        # pending_messages, which requires a valid checksum over the decoded
+        # data (== encoded here since ECC is off).
+        assembler = MessageAssembler(enable_error_correction=False)
+
         old_header = DMPHeader(
             message_id=b'old_msg',
-            timestamp=1000
+            timestamp=1000,
         )
-        
+
         import hashlib
         chunk_data = b'old chunk'
         checksum = hashlib.sha256(chunk_data).digest()[:8]
-        
+
         assembler.add_chunk(
             old_header.message_id,
             0,
             checksum + chunk_data,
             2,
-            old_header
+            old_header,
         )
-        
-        # Should be present initially
         assert old_header.message_id in assembler.pending_messages
-        
-        # Cleanup with current time past expiry
+
         assembler.cleanup_expired(current_time=1400, ttl=300)
-        
-        # Should be removed
         assert old_header.message_id not in assembler.pending_messages
 
 
