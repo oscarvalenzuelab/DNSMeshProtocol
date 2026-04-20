@@ -521,8 +521,13 @@ class TestDnsResolvers:
         # Both hosts are in the preferred tier right after construction.
         assert set(reader.healthy_hosts()) == {"8.8.8.8", "1.1.1.1"}
 
-    def test_make_reader_single_host_port_is_applied(self, config_home):
-        """Mixed-port workaround: the first explicit port wins."""
+    def test_make_reader_per_host_ports_applied(self, config_home):
+        """Each entry's explicit port reaches the underlying resolver.
+
+        M1.5 dropped the old "first explicit port wins" workaround:
+        `ResolverPool` now accepts `(ip, port)` tuples, so the CLI
+        hands each upstream's port through unchanged.
+        """
         cli.main(
             [
                 "init",
@@ -538,9 +543,55 @@ class TestDnsResolvers:
         from dmp.network.resolver_pool import ResolverPool
 
         assert isinstance(reader, ResolverPool)
-        # Pool is single-port today; inspect via snapshot + internal port.
-        # ResolverPool keeps the port on each _HostState.resolver.
-        assert reader._port == 53  # first entry's port won
+        # Each host uses its own port, not a single shared one.
+        by_host = {s.host: s.resolver.port for s in reader._states}
+        assert by_host == {"8.8.8.8": 53, "1.1.1.1": 5353}
+
+    def test_make_reader_portless_entries_default_to_53(self, config_home):
+        """Entries without an explicit port fall through to the ResolverPool default."""
+        cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--dns-resolvers",
+                "8.8.8.8,1.1.1.1",
+            ]
+        )
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        reader = cli._make_reader(cfg)
+        from dmp.network.resolver_pool import ResolverPool
+
+        assert isinstance(reader, ResolverPool)
+        # Both inherited the ResolverPool default of 53.
+        by_host = {s.host: s.resolver.port for s in reader._states}
+        assert by_host == {"8.8.8.8": 53, "1.1.1.1": 53}
+
+    def test_make_reader_mixed_port_entries_preserved(self, config_home):
+        """A mix of ported and portless entries round-trips cleanly.
+
+        The portless one defaults to 53; the ported one keeps its
+        explicit value. Confirms the CLI's new per-host wiring doesn't
+        leak the old "first port wins" coupling.
+        """
+        cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--dns-resolvers",
+                "8.8.8.8,1.1.1.1:5353",
+            ]
+        )
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        reader = cli._make_reader(cfg)
+        from dmp.network.resolver_pool import ResolverPool
+
+        assert isinstance(reader, ResolverPool)
+        by_host = {s.host: s.resolver.port for s in reader._states}
+        assert by_host == {"8.8.8.8": 53, "1.1.1.1": 5353}
 
     def test_make_reader_falls_back_to_dns_reader_when_list_empty(self, config_home):
         """Back-compat: legacy --dns-host path still produces a _DnsReader."""
