@@ -33,6 +33,7 @@ setup(
         "requests>=2.28.0",
         "boto3>=1.26.0",
         "argon2-cffi>=23.1.0",
+        "zfec>=1.5.7",
     ],
     extras_require={
         "dev": [

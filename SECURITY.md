@@ -95,9 +95,12 @@ The protocol assumes:
    disk is full. HTTP rate limiting and a per-name RRset size cap are
    future work; for now, operators should run the HTTP API with a
    bearer token (`DMP_HTTP_TOKEN`) and a reverse proxy rate limit.
-3. **Cross-chunk erasure coding is missing.** Reed-Solomon is per-chunk
-   only; it repairs bit errors inside a received chunk but a lost chunk
-   still kills the message. Real RS(k,n) across chunks is future work.
+3. **Erasure decode happens in-process**. Cross-chunk erasure coding
+   landed (k-of-n via zfec); any k of n chunks reconstruct, default
+   ~30% redundancy. The decoder trusts well-formed zfec share blocks —
+   a malformed block that passes the per-chunk RS checksum layer and
+   then confuses zfec would still return None rather than garbage, but
+   exotic zfec edge cases haven't been fuzzed.
 4. **Traffic analysis.** The protocol does not hide message timing, size,
    or `(sender, recipient)` correlation at the DNS-query level. A passive
    observer of a mailbox domain can count messages and infer their size.

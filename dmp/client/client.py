@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
+from dmp.core import erasure
 from dmp.core.chunking import MessageAssembler, MessageChunker
 from dmp.core.crypto import DMPCrypto, EncryptedMessage, MessageEncryption
 from dmp.core.dns import DMPDNSRecord
@@ -253,20 +254,30 @@ class DMPClient:
         )
 
         outer = DMPMessage(header=header, payload=encrypted.to_bytes())
-        chunks = self.chunker.chunk_message(outer)
-        total_chunks = len(chunks)
+        outer_bytes = outer.to_bytes()
+
+        # Cross-chunk erasure coding: split into k data blocks + parity.
+        # Any k of n received chunks reconstructs. erasure.encode also
+        # length-prefixes and pads to a whole number of DATA_PER_CHUNK
+        # blocks so the receiver can strip padding unambiguously.
+        shares, k, n = erasure.encode(outer_bytes)
+        total_chunks = n
+        data_chunks = k
 
         sender_spk = self.crypto.get_signing_public_key_bytes()
         msg_key = self._msg_key(msg_id, recipient_id, sender_spk)
 
-        # Publish chunks. We intentionally drop the metadata dict from the
-        # wire record — chunk_num and msg_key are already in the domain name
-        # and encoding them again would push us over the 255-byte TXT limit.
-        for chunk_num, chunk_bytes in chunks:
+        # Each share gets wrapped with the existing per-chunk RS + checksum
+        # so bit errors inside a received chunk are repaired BEFORE the
+        # erasure layer runs. Drop the metadata dict from the wire record
+        # — chunk_num and msg_key are already in the domain name and
+        # encoding them again would push us over the 255-byte TXT limit.
+        for chunk_num, share in enumerate(shares):
+            wire_chunk = self.chunker.wrap_block(share)
             record = DMPDNSRecord(
                 version=1,
                 record_type="chunk",
-                data=chunk_bytes,
+                data=wire_chunk,
                 metadata={},
             )
             ok = self.writer.publish_txt_record(
@@ -277,16 +288,12 @@ class DMPClient:
             if not ok:
                 return False
 
-        # Publish signed manifest. Try every slot in random order; take the
-        # first empty one. If all 10 are occupied, fall back to random (last
-        # writer wins). This keeps back-to-back sends from silently clobbering
-        # each other under low load while still making progress under heavy
-        # contention.
         manifest = SlotManifest(
             msg_id=msg_id,
             sender_spk=sender_spk,
             recipient_id=recipient_id,
             total_chunks=total_chunks,
+            data_chunks=data_chunks,
             ts=now,
             exp=now + ttl,
         )
@@ -367,13 +374,18 @@ class DMPClient:
             manifest.msg_id, manifest.recipient_id, manifest.sender_spk
         )
 
-        assembled: Optional[bytes] = None
+        # Walk every chunk position up to total_chunks, collecting valid
+        # shares into a dict keyed by share_id. Stop early once we have k
+        # shares — erasure.decode only needs k of n.
+        shares: Dict[int, bytes] = {}
         for chunk_num in range(manifest.total_chunks):
+            if len(shares) >= manifest.data_chunks:
+                break
             records = self.reader.query_txt_record(
                 self._chunk_domain(msg_key, chunk_num)
             )
             if not records:
-                return None
+                continue
             dmp_record: Optional[DMPDNSRecord] = None
             for txt in records:
                 if txt.startswith("v=dmp"):
@@ -383,15 +395,18 @@ class DMPClient:
                     except Exception:
                         continue
             if dmp_record is None or dmp_record.record_type != "chunk":
-                return None
-            chunk_bytes = dmp_record.data
-            assembled = self.assembler.add_chunk(
-                message_id=manifest.msg_id,
-                chunk_number=chunk_num,
-                chunk_data=chunk_bytes,
-                total_chunks=manifest.total_chunks,
-            )
+                continue
+            block = self.chunker.unwrap_block(dmp_record.data)
+            if block is None:
+                continue
+            shares[chunk_num] = block
 
+        if len(shares) < manifest.data_chunks:
+            return None
+
+        assembled = erasure.decode(
+            shares, manifest.data_chunks, manifest.total_chunks
+        )
         if assembled is None:
             return None
 
