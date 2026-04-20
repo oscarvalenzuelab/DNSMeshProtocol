@@ -38,6 +38,7 @@ def shared_store(monkeypatch):
 
     def fake_make_client(config, passphrase):
         from dmp.cli import _config_path
+
         replay_path = str(_config_path().parent / "replay_cache.json")
         client = DMPClient(
             config.username,
@@ -69,8 +70,9 @@ def shared_store(monkeypatch):
 
 class TestInitAndIdentity:
     def test_init_writes_config(self, config_home, capsys):
-        rc = cli.main(["init", "alice", "--domain", "mesh.test",
-                       "--endpoint", "http://node:8053"])
+        rc = cli.main(
+            ["init", "alice", "--domain", "mesh.test", "--endpoint", "http://node:8053"]
+        )
         assert rc == 0
         cfg = yaml.safe_load((config_home / "config.yaml").read_text())
         assert cfg["username"] == "alice"
@@ -79,7 +81,9 @@ class TestInitAndIdentity:
         # Per-identity random salt: 32 bytes = 64 hex chars.
         assert len(cfg["kdf_salt"]) == 64
 
-    def test_init_generates_unique_salts_per_identity(self, config_home, tmp_path, monkeypatch):
+    def test_init_generates_unique_salts_per_identity(
+        self, config_home, tmp_path, monkeypatch
+    ):
         """Two independent `dmp init` runs must produce distinct salts."""
         cli.main(["init", "alice", "--endpoint", "http://x"])
         first = yaml.safe_load((config_home / "config.yaml").read_text())["kdf_salt"]
@@ -104,7 +108,9 @@ class TestInitAndIdentity:
         cfg = yaml.safe_load((config_home / "config.yaml").read_text())
         assert cfg["username"] == "bob"
 
-    def test_identity_show_prints_keys(self, config_home, shared_store, monkeypatch, capsys):
+    def test_identity_show_prints_keys(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "pw")
         rc = cli.main(["identity", "show"])
@@ -121,6 +127,7 @@ class TestInitAndIdentity:
         cli.main(["identity", "show", "--json"])
         out = capsys.readouterr().out
         import json
+
         parsed = json.loads(out)
         assert parsed["username"] == "alice"
         assert len(parsed["public_key"]) == 64  # 32 bytes hex
@@ -129,7 +136,9 @@ class TestInitAndIdentity:
 class TestIdentityPublishFetch:
     """`dmp identity publish` + `dmp identity fetch` + `--add`."""
 
-    def test_publish_then_fetch_roundtrip(self, config_home, shared_store, monkeypatch, capsys):
+    def test_publish_then_fetch_roundtrip(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         """alice publishes, a second invocation as bob can fetch and add her."""
         # Alice sets up + publishes.
         cli.main(["init", "alice", "--endpoint", "http://x"])
@@ -147,11 +156,14 @@ class TestIdentityPublishFetch:
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         cli.main(["identity", "fetch", "alice", "--json"])
         import json
+
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["username"] == "alice"
         assert len(parsed["public_key"]) == 64  # hex
 
-    def test_fetch_add_stores_contact(self, config_home, shared_store, monkeypatch, capsys):
+    def test_fetch_add_stores_contact(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         cli.main(["identity", "publish"])
@@ -170,7 +182,9 @@ class TestIdentityPublishFetch:
         cli.main(["contacts", "list"])
         assert "alice" in capsys.readouterr().out
 
-    def test_fetch_missing_identity_errors(self, config_home, shared_store, monkeypatch):
+    def test_fetch_missing_identity_errors(
+        self, config_home, shared_store, monkeypatch
+    ):
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         with pytest.raises(SystemExit) as exc:
@@ -183,11 +197,16 @@ class TestIdentityPublishFetch:
         """Identity published under a user-controlled zone resolves via
         `user@host` addresses instead of the hash-based shared-mesh name."""
         # alice initializes with her own zone; publish goes to dmp.alice.example.com
-        cli.main([
-            "init", "alice",
-            "--endpoint", "http://x",
-            "--identity-domain", "alice.example.com",
-        ])
+        cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--identity-domain",
+                "alice.example.com",
+            ]
+        )
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         cli.main(["identity", "publish"])
@@ -306,7 +325,9 @@ class TestContacts:
 
 
 class TestSendRecv:
-    def test_send_and_recv_roundtrip(self, config_home, shared_store, monkeypatch, capsys):
+    def test_send_and_recv_roundtrip(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         # Set up alice's config.
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
@@ -326,7 +347,9 @@ class TestSendRecv:
         out = capsys.readouterr().out
         assert "hello from cli" in out
 
-    def test_send_unknown_recipient_errors(self, config_home, shared_store, monkeypatch):
+    def test_send_unknown_recipient_errors(
+        self, config_home, shared_store, monkeypatch
+    ):
         cli.main(["init", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "pw")
         with pytest.raises(SystemExit) as exc:
@@ -339,7 +362,9 @@ class TestSendRecv:
         cli.main(["recv"])
         assert "no new messages" in capsys.readouterr().out
 
-    def test_recv_twice_is_idempotent(self, config_home, shared_store, monkeypatch, capsys):
+    def test_recv_twice_is_idempotent(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
         """Persistent replay cache: second `dmp recv` in a fresh process
         doesn't re-deliver what was already delivered."""
         cli.main(["init", "alice", "--endpoint", "http://x"])
@@ -375,3 +400,225 @@ class TestLoadWithoutConfig:
         # Don't init; config doesn't exist.
         with pytest.raises(FileNotFoundError):
             cli.main(["identity", "show"])
+
+
+class TestDnsResolvers:
+    """`--dns-resolvers` multi-resolver pool wiring (M1.2)."""
+
+    def test_init_persists_resolver_list(self, config_home):
+        """Happy path: two bare IPs land in config as dns_resolvers."""
+        rc = cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--dns-resolvers",
+                "8.8.8.8,1.1.1.1",
+            ]
+        )
+        assert rc == 0
+        data = yaml.safe_load((config_home / "config.yaml").read_text())
+        assert data["dns_resolvers"] == ["8.8.8.8", "1.1.1.1"]
+
+    def test_init_persists_entries_with_ports(self, config_home):
+        """Port syntax round-trips through config in canonical form."""
+        rc = cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--dns-resolvers",
+                "8.8.8.8:53,1.1.1.1:5353",
+            ]
+        )
+        assert rc == 0
+        data = yaml.safe_load((config_home / "config.yaml").read_text())
+        assert data["dns_resolvers"] == ["8.8.8.8:53", "1.1.1.1:5353"]
+
+    def test_init_accepts_ipv6_bracket_port(self, config_home):
+        rc = cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--dns-resolvers",
+                "[2001:4860:4860::8888]:53,1.1.1.1",
+            ]
+        )
+        assert rc == 0
+        data = yaml.safe_load((config_home / "config.yaml").read_text())
+        assert data["dns_resolvers"] == ["[2001:4860:4860::8888]:53", "1.1.1.1"]
+
+    def test_init_rejects_hostname(self, config_home, capsys):
+        """ResolverPool forbids hostnames — so does our parser."""
+        with pytest.raises(SystemExit) as exc:
+            cli.main(
+                [
+                    "init",
+                    "alice",
+                    "--endpoint",
+                    "http://x",
+                    "--dns-resolvers",
+                    "dns.google",
+                ]
+            )
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "invalid --dns-resolvers" in err
+        # No config file was written on parse failure.
+        assert not (config_home / "config.yaml").exists()
+
+    def test_init_rejects_port_out_of_range(self, config_home):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(
+                [
+                    "init",
+                    "alice",
+                    "--endpoint",
+                    "http://x",
+                    "--dns-resolvers",
+                    "8.8.8.8:99999",
+                ]
+            )
+        assert exc.value.code == 1
+
+    def test_init_rejects_malformed_port(self, config_home):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(
+                [
+                    "init",
+                    "alice",
+                    "--endpoint",
+                    "http://x",
+                    "--dns-resolvers",
+                    "8.8.8.8:notaport",
+                ]
+            )
+        assert exc.value.code == 1
+
+    def test_make_client_uses_resolver_pool_when_list_set(
+        self, config_home, monkeypatch
+    ):
+        """With dns_resolvers populated, _make_reader builds a ResolverPool."""
+        cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--dns-resolvers",
+                "8.8.8.8,1.1.1.1",
+            ]
+        )
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        reader = cli._make_reader(cfg)
+        from dmp.network.resolver_pool import ResolverPool
+
+        assert isinstance(reader, ResolverPool)
+        # Both hosts are in the preferred tier right after construction.
+        assert set(reader.healthy_hosts()) == {"8.8.8.8", "1.1.1.1"}
+
+    def test_make_reader_single_host_port_is_applied(self, config_home):
+        """Mixed-port workaround: the first explicit port wins."""
+        cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--dns-resolvers",
+                "8.8.8.8:53,1.1.1.1:5353",
+            ]
+        )
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        reader = cli._make_reader(cfg)
+        from dmp.network.resolver_pool import ResolverPool
+
+        assert isinstance(reader, ResolverPool)
+        # Pool is single-port today; inspect via snapshot + internal port.
+        # ResolverPool keeps the port on each _HostState.resolver.
+        assert reader._port == 53  # first entry's port won
+
+    def test_make_reader_falls_back_to_dns_reader_when_list_empty(self, config_home):
+        """Back-compat: legacy --dns-host path still produces a _DnsReader."""
+        cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--dns-host",
+                "127.0.0.1",
+                "--dns-port",
+                "5353",
+            ]
+        )
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.dns_resolvers == []
+        reader = cli._make_reader(cfg)
+        assert isinstance(reader, cli._DnsReader)
+
+    def test_legacy_single_host_send_recv_still_works(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """The existing --dns-host flow still delivers messages end-to-end.
+
+        The `shared_store` fixture monkeypatches `_make_client` and
+        `_DnsReader`, so we're really checking that the legacy config
+        shape (no dns_resolvers) round-trips through load/save and
+        reaches the same send/recv path that existed before M1.2.
+        """
+        cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--dns-host",
+                "127.0.0.1",
+            ]
+        )
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        capsys.readouterr()
+
+        bob = DMPClient("bob", "bob-pass", domain="mesh.local", store=shared_store)
+        cli.main(["contacts", "add", "bob", bob.get_public_key_hex()])
+        cli.main(["send", "bob", "legacy hi"])
+        assert "sent" in capsys.readouterr().out
+
+        cli.main(["init", "bob", "--endpoint", "http://x", "--force"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+        cli.main(["recv"])
+        assert "legacy hi" in capsys.readouterr().out
+
+    def test_parse_resolver_entry_accepts_forms(self):
+        """Unit-level coverage of the parser's accepted forms."""
+        from dmp.cli import _parse_resolver_entry
+
+        assert _parse_resolver_entry("8.8.8.8") == ("8.8.8.8", None)
+        assert _parse_resolver_entry("8.8.8.8:53") == ("8.8.8.8", 53)
+        assert _parse_resolver_entry("2001:4860:4860::8888") == (
+            "2001:4860:4860::8888",
+            None,
+        )
+        assert _parse_resolver_entry("[2001:4860:4860::8888]:53") == (
+            "2001:4860:4860::8888",
+            53,
+        )
+
+    def test_parse_resolver_entry_rejects_bracket_with_bad_port(self):
+        """Bracketed IPv6 with a non-numeric port is rejected."""
+        from dmp.cli import _parse_resolver_entry
+
+        with pytest.raises(ValueError):
+            _parse_resolver_entry("[::1]:notaport")
+
+    def test_parse_resolver_entry_rejects_unmatched_bracket(self):
+        """Lone opening bracket without a closing one is rejected."""
+        from dmp.cli import _parse_resolver_entry
+
+        with pytest.raises(ValueError):
+            _parse_resolver_entry("[2001:4860:4860::8888")
