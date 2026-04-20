@@ -92,9 +92,17 @@ _DISCOVER_PROBE_NAME = "google.com"
 
 @dataclass
 class _HostState:
-    """Mutable health state for one upstream resolver."""
+    """Mutable health state for one upstream resolver.
+
+    `host` + `port` together identify the upstream: a pool built with
+    ``[("127.0.0.1", 5353), ("127.0.0.1", 5354)]`` produces two states
+    sharing an IP, and anything that keys off `host` alone would conflate
+    them. `snapshot()` surfaces both so debuggers / CLI output can
+    disambiguate.
+    """
 
     host: str
+    port: int
     resolver: dns.resolver.Resolver
     consecutive_failures: int = 0
     last_failure_ts: float = 0.0
@@ -225,7 +233,9 @@ class ResolverPool(DNSRecordReader):
             resolver.port = host_port
             resolver.timeout = timeout
             resolver.lifetime = lifetime
-            self._states.append(_HostState(host=host, resolver=resolver))
+            self._states.append(
+                _HostState(host=host, port=host_port, resolver=resolver)
+            )
 
     @staticmethod
     def _normalize_entry(entry: HostSpec, default_port: int) -> Tuple[str, int]:
@@ -373,24 +383,49 @@ class ResolverPool(DNSRecordReader):
     # ---------------------------------------------------------------
 
     def healthy_hosts(self) -> List[str]:
-        """Return the hosts currently in the preferred (not-cooled-down) tier.
+        """Return the hosts (IP literals) currently in the preferred tier.
 
-        This matches "the ones we'd pick first if we had a choice." A
-        cooled-down host is *still reachable* via the fallback tier (see
-        `_iter_ordered`), but it is not "healthy" in the sense reported
-        here — the pool would rather route around it if any other host
-        can answer.
+        Returns bare host strings, not `(ip, port)` tuples — this keeps
+        back-compat with callers that key off IPs for display. For a
+        port-aware view (two states sharing one IP on different ports
+        would collapse in the string list), use `healthy_upstreams()`.
+
+        "Preferred tier" matches "the ones we'd pick first if we had a
+        choice." A cooled-down host is *still reachable* via the
+        fallback tier (see `_iter_ordered`), but it is not "healthy" in
+        the sense reported here — the pool would rather route around it
+        if any other host can answer.
         """
         now = time.monotonic()
         with self._lock:
             return [s.host for s in self._states if self._is_preferred(s, now)]
 
+    def healthy_upstreams(self) -> List[Tuple[str, int]]:
+        """Port-aware variant of `healthy_hosts()`.
+
+        Returns `(ip, port)` tuples so callers keying off the full
+        upstream identity can distinguish e.g. two loopback resolvers
+        on different ports. Same preferred-tier semantics as
+        `healthy_hosts()`.
+        """
+        now = time.monotonic()
+        with self._lock:
+            return [
+                (s.host, s.port) for s in self._states if self._is_preferred(s, now)
+            ]
+
     def snapshot(self) -> List[dict]:
-        """Return a copy of per-host health for debugging / CLI display."""
+        """Return a copy of per-host health for debugging / CLI display.
+
+        The `"port"` field (added in M1.5) disambiguates two states
+        sharing a host IP; callers that only ever read `"host"`
+        continue to work unchanged.
+        """
         with self._lock:
             return [
                 {
                     "host": s.host,
+                    "port": s.port,
                     "consecutive_failures": s.consecutive_failures,
                     "last_failure_ts": s.last_failure_ts,
                     "last_success_ts": s.last_success_ts,
