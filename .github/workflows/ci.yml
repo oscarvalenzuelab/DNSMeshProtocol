@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run unit + integration tests
+        # Exclude the docker integration test — it needs a prebuilt image and
+        # is covered by the separate `docker` job below.
+        run: pytest --ignore=tests/test_docker_integration.py -v
+
+  lint:
+    name: lint + type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: black --check
+        run: black --check dmp tests
+
+      - name: mypy
+        # Start permissive; tighten as the codebase's annotations stabilize.
+        run: mypy --ignore-missing-imports dmp || true
+
+  docker:
+    name: docker build + integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python test harness
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Build container
+        run: docker build -t dmp-node:latest .
+
+      - name: Run docker integration tests
+        run: pytest tests/test_docker_integration.py -v
