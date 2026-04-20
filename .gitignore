@@ -26,6 +26,9 @@ ENV/
 env/
 .venv
 
+# Local session state
+.context/
+
 # Testing
 .tox/
 .coverage
