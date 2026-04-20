@@ -31,6 +31,8 @@ from typing import Optional
 from urllib.parse import unquote
 
 from dmp.network.base import DNSRecordReader, DNSRecordStore, DNSRecordWriter
+from dmp.server.metrics import REGISTRY
+from dmp.server.rate_limit import RateLimit, TokenBucketLimiter
 
 
 log = logging.getLogger(__name__)
@@ -94,69 +96,134 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
     # ---- routes -----------------------------------------------------------
 
     def do_GET(self) -> None:
+        status = self._handle_get()
+        self._record_request("GET", status)
+
+    def _handle_get(self) -> int:
         if self.path == "/health":
-            self._send_json(200, {"status": "ok"})
-            return
+            return self._handle_health()
+        if self.path == "/metrics":
+            text = REGISTRY.render().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(text)))
+            self.end_headers()
+            self.wfile.write(text)
+            return 200
         if self.path == "/stats":
             count = getattr(self.server.store, "record_count", lambda: None)()
             self._send_json(200, {"records": count})
-            return
+            return 200
         if self._match_name() is not None:
+            if not self._check_rate_limit():
+                return 429
             if not self._authorized():
                 self._send_json(401, {"error": "unauthorized"})
-                return
+                return 401
             name = self._match_name()
             reader = self._reader()
             if reader is None:
                 self._send_json(501, {"error": "reader not configured"})
-                return
+                return 501
             values = reader.query_txt_record(name)
             if values is None:
                 self._send_json(404, {"name": name, "values": []})
-                return
+                return 404
             self._send_json(200, {"name": name, "values": values})
-            return
+            return 200
         self._send_json(404, {"error": "not found"})
+        return 404
+
+    def _handle_health(self) -> int:
+        store = self.server.store
+        # Deep health: exercise the store. A plain "process is alive" check
+        # lets a wedged sqlite or a stale file handle look healthy to k8s/DO
+        # probes and traffic keeps flowing to a broken node.
+        try:
+            values = store.query_txt_record("__dmp_health_probe__")
+            # Absence is fine; we only care the call returned without raising.
+            _ = values
+        except Exception as e:
+            self._send_json(503, {"status": "degraded", "store": str(e)})
+            return 503
+        self._send_json(200, {"status": "ok"})
+        return 200
 
     def do_POST(self) -> None:
+        status = self._handle_post()
+        self._record_request("POST", status)
+
+    def _handle_post(self) -> int:
         if self._match_name() is None:
             self._send_json(404, {"error": "not found"})
-            return
+            return 404
+        if not self._check_rate_limit():
+            return 429
         if not self._authorized():
             self._send_json(401, {"error": "unauthorized"})
-            return
+            return 401
         writer = self._writer()
         if writer is None:
             self._send_json(501, {"error": "writer not configured"})
-            return
+            return 501
         body = self._read_json_body()
         if body is None:
             self._send_json(400, {"error": "invalid body"})
-            return
+            return 400
         value = body.get("value")
         ttl = body.get("ttl", 300)
         if not isinstance(value, str) or not isinstance(ttl, int) or ttl <= 0:
             self._send_json(400, {"error": "value (str) and ttl (int > 0) required"})
-            return
+            return 400
         name = self._match_name()
         ok = writer.publish_txt_record(name, value, ttl=ttl)
-        self._send_json(201 if ok else 502, {"ok": ok})
+        status = 201 if ok else 502
+        self._send_json(status, {"ok": ok})
+        return status
 
     def do_DELETE(self) -> None:
+        status = self._handle_delete()
+        self._record_request("DELETE", status)
+
+    def _handle_delete(self) -> int:
         if self._match_name() is None:
             self._send_json(404, {"error": "not found"})
-            return
+            return 404
+        if not self._check_rate_limit():
+            return 429
         if not self._authorized():
             self._send_json(401, {"error": "unauthorized"})
-            return
+            return 401
         writer = self._writer()
         if writer is None:
             self._send_json(501, {"error": "writer not configured"})
-            return
+            return 501
         body = self._read_json_body() or {}
         value = body.get("value") if isinstance(body, dict) else None
         ok = writer.delete_txt_record(self._match_name(), value=value)
-        self._send_empty(204 if ok else 404)
+        status = 204 if ok else 404
+        self._send_empty(status)
+        return status
+
+    def _check_rate_limit(self) -> bool:
+        limiter: Optional[TokenBucketLimiter] = self.server.rate_limiter
+        if limiter is None or not limiter.enabled:
+            return True
+        client_ip = self.client_address[0]
+        if limiter.allow(client_ip):
+            return True
+        self._send_json(429, {"error": "rate limit exceeded"})
+        return False
+
+    def _record_request(self, method: str, status: int) -> None:
+        try:
+            REGISTRY.counter(
+                "dmp_http_requests_total",
+                "Total DMP HTTP API requests, by method and status",
+                labels={"method": method, "status": str(status)},
+            )
+        except Exception:
+            pass
 
     # ---- introspection helpers for handler ---------------------------------
 
@@ -182,10 +249,11 @@ class _DMPHttpServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, handler, store, bearer_token):
+    def __init__(self, addr, handler, store, bearer_token, rate_limiter):
         super().__init__(addr, handler)
         self.store = store
         self.bearer_token = bearer_token
+        self.rate_limiter = rate_limiter
 
 
 class DMPHttpApi:
@@ -198,11 +266,15 @@ class DMPHttpApi:
         host: str = "0.0.0.0",
         port: int = 8053,
         bearer_token: Optional[str] = None,
+        rate_limit: Optional[RateLimit] = None,
     ):
         self.store = store
         self.host = host
         self.port = port
         self.bearer_token = bearer_token
+        self.rate_limiter = (
+            TokenBucketLimiter(rate_limit) if rate_limit and rate_limit.enabled else None
+        )
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -220,6 +292,7 @@ class DMPHttpApi:
             _DMPHttpHandler,
             self.store,
             self.bearer_token,
+            self.rate_limiter,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(

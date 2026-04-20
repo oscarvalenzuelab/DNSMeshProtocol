@@ -7,6 +7,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added (ops hardening)
+
+- Deep `/health`: probes the store (`query_txt_record` on a sentinel name).
+  Returns 503 `{"status": "degraded"}` if the store raises. Kubernetes and
+  DigitalOcean liveness probes now see actual health, not just "process alive."
+- `/metrics` endpoint exposing Prometheus text format:
+  `dmp_http_requests_total{method,status}`, `dmp_dns_queries_total{outcome}`,
+  and a lazy `dmp_records` gauge backed by `SqliteMailboxStore.record_count()`.
+- Per-source-IP token-bucket rate limiting on both the HTTP API and UDP DNS
+  server. Opt-in via `DMP_HTTP_RATE`/`DMP_HTTP_BURST` and
+  `DMP_DNS_RATE`/`DMP_DNS_BURST`. LRU-eviction at 10k keys bounds memory
+  under distributed scans.
+- `DMP_LOG_FORMAT=json` emits one-JSON-object-per-line logs with extras
+  surfaced as top-level keys. Default stays human-readable.
+
 ### Added
 
 - `dmp.cli` — `dmp` command: `init`, `identity show`, `contacts add/list`,

@@ -31,6 +31,8 @@ import dns.rdtypes.ANY.TXT
 import dns.rrset
 
 from dmp.network.base import DNSRecordReader
+from dmp.server.metrics import REGISTRY
+from dmp.server.rate_limit import RateLimit, TokenBucketLimiter
 
 
 log = logging.getLogger(__name__)
@@ -52,10 +54,24 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
 
     def handle(self) -> None:
         data, sock = self.request
+        limiter = self.server.rate_limiter
+        client_ip = self.client_address[0]
+        if limiter is not None and not limiter.allow(client_ip):
+            REGISTRY.counter(
+                "dmp_dns_queries_total",
+                "DMP DNS queries by outcome",
+                labels={"outcome": "rate_limited"},
+            )
+            return  # UDP — just drop.
+
         try:
             query = dns.message.from_wire(data)
         except dns.exception.DNSException as e:
             log.debug("unparseable DNS packet: %s", e)
+            REGISTRY.counter(
+                "dmp_dns_queries_total",
+                labels={"outcome": "malformed"},
+            )
             return
 
         try:
@@ -65,6 +81,12 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             response = dns.message.make_response(query)
             response.set_rcode(dns.rcode.SERVFAIL)
 
+        rcode_name = dns.rcode.to_text(response.rcode())
+        REGISTRY.counter(
+            "dmp_dns_queries_total",
+            "DMP DNS queries by outcome",
+            labels={"outcome": rcode_name.lower()},
+        )
         sock.sendto(response.to_wire(), self.client_address)
 
     def _build_response(self, query: dns.message.Message) -> dns.message.Message:
@@ -113,10 +135,11 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, server_address, handler_cls, reader, ttl):
+    def __init__(self, server_address, handler_cls, reader, ttl, rate_limiter):
         super().__init__(server_address, handler_cls)
         self.reader = reader
         self.ttl = ttl
+        self.rate_limiter = rate_limiter
 
 
 class DMPDnsServer:
@@ -133,11 +156,15 @@ class DMPDnsServer:
         host: str = "0.0.0.0",
         port: int = 5353,
         ttl: int = DEFAULT_TTL,
+        rate_limit: Optional[RateLimit] = None,
     ):
         self.reader = reader
         self.host = host
         self.port = port
         self.ttl = ttl
+        self.rate_limiter = (
+            TokenBucketLimiter(rate_limit) if rate_limit and rate_limit.enabled else None
+        )
         self._server: Optional[_ThreadingUDPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -151,7 +178,11 @@ class DMPDnsServer:
         if self._server is not None:
             return
         self._server = _ThreadingUDPServer(
-            (self.host, self.port), _DMPRequestHandler, self.reader, self.ttl
+            (self.host, self.port),
+            _DMPRequestHandler,
+            self.reader,
+            self.ttl,
+            self.rate_limiter,
         )
         # If the caller asked for port 0, pick up the actual bound port.
         self.port = self._server.server_address[1]
