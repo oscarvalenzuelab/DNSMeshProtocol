@@ -28,11 +28,17 @@ class TestSqliteMailboxStore:
     def test_missing_returns_none(self, store):
         assert store.query_txt_record("nope.example.com") is None
 
-    def test_replace_on_republish(self, store):
+    def test_distinct_values_append_to_rrset(self, store):
+        """Two different values at the same name coexist (DNS RRset semantics)."""
         store.publish_txt_record("a.example.com", "first", ttl=60)
         store.publish_txt_record("a.example.com", "second", ttl=60)
-        # RRset-style: re-publish replaces the prior value.
-        assert store.query_txt_record("a.example.com") == ["second"]
+        assert store.query_txt_record("a.example.com") == ["first", "second"]
+
+    def test_identical_republish_refreshes_ttl(self, store):
+        """Re-publishing the exact same value deduplicates but keeps the row."""
+        store.publish_txt_record("a.example.com", "same", ttl=60)
+        store.publish_txt_record("a.example.com", "same", ttl=60)
+        assert store.query_txt_record("a.example.com") == ["same"]
 
     def test_delete_by_name(self, store):
         store.publish_txt_record("a.example.com", "v1", ttl=60)

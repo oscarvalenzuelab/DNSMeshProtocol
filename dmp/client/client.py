@@ -256,22 +256,17 @@ class DMPClient:
             exp=now + ttl,
         )
         slot_record = manifest.sign(self.crypto)
-        chosen_slot = self._pick_slot(recipient_id)
+        # Append semantics in the store make slot choice effectively cosmetic:
+        # we can't overwrite someone else's manifest even if we land in the
+        # same slot. Spread load across slots deterministically based on the
+        # msg_id so recipients see a roughly-even RRset distribution instead
+        # of a single crowded slot.
+        slot = int.from_bytes(msg_id[:4], "big") % SLOT_COUNT
         return self.writer.publish_txt_record(
-            self._slot_domain(recipient_id, chosen_slot),
+            self._slot_domain(recipient_id, slot),
             slot_record,
             ttl=ttl,
         )
-
-    def _pick_slot(self, recipient_id: bytes) -> int:
-        """Pick a preferably-empty slot. Deterministic scan in random order."""
-        order = list(range(SLOT_COUNT))
-        random.shuffle(order)
-        for slot in order:
-            if not self.reader.query_txt_record(self._slot_domain(recipient_id, slot)):
-                return slot
-        # All slots occupied — last-writer-wins fallback.
-        return order[0]
 
     # ---- receive -----------------------------------------------------------
 

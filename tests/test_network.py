@@ -22,11 +22,23 @@ class TestInMemoryDNSStore:
         store = InMemoryDNSStore()
         assert store.query_txt_record("nope.example.com") is None
 
-    def test_overwrite_replaces_record(self):
+    def test_distinct_values_append_to_rrset(self):
+        """Two different values at the same name coexist (DNS RRset semantics).
+
+        This is load-bearing: the prior overwrite semantics let an attacker
+        who could reach the publish endpoint wipe another sender's manifest
+        out of a recipient's mailbox slot.
+        """
         store = InMemoryDNSStore()
         store.publish_txt_record("a.example.com", "first")
         store.publish_txt_record("a.example.com", "second")
-        assert store.query_txt_record("a.example.com") == ["second"]
+        assert store.query_txt_record("a.example.com") == ["first", "second"]
+
+    def test_identical_publish_is_idempotent(self):
+        store = InMemoryDNSStore()
+        store.publish_txt_record("a.example.com", "same")
+        store.publish_txt_record("a.example.com", "same")
+        assert store.query_txt_record("a.example.com") == ["same"]
 
     def test_delete_by_name(self):
         store = InMemoryDNSStore()
