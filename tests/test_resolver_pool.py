@@ -392,8 +392,13 @@ class TestResolverPoolHealth:
         assert snap["1.1.1.1"]["consecutive_failures"] == 0
         assert snap["1.1.1.1"]["last_success_ts"] > 0
 
-    def test_empty_answer_returns_none_without_demotion(self):
-        """A resolver that returns zero rdatas is treated like NoAnswer."""
+    def test_empty_answer_falls_through_to_next_resolver(self):
+        """A resolver returning zero rdatas is treated like NoAnswer.
+
+        It doesn't disprove anyone and it doesn't count as a real hit,
+        so we continue down the priority list. If a later resolver
+        actually returns records, they win.
+        """
 
         def empty(n, t):
             return _FakeAnswer()  # zero-length iterable
@@ -404,7 +409,104 @@ class TestResolverPoolHealth:
         ) as mock_resolve:
             mock_resolve.side_effect = _route_by_nameserver(routes)
             pool = ResolverPool(["1.1.1.1", "9.9.9.9"])
-            # An empty answer counts as a successful hit with zero records;
-            # we return None (no records) rather than falling through, since
-            # that matches the reader contract: None = "no record here."
-            assert pool.query_txt_record("x") is None
+            assert pool.query_txt_record("x") == ["ok"]
+
+
+# ---------------------------------------------------------------------
+# Oracle-based demotion: NXDOMAIN is a health failure only if a later
+# resolver disproves it with a real answer.
+# ---------------------------------------------------------------------
+
+
+class TestOracleDemotion:
+    def test_lying_primary_demoted_when_secondary_succeeds(self):
+        """Primary says NXDOMAIN; secondary returns TXT. Primary is wrong.
+
+        The later-resolver oracle proves the primary was lying,
+        stale, or censoring. Its `consecutive_failures` must tick up
+        and it must drop out of `healthy_hosts()` so subsequent
+        queries skip it while in cooldown.
+        """
+        routes = {
+            "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+            "9.9.9.9": lambda n, t: _answer("real-record"),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], failure_threshold=1)
+            assert pool.query_txt_record("name.example.com") == ["real-record"]
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        assert snap["1.1.1.1"]["consecutive_failures"] == 1
+        assert snap["9.9.9.9"]["consecutive_failures"] == 0
+        assert "1.1.1.1" not in pool.healthy_hosts()
+        assert "9.9.9.9" in pool.healthy_hosts()
+
+    def test_lying_primary_demoted_when_secondary_succeeds_via_noanswer(self):
+        """Same as above but the primary raises NoAnswer instead of NXDOMAIN."""
+        routes = {
+            "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.resolver.NoAnswer()),
+            "9.9.9.9": lambda n, t: _answer("real-record"),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], failure_threshold=1)
+            assert pool.query_txt_record("name.example.com") == ["real-record"]
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        assert snap["1.1.1.1"]["consecutive_failures"] == 1
+        assert "1.1.1.1" not in pool.healthy_hosts()
+
+    def test_all_nxdomain_still_does_not_demote(self):
+        """Every resolver says NXDOMAIN: nobody oracled anybody.
+
+        This pins the "true missing record" behavior the r1 fix
+        introduced. Without the oracle, a benign absent-mailbox lookup
+        would poison the pool on every call.
+        """
+        routes = {
+            "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+            "9.9.9.9": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+            "8.8.8.8": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9", "8.8.8.8"], failure_threshold=1)
+            assert pool.query_txt_record("absent.example.com") is None
+
+        for snap in pool.snapshot():
+            assert snap["consecutive_failures"] == 0
+        assert pool.healthy_hosts() == ["1.1.1.1", "9.9.9.9", "8.8.8.8"]
+
+    def test_multiple_lying_primaries_all_demoted_by_one_oracle(self):
+        """Two primaries lie; third succeeds. Both liars get demoted.
+
+        Ensures the retroactive demotion walks the whole deferred
+        list, not just the immediate predecessor.
+        """
+        routes = {
+            "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+            "2.2.2.2": lambda n, t: (_ for _ in ()).throw(dns.resolver.NoAnswer()),
+            "9.9.9.9": lambda n, t: _answer("real"),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "2.2.2.2", "9.9.9.9"], failure_threshold=1)
+            assert pool.query_txt_record("x.example.com") == ["real"]
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        assert snap["1.1.1.1"]["consecutive_failures"] == 1
+        assert snap["2.2.2.2"]["consecutive_failures"] == 1
+        assert snap["9.9.9.9"]["consecutive_failures"] == 0
+        healthy = pool.healthy_hosts()
+        assert "1.1.1.1" not in healthy
+        assert "2.2.2.2" not in healthy
+        assert "9.9.9.9" in healthy
