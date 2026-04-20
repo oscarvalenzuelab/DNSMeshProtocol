@@ -32,6 +32,7 @@ setup(
         "asyncio-throttle>=1.0.0",
         "requests>=2.28.0",
         "boto3>=1.26.0",
+        "argon2-cffi>=23.1.0",
     ],
     extras_require={
         "dev": [

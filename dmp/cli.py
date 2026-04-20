@@ -51,6 +51,12 @@ class CLIConfig:
     dns_host: Optional[str] = None              # host:port of the DNS resolver
     dns_port: int = 5353
     passphrase_file: Optional[str] = None       # alternative to DMP_PASSPHRASE
+    # 32 random bytes generated at `dmp init`, stored as hex. Combined with
+    # the passphrase under Argon2id to derive the X25519 seed. Two users who
+    # happen to share a passphrase still get independent identities; an
+    # attacker who captures the public identity has to do a per-user
+    # offline brute force rather than a single rainbow table.
+    kdf_salt: str = ""
     contacts: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -68,6 +74,7 @@ class CLIConfig:
             dns_host=data.get("dns_host"),
             dns_port=int(data.get("dns_port", 5353)),
             passphrase_file=data.get("passphrase_file"),
+            kdf_salt=data.get("kdf_salt", ""),
             contacts=dict(data.get("contacts", {})),
         )
 
@@ -167,6 +174,9 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
     # Persist the replay cache next to the config so repeated `dmp recv` calls
     # across separate CLI processes don't re-deliver the same message.
     replay_path = str(_config_path().parent / "replay_cache.json")
+    # Prefer the per-identity salt from config; fall back to the library
+    # default only if this config predates the kdf_salt field.
+    kdf_salt = bytes.fromhex(config.kdf_salt) if config.kdf_salt else None
     client = DMPClient(
         config.username,
         passphrase,
@@ -174,6 +184,7 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
         writer=writer,
         reader=reader,
         replay_cache_path=replay_path,
+        kdf_salt=kdf_salt,
     )
     for name, pubkey in config.contacts.items():
         client.add_contact(name, pubkey, domain=config.domain)
@@ -199,10 +210,18 @@ def cmd_init(args: argparse.Namespace) -> int:
         http_token=args.http_token,
         dns_host=args.dns_host,
         dns_port=args.dns_port,
+        # Per-identity random salt so two users with the same passphrase
+        # still derive different keys. 32 bytes is well above Argon2's
+        # minimum (8) and matches our key length.
+        kdf_salt=os.urandom(32).hex(),
     )
     cfg.save(path)
     print(f"wrote config to {path}")
     print("Next: set DMP_PASSPHRASE or create a passphrase file, then `dmp identity show`.")
+    print(
+        "Keep this config file. If you lose the kdf_salt you cannot "
+        "recover this identity even with the passphrase."
+    )
     return 0
 
 

@@ -13,6 +13,7 @@ import hashlib
 from typing import Tuple, Optional
 from dataclasses import dataclass
 
+from argon2.low_level import Type as Argon2Type, hash_secret_raw
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey, X25519PublicKey
@@ -24,6 +25,17 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
+
+
+# Argon2id parameters for passphrase → 32-byte X25519 seed.
+# Tuned for ~20ms on a modern laptop. Still orders of magnitude more
+# resistant to offline brute force than the previous PBKDF2-SHA256 at
+# 100_000 iterations against a fixed salt. Operators who need more
+# margin can pass their own parameters through from_passphrase(...).
+ARGON2_TIME_COST = 2
+ARGON2_MEMORY_COST = 32 * 1024  # KiB → 32 MiB
+ARGON2_PARALLELISM = 2
+ARGON2_HASH_LEN = 32
 
 
 @dataclass
@@ -88,20 +100,40 @@ class DMPCrypto:
         return cls(private_key)
     
     @classmethod
-    def from_passphrase(cls, passphrase: str, salt: Optional[bytes] = None) -> 'DMPCrypto':
-        """Derive keypair from passphrase using PBKDF2"""
+    def from_passphrase(
+        cls,
+        passphrase: str,
+        salt: Optional[bytes] = None,
+        *,
+        time_cost: int = ARGON2_TIME_COST,
+        memory_cost: int = ARGON2_MEMORY_COST,
+        parallelism: int = ARGON2_PARALLELISM,
+    ) -> "DMPCrypto":
+        """Derive an X25519 keypair from a passphrase using Argon2id.
+
+        Argon2id is memory-hard, which makes offline brute force
+        dramatically harder than the previous PBKDF2-SHA256 implementation.
+        Callers should pass a per-identity random `salt` so two users who
+        happen to pick the same passphrase still end up with different keys
+        and one rainbow table can't crack both. For back-compat with code
+        paths that don't have a salt handy (tests, quick demos) we default
+        to a fixed sentinel — but that path is explicitly weaker and is
+        flagged in SECURITY.md.
+        """
         if salt is None:
-            salt = b'DMP-DEFAULT-SALT'  # For deterministic key generation
-        
-        # Derive 32 bytes for private key
-        key_material = hashlib.pbkdf2_hmac(
-            'sha256',
-            passphrase.encode('utf-8'),
-            salt,
-            iterations=100000,
-            dklen=32
+            salt = b"DMP-default-v2-argon2id"
+        if len(salt) < 8:
+            raise ValueError("salt must be at least 8 bytes")
+
+        key_material = hash_secret_raw(
+            secret=passphrase.encode("utf-8"),
+            salt=salt,
+            time_cost=time_cost,
+            memory_cost=memory_cost,
+            parallelism=parallelism,
+            hash_len=ARGON2_HASH_LEN,
+            type=Argon2Type.ID,
         )
-        
         return cls.from_private_bytes(key_material)
     
     def get_public_key_bytes(self) -> bytes:

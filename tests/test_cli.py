@@ -61,6 +61,20 @@ class TestInitAndIdentity:
         assert cfg["username"] == "alice"
         assert cfg["domain"] == "mesh.test"
         assert cfg["endpoint"] == "http://node:8053"
+        # Per-identity random salt: 32 bytes = 64 hex chars.
+        assert len(cfg["kdf_salt"]) == 64
+
+    def test_init_generates_unique_salts_per_identity(self, config_home, tmp_path, monkeypatch):
+        """Two independent `dmp init` runs must produce distinct salts."""
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        first = yaml.safe_load((config_home / "config.yaml").read_text())["kdf_salt"]
+
+        other_home = tmp_path / "dmp-other"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(other_home))
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        second = yaml.safe_load((other_home / "config.yaml").read_text())["kdf_salt"]
+
+        assert first != second
 
     def test_init_refuses_overwrite_without_force(self, config_home):
         cli.main(["init", "alice", "--endpoint", "http://a"])
