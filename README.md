@@ -1,218 +1,130 @@
-# DNS Mesh Protocol (DMP)
+# DNS Mesh Protocol
 
-Decentralized peer-to-peer messaging that tunnels encrypted messages through DNS TXT records. Each message is end-to-end encrypted, signed by the sender's Ed25519 identity, chunked, and published as TXT records on a shared mesh domain. Recipients poll their mailbox slots, verify, reassemble, and decrypt.
+**A censorship-resistant messaging protocol that rides on DNS — the one
+internet service almost nothing blocks.**
 
-> **Status: alpha.** The protocol and API are unstable. Known limits are documented in [SECURITY.md](SECURITY.md). Do not use for anything whose secrecy matters until it's reviewed by someone other than its author.
+📖 **Full documentation → https://oscarvalenzuelab.github.io/DNSMeshProtocol/**
 
-## What you get
+---
 
-- **End-to-end encryption with forward secrecy.** X25519 ECDH +
-  ChaCha20-Poly1305 with an ephemeral sender keypair per message.
-  When the recipient has published signed one-time prekeys
-  (`dmp identity refresh-prekeys`), ECDH runs against a prekey that
-  the recipient deletes after decrypt — so a later leak of the
-  long-term X25519 key cannot recover past messages. Fallback to the
-  long-term key when no prekey pool is available; no FS for that
-  message. See [SECURITY.md](SECURITY.md) for the full model.
-- **Sender authentication, pinned-or-TOFU.** Every slot manifest is
-  Ed25519-signed. When you have at least one contact with a pinned
-  signing key (`dmp contacts add --signing-key ...` or `dmp identity
-  fetch user --add`), unknown-signer manifests are dropped. With zero
-  pinned contacts, receive falls back to **trust-on-first-use** and
-  delivers any signature-valid message — useful for onboarding, but
-  you are trusting the first signer to show up. Always pin contacts
-  before treating incoming messages as authenticated. See
-  [SECURITY.md](SECURITY.md).
-- **AEAD binds a canonical header subset** (`version`, `message_type`,
-  `msg_id`, `sender_id`, `recipient_id`, `timestamp`, `ttl`). On receive,
-  the decrypted inner header is cross-checked against the signed manifest
-  — mismatched `msg_id` or `recipient_id` is rejected, and stale
-  `timestamp + ttl` is dropped.
-- **Replay protection.** Per-recipient `(sender_spk, msg_id)` cache
-  rejects re-publications within its TTL window.
-- **Per-chunk Reed-Solomon** (32 parity bytes per chunk) for bit-error
-  repair within a received chunk, plus **cross-chunk erasure coding** so
-  any k-of-n chunks reconstruct the message (~30% redundancy by default).
-  Chunk loss up to n-k is fully recoverable.
-- **Pluggable transport.** Any `DNSRecordWriter` / `DNSRecordReader` works — in-memory for tests, sqlite for nodes, Cloudflare/Route53/BIND for production.
-- **Self-contained node.** One Python process serves UDP DNS + HTTP submissions from a persistent sqlite store, with a TTL cleanup worker.
-- **Docker-first deploy.** `docker compose up` gives you a running node with persistence.
+> **Status: alpha, pre-audit.** Two rounds of independent code review
+> shipped. Third-party cryptographic audit is the gate to tagging
+> `v0.2.0-beta`. Do not route anything whose secrecy matters through
+> DMP until that audit is done. See [SECURITY.md](SECURITY.md).
 
-## Quick start (local)
+## The pitch
 
-Run a node, publish an identity to DNS, and receive your own message.
+Instead of sending messages through a central server you have to trust,
+DNS Mesh Protocol encrypts each message end-to-end and writes it as
+DNS records on a node *you* choose. The recipient looks those records
+up the same way any computer looks up `google.com`. If DNS works on
+your network, DMP works on your network.
+
+- **One docker container** is a complete, deployable node.
+- **One command-line tool** covers identity, key management, send, and
+  receive.
+- **One protocol** composes Ed25519 signatures, X25519 ECDH,
+  ChaCha20-Poly1305, Argon2id passphrase derivation, one-time prekeys
+  for forward secrecy, and Reed-Solomon erasure coding for chunk loss.
+
+## Quick start
 
 ```bash
-# 1. Build and start the node
-docker build -t dmp-node:latest .
-docker run -d --name dmp-node \
-  -p 5353:5353/udp -p 8053:8053/tcp \
-  -v dmp-data:/var/lib/dmp \
-  dmp-node:latest
+git clone https://github.com/oscarvalenzuelab/DNSMeshProtocol.git
+cd DNSMeshProtocol
 
-# 2. Install the CLI
+# Install the CLI
 pip install -e .
 
-# 3. Create an identity
-export DMP_PASSPHRASE=my-pass
+# Build and run the node
+docker build -t dmp-node:latest .
+docker run -d -p 5353:5353/udp -p 8053:8053/tcp \
+  -v dmp-data:/var/lib/dmp dmp-node:latest
+
+# Set up an identity and send your first message
+export DMP_PASSPHRASE=a-strong-passphrase
 dmp init alice --domain mesh.local \
                --endpoint http://127.0.0.1:8053 \
                --dns-host 127.0.0.1 --dns-port 5353
-
-# 4. Publish your identity record to DNS so others can look you up
 dmp identity publish
-
-# 5. Another process (simulating a friend) fetches, adds, and messages you
-export DMP_CONFIG_HOME=/tmp/bob-home
-export DMP_PASSPHRASE=bob-pass
-dmp init bob --domain mesh.local \
-             --endpoint http://127.0.0.1:8053 \
-             --dns-host 127.0.0.1 --dns-port 5353
-dmp identity fetch alice --add          # verifies signature, stores contact
-dmp send alice "hello from bob"
-
-# 6. Back in alice's shell
-unset DMP_CONFIG_HOME
-export DMP_PASSPHRASE=my-pass
-dmp recv
 ```
 
-Production deploys put Caddy in front for TLS:
+Full walk-through with two users:
+[Getting Started](https://oscarvalenzuelab.github.io/DNSMeshProtocol/getting-started).
 
-```bash
-export DMP_NODE_HOSTNAME=dmp.example.com   # must have DNS A/AAAA first
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-```
+## What you get
 
-## Architecture
-
-```
-┌────────────────────────────────────────────────────────────┐
-│                         DMPClient                          │
-│   encrypt → chunk → publish → poll → verify → decrypt      │
-└──────────────┬─────────────────────────────────────────────┘
-               │ DNSRecordWriter           DNSRecordReader
-               ▼                           ▼
-     ┌─────────────────┐         ┌──────────────────────┐
-     │  HTTP API       │         │   DNS resolver       │
-     │  POST /v1/...   │         │   UDP query → TXT    │
-     └────────┬────────┘         └──────────────────────┘
-              ▼                           ▲
-     ┌────────────────────────────────────┴───────────────┐
-     │                    DMPNode                         │
-     │   HTTP ──► SqliteMailboxStore ◄── DNS server       │
-     │                     ▲                              │
-     │                     │  CleanupWorker               │
-     └────────────────────────────────────────────────────┘
-```
-
-The client talks to a node's HTTP API to publish records. Anyone in the world queries those records via DNS. Encryption and signing happen client-side; the node only sees opaque TXT blobs.
-
-## Wire format
-
-### Chunk record (≤255 bytes, single DNS TXT string)
-
-```
-chunk-NNNN-<msg_key12>.<mesh_domain>           IN TXT  "v=dmp1;t=chunk;d=<b64 payload>"
-```
-
-Each chunk carries 128 bytes of payload + 8-byte SHA-256 prefix checksum + 32 bytes of Reed-Solomon parity. `msg_key = sha256(msg_id + recipient_id + sender_spk)[:12]` so sender and recipient derive the same path without contact bootstrap.
-
-### Slot manifest record (≤255 bytes, binary wire format)
-
-```
-slot-<N>.mb-<recipient_hash12>.<mesh_domain>   IN TXT  "v=dmp1;t=manifest;d=<b64 body||ed25519_sig>"
-```
-
-Binary body: `msg_id(16) || sender_spk(32) || recipient_id(32) || total_chunks(4) || ts(8) || exp(8)` = 100 bytes. Ed25519 signature covers the body; recipient verifies against the `sender_spk` embedded in the body.
+- **End-to-end encryption with forward secrecy.** Past messages stay
+  safe if long-term keys leak later.
+- **Signed sender authentication.** With pinned contacts, unknown
+  signers are dropped. Without, receive runs in trust-on-first-use.
+- **Zone-anchored identity addresses.** `alice@alice.example.com` —
+  squatting requires compromising DNS for the zone.
+- **Cross-chunk erasure coding.** Loss of up to `n-k` chunks still
+  reconstructs the message.
+- **Persistent, sized-bounded node.** sqlite storage, TTL cleanup,
+  token-bucket rate limits, bounded concurrency, Prometheus metrics.
+- **Docker-first deploy.** `docker compose` for dev, Caddy + Let's
+  Encrypt overlay for production.
 
 ## Running a node
 
-### Docker (recommended)
-
 ```bash
-docker build -t dmp-node:latest .
-docker run -d \
-  -p 5353:5353/udp -p 8053:8053/tcp \
-  -v dmp-data:/var/lib/dmp \
-  -e DMP_HTTP_TOKEN=shared-secret \
-  dmp-node:latest
-```
-
-For production where you want real DNS port 53, remap with `-p 53:5353/udp` after stopping `systemd-resolved` (or anything else holding port 53) on the host.
-
-### docker-compose
-
-```bash
+# Dev
 docker compose up -d
+
+# Production (real hostname, auto TLS)
+export DMP_NODE_HOSTNAME=dmp.example.com
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
-### As a Python process
-
-```bash
-pip install -e .
-python -m dmp.server           # reads config from env vars
-# or
-dmp node --dns-port 5353 --http-port 8053
-```
-
-Environment variables: `DMP_DB_PATH`, `DMP_DNS_{HOST,PORT,TTL}`, `DMP_HTTP_{HOST,PORT,TOKEN}`, `DMP_CLEANUP_INTERVAL`, `DMP_LOG_LEVEL`.
-
-## Using the library
-
-```python
-from dmp.client.client import DMPClient
-from dmp.network.memory import InMemoryDNSStore
-
-store = InMemoryDNSStore()
-alice = DMPClient("alice", "alice-pass", domain="mesh.local", store=store)
-bob = DMPClient("bob", "bob-pass", domain="mesh.local", store=store)
-alice.add_contact("bob", bob.get_public_key_hex())
-
-alice.send_message("bob", "hello")
-for msg in bob.receive_messages():
-    print(msg.plaintext.decode())
-```
-
-For a real deployment, swap `store=` for `writer=` (HTTP adapter) and `reader=` (DNS adapter). See [`dmp/cli.py`](dmp/cli.py) for working adapters.
-
-## Testing
-
-```bash
-pip install -e ".[dev]"
-pytest -v                                           # unit + integration, no docker
-docker build -t dmp-node:latest . && pytest -v     # full suite including docker
-```
+See [Deployment](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment).
 
 ## Project layout
 
 ```
 dmp/
-├── core/              Protocol primitives
-│   ├── message.py     DMPMessage, DMPHeader
-│   ├── crypto.py      X25519 + ChaCha20-Poly1305, Ed25519 signing, AEAD with header AAD
-│   ├── chunking.py    Per-chunk Reed-Solomon + checksums
-│   ├── dns.py         DNS record encoding helpers
-│   └── manifest.py    Signed slot manifests + replay cache
-├── network/           Transport abstraction
-│   ├── base.py        DNSRecordWriter / DNSRecordReader / DNSRecordStore ABCs
-│   ├── memory.py      InMemoryDNSStore
-│   └── dns_publisher.py  Cloudflare / Route53 / BIND / dnsmasq backends
-├── storage/
-│   └── sqlite_store.py   Persistent TTL-aware DNSRecordStore
-├── server/
-│   ├── dns_server.py  UDP DNS server serving TXT from a store
-│   ├── http_api.py    REST publish/query/delete
-│   ├── cleanup.py     Background TTL reaper
-│   └── node.py        DMPNode orchestrator
-├── client/
-│   └── client.py      DMPClient: encrypt/chunk/publish/poll/verify/decrypt
-└── cli.py             `dmp` command-line interface
+├── core/       Protocol primitives: crypto, chunking, erasure,
+│               manifests, identity, prekeys, DNS encoding
+├── network/    DNSRecordWriter / DNSRecordReader abstraction +
+│               Cloudflare, Route53, BIND, in-memory backends
+├── storage/    SqliteMailboxStore — persistent TTL-aware record store
+├── server/     DMPNode: UDP DNS server, HTTP API, cleanup worker,
+│               metrics, rate limiting, structured logging
+├── client/     DMPClient — send / receive / identity / prekeys
+└── cli.py      `dmp` command-line interface
+
+docs/          Jekyll docs site (Just the Docs theme, GitHub Pages)
+tests/         230+ unit, integration, and docker-in-the-loop tests
+Dockerfile, docker-compose.yml, docker-compose.prod.yml, Caddyfile
 ```
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest                                         # ~230 tests
+docker build -t dmp-node:latest .
+pytest tests/test_docker_integration.py        # 4 docker tests
+```
+
+## Not a good fit for
+
+- Real-time chat (seconds-to-minutes latency by design)
+- File transfer or media payloads
+- Anonymity from traffic analysis (DMP hides content, not metadata)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Every PR that changes behavior
+needs a test. Security-sensitive changes in `dmp/core/crypto.py`,
+`dmp/core/manifest.py`, `dmp/core/prekeys.py`, or the AEAD AAD surface
+get an extra round of review.
 
 ## License
 
-[AGPL-3.0](LICENSE). If you host this as a service, you must publish your source changes.
+[AGPL-3.0](LICENSE). If you host DMP as a service you must publish
+your source changes.
 
 ## Author
 

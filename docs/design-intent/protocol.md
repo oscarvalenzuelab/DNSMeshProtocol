@@ -1,18 +1,20 @@
+---
+title: Protocol overview (aspirational)
+layout: default
+parent: Design Intent
+nav_order: 1
+---
+
 # DNS Mesh Protocol Technical Overview
 
-> **Status note (2026-04-20):** This document describes the *aspirational*
-> DMP design — a multi-node mesh with peer discovery, resolver pools, store
-> relays, and 3× redundancy. The current implementation is considerably
-> smaller: one client, one node, one sqlite store, one UDP DNS server.
->
-> For what's actually shipping, read:
->
-> - `README.md` — current architecture and quick start
-> - `SECURITY.md` — threat model and honest list of limits
-> - `CHANGELOG.md` — what each tagged version actually does
->
-> Anything here that isn't reflected in those three files is future work,
-> not current behavior. Treat this file as design intent.
+{: .warning }
+This document describes the *aspirational* DMP design — a multi-node mesh
+with peer discovery, resolver pools, store relays, and 3× redundancy. The
+current implementation is considerably smaller: one client, one node, one
+sqlite store, one UDP DNS server.
+Treat this file as **design intent**, not current behavior. For what
+actually ships, see the [Protocol]({{ site.baseurl }}/protocol) section
+and [SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md).
 
 ## Core Concept
 

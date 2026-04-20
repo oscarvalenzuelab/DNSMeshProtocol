@@ -1,16 +1,18 @@
+---
+title: Implementation requirements (aspirational)
+layout: default
+parent: Design Intent
+nav_order: 2
+---
+
 # DNS Mesh Protocol (DMP) - Implementation Requirements
 
-> **Status note (2026-04-20):** This document is the original implementation
-> spec. The shipping code is smaller and more conservative than what's
-> described here — no mesh routing, no peer discovery, no resolver pool
-> failover, no multi-node storage, no 3× redundancy, no bootstrap-domain
-> gossip. Current scope is one client, one node, one sqlite store.
->
-> Treat this file as design intent / future work. For what actually ships:
->
-> - `README.md` — current architecture
-> - `SECURITY.md` — threat model and honest limits
-> - `CHANGELOG.md` — what each tagged version does
+{: .warning }
+This document is the original implementation spec. The shipping code is
+smaller and more conservative than what's described here — no mesh routing,
+no peer discovery, no resolver pool failover, no multi-node storage, no
+3× redundancy, no bootstrap-domain gossip. Current scope is one client,
+one node, one sqlite store. Treat as design intent, not current behavior.
 
 ## Project Overview
 
