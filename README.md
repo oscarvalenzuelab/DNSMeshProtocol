@@ -17,7 +17,7 @@ Decentralized peer-to-peer messaging that tunnels encrypted messages through DNS
 
 ## Quick start (local)
 
-Run a node and send a message to yourself in one terminal.
+Run a node, publish an identity to DNS, and receive your own message.
 
 ```bash
 # 1. Build and start the node
@@ -30,14 +30,35 @@ docker run -d --name dmp-node \
 # 2. Install the CLI
 pip install -e .
 
-# 3. Create an identity and send to yourself
+# 3. Create an identity
 export DMP_PASSPHRASE=my-pass
-dmp init alice --domain mesh.local --endpoint http://127.0.0.1:8053 --dns-host 127.0.0.1 --dns-port 5353
-dmp identity show    # copy the public_key
+dmp init alice --domain mesh.local \
+               --endpoint http://127.0.0.1:8053 \
+               --dns-host 127.0.0.1 --dns-port 5353
 
-dmp contacts add me <paste public_key>
-dmp send me "hello from me"
+# 4. Publish your identity record to DNS so others can look you up
+dmp identity publish
+
+# 5. Another process (simulating a friend) fetches, adds, and messages you
+export DMP_CONFIG_HOME=/tmp/bob-home
+export DMP_PASSPHRASE=bob-pass
+dmp init bob --domain mesh.local \
+             --endpoint http://127.0.0.1:8053 \
+             --dns-host 127.0.0.1 --dns-port 5353
+dmp identity fetch alice --add          # verifies signature, stores contact
+dmp send alice "hello from bob"
+
+# 6. Back in alice's shell
+unset DMP_CONFIG_HOME
+export DMP_PASSPHRASE=my-pass
 dmp recv
+```
+
+Production deploys put Caddy in front for TLS:
+
+```bash
+export DMP_NODE_HOSTNAME=dmp.example.com   # must have DNS A/AAAA first
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
 ## Architecture

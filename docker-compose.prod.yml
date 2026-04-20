@@ -1,0 +1,36 @@
+# Overlay for production deployments: puts Caddy in front of dmp-node with
+# automatic Let's Encrypt certificates, and drops the raw 8053 port from the
+# host. Use with:
+#
+#     export DMP_NODE_HOSTNAME=dmp.example.com
+#     docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# You MUST have DNS A/AAAA records for $DMP_NODE_HOSTNAME pointing at this
+# server before Caddy's ACME challenge will succeed.
+
+services:
+  dmp-node:
+    # Don't expose HTTP publicly in prod; Caddy handles it over TLS.
+    ports:
+      - "5353:5353/udp"
+    # dmp-node:8053 is still reachable from within the compose network.
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    environment:
+      DMP_NODE_HOSTNAME: ${DMP_NODE_HOSTNAME:?set DMP_NODE_HOSTNAME}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - dmp-node
+
+volumes:
+  caddy-data:
+  caddy-config:

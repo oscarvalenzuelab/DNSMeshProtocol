@@ -30,7 +30,9 @@ def shared_store(monkeypatch):
     """Force _make_client to use a shared in-memory store across test clients.
 
     Preserves the real CLI's persistent-replay-cache path so tests exercise
-    that wiring too (one replay cache per config home / identity).
+    that wiring too (one replay cache per config home / identity). Also
+    monkeypatches `_DnsReader` so the identity-fetch path (which bypasses
+    _make_client) sees the same shared store.
     """
     store = InMemoryDNSStore()
 
@@ -48,7 +50,15 @@ def shared_store(monkeypatch):
             client.add_contact(name, pubkey, domain=config.domain)
         return client
 
+    class _SharedStoreReader:
+        def query_txt_record(self, name):
+            return store.query_txt_record(name)
+
+    def fake_dns_reader(host, port=5353):
+        return _SharedStoreReader()
+
     monkeypatch.setattr(cli, "_make_client", fake_make_client)
+    monkeypatch.setattr(cli, "_DnsReader", fake_dns_reader)
     return store
 
 
@@ -109,6 +119,58 @@ class TestInitAndIdentity:
         parsed = json.loads(out)
         assert parsed["username"] == "alice"
         assert len(parsed["public_key"]) == 64  # 32 bytes hex
+
+
+class TestIdentityPublishFetch:
+    """`dmp identity publish` + `dmp identity fetch` + `--add`."""
+
+    def test_publish_then_fetch_roundtrip(self, config_home, shared_store, monkeypatch, capsys):
+        """alice publishes, a second invocation as bob can fetch and add her."""
+        # Alice sets up + publishes.
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        cli.main(["identity", "publish"])
+        assert "published identity" in capsys.readouterr().out
+
+        # Bob's CLI (different config home; same shared in-memory store)
+        # fetches alice's record and verifies it.
+        bob_home = config_home.parent / "bob-home"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(["init", "bob", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+        cli.main(["identity", "fetch", "alice", "--json"])
+        import json
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["username"] == "alice"
+        assert len(parsed["public_key"]) == 64  # hex
+
+    def test_fetch_add_stores_contact(self, config_home, shared_store, monkeypatch, capsys):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        cli.main(["identity", "publish"])
+        capsys.readouterr()
+
+        bob_home = config_home.parent / "bob-home-2"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(["init", "bob", "--endpoint", "http://x"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+        capsys.readouterr()
+
+        cli.main(["identity", "fetch", "alice", "--add"])
+        out = capsys.readouterr().out
+        assert "added contact alice" in out
+
+        cli.main(["contacts", "list"])
+        assert "alice" in capsys.readouterr().out
+
+    def test_fetch_missing_identity_errors(self, config_home, shared_store, monkeypatch):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["identity", "fetch", "nobody"])
+        assert exc.value.code == 2
 
 
 class TestContacts:

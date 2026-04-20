@@ -1,0 +1,25 @@
+# Caddy config for the DMP node HTTP API.
+#
+# Set DMP_NODE_HOSTNAME to the fully-qualified name that points at this server.
+# Caddy will obtain a Let's Encrypt certificate automatically and reverse-proxy
+# to the dmp-node container on its internal :8053 port.
+#
+# For a dev setup without a real hostname, swap the first line for:
+#   :8443
+# and drop the TLS config, or run the node directly with the HTTP port exposed.
+
+{$DMP_NODE_HOSTNAME} {
+    encode gzip zstd
+
+    # Preserve client IP so dmp-node's rate limiter sees the real source.
+    reverse_proxy dmp-node:8053 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+    }
+
+    # Modest abuse control at the edge; the node has its own limiter too.
+    log {
+        output stdout
+        format json
+    }
+}
