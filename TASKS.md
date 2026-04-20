@@ -1,7 +1,9 @@
 # Current sprint
 
-**Sprint goal:** deliver M1 — resolver resilience. Turn "works where you
-configured it" into "works wherever DNS works."
+**Sprint status:** M1 — resolver resilience — **CLOSED** (2026-04-20).
+All four tasks merged to `main`. Next sprint to be opened from
+`ROADMAP.md` backlog (M2 federation is the natural follow-on, but M1.5
+and M1.retro-codex are smaller unblocked items that can slot in first).
 
 See `ROADMAP.md` for the long-horizon view. This file is the active
 work queue.
@@ -16,46 +18,20 @@ work queue.
 
 ## Active
 
-### M1.1 — `ResolverPool` class with failover — DONE (→ see Done section)
-
----
-
-### M1.2 — DONE (→ Done section)
-### M1.3 — DONE (→ Done section)
-
----
-
-### M1.4 — Integration test: resolver failover under partial block
-
-| Field | Value |
-|---|---|
-| **ID** | `M1.4` |
-| **Status** | `pending` |
-| **Owner** | — |
-| **Depends on** | `M1.1`, `M1.2` |
-| **Blocks** | — |
-| **Estimated effort** | 2 days |
-| **Touch zones** | `tests/test_resolver_failover.py` (new) |
-
-**Acceptance criteria:**
-
-- [ ] Spins up two local UDP "DNS stubs": one that serves DMP records
-      correctly and one that returns NXDOMAIN for everything.
-- [ ] A client configured with the NXDOMAIN stub first, real stub
-      second, still delivers a message.
-- [ ] Cooldown: after N NXDOMAIN answers, the bad stub is demoted;
-      queries succeed faster on subsequent calls.
+_No tasks currently active. Promote from Backlog to open the next sprint._
 
 ## Backlog (promoted to active as bandwidth allows)
 
-These come from `ROADMAP.md`. Pull only after M1 sprint closes.
+Small follow-ups surfaced during M1, plus items pulled from `ROADMAP.md`.
 
 - **M1.5** — Per-host ports in `ResolverPool`. Extend the pool to accept
   `List[Tuple[str, int]]` (or parallel `ports` list) so each upstream can
   carry its own port. Drops the "first explicit port wins" workaround in
-  `dmp/cli.py::_make_reader`. Effort: ~0.5 day. Touch zones:
-  `dmp/network/resolver_pool.py`, `tests/test_resolver_pool.py`,
-  `dmp/cli.py`. Surfaced during M1.2 implementation.
+  `dmp/cli.py::_make_reader` and lets the M1.4 integration test drop its
+  test-only `_PerHostPortResolverPool` subclass. Effort: ~0.5 day. Touch
+  zones: `dmp/network/resolver_pool.py`, `tests/test_resolver_pool.py`,
+  `tests/test_resolver_failover.py`, `dmp/cli.py`. Surfaced during M1.2
+  and reinforced during M1.4.
 - **M1.retro-codex** — Retroactive Codex review of M1.2 (commit
   `3096eb0`) and M1.3 (commit `d39cb56`). OpenAI API was returning 503
   at merge time; self-review served as a reasonable substitute but
@@ -82,3 +58,8 @@ These come from `ROADMAP.md`. Pull only after M1 sprint closes.
   + `dmp resolvers discover [--save]` + `dmp resolvers list` CLI —
   commit `d39cb56`. 18 new test cases. Codex review pending (see
   M1.retro-codex).
+- **M1.4** — Integration test: resolver failover under partial block.
+  Real-UDP stubs (good `DMPDnsServer` + handcrafted NXDOMAIN server),
+  8 tests covering the three TASKS.md acceptance criteria plus oracle
+  semantics under real UDP — commits `29c5c44` (impl) + `6108c66`
+  (atomic port-bind fix from Codex P2). Final Codex review: clean.
