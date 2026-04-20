@@ -729,6 +729,125 @@ class TestOracleDemotion:
             assert snap["consecutive_failures"] == 0
         assert pool.healthy_hosts() == ["1.1.1.1", "9.9.9.9", "8.8.8.8"]
 
+    def test_nxdomain_resets_consecutive_failures_when_no_oracle(self):
+        """A legitimate not-found response resets any stale failure streak.
+
+        With `failure_threshold > 1`, a resolver that had an earlier
+        transport blip accumulates `consecutive_failures = 1`. If it
+        later serves a genuine NXDOMAIN (no later resolver disproves
+        it), that IS a healthy response — it successfully returned
+        authoritative "no such record" data. Without a reset, a future
+        unrelated timeout would count as the "second consecutive"
+        failure and demote a resolver that served correctly in between.
+        """
+        routes = {
+            "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+            "9.9.9.9": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], failure_threshold=2)
+
+            # Simulate a prior transport failure that left the streak
+            # at 1 but below the threshold (still preferred).
+            pool._states[0].consecutive_failures = 1
+            pool._states[1].consecutive_failures = 1
+
+            # All-NXDOMAIN query — nobody oracled anybody.
+            assert pool.query_txt_record("absent.example.com") is None
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        # The legitimate not-found reset both streaks to 0.
+        assert snap["1.1.1.1"]["consecutive_failures"] == 0
+        assert snap["9.9.9.9"]["consecutive_failures"] == 0
+
+    def test_nxdomain_does_not_reset_when_oracle_demotes(self):
+        """When a later resolver returns TXT, the not-found primary is demoted.
+
+        The oracle-demote path must take precedence over the all-
+        not-found reset path: if we reset first and then demote, we'd
+        net out to `consecutive_failures = 1` which is the same as
+        plain demotion — but the two paths are mutually exclusive by
+        construction, so this test pins that.
+        """
+        routes = {
+            "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+            "9.9.9.9": lambda n, t: _answer("real-record"),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], failure_threshold=2)
+
+            # Primary starts with streak = 0 (clean). Secondary too.
+            assert pool.query_txt_record("name.example.com") == ["real-record"]
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        # Primary was oracle-demoted (+1), NOT reset to 0.
+        assert snap["1.1.1.1"]["consecutive_failures"] == 1
+        # Secondary's success reset its own streak.
+        assert snap["9.9.9.9"]["consecutive_failures"] == 0
+
+    def test_multi_failure_threshold_streak_semantics(self):
+        """With `failure_threshold=2`, a mid-success breaks the streak.
+
+        Timeline:
+          1. Timeout from 1.1.1.1 -> streak goes to 1 (still preferred,
+             below threshold of 2).
+          2. TXT hit from 1.1.1.1 -> streak resets to 0.
+          3. Timeout from 1.1.1.1 -> streak goes to 1.
+
+        End state: streak = 1, NOT 2. This already holds via the
+        existing `_mark_success` call on a TXT hit, but we lock it in
+        to catch any regression in the spirit of "consecutive" — and
+        to pair with the new all-not-found reset path for the same
+        reason.
+        """
+        behavior = {"mode": "timeout"}
+        call_log = []
+
+        def handler(n, t):
+            call_log.append(behavior["mode"])
+            mode = behavior["mode"]
+            if mode == "timeout":
+                raise dns.exception.Timeout()
+            return _answer("ok")
+
+        routes = {
+            "1.1.1.1": handler,
+            "9.9.9.9": lambda n, t: _answer("fallback"),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(
+                ["1.1.1.1", "9.9.9.9"],
+                failure_threshold=2,
+                cooldown_seconds=60.0,
+            )
+
+            # Step 1: timeout -> streak = 1.
+            assert pool.query_txt_record("x") == ["fallback"]
+            assert pool.snapshot()[0]["consecutive_failures"] == 1
+
+            # Step 2: success -> streak resets to 0.
+            behavior["mode"] = "ok"
+            assert pool.query_txt_record("x") == ["ok"]
+            assert pool.snapshot()[0]["consecutive_failures"] == 0
+
+            # Step 3: timeout again -> streak goes back to 1, NOT 2.
+            behavior["mode"] = "timeout"
+            assert pool.query_txt_record("x") == ["fallback"]
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        assert snap["1.1.1.1"]["consecutive_failures"] == 1
+        # Still preferred (below threshold of 2).
+        assert "1.1.1.1" in pool.healthy_hosts()
+
     def test_multiple_lying_primaries_all_demoted_by_one_oracle(self):
         """Two primaries lie; third succeeds. Both liars get demoted.
 

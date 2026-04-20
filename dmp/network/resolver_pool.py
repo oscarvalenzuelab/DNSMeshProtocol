@@ -198,6 +198,18 @@ class ResolverPool(DNSRecordReader):
         resolver produces a real TXT answer for the same query.
         Otherwise the name is presumed genuinely absent and no health
         bookkeeping touches the not-found resolvers.
+
+        A genuine not-found answer (one that nobody later oracle-
+        demotes) is itself a healthy response — the resolver
+        successfully served authoritative "no such record" data. So
+        when we reach the end of the pool with every resolver agreeing
+        the name is absent, we reset the streak for each not-found
+        resolver the same way a successful TXT hit would. Otherwise,
+        with `failure_threshold > 1`, a prior transport timeout would
+        silently persist across healthy NXDOMAIN answers, and the next
+        unrelated timeout would count as the "second consecutive"
+        failure and demote a resolver that had been serving correctly
+        in between.
         """
         tried_not_found: List[_HostState] = []
 
@@ -208,7 +220,8 @@ class ResolverPool(DNSRecordReader):
                 # Defer the health decision: if a later resolver
                 # returns a real record, this one was wrong and we'll
                 # demote it retroactively. If everyone agrees the name
-                # is missing, we leave it alone.
+                # is missing, we treat it as a healthy "no such record"
+                # answer and reset the streak below.
                 tried_not_found.append(state)
                 continue
             except self._TRANSPORT_ERRORS:
@@ -239,13 +252,21 @@ class ResolverPool(DNSRecordReader):
 
             # Zero-length answer: treat like NoAnswer for this
             # resolver (it didn't disprove the earlier ones) and
-            # continue looking. Its own health is unchanged.
+            # continue looking. Its own health is unchanged for now;
+            # if no later resolver oracles it, the not-found reset
+            # below covers it.
             tried_not_found.append(state)
             continue
 
         # Every resolver either returned not-found or a transport
-        # error. The not-found resolvers stay un-demoted — nothing
-        # oracled them.
+        # error, and no oracle fired. Not-found resolvers served a
+        # legitimate "no such record" response, which IS a healthy
+        # answer — reset their streaks so a stale earlier transport
+        # failure doesn't combine with a future one into a spurious
+        # "consecutive" demotion. Transport-error resolvers already
+        # got `_mark_failure` above.
+        for healthy_state in tried_not_found:
+            self._mark_success(healthy_state)
         return None
 
     # ---------------------------------------------------------------
