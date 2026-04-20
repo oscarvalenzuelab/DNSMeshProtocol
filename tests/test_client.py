@@ -76,6 +76,74 @@ class TestSendReceive:
         assert alice.add_contact("badhex", "zz") is False
         assert alice.add_contact("shortkey", "aabb") is False
 
+    def test_txt_records_fit_in_single_dns_string(self):
+        """Every published TXT value must be <= 255 bytes to fit a single DNS string.
+
+        Real DNS backends (BIND UPDATE, Route53, dnsmasq) publish one string
+        per record by default. A record that exceeds 255 bytes either gets
+        truncated, rejected, or silently splits in backend-specific ways.
+        """
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+
+        # A multi-chunk message exercises both chunk records and the manifest.
+        assert alice.send_message("bob", "X" * 600)
+
+        for name in store.list_names():
+            for value in store.query_txt_record(name) or []:
+                assert len(value.encode("utf-8")) <= 255, (
+                    f"TXT record at {name} is {len(value)} bytes — exceeds DNS per-string limit"
+                )
+
+    def test_transient_chunk_miss_does_not_blacklist(self):
+        """Replay cache must not record a manifest until decrypt succeeds.
+
+        If chunks are not yet visible when the recipient first sees the
+        manifest, a naive cache would lock the message out forever. The fixed
+        client records only post-decrypt, so a later poll still delivers.
+        """
+        import hashlib
+
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+        assert alice.send_message("bob", "deferred")
+
+        # Find the chunk records and remove them so the first poll can't fetch.
+        bob_user_id = hashlib.sha256(bytes.fromhex(bob.get_public_key_hex())).digest()
+        chunk_names = [n for n in store.list_names() if n.startswith("chunk-")]
+        assert chunk_names  # sanity check
+
+        saved = {n: store.query_txt_record(n) for n in chunk_names}
+        for n in chunk_names:
+            store.delete_txt_record(n)
+
+        # First poll: manifest visible, chunks missing → decrypt fails silently.
+        assert bob.receive_messages() == []
+        # Make chunks available again (simulates DNS propagation).
+        for n, values in saved.items():
+            store.publish_txt_record(n, values[0])
+        # Second poll: manifest still in slot, chunks now present → delivered.
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"deferred"
+
+    def test_concurrent_sends_do_not_silently_clobber(self):
+        """Back-to-back sends prefer empty slots so neither message is lost."""
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+        eve = DMPClient("eve", "eve-pass", domain="mesh.test", store=store)
+        eve.add_contact("bob", bob.get_public_key_hex())
+
+        # Two different senders, two back-to-back messages to bob. With 10
+        # empty slots available, the first-empty scan should deposit them in
+        # distinct slots.
+        assert alice.send_message("bob", "from-alice")
+        assert eve.send_message("bob", "from-eve")
+        inbox = bob.receive_messages()
+        assert len(inbox) == 2
+        payloads = sorted(m.plaintext for m in inbox)
+        assert payloads == [b"from-alice", b"from-eve"]
+
     def test_signed_manifest_rejects_impersonation(self):
         """An attacker forging a manifest in a victim's slot is caught."""
         import hashlib

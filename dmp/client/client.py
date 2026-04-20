@@ -223,13 +223,15 @@ class DMPClient:
         sender_spk = self.crypto.get_signing_public_key_bytes()
         msg_key = self._msg_key(msg_id, recipient_id, sender_spk)
 
-        # Publish chunks
+        # Publish chunks. We intentionally drop the metadata dict from the
+        # wire record — chunk_num and msg_key are already in the domain name
+        # and encoding them again would push us over the 255-byte TXT limit.
         for chunk_num, chunk_bytes in chunks:
             record = DMPDNSRecord(
                 version=1,
                 record_type="chunk",
                 data=chunk_bytes,
-                metadata={"chunk": chunk_num, "msg_key": msg_key},
+                metadata={},
             )
             ok = self.writer.publish_txt_record(
                 self._chunk_domain(msg_key, chunk_num),
@@ -239,7 +241,11 @@ class DMPClient:
             if not ok:
                 return False
 
-        # Publish signed manifest at a random slot
+        # Publish signed manifest. Try every slot in random order; take the
+        # first empty one. If all 10 are occupied, fall back to random (last
+        # writer wins). This keeps back-to-back sends from silently clobbering
+        # each other under low load while still making progress under heavy
+        # contention.
         manifest = SlotManifest(
             msg_id=msg_id,
             sender_spk=sender_spk,
@@ -249,12 +255,22 @@ class DMPClient:
             exp=now + ttl,
         )
         slot_record = manifest.sign(self.crypto)
-        slot = random.randint(0, SLOT_COUNT - 1)
+        chosen_slot = self._pick_slot(recipient_id)
         return self.writer.publish_txt_record(
-            self._slot_domain(recipient_id, slot),
+            self._slot_domain(recipient_id, chosen_slot),
             slot_record,
             ttl=ttl,
         )
+
+    def _pick_slot(self, recipient_id: bytes) -> int:
+        """Pick a preferably-empty slot. Deterministic scan in random order."""
+        order = list(range(SLOT_COUNT))
+        random.shuffle(order)
+        for slot in order:
+            if not self.reader.query_txt_record(self._slot_domain(recipient_id, slot)):
+                return slot
+        # All slots occupied — last-writer-wins fallback.
+        return order[0]
 
     # ---- receive -----------------------------------------------------------
 
@@ -279,19 +295,27 @@ class DMPClient:
                     continue
                 if manifest.is_expired():
                     continue
-                if not self.replay_cache.check_and_record(
-                    manifest.sender_spk, manifest.msg_id, manifest.exp
+                # Check-only here; we record in the replay cache *after* we
+                # actually decode the message. Otherwise a transient DNS miss
+                # during chunk fetch would permanently suppress a still-valid
+                # manifest on later polls.
+                if self.replay_cache.has_seen(
+                    manifest.sender_spk, manifest.msg_id
                 ):
                     continue
                 decoded = self._fetch_and_decrypt(manifest)
-                if decoded is not None:
-                    plaintext, ts, msg_id = decoded
-                    results.append(InboxMessage(
-                        sender_signing_pk=manifest.sender_spk,
-                        plaintext=plaintext,
-                        timestamp=ts,
-                        msg_id=msg_id,
-                    ))
+                if decoded is None:
+                    continue
+                plaintext, ts, msg_id = decoded
+                self.replay_cache.record(
+                    manifest.sender_spk, manifest.msg_id, manifest.exp
+                )
+                results.append(InboxMessage(
+                    sender_signing_pk=manifest.sender_spk,
+                    plaintext=plaintext,
+                    timestamp=ts,
+                    msg_id=msg_id,
+                ))
         return results
 
     def _fetch_and_decrypt(

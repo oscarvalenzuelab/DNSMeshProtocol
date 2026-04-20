@@ -39,15 +39,19 @@ class TestSlotManifest:
         assert parsed.sender_spk == sender.get_signing_public_key_bytes()
 
     def test_tampered_payload_rejected(self):
+        import base64
         sender = DMPCrypto()
         recipient = DMPCrypto()
         now = int(time.time())
         manifest = _make_manifest(sender, recipient, now)
 
         record = manifest.sign(sender)
-        # Flip the total_chunks value in a crude way; either the base64 decode
-        # breaks or the signature fails.
-        tampered = record.replace(";s=", ";s=aaaa")
+        # Flip one byte in the signed wire payload. Signature will no longer
+        # verify against the sender_spk embedded in the body.
+        prefix = "v=dmp1;t=manifest;d="
+        wire = bytearray(base64.b64decode(record[len(prefix):]))
+        wire[80] ^= 0xFF  # inside the total_chunks field
+        tampered = prefix + base64.b64encode(bytes(wire)).decode("ascii")
         assert SlotManifest.parse_and_verify(tampered) is None
 
     def test_wrong_signer_rejected(self):
@@ -64,7 +68,11 @@ class TestSlotManifest:
     def test_malformed_record_returns_none(self):
         assert SlotManifest.parse_and_verify("not-a-dmp-record") is None
         assert SlotManifest.parse_and_verify("v=dmp1;t=manifest") is None
-        assert SlotManifest.parse_and_verify("v=dmp1;t=manifest;d=notbase64;s=xx") is None
+        assert SlotManifest.parse_and_verify("v=dmp1;t=manifest;d=notbase64") is None
+        # Correct prefix, decodable base64, but wrong length.
+        import base64
+        short = base64.b64encode(b"too short").decode("ascii")
+        assert SlotManifest.parse_and_verify(f"v=dmp1;t=manifest;d={short}") is None
 
     def test_expiry(self):
         sender = DMPCrypto()

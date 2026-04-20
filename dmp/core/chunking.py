@@ -36,8 +36,12 @@ class MessageChunker:
     reedsolo handles variable-length encode/decode internally, so no padding games.
     """
 
-    # Max bytes of raw message data per chunk (before RS + checksum overhead)
-    DATA_PER_CHUNK = 200
+    # Max bytes of raw message data per chunk (before RS + checksum overhead).
+    # Sized so the full TXT record (`v=dmp1;t=chunk;d=<b64>`) fits in one
+    # 255-byte DNS TXT string:
+    #   128 raw + 32 RS + 8 checksum = 168 bytes  →  224 base64 chars
+    #   plus 17-char prefix "v=dmp1;t=chunk;d=" = 241 chars total.
+    DATA_PER_CHUNK = 128
     MAX_CHUNK_SIZE = DATA_PER_CHUNK  # back-compat alias
     # Reed-Solomon parameters — 32 parity bytes corrects up to 16 byte-errors per chunk
     RS_SYMBOLS = 32

@@ -8,32 +8,43 @@ identity so it can't be forged or silently mutated.
 Without this, anyone can publish to a mailbox slot and impersonate any sender.
 With this, forged slots are detectable and the recipient-side replay cache can
 reject re-publication of old valid manifests.
+
+Wire format (compact binary to fit in one 255-byte DNS TXT string):
+
+    v=dmp1;t=manifest;d=<b64(body || sig)>
+
+body = msg_id(16) || sender_spk(32) || recipient_id(32) || total_chunks(4) ||
+       ts(8) || exp(8)                                              =  100 bytes
+sig  = Ed25519 signature over `body`                                =   64 bytes
+total                                                               =  164 bytes
+base64                                                              =  220 chars
+prefix `v=dmp1;t=manifest;d=`                                       =   20 chars
+wire total                                                          =  240 chars  (fits)
 """
 
 from __future__ import annotations
 
 import base64
-import json
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 from dmp.core.crypto import DMPCrypto
 
 
-RECORD_PREFIX = "v=dmp1;t=manifest"
-DEFAULT_MANIFEST_TTL = 300  # seconds the manifest claims validity for
+RECORD_PREFIX = "v=dmp1;t=manifest;d="
+_BODY_LEN = 16 + 32 + 32 + 4 + 8 + 8   # 100 bytes
+_SIG_LEN = 64
+_WIRE_LEN = _BODY_LEN + _SIG_LEN        # 164 bytes
+DEFAULT_MANIFEST_TTL = 300
 
 
 @dataclass
 class SlotManifest:
     """Claim that a message is waiting at a mailbox slot.
 
-    Wire form: "v=dmp1;t=manifest;d=<b64(json)>;s=<b64(ed25519_sig)>"
-
-    The signature covers the canonical JSON bytes of the manifest fields
-    (`msg_id`, `sender_spk`, `recipient_id`, `total_chunks`, `ts`, `exp`) so
-    any mutation flips verification.
+    The Ed25519 signature covers `to_body_bytes()` so any mutation of any
+    field breaks verification.
     """
 
     msg_id: bytes            # 16 bytes
@@ -43,42 +54,42 @@ class SlotManifest:
     ts: int                  # unix seconds when the sender published
     exp: int                 # unix seconds after which recipient should drop
 
-    def to_canonical_bytes(self) -> bytes:
-        """Canonical JSON bytes used both for the wire payload and AAD-style signing."""
-        return json.dumps(
-            {
-                "msg_id": self.msg_id.hex(),
-                "sender_spk": self.sender_spk.hex(),
-                "recipient_id": self.recipient_id.hex(),
-                "total_chunks": self.total_chunks,
-                "ts": self.ts,
-                "exp": self.exp,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
+    def to_body_bytes(self) -> bytes:
+        """Binary representation of the manifest fields, used as the signed payload."""
+        if len(self.msg_id) != 16:
+            raise ValueError("msg_id must be 16 bytes")
+        if len(self.sender_spk) != 32:
+            raise ValueError("sender_spk must be 32 bytes")
+        if len(self.recipient_id) != 32:
+            raise ValueError("recipient_id must be 32 bytes")
+        return (
+            self.msg_id
+            + self.sender_spk
+            + self.recipient_id
+            + self.total_chunks.to_bytes(4, "big")
+            + self.ts.to_bytes(8, "big")
+            + self.exp.to_bytes(8, "big")
+        )
 
     @classmethod
-    def from_canonical_bytes(cls, data: bytes) -> "SlotManifest":
-        obj = json.loads(data.decode("utf-8"))
+    def from_body_bytes(cls, body: bytes) -> "SlotManifest":
+        if len(body) != _BODY_LEN:
+            raise ValueError(f"manifest body must be {_BODY_LEN} bytes, got {len(body)}")
         return cls(
-            msg_id=bytes.fromhex(obj["msg_id"]),
-            sender_spk=bytes.fromhex(obj["sender_spk"]),
-            recipient_id=bytes.fromhex(obj["recipient_id"]),
-            total_chunks=int(obj["total_chunks"]),
-            ts=int(obj["ts"]),
-            exp=int(obj["exp"]),
+            msg_id=body[0:16],
+            sender_spk=body[16:48],
+            recipient_id=body[48:80],
+            total_chunks=int.from_bytes(body[80:84], "big"),
+            ts=int.from_bytes(body[84:92], "big"),
+            exp=int.from_bytes(body[92:100], "big"),
         )
 
     def sign(self, sender_crypto: DMPCrypto) -> str:
         """Return the wire-format TXT record string, signed by `sender_crypto`."""
-        payload = self.to_canonical_bytes()
-        signature = sender_crypto.sign_data(payload)
-        return (
-            f"{RECORD_PREFIX};"
-            f"d={base64.b64encode(payload).decode('ascii')};"
-            f"s={base64.b64encode(signature).decode('ascii')}"
-        )
+        body = self.to_body_bytes()
+        signature = sender_crypto.sign_data(body)
+        wire = body + signature
+        return f"{RECORD_PREFIX}{base64.b64encode(wire).decode('ascii')}"
 
     @classmethod
     def parse_and_verify(
@@ -86,35 +97,27 @@ class SlotManifest:
     ) -> Optional[Tuple["SlotManifest", bytes]]:
         """Parse and verify a manifest TXT record.
 
-        Returns (manifest, raw_signature) on success, or None if the record
-        is malformed or the signature is invalid against the sender_spk field.
-        Callers should still check `exp` and replay state.
+        Returns (manifest, raw_signature) on success, or None if the record is
+        malformed, truncated, or the signature fails verification against the
+        sender_spk embedded in the body. Callers should still check `exp` and
+        replay state.
         """
         if not record.startswith(RECORD_PREFIX):
             return None
-        parts: Dict[str, str] = {}
-        for piece in record.split(";"):
-            if "=" in piece:
-                key, _, value = piece.partition("=")
-                parts[key.strip()] = value.strip()
-
-        raw_b64 = parts.get("d")
-        sig_b64 = parts.get("s")
-        if not raw_b64 or not sig_b64:
-            return None
-
         try:
-            payload = base64.b64decode(raw_b64)
-            signature = base64.b64decode(sig_b64)
+            wire = base64.b64decode(record[len(RECORD_PREFIX):])
         except Exception:
             return None
-
-        try:
-            manifest = cls.from_canonical_bytes(payload)
-        except (ValueError, KeyError, json.JSONDecodeError):
+        if len(wire) != _WIRE_LEN:
             return None
 
-        if not DMPCrypto.verify_signature(payload, signature, manifest.sender_spk):
+        body = wire[:_BODY_LEN]
+        signature = wire[_BODY_LEN:]
+        try:
+            manifest = cls.from_body_bytes(body)
+        except ValueError:
+            return None
+        if not DMPCrypto.verify_signature(body, signature, manifest.sender_spk):
             return None
         return manifest, signature
 
@@ -127,13 +130,37 @@ class SlotManifest:
 class ReplayCache:
     """Reject re-publication of already-seen (sender_spk, msg_id) pairs.
 
-    In-memory only. Entries are purged when their stored expiry passes, so the
-    cache stays bounded under normal traffic. Persisting across restarts is
-    future work — an attacker who catches a process restart can replay.
+    Split API:
+      has_seen(spk, msg_id)  — read-only check; safe to call before fetch.
+      record(spk, msg_id, exp) — commit the pair to the seen set.
+
+    The caller is responsible for only calling `record()` once a message has
+    been successfully decoded, so a transient DNS miss during chunk fetch
+    doesn't permanently blacklist a valid manifest.
+
+    In-memory only. Entries are purged when their stored expiry passes, so
+    the cache stays bounded under normal traffic. Process restarts forget
+    the seen set — an attacker who catches a restart can replay.
     """
 
     default_ttl: int = 3600
     _seen: Dict[Tuple[bytes, bytes], int] = field(default_factory=dict)
+
+    def has_seen(self, sender_spk: bytes, msg_id: bytes) -> bool:
+        self._purge()
+        return (bytes(sender_spk), bytes(msg_id)) in self._seen
+
+    def record(
+        self,
+        sender_spk: bytes,
+        msg_id: bytes,
+        expiry: Optional[int] = None,
+    ) -> None:
+        self._purge()
+        key = (bytes(sender_spk), bytes(msg_id))
+        self._seen[key] = (
+            expiry if expiry is not None else int(time.time()) + self.default_ttl
+        )
 
     def check_and_record(
         self,
@@ -141,17 +168,16 @@ class ReplayCache:
         msg_id: bytes,
         expiry: Optional[int] = None,
     ) -> bool:
-        """Return True if this is a fresh (sender, msg_id); False if replay.
+        """Atomically check-then-record.
 
-        Fresh pairs are recorded so subsequent calls with the same pair return
-        False. `expiry` controls when the entry can be forgotten; defaults to
-        now + default_ttl.
+        Returns True if the pair is fresh (and records it); False on replay.
+        Kept for callers that genuinely want the old single-step semantics.
+        New code should prefer `has_seen` + `record` around the work that
+        proves the message was actually delivered.
         """
-        self._purge()
-        key = (bytes(sender_spk), bytes(msg_id))
-        if key in self._seen:
+        if self.has_seen(sender_spk, msg_id):
             return False
-        self._seen[key] = expiry if expiry is not None else int(time.time()) + self.default_ttl
+        self.record(sender_spk, msg_id, expiry)
         return True
 
     def _purge(self) -> None:
