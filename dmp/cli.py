@@ -770,8 +770,18 @@ def cmd_resolvers_discover(args: argparse.Namespace) -> int:
 
 
 def cmd_resolvers_list(args: argparse.Namespace) -> int:
-    """Print the currently configured `dns_resolvers` list."""
-    cfg = CLIConfig.load(_config_path())
+    """Print the currently configured `dns_resolvers` list.
+
+    On a fresh install with no `config.yaml`, this used to raise
+    `FileNotFoundError` from `CLIConfig.load` and dump a traceback —
+    unfriendly for `dmp resolvers list` as a diagnostic command.
+    Check for the config up front and surface a clean exit-1 with the
+    same "run `dmp init` first" hint other commands use via `_die`.
+    """
+    path = _config_path()
+    if not path.exists():
+        _die(1, f"no config at {path} — run `dmp init <username>` first")
+    cfg = CLIConfig.load(path)
     if not cfg.dns_resolvers:
         print(
             "(no dns_resolvers configured — run `dmp resolvers discover "
