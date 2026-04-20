@@ -50,15 +50,13 @@ Each chunk gets sent through multiple resolvers for redundancy. The protocol tra
 
 ### Error Correction
 
-Reed Solomon error correction adds 30 percent redundancy to messages. This means recipients can reconstruct the complete message even if 30 percent of chunks never arrive. The error correction operates at the chunk level, allowing recovery from packet loss, DNS failures, or censorship attempts that block some queries.
+Each chunk carries its own Reed Solomon parity bytes, so bit level corruption inside a received chunk can be repaired. This is per chunk protection, not cross chunk erasure coding: a chunk that is lost entirely still kills the message, and the recipient must get every chunk to reassemble. True erasure coding across chunks is future work.
 
-The protocol also includes checksums and sequence numbers for detecting corrupted or missing chunks. If chunks arrive out of order, the reassembly process automatically reorders them. Missing chunks trigger retransmission requests through alternative paths.
+Chunks carry SHA 256 prefix checksums for integrity; the assembler rejects any chunk whose body does not match, as well as chunks whose number falls outside the manifest's stated range. Reassembly requires a contiguous set of chunk indexes, so a malformed or attacker injected chunk cannot poison the buffer.
 
 ### Traffic Analysis Resistance
 
-The protocol implements several techniques to resist traffic analysis. Random delays between DNS queries prevent timing correlation attacks. Dummy traffic generation masks real communication patterns. Message padding ensures all messages appear the same size to observers.
-
-Chunk ordering gets randomized so observers cannot determine message boundaries. The protocol spreads chunks across multiple resolvers and time windows, making it difficult to correlate related queries. These techniques combine to provide reasonable privacy against passive network observation.
+The protocol design allows for random delays between DNS queries, dummy traffic generation, and message padding to resist timing and size based correlation attacks. The current implementation does not yet include these. A passive observer of a mailbox domain can still count messages and infer their approximate size from the number of chunk subdomains. Hardening this is tracked as future work.
 
 ### Network Bootstrap
 

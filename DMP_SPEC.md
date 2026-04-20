@@ -64,19 +64,22 @@ class DMPHeader:
 #### 3.1 Message Chunking System
 ```python
 class MessageChunker:
-    MAX_CHUNK_SIZE = 240  # bytes, conservative for DNS TXT records
-    
+    DATA_PER_CHUNK = 128  # raw bytes per chunk (before RS + checksum)
+
     def chunk_message(self, message: bytes, message_id: bytes) -> List[DMPChunk]:
-        # Add Reed-Solomon error correction (30% redundancy)
-        # Split into DNS-compatible chunks
-        # Add checksum verification
+        # Per-chunk Reed-Solomon (32 parity bytes) for bit-error repair
+        # Split into DNS-compatible chunks that fit one 255-byte TXT string
+        # Add SHA-256 prefix checksum for integrity
         # Return list of chunks with metadata
 ```
 
 #### 3.2 Reed-Solomon Error Correction
-- Implement 30% redundancy for error correction
-- Enable message reconstruction with up to 30% packet loss
-- Handle missing chunk detection and recovery
+
+The implementation uses **per-chunk** Reed-Solomon: each chunk carries 32
+parity bytes that can repair up to 16 byte-errors inside that chunk. This is
+bit-error protection, not cross-chunk erasure coding — a lost chunk still
+kills the message. True RS(k, n) erasure across chunks is documented as
+future work.
 
 #### 3.3 Packet Assembly and Verification
 ```python
