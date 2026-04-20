@@ -401,6 +401,21 @@ class TestLoadWithoutConfig:
         with pytest.raises(FileNotFoundError):
             cli.main(["identity", "show"])
 
+    def test_resolvers_list_without_config_exits_cleanly(self, config_home, capsys):
+        """`dmp resolvers list` on a fresh install (no config.yaml) must
+        not dump a FileNotFoundError traceback — it's a diagnostic
+        command, and a missing config is the expected "not yet set up"
+        state. Surface a friendly exit-1 via `_die` instead, matching
+        the pattern used by `dmp resolvers discover --save`.
+        """
+        # Don't init; config doesn't exist.
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["resolvers", "list"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        # The hint should mention `dmp init` so users know what to do.
+        assert "dmp init" in err
+
 
 class TestDnsResolvers:
     """`--dns-resolvers` multi-resolver pool wiring (M1.2)."""
