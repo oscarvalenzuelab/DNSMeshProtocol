@@ -7,6 +7,25 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added (onboarding + TLS)
+
+- `dmp.core.identity.IdentityRecord`: signed, binary-encoded DMP identity
+  record with `username`, `x25519_pk`, `ed25519_spk`, and `ts`. Signed
+  by the identity's Ed25519 key; fits a single 255-byte DNS TXT string.
+  Published at `id-{sha256(username)[:16]}.{domain}` so DNS labels
+  don't expose the plaintext username.
+- `dmp identity publish` — pushes the current identity record to the
+  node's store. Default TTL is 86400 s; override with `--ttl`.
+- `dmp identity fetch <username>` — resolves, verifies, and displays a
+  remote identity record. `--add` saves it as a local contact after
+  signature verification. `--domain` overrides the mesh domain. `--json`
+  machine-readable output.
+- `Caddyfile` + `docker-compose.prod.yml` — overlay that fronts the node
+  with Caddy, automatic Let's Encrypt, and HTTP/3. Drops the raw 8053
+  host port; Caddy handles TLS termination on 443. Activate with
+  `DMP_NODE_HOSTNAME=... docker compose -f docker-compose.yml -f
+  docker-compose.prod.yml up -d`.
+
 ### Added (ops hardening)
 
 - Deep `/health`: probes the store (`query_txt_record` on a sentinel name).

@@ -238,6 +238,70 @@ def cmd_identity_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_identity_publish(args: argparse.Namespace) -> int:
+    """Publish a signed identity record to DNS so contacts can resolve us."""
+    from dmp.core.identity import make_record, identity_domain
+
+    cfg = CLIConfig.load(_config_path())
+    passphrase = _load_passphrase(cfg)
+    client = _make_client(cfg, passphrase)
+    record = make_record(client.crypto, cfg.username)
+    wire = record.sign(client.crypto)
+    name = identity_domain(cfg.username, cfg.domain)
+    ok = client.writer.publish_txt_record(name, wire, ttl=args.ttl)
+    if not ok:
+        _die(2, "publish failed — see node logs")
+    print(f"published identity to {name}")
+    print(f"  others can resolve you with: dmp identity fetch {cfg.username}")
+    return 0
+
+
+def cmd_identity_fetch(args: argparse.Namespace) -> int:
+    """Resolve an identity record from DNS and optionally add it as a contact."""
+    from dmp.core.identity import IdentityRecord, identity_domain
+
+    cfg = CLIConfig.load(_config_path())
+    # Fetch is read-only — no passphrase needed. Build a minimal reader path
+    # without going through _make_client (which loads the identity key).
+    reader = _DnsReader(cfg.dns_host, cfg.dns_port)
+    name = identity_domain(args.username, args.domain or cfg.domain)
+    records = reader.query_txt_record(name)
+    if not records:
+        _die(2, f"no identity record at {name}")
+
+    identity = None
+    for record in records:
+        parsed = IdentityRecord.parse_and_verify(record)
+        if parsed is not None:
+            identity = parsed[0]
+            break
+    if identity is None:
+        _die(2, f"found TXT records at {name} but none verified as a DMP identity")
+
+    if args.json:
+        print(json.dumps({
+            "username": identity.username,
+            "public_key": identity.x25519_pk.hex(),
+            "signing_public_key": identity.ed25519_spk.hex(),
+            "ts": identity.ts,
+            "dns_name": name,
+        }, indent=2))
+    else:
+        print(f"username:           {identity.username}")
+        print(f"public_key:         {identity.x25519_pk.hex()}")
+        print(f"signing_public_key: {identity.ed25519_spk.hex()}")
+        print(f"published at:       {identity.ts}")
+
+    if args.add:
+        if identity.username in cfg.contacts:
+            print(f"(contact `{identity.username}` already exists — not overwriting)")
+        else:
+            cfg.contacts[identity.username] = identity.x25519_pk.hex()
+            cfg.save(_config_path())
+            print(f"added contact {identity.username}")
+    return 0
+
+
 def cmd_contacts_add(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
     if len(bytes.fromhex(args.pubkey)) != 32:
@@ -349,6 +413,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_id_show = sub_id.add_parser("show", help="print identity keys")
     p_id_show.add_argument("--json", action="store_true")
     p_id_show.set_defaults(func=cmd_identity_show)
+
+    p_id_pub = sub_id.add_parser(
+        "publish", help="publish a signed identity record to DNS"
+    )
+    p_id_pub.add_argument(
+        "--ttl", type=int, default=86400,
+        help="TXT record TTL in seconds (default: 86400 = 1 day)",
+    )
+    p_id_pub.set_defaults(func=cmd_identity_publish)
+
+    p_id_fetch = sub_id.add_parser(
+        "fetch", help="resolve someone's identity record from DNS"
+    )
+    p_id_fetch.add_argument("username")
+    p_id_fetch.add_argument(
+        "--domain",
+        help="override the mesh domain (defaults to our own)",
+    )
+    p_id_fetch.add_argument(
+        "--add", action="store_true",
+        help="save the resolved identity as a local contact",
+    )
+    p_id_fetch.add_argument("--json", action="store_true")
+    p_id_fetch.set_defaults(func=cmd_identity_fetch)
 
     # contacts
     p_c = sub.add_parser("contacts", help="manage contacts")
