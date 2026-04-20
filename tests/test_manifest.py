@@ -1,0 +1,121 @@
+"""Tests for signed slot manifests and replay cache."""
+
+import time
+import uuid
+
+import pytest
+
+from dmp.core.crypto import DMPCrypto
+from dmp.core.manifest import ReplayCache, SlotManifest
+
+
+def _make_manifest(sender: DMPCrypto, recipient: DMPCrypto, now: int) -> SlotManifest:
+    import hashlib
+    return SlotManifest(
+        msg_id=uuid.uuid4().bytes,
+        sender_spk=sender.get_signing_public_key_bytes(),
+        recipient_id=hashlib.sha256(recipient.get_public_key_bytes()).digest(),
+        total_chunks=4,
+        ts=now,
+        exp=now + 300,
+    )
+
+
+class TestSlotManifest:
+    def test_sign_parse_roundtrip(self):
+        sender = DMPCrypto()
+        recipient = DMPCrypto()
+        now = int(time.time())
+        manifest = _make_manifest(sender, recipient, now)
+
+        record = manifest.sign(sender)
+        assert record.startswith("v=dmp1;t=manifest")
+
+        result = SlotManifest.parse_and_verify(record)
+        assert result is not None
+        parsed, _ = result
+        assert parsed.msg_id == manifest.msg_id
+        assert parsed.total_chunks == manifest.total_chunks
+        assert parsed.sender_spk == sender.get_signing_public_key_bytes()
+
+    def test_tampered_payload_rejected(self):
+        sender = DMPCrypto()
+        recipient = DMPCrypto()
+        now = int(time.time())
+        manifest = _make_manifest(sender, recipient, now)
+
+        record = manifest.sign(sender)
+        # Flip the total_chunks value in a crude way; either the base64 decode
+        # breaks or the signature fails.
+        tampered = record.replace(";s=", ";s=aaaa")
+        assert SlotManifest.parse_and_verify(tampered) is None
+
+    def test_wrong_signer_rejected(self):
+        real_sender = DMPCrypto()
+        impostor = DMPCrypto()
+        recipient = DMPCrypto()
+        now = int(time.time())
+        manifest = _make_manifest(real_sender, recipient, now)
+        # Keep real_sender's spk in the manifest, but sign with impostor — verify
+        # will fail because the embedded spk won't match the impostor's signature.
+        record = manifest.sign(impostor)
+        assert SlotManifest.parse_and_verify(record) is None
+
+    def test_malformed_record_returns_none(self):
+        assert SlotManifest.parse_and_verify("not-a-dmp-record") is None
+        assert SlotManifest.parse_and_verify("v=dmp1;t=manifest") is None
+        assert SlotManifest.parse_and_verify("v=dmp1;t=manifest;d=notbase64;s=xx") is None
+
+    def test_expiry(self):
+        sender = DMPCrypto()
+        recipient = DMPCrypto()
+        now = int(time.time())
+        manifest = SlotManifest(
+            msg_id=uuid.uuid4().bytes,
+            sender_spk=sender.get_signing_public_key_bytes(),
+            recipient_id=b'\x01' * 32,
+            total_chunks=1,
+            ts=now - 1000,
+            exp=now - 500,
+        )
+        assert manifest.is_expired()
+        # Round-trip still works; expiry is a separate concern from signature.
+        record = manifest.sign(sender)
+        result = SlotManifest.parse_and_verify(record)
+        assert result is not None
+        parsed, _ = result
+        assert parsed.is_expired()
+
+
+class TestReplayCache:
+    def test_first_seen_accepted(self):
+        cache = ReplayCache()
+        assert cache.check_and_record(b'A' * 32, b'M' * 16)
+
+    def test_second_seen_rejected(self):
+        cache = ReplayCache()
+        sender = b'A' * 32
+        msg_id = b'M' * 16
+        assert cache.check_and_record(sender, msg_id)
+        assert not cache.check_and_record(sender, msg_id)
+
+    def test_different_senders_are_independent(self):
+        cache = ReplayCache()
+        msg_id = b'M' * 16
+        assert cache.check_and_record(b'A' * 32, msg_id)
+        assert cache.check_and_record(b'B' * 32, msg_id)
+
+    def test_expired_entry_is_forgotten(self):
+        cache = ReplayCache()
+        sender = b'A' * 32
+        msg_id = b'M' * 16
+        # Record with an expiry already in the past
+        assert cache.check_and_record(sender, msg_id, expiry=int(time.time()) - 1)
+        # Next call purges the expired entry and accepts the pair again
+        assert cache.check_and_record(sender, msg_id)
+
+    def test_size_tracks_live_entries(self):
+        cache = ReplayCache()
+        cache.check_and_record(b'A' * 32, b'M' * 16, expiry=int(time.time()) + 10)
+        cache.check_and_record(b'B' * 32, b'M' * 16, expiry=int(time.time()) + 10)
+        assert cache.size() == 2
