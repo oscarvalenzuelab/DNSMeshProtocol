@@ -34,7 +34,7 @@ import yaml
 
 from dmp.client.client import DMPClient
 from dmp.network.base import DNSRecordReader, DNSRecordWriter
-from dmp.network.resolver_pool import ResolverPool
+from dmp.network.resolver_pool import ResolverPool, WELL_KNOWN_RESOLVERS
 
 # ----------------------------- config ----------------------------------------
 
@@ -55,7 +55,9 @@ class CLIConfig:
     # ("8.8.8.8", "2001:4860:4860::8888") or `host:port` (IPv4) /
     # `[host]:port` (IPv6). When non-empty, the CLI builds a
     # `ResolverPool` over these and `dns_host` / `dns_port` are ignored
-    # for reads. An empty list preserves the legacy single-host behavior.
+    # for reads. Populated by `dmp init --dns-resolvers` or
+    # `dmp resolvers discover --save`. Empty list preserves the legacy
+    # single-host behavior.
     dns_resolvers: List[str] = field(default_factory=list)
     passphrase_file: Optional[str] = None  # alternative to DMP_PASSPHRASE
     # 32 random bytes generated at `dmp init`, stored as hex. Combined with
@@ -95,6 +97,10 @@ class CLIConfig:
                     "spk": value.get("spk", ""),
                 }
         raw_resolvers = data.get("dns_resolvers", []) or []
+        # Be generous in what we accept: a single-string config (legacy
+        # typo) shouldn't crash the loader.
+        if isinstance(raw_resolvers, str):
+            raw_resolvers = [raw_resolvers]
         dns_resolvers: List[str] = [str(r) for r in raw_resolvers]
         return cls(
             username=data.get("username", ""),
@@ -723,6 +729,63 @@ def cmd_recv(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resolvers_discover(args: argparse.Namespace) -> int:
+    """Probe WELL_KNOWN_RESOLVERS and print (or save) the working subset.
+
+    Without `--save`, this is a read-only diagnostic — useful on a
+    captive network to sanity-check which upstreams are reachable
+    before committing to them. With `--save`, the working list is
+    written to config as `dns_resolvers`; a subsequent `dmp resolvers
+    list` (and, once M1.2 lands, the normal client read path) will
+    pick it up.
+
+    If every candidate fails, `ResolverPool.discover` raises
+    ValueError. We surface that as exit code 2 (network/backend
+    error) rather than creating a useless empty pool.
+    """
+    try:
+        pool = ResolverPool.discover(WELL_KNOWN_RESOLVERS, timeout=args.timeout)
+    except ValueError as exc:
+        _die(2, f"resolver discovery failed: {exc}")
+
+    working = [snap["host"] for snap in pool.snapshot()]
+    print(f"discovered {len(working)} working resolver(s):")
+    for host in working:
+        print(f"  {host}")
+
+    if args.save:
+        # `dmp init` may not have run yet on a fresh machine; in that
+        # case there's no config to update and the user should init
+        # first. If the config does exist, we just set the new field
+        # (creating it if absent) and persist.
+        path = _config_path()
+        if not path.exists():
+            _die(
+                1,
+                f"no config at {path} — run `dmp init <username>` before "
+                f"`dmp resolvers discover --save`",
+            )
+        cfg = CLIConfig.load(path)
+        cfg.dns_resolvers = working
+        cfg.save(path)
+        print(f"saved {len(working)} resolvers to {path}")
+    return 0
+
+
+def cmd_resolvers_list(args: argparse.Namespace) -> int:
+    """Print the currently configured `dns_resolvers` list."""
+    cfg = CLIConfig.load(_config_path())
+    if not cfg.dns_resolvers:
+        print(
+            "(no dns_resolvers configured — run `dmp resolvers discover "
+            "--save` to populate)"
+        )
+        return 0
+    for host in cfg.dns_resolvers:
+        print(host)
+    return 0
+
+
 def cmd_node(args: argparse.Namespace) -> int:
     """Convenience: launch a dmp-node in the foreground."""
     from dmp.server.node import DMPNode, DMPNodeConfig
@@ -862,6 +925,30 @@ def build_parser() -> argparse.ArgumentParser:
     # recv
     p_r = sub.add_parser("recv", help="poll for new messages")
     p_r.set_defaults(func=cmd_recv)
+
+    # resolvers (discover / list public upstream DNS resolvers)
+    p_rv = sub.add_parser("resolvers", help="manage upstream DNS resolvers")
+    sub_rv = p_rv.add_subparsers(dest="sub", required=True)
+    p_rv_discover = sub_rv.add_parser(
+        "discover",
+        help="probe well-known public resolvers and print the working set",
+    )
+    p_rv_discover.add_argument(
+        "--save",
+        action="store_true",
+        help="persist the working resolvers to config as dns_resolvers",
+    )
+    p_rv_discover.add_argument(
+        "--timeout",
+        type=float,
+        default=2.0,
+        help="per-resolver probe timeout in seconds (default: 2.0)",
+    )
+    p_rv_discover.set_defaults(func=cmd_resolvers_discover)
+    p_rv_list = sub_rv.add_parser(
+        "list", help="print the currently configured dns_resolvers"
+    )
+    p_rv_list.set_defaults(func=cmd_resolvers_list)
 
     # node (convenience launcher)
     p_n = sub.add_parser("node", help="run a dmp node in the foreground")
