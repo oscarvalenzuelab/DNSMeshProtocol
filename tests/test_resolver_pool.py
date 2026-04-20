@@ -375,18 +375,31 @@ class TestResolverPoolHealth:
         snap = {s["host"]: s for s in pool.snapshot()}
         assert snap["1.1.1.1"]["consecutive_failures"] == 0
 
-    def test_bad_resolver_is_skipped_during_cooldown(self):
-        """Once cooldown is active, the bad host is not re-queried."""
-        down_call_count = {"n": 0}
+    def test_bad_resolver_is_deprioritized_during_cooldown(self):
+        """A cooled-down host is still reachable, but only after preferred hosts.
+
+        Cooldown is a priority signal, not a hard ban: we never want a
+        single host's cooldown to blackhole lookups, so a cooled-down
+        resolver stays in the iteration — it just moves to the
+        fallback tier behind every preferred (not-cooled-down) host.
+
+        Here the primary always fails and the secondary always answers.
+        After the primary enters cooldown, subsequent queries must be
+        served by the secondary *first* (preferred tier), and the
+        primary must never be reached on those queries because the
+        secondary already satisfied the request.
+        """
+        call_log = []
 
         def always_fail(n, t):
-            down_call_count["n"] += 1
+            call_log.append("1.1.1.1")
             raise dns.exception.Timeout()
 
-        routes = {
-            "1.1.1.1": always_fail,
-            "9.9.9.9": lambda n, t: _answer("ok"),
-        }
+        def always_ok(n, t):
+            call_log.append("9.9.9.9")
+            return _answer("ok")
+
+        routes = {"1.1.1.1": always_fail, "9.9.9.9": always_ok}
         with patch.object(
             dns.resolver.Resolver, "resolve", autospec=True
         ) as mock_resolve:
@@ -398,14 +411,176 @@ class TestResolverPoolHealth:
             )
             # First query: primary fails (1 call), secondary wins.
             assert pool.query_txt_record("x") == ["ok"]
-            # Second query within cooldown: primary must NOT be retried.
+            # Second query within cooldown: secondary is preferred-tier
+            # and answers first, so the primary is never reached.
+            assert pool.query_txt_record("x") == ["ok"]
+            # Third query: same story.
             assert pool.query_txt_record("x") == ["ok"]
 
-        assert (
-            down_call_count["n"] == 1
-        ), "primary should be skipped during cooldown, not re-queried"
+        # Primary was only ever called once — the initial failure.
+        # On subsequent queries the preferred-tier secondary answered
+        # before the fallback tier was consulted.
+        assert call_log.count("1.1.1.1") == 1, (
+            "primary should be deprioritized after cooldown, only reached "
+            "if the preferred tier is exhausted"
+        )
+        assert call_log.count("9.9.9.9") == 3
         assert "9.9.9.9" in pool.healthy_hosts()
         assert "1.1.1.1" not in pool.healthy_hosts()
+
+    def test_all_resolvers_cooled_down_still_tries_them(self):
+        """If every preferred host is in cooldown, fall back to them.
+
+        A transient failure across all resolvers must not blackhole
+        lookups for the full cooldown window. When one of the
+        cooled-down hosts recovers, the next query should succeed via
+        the fallback tier and promote that host back to the preferred
+        tier.
+        """
+        primary_behavior = {"1.1.1.1": "fail", "9.9.9.9": "fail"}
+
+        def route(n, t):
+            # Dispatch through the actual caller's nameserver — set
+            # up below with autospec so `self` is the Resolver.
+            raise AssertionError  # pragma: no cover (replaced per-call)
+
+        def make_handler(host):
+            def handler(n, t):
+                mode = primary_behavior[host]
+                if mode == "fail":
+                    raise dns.exception.Timeout()
+                return _answer(f"from-{host}")
+
+            return handler
+
+        routes = {
+            "1.1.1.1": make_handler("1.1.1.1"),
+            "9.9.9.9": make_handler("9.9.9.9"),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(
+                ["1.1.1.1", "9.9.9.9"],
+                cooldown_seconds=60.0,
+                failure_threshold=1,
+            )
+            # First query: both fail, both enter cooldown, None returned.
+            assert pool.query_txt_record("x") is None
+            assert pool.healthy_hosts() == []
+
+            # Now 9.9.9.9 recovers — before the cooldown elapses. The
+            # old behavior would have returned None without sending any
+            # query. New behavior: the fallback tier is consulted and
+            # the lookup succeeds.
+            primary_behavior["9.9.9.9"] = "ok"
+            assert pool.query_txt_record("x") == ["from-9.9.9.9"]
+
+        # The successful call reset 9.9.9.9's failure counter and
+        # promoted it back to the preferred tier.
+        snap = {s["host"]: s for s in pool.snapshot()}
+        assert snap["9.9.9.9"]["consecutive_failures"] == 0
+        assert "9.9.9.9" in pool.healthy_hosts()
+
+    def test_single_resolver_pool_never_blackholes(self):
+        """A single-host pool must not blackhole lookups during cooldown.
+
+        With only one resolver, the preferred tier is empty the moment
+        it enters cooldown. The fallback tier (that same resolver) is
+        the only way to ever get an answer before the cooldown elapses,
+        and the pool must still try it rather than returning None
+        unconditionally.
+        """
+        call_log = []
+        behavior = {"mode": "fail"}
+
+        def handler(n, t):
+            call_log.append("1.1.1.1")
+            if behavior["mode"] == "fail":
+                raise dns.exception.Timeout()
+            return _answer("ok")
+
+        routes = {"1.1.1.1": handler}
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(
+                ["1.1.1.1"],
+                cooldown_seconds=60.0,
+                failure_threshold=1,
+            )
+            # First query: the resolver fails, enters cooldown.
+            assert pool.query_txt_record("x") is None
+            assert pool.healthy_hosts() == []
+            assert len(call_log) == 1
+
+            # Resolver recovers. Next query must still reach it even
+            # though it's in cooldown (single-host pool).
+            behavior["mode"] = "ok"
+            assert pool.query_txt_record("x") == ["ok"]
+            assert len(call_log) == 2
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        assert snap["1.1.1.1"]["consecutive_failures"] == 0
+        assert "1.1.1.1" in pool.healthy_hosts()
+
+    def test_fallback_tier_ordered_by_least_recent_failure(self):
+        """Among cooled-down hosts, the oldest failure is tried first.
+
+        Rationale: the resolver whose failure is farthest in the past
+        has had the most time to recover, so it's the most promising
+        candidate in the fallback tier. We freeze `last_failure_ts`
+        values via the internal state so the test is deterministic.
+        """
+        call_log = []
+
+        def make_handler(host, response):
+            def handler(n, t):
+                call_log.append(host)
+                if response == "timeout":
+                    raise dns.exception.Timeout()
+                return _answer(response)
+
+            return handler
+
+        routes = {
+            "1.1.1.1": make_handler("1.1.1.1", "timeout"),
+            "2.2.2.2": make_handler("2.2.2.2", "from-2.2.2.2"),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(
+                ["1.1.1.1", "2.2.2.2"],
+                cooldown_seconds=60.0,
+                failure_threshold=1,
+            )
+
+            # Manually construct the scenario: both hosts in cooldown,
+            # but 2.2.2.2 has the OLDER failure timestamp. Higher
+            # priority in the configured order (1.1.1.1 first) must
+            # NOT dictate fallback order — "least recent failure" wins.
+            now = __import__("time").monotonic()
+            for state in pool._states:
+                state.consecutive_failures = 1  # trips threshold
+            # 1.1.1.1 failed recently (t = now - 1s); 2.2.2.2 long ago
+            # (t = now - 30s). Both still in cooldown (< 60s).
+            states_by_host = {s.host: s for s in pool._states}
+            states_by_host["1.1.1.1"].last_failure_ts = now - 1.0
+            states_by_host["2.2.2.2"].last_failure_ts = now - 30.0
+
+            # Preferred tier is empty; fallback tier should visit
+            # 2.2.2.2 first (older failure) and succeed, never
+            # reaching 1.1.1.1.
+            assert pool.query_txt_record("x") == ["from-2.2.2.2"]
+
+        assert call_log == ["2.2.2.2"], (
+            f"expected only the older-failure resolver to be called, "
+            f"got {call_log!r}"
+        )
 
     def test_cooldown_expiration_promotes_resolver_back(self):
         """After cooldown elapses, a previously-bad resolver is tried again.
