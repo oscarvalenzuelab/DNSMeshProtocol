@@ -82,9 +82,21 @@ class ResolverPool(DNSRecordReader):
         "bad" and put into cooldown. `1` means fail-fast.
     """
 
-    _TRANSPORT_ERRORS = (
+    # Name-not-found answers describe the *queried name*, not the
+    # resolver's health. A resolver that authoritatively replies "no
+    # such record" is behaving correctly; we should try the next
+    # upstream (another resolver might have a fresher view, or the
+    # record may live in a zone only some resolvers see) but we must
+    # NOT demote it — otherwise a single cache miss (e.g. a lookup for
+    # an absent mailbox) poisons the pool.
+    _NAME_NOT_FOUND_ERRORS = (
         dns.resolver.NXDOMAIN,
         dns.resolver.NoAnswer,
+    )
+
+    # Transport-level faults: the resolver is unreachable, slow, or
+    # otherwise misbehaving. These DO count against its health.
+    _TRANSPORT_ERRORS = (
         dns.resolver.NoNameservers,
         dns.exception.Timeout,
         dns.exception.DNSException,
@@ -134,6 +146,12 @@ class ResolverPool(DNSRecordReader):
         for state in self._iter_eligible():
             try:
                 answers = state.resolver.resolve(name, "TXT")
+            except self._NAME_NOT_FOUND_ERRORS:
+                # The resolver answered, just with "no such name /
+                # no such record." That's a normal query outcome, not
+                # a resolver fault — try the next upstream but leave
+                # this one's health untouched.
+                continue
             except self._TRANSPORT_ERRORS:
                 self._mark_failure(state)
                 continue
