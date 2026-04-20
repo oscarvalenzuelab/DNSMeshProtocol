@@ -25,6 +25,8 @@ wire total                                                          =  240 chars
 from __future__ import annotations
 
 import base64
+import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
@@ -138,13 +140,64 @@ class ReplayCache:
     been successfully decoded, so a transient DNS miss during chunk fetch
     doesn't permanently blacklist a valid manifest.
 
-    In-memory only. Entries are purged when their stored expiry passes, so
-    the cache stays bounded under normal traffic. Process restarts forget
-    the seen set — an attacker who catches a restart can replay.
+    Optionally persists to disk at `persist_path`. Each `record()` rewrites
+    the file atomically (write to `<path>.tmp`, rename into place) so a
+    crash mid-write leaves either the old or the new state, never a torn
+    file. If `persist_path` is None the cache is purely in-memory and
+    resets on process restart.
+
+    Format: JSON array of `[sender_spk_hex, msg_id_hex, expiry_unix]`.
+    Expired entries are dropped on load, on every query, and on every record.
     """
 
     default_ttl: int = 3600
+    persist_path: Optional[str] = None
     _seen: Dict[Tuple[bytes, bytes], int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.persist_path:
+            self._load()
+
+    # ---- persistence -------------------------------------------------------
+
+    def _load(self) -> None:
+        if not self.persist_path:
+            return
+        try:
+            with open(self.persist_path, "r") as f:
+                raw = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        if not isinstance(raw, list):
+            return
+        now = int(time.time())
+        loaded: Dict[Tuple[bytes, bytes], int] = {}
+        for entry in raw:
+            try:
+                spk_hex, mid_hex, exp = entry
+                exp = int(exp)
+                if exp <= now:
+                    continue
+                loaded[(bytes.fromhex(spk_hex), bytes.fromhex(mid_hex))] = exp
+            except (ValueError, TypeError):
+                continue
+        self._seen = loaded
+
+    def _save(self) -> None:
+        if not self.persist_path:
+            return
+        data = [
+            [spk.hex(), mid.hex(), exp]
+            for (spk, mid), exp in self._seen.items()
+        ]
+        tmp = self.persist_path + ".tmp"
+        parent = os.path.dirname(self.persist_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, self.persist_path)
+
+    # ---- public API --------------------------------------------------------
 
     def has_seen(self, sender_spk: bytes, msg_id: bytes) -> bool:
         self._purge()
@@ -161,6 +214,7 @@ class ReplayCache:
         self._seen[key] = (
             expiry if expiry is not None else int(time.time()) + self.default_ttl
         )
+        self._save()
 
     def check_and_record(
         self,
@@ -183,8 +237,11 @@ class ReplayCache:
     def _purge(self) -> None:
         now = int(time.time())
         expired = [k for k, exp in self._seen.items() if now > exp]
+        if not expired:
+            return
         for k in expired:
             self._seen.pop(k, None)
+        self._save()
 
     def size(self) -> int:
         self._purge()

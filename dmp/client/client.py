@@ -70,6 +70,7 @@ class DMPClient:
         store: Optional[DNSRecordStore] = None,
         writer: Optional[DNSRecordWriter] = None,
         reader: Optional[DNSRecordReader] = None,
+        replay_cache_path: Optional[str] = None,
     ):
         if store is not None:
             if writer is None:
@@ -92,7 +93,7 @@ class DMPClient:
         self.chunker = MessageChunker(enable_error_correction=True)
         self.assembler = MessageAssembler(enable_error_correction=True)
         self.encryption = MessageEncryption(self.crypto)
-        self.replay_cache = ReplayCache()
+        self.replay_cache = ReplayCache(persist_path=replay_cache_path)
 
         self.contacts: Dict[str, Contact] = {}
 

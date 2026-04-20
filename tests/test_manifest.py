@@ -127,3 +127,61 @@ class TestReplayCache:
         cache.check_and_record(b'A' * 32, b'M' * 16, expiry=int(time.time()) + 10)
         cache.check_and_record(b'B' * 32, b'M' * 16, expiry=int(time.time()) + 10)
         assert cache.size() == 2
+
+
+class TestReplayCachePersistence:
+    def test_record_persists_across_instances(self, tmp_path):
+        path = str(tmp_path / "replay.json")
+        c1 = ReplayCache(persist_path=path)
+        c1.record(b'A' * 32, b'M' * 16, expiry=int(time.time()) + 300)
+
+        c2 = ReplayCache(persist_path=path)
+        assert c2.has_seen(b'A' * 32, b'M' * 16)
+
+    def test_expired_entries_dropped_on_load(self, tmp_path):
+        path = str(tmp_path / "replay.json")
+        c1 = ReplayCache(persist_path=path)
+        c1.record(b'A' * 32, b'M' * 16, expiry=int(time.time()) - 1)
+
+        c2 = ReplayCache(persist_path=path)
+        assert not c2.has_seen(b'A' * 32, b'M' * 16)
+        assert c2.size() == 0
+
+    def test_corrupt_persistence_file_ignored(self, tmp_path):
+        path = tmp_path / "replay.json"
+        path.write_text("not json")
+        cache = ReplayCache(persist_path=str(path))
+        # Corrupt file doesn't crash — cache just starts empty and overwrites.
+        assert cache.size() == 0
+        cache.record(b'A' * 32, b'M' * 16, expiry=int(time.time()) + 300)
+
+        # Next load reads the fresh file written on that record().
+        c2 = ReplayCache(persist_path=str(path))
+        assert c2.has_seen(b'A' * 32, b'M' * 16)
+
+    def test_missing_persistence_file_starts_empty(self, tmp_path):
+        path = str(tmp_path / "does-not-exist.json")
+        cache = ReplayCache(persist_path=path)
+        assert cache.size() == 0
+
+    def test_atomic_write_no_torn_file(self, tmp_path):
+        # The implementation writes to <path>.tmp and renames. We can at least
+        # verify the tmp file doesn't leak after successful writes.
+        path = tmp_path / "replay.json"
+        cache = ReplayCache(persist_path=str(path))
+        cache.record(b'A' * 32, b'M' * 16, expiry=int(time.time()) + 300)
+        assert path.exists()
+        assert not (tmp_path / "replay.json.tmp").exists()
+
+    def test_purge_rewrites_persistence(self, tmp_path):
+        path = str(tmp_path / "replay.json")
+        cache = ReplayCache(persist_path=path)
+        cache.record(b'A' * 32, b'M' * 16, expiry=int(time.time()) - 1)
+        cache.record(b'B' * 32, b'M' * 16, expiry=int(time.time()) + 300)
+
+        # Trigger a purge via a read-side call.
+        cache.has_seen(b'A' * 32, b'M' * 16)
+
+        c2 = ReplayCache(persist_path=path)
+        assert not c2.has_seen(b'A' * 32, b'M' * 16)
+        assert c2.has_seen(b'B' * 32, b'M' * 16)
