@@ -140,10 +140,18 @@ CREATE TABLE IF NOT EXISTS prekeys (
     private_key BLOB NOT NULL,
     public_key BLOB NOT NULL,
     exp INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    wire_record TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_prekeys_exp ON prekeys(exp);
 """
+
+# For upgrading existing databases that predate wire_record. Sqlite ignores
+# the ALTER if the column already exists? No — sqlite raises "duplicate
+# column name". Guard with a check on columns.
+_WIRE_RECORD_COLUMN_MIGRATION = (
+    "ALTER TABLE prekeys ADD COLUMN wire_record TEXT DEFAULT ''"
+)
 
 
 class PrekeyStore:
@@ -169,6 +177,15 @@ class PrekeyStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        # Migrate older databases that lacked wire_record. Needed so a
+        # client upgraded in place can still delete its published prekeys
+        # on consume — without this, the published record rots in DNS.
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(prekeys)").fetchall()
+        }
+        if "wire_record" not in cols:
+            self._conn.execute(_WIRE_RECORD_COLUMN_MIGRATION)
         try:
             os.chmod(db_path, 0o600)
         except OSError:
@@ -196,6 +213,9 @@ class PrekeyStore:
         Returns the (Prekey, X25519PrivateKey) list so the caller can
         immediately sign and publish the public side. The prekey_id is a
         32-bit random value; collisions with existing rows are retried.
+        Callers should then call `record_wire(prekey_id, wire)` with the
+        signed TXT record bytes so `consume()` can also DELETE the
+        published record from DNS.
         """
         now = int(time.time())
         exp = now + ttl_seconds
@@ -232,6 +252,30 @@ class PrekeyStore:
                 )
                 out.append((Prekey(prekey_id=pid, public_key=pk_bytes, exp=exp), sk))
         return out
+
+    def record_wire(self, prekey_id: int, wire_record: str) -> None:
+        """Remember the signed TXT record bytes we published for this prekey.
+
+        `consume()` uses it to DELETE the prekey from DNS so senders don't
+        keep picking consumed entries. Callers should do this right after
+        a successful publish.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE prekeys SET wire_record = ? WHERE prekey_id = ?",
+                (wire_record, prekey_id),
+            )
+
+    def get_wire(self, prekey_id: int) -> Optional[str]:
+        """Return the stored wire-record string for `prekey_id`, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT wire_record FROM prekeys WHERE prekey_id = ?",
+                (prekey_id,),
+            ).fetchone()
+        if row is None or not row[0]:
+            return None
+        return str(row[0])
 
     # ---- lookup + consumption ---------------------------------------------
 

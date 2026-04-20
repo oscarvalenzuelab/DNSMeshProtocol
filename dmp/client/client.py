@@ -252,6 +252,11 @@ class DMPClient:
         prekey *records* in DNS stay until they expire; previous prekey
         *private keys* in the local store stay until cleanup_expired runs.
         Returns the number successfully published.
+
+        Records the exact wire bytes of each published prekey in the local
+        PrekeyStore so `consume_prekey` can DELETE the matching published
+        record from DNS — otherwise the consumed (now undecryptable)
+        prekey_pub would keep attracting senders until its TTL expired.
         """
         pool = self.prekey_store.generate_pool(count=count, ttl_seconds=ttl_seconds)
         name = prekey_rrset_name(self.username, self.domain)
@@ -259,8 +264,30 @@ class DMPClient:
         for prekey, _sk in pool:
             wire = prekey.sign(self.crypto)
             if self.writer.publish_txt_record(name, wire, ttl=ttl_seconds):
+                self.prekey_store.record_wire(prekey.prekey_id, wire)
                 published += 1
         return published
+
+    def _consume_prekey(self, prekey_id: int) -> None:
+        """Delete a prekey both locally and in DNS.
+
+        The local sqlite row carries the sk (FS secret) and the wire-record
+        string we published. We DELETE the wire record from the node so
+        later senders won't pick a prekey whose sk is already gone, then
+        drop the sqlite row. Best-effort on the DNS side — if the DELETE
+        fails we log nothing and still wipe the local sk; the published
+        prekey will just rot until its TTL elapses (old behavior).
+        """
+        wire = self.prekey_store.get_wire(prekey_id)
+        if wire:
+            try:
+                self.writer.delete_txt_record(
+                    prekey_rrset_name(self.username, self.domain),
+                    value=wire,
+                )
+            except Exception:
+                pass
+        self.prekey_store.consume(prekey_id)
 
     # ---- send --------------------------------------------------------------
 
@@ -312,7 +339,12 @@ class DMPClient:
 
         # Encrypt once, with AAD bound to a canonical header subset that excludes
         # total_chunks (unknown until after chunking). Everything else that
-        # matters — sender_id, recipient_id, msg_id, timestamp, ttl — is bound.
+        # matters — sender_id, recipient_id, msg_id, timestamp, ttl, and the
+        # chosen prekey_id — is bound. Including prekey_id here is
+        # defense-in-depth: the ECDH key mismatch already breaks decryption
+        # if the sender lies about which prekey they used, but binding it
+        # into AAD makes the mismatch surface cleanly as an AEAD tag
+        # failure rather than as an opaque "shared secret disagreed".
         aad_header = DMPHeader(
             version=header.version,
             message_type=header.message_type,
@@ -324,7 +356,7 @@ class DMPClient:
             timestamp=header.timestamp,
             ttl=header.ttl,
         )
-        aad_bytes = aad_header.to_bytes()
+        aad_bytes = aad_header.to_bytes() + prekey_id.to_bytes(4, "big")
         encrypted = self.encryption.encrypt_with_header(
             message.encode("utf-8"),
             recipient_pubkey,
@@ -514,7 +546,9 @@ class DMPClient:
         if outer.header.is_expired():
             return None
 
-        # Rebuild the same AAD the sender bound at encrypt time.
+        # Rebuild the same AAD the sender bound at encrypt time. Includes
+        # manifest.prekey_id so a sender who encrypts with one prekey but
+        # claims another in the manifest fails AEAD verification.
         aad_header = DMPHeader(
             version=outer.header.version,
             message_type=outer.header.message_type,
@@ -526,6 +560,7 @@ class DMPClient:
             timestamp=outer.header.timestamp,
             ttl=outer.header.ttl,
         )
+        aad_bytes = aad_header.to_bytes() + manifest.prekey_id.to_bytes(4, "big")
         # Prekey-based ECDH path for forward secrecy. When manifest.prekey_id
         # is nonzero, look up the matching one-time X25519 private key in the
         # local store and use it for decrypt instead of our long-term key.
@@ -540,13 +575,15 @@ class DMPClient:
                 return None
         try:
             plaintext = self.encryption.decrypt_with_header(
-                encrypted, aad_header.to_bytes(), private_key=prekey_private
+                encrypted, aad_bytes, private_key=prekey_private
             )
         except Exception:
             return None
         if manifest.prekey_id != NO_PREKEY:
-            # One-time use: delete the sk now so future compromise can't
-            # decrypt the stored ciphertext. Best effort — a crash between
-            # decrypt and consume leaves the row on disk.
-            self.prekey_store.consume(manifest.prekey_id)
+            # One-time use: delete the sk locally AND the matching public
+            # record from DNS so future senders don't pick a prekey whose
+            # sk is gone. Best effort — a crash between decrypt and consume
+            # leaves the sk on disk; a DELETE failure leaves the prekey_pub
+            # rotting until its TTL.
+            self._consume_prekey(manifest.prekey_id)
         return plaintext, outer.header.timestamp, outer.header.message_id

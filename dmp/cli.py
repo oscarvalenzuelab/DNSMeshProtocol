@@ -478,9 +478,15 @@ def cmd_contacts_add(args: argparse.Namespace) -> int:
         print(f"added contact {args.name} (pinned signing key)")
     else:
         print(
-            f"added contact {args.name} (WARNING: no signing key pinned — "
-            f"incoming messages from this contact will fall back to "
-            f"trust-on-first-use until you re-add with --signing-key)"
+            f"added contact {args.name}\n"
+            f"  WARNING: no Ed25519 signing key pinned. Until at least one\n"
+            f"  contact has a pinned signing key, `dmp recv` runs in\n"
+            f"  trust-on-first-use mode — any signature-valid manifest\n"
+            f"  addressed to you will be delivered, including from senders\n"
+            f"  you never added. Re-run with --signing-key <64-hex>, or\n"
+            f"  bootstrap via `dmp identity fetch <user> --add` which\n"
+            f"  pins both keys.",
+            file=sys.stderr,
         )
     return 0
 
@@ -609,8 +615,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="generate and publish a fresh pool of one-time X3DH prekeys",
     )
     p_id_pk.add_argument(
-        "--count", type=int, default=50,
-        help="number of prekeys to generate (default 50)",
+        "--count", type=int, default=25,
+        help="number of prekeys to generate (default 25 — stays under a "
+             "default node HTTP burst so the full pool publishes in one shot)",
     )
     p_id_pk.add_argument(
         "--ttl", type=int, default=86400,

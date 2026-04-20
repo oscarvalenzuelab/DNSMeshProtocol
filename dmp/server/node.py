@@ -72,12 +72,20 @@ class DMPNodeConfig:
     http_host: str = "0.0.0.0"
     http_port: int = 8053
     http_token: Optional[str] = None
-    http_rate: float = 5.0
-    http_burst: float = 20.0
+    # Bursts are sized for legitimate bulk publishes: a fresh
+    # `dmp identity refresh-prekeys --count 50` + a manifest and half a
+    # dozen chunks lands under the burst, while a sustained flood is
+    # still throttled to http_rate per second.
+    http_rate: float = 10.0
+    http_burst: float = 100.0
     # Resource caps on publish — see http_api.DEFAULT_MAX_*.
     max_ttl: int = DEFAULT_MAX_TTL
     max_value_bytes: int = DEFAULT_MAX_VALUE_BYTES
     max_values_per_name: int = DEFAULT_MAX_VALUES_PER_NAME
+    # Per-server concurrency ceilings. Above these caps the server drops
+    # new connections/packets rather than spawning unbounded threads.
+    http_max_concurrency: int = 64
+    dns_max_concurrency: int = 128
     cleanup_interval: float = 60.0
     log_level: str = "INFO"
     log_format: str = "text"   # "text" or "json"
@@ -102,6 +110,12 @@ class DMPNodeConfig:
             ),
             max_values_per_name=int(
                 os.environ.get("DMP_MAX_VALUES_PER_NAME", cls.max_values_per_name)
+            ),
+            http_max_concurrency=int(
+                os.environ.get("DMP_HTTP_MAX_CONCURRENCY", cls.http_max_concurrency)
+            ),
+            dns_max_concurrency=int(
+                os.environ.get("DMP_DNS_MAX_CONCURRENCY", cls.dns_max_concurrency)
             ),
             cleanup_interval=float(
                 os.environ.get("DMP_CLEANUP_INTERVAL", cls.cleanup_interval)
@@ -149,6 +163,7 @@ class DMPNode:
                 rate_per_second=self.config.dns_rate,
                 burst=self.config.dns_burst,
             ),
+            max_concurrency=self.config.dns_max_concurrency,
         )
         self.http = DMPHttpApi(
             self.store,
@@ -158,6 +173,7 @@ class DMPNode:
             max_ttl=self.config.max_ttl,
             max_value_bytes=self.config.max_value_bytes,
             max_values_per_name=self.config.max_values_per_name,
+            max_concurrency=self.config.http_max_concurrency,
             rate_limit=RateLimit(
                 rate_per_second=self.config.http_rate,
                 burst=self.config.http_burst,
