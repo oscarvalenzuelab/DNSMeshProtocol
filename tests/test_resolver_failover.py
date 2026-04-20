@@ -6,105 +6,32 @@ fans TXT queries across them. One stub serves real DMP records; the
 other returns NXDOMAIN for every query (simulating censorship, split-
 horizon staleness, or a lying recursive resolver).
 
-Port handling note
-------------------
-`ResolverPool.__init__` accepts a single `port` shared across all
-upstreams — see TASKS.md M1.5 (per-host ports) in the backlog. Our two
-stubs need distinct ephemeral UDP ports, so we can't drive a real
-`ResolverPool` directly without resolving that limitation.
-
-Options considered:
-  (a) Bind the two stubs to 127.0.0.1 and 127.0.0.2 on the same port.
-      Works on darwin but not portable; CI Linux containers often don't
-      have 127.0.0.2 configured.
-  (b) Monkey-patch `dns.resolver.Resolver` per-instance to carry a
-      per-host port. Fragile — couples the test to dnspython internals.
-  (c) Define a thin test-only subclass of `ResolverPool` that accepts
-      per-host ports. Explicitly permitted by the M1.4 task brief:
-      "a minimal test-only subclass of ResolverPool that accepts
-      per-host ports is acceptable inside tests/test_resolver_failover.py."
-
-We pick (c): `_PerHostPortResolverPool` below. It is strictly additive
-— it reuses the base class's health model, iteration logic, NXDOMAIN
-oracle, and cooldown semantics unchanged. Only the construction of
-each underlying `dns.resolver.Resolver` is specialized to carry a
-per-host port.
+Port handling
+-------------
+`ResolverPool.__init__` accepts `hosts=[("ip", port), ...]` for per-host
+ports (M1.5). We pass the stubs' ephemeral ports straight through; no
+test-only subclass required.
 """
 
 from __future__ import annotations
 
-import ipaddress
 import socket
 import threading
 import time
-from typing import List, Sequence, Tuple
 
 import dns.flags
 import dns.message
 import dns.rcode
-import dns.resolver
 import pytest
 
 from dmp.client.client import DMPClient
 from dmp.network.memory import InMemoryDNSStore
-from dmp.network.resolver_pool import ResolverPool, _HostState
+from dmp.network.resolver_pool import ResolverPool
 from dmp.server.dns_server import DMPDnsServer
 
 # ---------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------
-
-
-class _PerHostPortResolverPool(ResolverPool):
-    """Test-only ResolverPool that accepts `(host, port)` pairs.
-
-    The production `ResolverPool` shares a single port across all
-    upstreams (M1.5 backlog). For integration tests we need two stubs
-    on distinct ephemeral UDP ports, so we specialize the per-host
-    `dns.resolver.Resolver` construction to carry the port alongside
-    its host.
-
-    Everything else — health bookkeeping, iteration order, oracle
-    demotion, cooldown, snapshot(), healthy_hosts() — is inherited
-    untouched. This keeps the test honest: we're exercising the real
-    failover state machine, not a reimplementation.
-    """
-
-    def __init__(
-        self,
-        hosts_with_ports: Sequence[Tuple[str, int]],
-        *,
-        timeout: float = 5.0,
-        lifetime: float = 10.0,
-        cooldown_seconds: float = 60.0,
-        failure_threshold: int = 1,
-    ) -> None:
-        if not hosts_with_ports:
-            raise ValueError("requires at least one host")
-        if failure_threshold < 1:
-            raise ValueError("failure_threshold must be >= 1")
-
-        for host, _port in hosts_with_ports:
-            # Mirror the parent's IP-literal guard so misuse in tests
-            # fails fast with the same message shape.
-            ipaddress.ip_address(host)
-
-        # We intentionally do NOT call super().__init__: it would build
-        # resolvers using its single-port assumption. Instead we set
-        # up the same attributes directly with per-host ports.
-        self._port = hosts_with_ports[0][1]  # cosmetic; unused by us
-        self._cooldown_seconds = cooldown_seconds
-        self._failure_threshold = failure_threshold
-        self._lock = threading.Lock()
-
-        self._states: List[_HostState] = []
-        for host, port in hosts_with_ports:
-            resolver = dns.resolver.Resolver(configure=False)
-            resolver.nameservers = [host]
-            resolver.port = port
-            resolver.timeout = timeout
-            resolver.lifetime = lifetime
-            self._states.append(_HostState(host=host, resolver=resolver))
 
 
 class _NxdomainServer:
@@ -238,10 +165,8 @@ class TestResolverFailoverAcceptance:
         """
         shared_store.publish_txt_record("hello.mesh.test", "v=dmp1;t=chunk")
 
-        good = _PerHostPortResolverPool([("127.0.0.1", good_stub.port)])
-        bad = _PerHostPortResolverPool(
-            [("127.0.0.1", bad_stub.port)], failure_threshold=1
-        )
+        good = ResolverPool([("127.0.0.1", good_stub.port)])
+        bad = ResolverPool([("127.0.0.1", bad_stub.port)], failure_threshold=1)
 
         # Good stub serves what we published.
         assert good.query_txt_record("hello.mesh.test") == ["v=dmp1;t=chunk"]
@@ -261,7 +186,7 @@ class TestResolverFailoverAcceptance:
         delivery down."
         """
         # Bad resolver in the preferred slot; good resolver behind it.
-        pool = _PerHostPortResolverPool(
+        pool = ResolverPool(
             [
                 ("127.0.0.1", bad_stub.port),
                 ("127.0.0.1", good_stub.port),
@@ -312,7 +237,7 @@ class TestResolverFailoverAcceptance:
         """
         shared_store.publish_txt_record("named.mesh.test", "v=dmp1;t=chunk;d=a")
 
-        pool = _PerHostPortResolverPool(
+        pool = ResolverPool(
             [
                 ("127.0.0.1", bad_stub.port),
                 ("127.0.0.1", good_stub.port),
@@ -364,7 +289,7 @@ class TestResolverFailoverTiming:
         """
         shared_store.publish_txt_record("timing.mesh.test", "v=dmp1;t=chunk;d=b")
 
-        pool = _PerHostPortResolverPool(
+        pool = ResolverPool(
             [
                 ("127.0.0.1", bad_stub.port),
                 ("127.0.0.1", good_stub.port),
@@ -403,7 +328,7 @@ class TestResolverFailoverTiming:
         blackhole — it resolves promptly to None so the caller can
         surface "not found."
         """
-        pool = _PerHostPortResolverPool(
+        pool = ResolverPool(
             [("127.0.0.1", bad_stub.port)],
             failure_threshold=1,
             cooldown_seconds=60.0,
@@ -427,7 +352,7 @@ class TestResolverFailoverTiming:
         """
         shared_store.publish_txt_record("primary.mesh.test", "v=dmp1;t=chunk;d=c")
 
-        pool = _PerHostPortResolverPool(
+        pool = ResolverPool(
             [
                 ("127.0.0.1", good_stub.port),
                 ("127.0.0.1", bad_stub.port),
@@ -458,7 +383,7 @@ class TestResolverFailoverOracle:
         second_bad = _NxdomainServer(host="127.0.0.1", port=0)
         second_bad.start()
         try:
-            pool = _PerHostPortResolverPool(
+            pool = ResolverPool(
                 [
                     ("127.0.0.1", bad_stub.port),
                     ("127.0.0.1", second_bad.port),
@@ -490,7 +415,7 @@ class TestResolverFailoverOracle:
         """
         shared_store.publish_txt_record("oracle.mesh.test", "v=dmp1;t=chunk;d=d")
 
-        pool = _PerHostPortResolverPool(
+        pool = ResolverPool(
             [
                 ("127.0.0.1", bad_stub.port),
                 ("127.0.0.1", good_stub.port),
