@@ -57,7 +57,11 @@ class CLIConfig:
     # attacker who captures the public identity has to do a per-user
     # offline brute force rather than a single rainbow table.
     kdf_salt: str = ""
-    contacts: Dict[str, str] = field(default_factory=dict)
+    # Each contact is {"pub": <x25519 hex>, "spk": <ed25519 hex or "">}.
+    # `spk` may be empty for contacts added before Ed25519 pinning landed
+    # (and for the `contacts add` shortcut that doesn't require a signing
+    # key). Pinned `spk` is what gates incoming manifests from that sender.
+    contacts: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "CLIConfig":
@@ -66,6 +70,17 @@ class CLIConfig:
                 f"no config at {path} — run `dmp init <username>` first"
             )
         data = yaml.safe_load(path.read_text()) or {}
+        raw_contacts = data.get("contacts", {}) or {}
+        contacts: Dict[str, Dict[str, str]] = {}
+        for name, value in raw_contacts.items():
+            if isinstance(value, str):
+                # Legacy format: username -> pubkey_hex.
+                contacts[name] = {"pub": value, "spk": ""}
+            elif isinstance(value, dict):
+                contacts[name] = {
+                    "pub": value.get("pub", ""),
+                    "spk": value.get("spk", ""),
+                }
         return cls(
             username=data.get("username", ""),
             domain=data.get("domain", "mesh.local"),
@@ -75,7 +90,7 @@ class CLIConfig:
             dns_port=int(data.get("dns_port", 5353)),
             passphrase_file=data.get("passphrase_file"),
             kdf_salt=data.get("kdf_salt", ""),
-            contacts=dict(data.get("contacts", {})),
+            contacts=contacts,
         )
 
     def save(self, path: Path) -> None:
@@ -186,8 +201,13 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
         replay_cache_path=replay_path,
         kdf_salt=kdf_salt,
     )
-    for name, pubkey in config.contacts.items():
-        client.add_contact(name, pubkey, domain=config.domain)
+    for name, entry in config.contacts.items():
+        client.add_contact(
+            name,
+            entry.get("pub", ""),
+            domain=config.domain,
+            signing_key_hex=entry.get("spk", ""),
+        )
     return client
 
 
@@ -258,6 +278,7 @@ def cmd_identity_publish(args: argparse.Namespace) -> int:
 
 def cmd_identity_fetch(args: argparse.Namespace) -> int:
     """Resolve an identity record from DNS and optionally add it as a contact."""
+    import hashlib
     from dmp.core.identity import IdentityRecord, identity_domain
 
     cfg = CLIConfig.load(_config_path())
@@ -269,14 +290,57 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
     if not records:
         _die(2, f"no identity record at {name}")
 
-    identity = None
+    # Append-semantics mailbox means the identity domain can hold multiple
+    # valid records. If we just take the first verifying one we hand the
+    # squatter a win. Collect ALL valid records and force the user to choose
+    # via out-of-band fingerprint comparison when there's more than one.
+    valid: list[IdentityRecord] = []
     for record in records:
         parsed = IdentityRecord.parse_and_verify(record)
         if parsed is not None:
-            identity = parsed[0]
-            break
-    if identity is None:
+            valid.append(parsed[0])
+    if not valid:
         _die(2, f"found TXT records at {name} but none verified as a DMP identity")
+
+    def _fingerprint(rec: IdentityRecord) -> str:
+        # 16-char hex fingerprint over (x25519_pk || ed25519_spk).
+        raw = rec.x25519_pk + rec.ed25519_spk
+        return hashlib.sha256(raw).hexdigest()[:16]
+
+    identity: IdentityRecord
+    if len(valid) == 1:
+        identity = valid[0]
+    else:
+        # Multiple valid records at one name — someone is squatting, or a
+        # legitimate rotation never cleaned up the old one. Refuse to
+        # auto-pick. The user has to compare fingerprints out-of-band and
+        # re-run with --accept-fingerprint=<16-hex>.
+        want = getattr(args, "accept_fingerprint", None)
+        match = None
+        if want:
+            for rec in valid:
+                if _fingerprint(rec) == want.lower():
+                    match = rec
+                    break
+        if match is None:
+            print(
+                f"ambiguous: {len(valid)} valid identity records at {name}",
+                file=sys.stderr,
+            )
+            for rec in valid:
+                print(
+                    f"  fingerprint={_fingerprint(rec)}  "
+                    f"x25519={rec.x25519_pk.hex()[:16]}...  "
+                    f"ed25519={rec.ed25519_spk.hex()[:16]}...  "
+                    f"ts={rec.ts}",
+                    file=sys.stderr,
+                )
+            print(
+                "verify out-of-band and rerun with --accept-fingerprint=<16-hex>",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        identity = match
 
     if args.json:
         print(json.dumps({
@@ -296,30 +360,57 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         if identity.username in cfg.contacts:
             print(f"(contact `{identity.username}` already exists — not overwriting)")
         else:
-            cfg.contacts[identity.username] = identity.x25519_pk.hex()
+            cfg.contacts[identity.username] = {
+                "pub": identity.x25519_pk.hex(),
+                "spk": identity.ed25519_spk.hex(),
+            }
             cfg.save(_config_path())
-            print(f"added contact {identity.username}")
+            print(f"added contact {identity.username} (pinned signing key)")
     return 0
 
 
 def cmd_contacts_add(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
-    if len(bytes.fromhex(args.pubkey)) != 32:
+    try:
+        if len(bytes.fromhex(args.pubkey)) != 32:
+            raise ValueError
+    except ValueError:
         _die(1, "public key must be 32 bytes (64 hex characters)")
-    cfg.contacts[args.name] = args.pubkey.lower()
+
+    spk_hex = ""
+    if args.signing_key:
+        try:
+            if len(bytes.fromhex(args.signing_key)) != 32:
+                raise ValueError
+        except ValueError:
+            _die(1, "signing key must be 32 bytes (64 hex characters)")
+        spk_hex = args.signing_key.lower()
+
+    cfg.contacts[args.name] = {
+        "pub": args.pubkey.lower(),
+        "spk": spk_hex,
+    }
     cfg.save(_config_path())
-    print(f"added contact {args.name}")
+    if spk_hex:
+        print(f"added contact {args.name} (pinned signing key)")
+    else:
+        print(
+            f"added contact {args.name} (WARNING: no signing key pinned — "
+            f"incoming messages from this contact will fall back to "
+            f"trust-on-first-use until you re-add with --signing-key)"
+        )
     return 0
 
 
 def cmd_contacts_list(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
     if not cfg.contacts:
-        print("(no contacts yet — `dmp contacts add <name> <pubkey_hex>`)")
+        print("(no contacts yet — `dmp contacts add <name> <pubkey_hex>` or `dmp identity fetch <user> --add`)")
         return 0
     width = max(len(n) for n in cfg.contacts)
-    for name, pubkey in sorted(cfg.contacts.items()):
-        print(f"{name:<{width}}  {pubkey}")
+    for name, entry in sorted(cfg.contacts.items()):
+        pin = "pinned" if entry.get("spk") else "UNPINNED"
+        print(f"{name:<{width}}  {entry.get('pub', '')}  ({pin})")
     return 0
 
 
@@ -435,6 +526,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--add", action="store_true",
         help="save the resolved identity as a local contact",
     )
+    p_id_fetch.add_argument(
+        "--accept-fingerprint",
+        dest="accept_fingerprint",
+        default=None,
+        help="when multiple identity records exist at this name, require "
+             "this 16-hex fingerprint to disambiguate (verify out-of-band first)",
+    )
     p_id_fetch.add_argument("--json", action="store_true")
     p_id_fetch.set_defaults(func=cmd_identity_fetch)
 
@@ -444,6 +542,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_c_add = sub_c.add_parser("add", help="add a contact")
     p_c_add.add_argument("name")
     p_c_add.add_argument("pubkey", help="recipient's X25519 pubkey (64 hex chars)")
+    p_c_add.add_argument(
+        "--signing-key",
+        default="",
+        help="recipient's Ed25519 signing pubkey (64 hex) — pins identity; "
+             "without this, incoming manifests from this contact fall back "
+             "to TOFU",
+    )
     p_c_add.set_defaults(func=cmd_contacts_add)
     p_c_list = sub_c.add_parser("list", help="list contacts")
     p_c_list.set_defaults(func=cmd_contacts_list)

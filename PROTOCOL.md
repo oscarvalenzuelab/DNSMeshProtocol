@@ -1,5 +1,19 @@
 # DNS Mesh Protocol Technical Overview
 
+> **Status note (2026-04-20):** This document describes the *aspirational*
+> DMP design — a multi-node mesh with peer discovery, resolver pools, store
+> relays, and 3× redundancy. The current implementation is considerably
+> smaller: one client, one node, one sqlite store, one UDP DNS server.
+>
+> For what's actually shipping, read:
+>
+> - `README.md` — current architecture and quick start
+> - `SECURITY.md` — threat model and honest list of limits
+> - `CHANGELOG.md` — what each tagged version actually does
+>
+> Anything here that isn't reflected in those three files is future work,
+> not current behavior. Treat this file as design intent.
+
 ## Core Concept
 
 The DNS Mesh Protocol enables peer to peer messaging by encoding encrypted messages as DNS queries and responses. Since DNS traffic operates on port 53 and is fundamental to internet operation, it typically bypasses firewalls and content filters. The protocol transforms any DNS resolver into a message relay node, creating a globally distributed, censorship resistant communication network.
@@ -14,9 +28,9 @@ Bob's client continuously polls DNS for messages addressed to him by querying hi
 
 ### Encryption Architecture
 
-Every message uses ephemeral key pairs for forward secrecy. The sender generates a temporary key pair for each message and performs an ECDH key exchange with the recipient's public key. This produces a shared secret used to derive encryption keys via HKDF. The actual message encryption uses ChaCha20 for confidentiality and Poly1305 for authentication, creating an authenticated encrypted payload that only the intended recipient can decrypt.
+Every message uses an ephemeral sender keypair. The sender generates a temporary X25519 keypair per message and performs ECDH with the recipient's long-term X25519 public key. This produces a shared secret used to derive encryption keys via HKDF. The message is then encrypted with ChaCha20-Poly1305 AEAD.
 
-The protocol embeds the ephemeral public key with the encrypted message, allowing the recipient to complete their side of the key exchange. Even if an attacker compromises a user's long term private key, they cannot decrypt past messages because the ephemeral keys are discarded after use.
+The per-message ephemeral sender key means two messages to the same recipient don't share a session key, which prevents trivial key-material correlation. It does NOT provide forward secrecy against recipient key compromise: anyone who later obtains the recipient's long-term X25519 private key can decrypt recorded historical ciphertexts. Real forward secrecy would require the recipient to publish ephemeral prekeys (Signal-style) or a ratchet, which this protocol does not currently implement.
 
 ### DNS Encoding Strategy
 

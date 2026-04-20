@@ -42,6 +42,14 @@ _NAME_PATH_RE = re.compile(r"^/v1/records/(?P<name>[^/]+)/?$")
 # Cap request body size to catch obviously-abusive clients before JSON parsing.
 MAX_BODY_BYTES = 16 * 1024
 
+# Default resource caps. Each is adjustable per-node via DMPHttpApi kwargs
+# (and DMP_MAX_* env vars in DMPNode). Defaults chosen so a single writer
+# can't silently bloat the sqlite store through one legitimate-looking
+# series of publishes.
+DEFAULT_MAX_TTL = 86_400          # 1 day
+DEFAULT_MAX_VALUE_BYTES = 2_048   # ~8× a single 255-byte TXT string
+DEFAULT_MAX_VALUES_PER_NAME = 64  # per-RRset cardinality cap on publish
+
 
 class _DMPHttpHandler(BaseHTTPRequestHandler):
     # HTTPServer sets server attribute; we attach store + token there.
@@ -175,7 +183,39 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         if not isinstance(value, str) or not isinstance(ttl, int) or ttl <= 0:
             self._send_json(400, {"error": "value (str) and ttl (int > 0) required"})
             return 400
+
+        # Resource caps — enforced before touching the store so a single
+        # malicious request can't silently burn disk.
+        max_ttl = self.server.max_ttl
+        if ttl > max_ttl:
+            self._send_json(
+                400,
+                {"error": f"ttl exceeds cap of {max_ttl}s"},
+            )
+            return 400
+        max_value = self.server.max_value_bytes
+        if len(value.encode("utf-8")) > max_value:
+            self._send_json(
+                400,
+                {"error": f"value exceeds cap of {max_value} bytes"},
+            )
+            return 400
+
         name = self._match_name()
+
+        # Per-RRset cardinality cap. Count *existing* distinct values at
+        # this name; reject only when we'd add a new one past the cap.
+        max_rrset = self.server.max_values_per_name
+        if max_rrset > 0:
+            reader = self._reader()
+            existing = reader.query_txt_record(name) if reader else None
+            if existing is not None and len(existing) >= max_rrset and value not in existing:
+                self._send_json(
+                    413,
+                    {"error": f"RRset at {name} already holds {max_rrset} values"},
+                )
+                return 413
+
         ok = writer.publish_txt_record(name, value, ttl=ttl)
         status = 201 if ok else 502
         self._send_json(status, {"ok": ok})
@@ -249,11 +289,24 @@ class _DMPHttpServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, handler, store, bearer_token, rate_limiter):
+    def __init__(
+        self,
+        addr,
+        handler,
+        store,
+        bearer_token,
+        rate_limiter,
+        max_ttl,
+        max_value_bytes,
+        max_values_per_name,
+    ):
         super().__init__(addr, handler)
         self.store = store
         self.bearer_token = bearer_token
         self.rate_limiter = rate_limiter
+        self.max_ttl = max_ttl
+        self.max_value_bytes = max_value_bytes
+        self.max_values_per_name = max_values_per_name
 
 
 class DMPHttpApi:
@@ -267,6 +320,9 @@ class DMPHttpApi:
         port: int = 8053,
         bearer_token: Optional[str] = None,
         rate_limit: Optional[RateLimit] = None,
+        max_ttl: int = DEFAULT_MAX_TTL,
+        max_value_bytes: int = DEFAULT_MAX_VALUE_BYTES,
+        max_values_per_name: int = DEFAULT_MAX_VALUES_PER_NAME,
     ):
         self.store = store
         self.host = host
@@ -275,6 +331,9 @@ class DMPHttpApi:
         self.rate_limiter = (
             TokenBucketLimiter(rate_limit) if rate_limit and rate_limit.enabled else None
         )
+        self.max_ttl = int(max_ttl)
+        self.max_value_bytes = int(max_value_bytes)
+        self.max_values_per_name = int(max_values_per_name)
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -293,6 +352,9 @@ class DMPHttpApi:
             self.store,
             self.bearer_token,
             self.rate_limiter,
+            self.max_ttl,
+            self.max_value_bytes,
+            self.max_values_per_name,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
