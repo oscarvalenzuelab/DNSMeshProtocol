@@ -9,6 +9,28 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added (M1 — resolver resilience, partial)
 
+- `ResolverPool.discover(candidates, timeout=2.0)` classmethod: probes
+  each candidate with a cheap TXT query (defaults to `google.com`) and
+  returns a new `ResolverPool` containing only the candidates that
+  answered within `timeout`. Non-literal entries (hostnames, typos) are
+  skipped with a logged warning instead of aborting the whole batch.
+  Raises `ValueError` if zero candidates pass — empty pools are
+  deliberately prohibited because every future query would silently
+  fail, and callers are better served by a clear failure at the
+  discovery boundary. Addresses ROADMAP milestone M1.3.
+- `dmp.network.WELL_KNOWN_RESOLVERS`: module-level tuple of eight IPv4
+  public resolvers across four operators (Google, Cloudflare, Quad9,
+  OpenDNS). Operator diversity is the point — a single provider outage
+  or blocklist doesn't take the pool down.
+- `dmp resolvers discover [--save] [--timeout S]` CLI subcommand: runs
+  `ResolverPool.discover(WELL_KNOWN_RESOLVERS)` and prints the working
+  list. With `--save`, writes the result to config as `dns_resolvers`
+  (creating the field if absent, so the command works even before
+  M1.2's `--dns-resolvers` init flag lands).
+- `dmp resolvers list`: prints the currently configured `dns_resolvers`.
+- `CLIConfig.dns_resolvers`: optional list field on the config, default
+  empty. Written by `dmp resolvers discover --save`; will be consumed
+  by M1.2's multi-resolver `_make_client` wiring when that lands.
 - `dmp.network.resolver_pool.ResolverPool`: a `DNSRecordReader` that wraps
   multiple upstream resolvers (IP literals only) with per-host health
   tracking and priority-ordered failover. Addresses ROADMAP milestone

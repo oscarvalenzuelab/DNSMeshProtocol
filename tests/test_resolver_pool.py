@@ -1,5 +1,7 @@
 """Tests for ResolverPool — priority ordering, failover, cooldown."""
 
+import ipaddress
+import logging
 import socket
 from unittest.mock import patch
 
@@ -8,7 +10,7 @@ import dns.name
 import dns.resolver
 import pytest
 
-from dmp.network import DNSRecordReader, ResolverPool
+from dmp.network import DNSRecordReader, ResolverPool, WELL_KNOWN_RESOLVERS
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -874,3 +876,183 @@ class TestOracleDemotion:
         assert "1.1.1.1" not in healthy
         assert "2.2.2.2" not in healthy
         assert "9.9.9.9" in healthy
+
+
+# ---------------------------------------------------------------------
+# Discovery (classmethod) + WELL_KNOWN_RESOLVERS constant.
+# ---------------------------------------------------------------------
+
+
+class TestWellKnownResolvers:
+    def test_has_at_least_four_entries(self):
+        """Operator diversity requires ≥4 entries (Google, Cloudflare,
+        Quad9, OpenDNS at minimum) so a single provider's outage doesn't
+        take the whole pool down."""
+        assert len(WELL_KNOWN_RESOLVERS) >= 4
+
+    def test_all_entries_are_ipv4_literals(self):
+        """IPv4 only: a silently-unreachable v6 literal on a v4-only
+        network would burn discovery budget without paying back."""
+        for host in WELL_KNOWN_RESOLVERS:
+            addr = ipaddress.ip_address(host)
+            assert isinstance(addr, ipaddress.IPv4Address), f"{host!r} is not IPv4"
+
+    def test_includes_major_providers(self):
+        """The four-operator balance is a contract, not an accident."""
+        hosts = set(WELL_KNOWN_RESOLVERS)
+        assert "8.8.8.8" in hosts  # Google
+        assert "1.1.1.1" in hosts  # Cloudflare
+        assert "9.9.9.9" in hosts  # Quad9
+        assert "208.67.222.222" in hosts  # OpenDNS
+
+
+class TestResolverPoolDiscover:
+    def test_keeps_only_successful_candidates(self):
+        """A candidate that answers is in, one that times out is out."""
+
+        def router(self, name, rdtype="A", *args, **kwargs):
+            host = self.nameservers[0]
+            if host == "1.1.1.1":
+                return _answer("ok")
+            if host == "9.9.9.9":
+                raise dns.exception.Timeout()
+            raise AssertionError(f"unexpected host {host!r}")
+
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True, side_effect=router
+        ):
+            pool = ResolverPool.discover(["1.1.1.1", "9.9.9.9"], timeout=0.5)
+
+        hosts = [s["host"] for s in pool.snapshot()]
+        assert hosts == ["1.1.1.1"]
+
+    def test_preserves_candidate_order(self):
+        """Successful candidates retain the caller's insertion order.
+
+        Priority in a ResolverPool is insertion order — discovery is
+        usually called with a list the caller implicitly ordered by
+        preference, so shuffling would silently change failover
+        behavior downstream.
+        """
+
+        def router(self, name, rdtype="A", *args, **kwargs):
+            # Everybody but 9.9.9.9 answers.
+            host = self.nameservers[0]
+            if host == "9.9.9.9":
+                raise dns.exception.Timeout()
+            return _answer("ok")
+
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True, side_effect=router
+        ):
+            pool = ResolverPool.discover(["8.8.8.8", "9.9.9.9", "1.1.1.1"], timeout=0.5)
+
+        assert [s["host"] for s in pool.snapshot()] == ["8.8.8.8", "1.1.1.1"]
+
+    def test_deduplicates_candidates(self):
+        """Duplicate candidates are probed (and kept) once."""
+        call_count = {"1.1.1.1": 0}
+
+        def router(self, name, rdtype="A", *args, **kwargs):
+            host = self.nameservers[0]
+            call_count[host] = call_count.get(host, 0) + 1
+            return _answer("ok")
+
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True, side_effect=router
+        ):
+            pool = ResolverPool.discover(["1.1.1.1", "1.1.1.1", "1.1.1.1"], timeout=0.5)
+
+        assert [s["host"] for s in pool.snapshot()] == ["1.1.1.1"]
+        assert call_count["1.1.1.1"] == 1
+
+    def test_all_timeouts_raise_value_error(self):
+        """Every candidate times out: discover raises rather than
+        building an empty pool that would fail every future query.
+
+        Empty-pool-prohibited is the design choice — a pool with zero
+        hosts is indistinguishable at construction from one with a
+        valid list, but every query would return None, so callers
+        would much rather see the failure at the discovery boundary.
+        """
+
+        def router(self, name, rdtype="A", *args, **kwargs):
+            raise dns.exception.Timeout()
+
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True, side_effect=router
+        ):
+            with pytest.raises(ValueError, match="no candidates answered"):
+                ResolverPool.discover(["1.1.1.1", "9.9.9.9"], timeout=0.1)
+
+    def test_non_ip_entries_are_filtered_with_warning(self, caplog):
+        """Hostnames / typos are skipped with a log warning, not rejected."""
+
+        def router(self, name, rdtype="A", *args, **kwargs):
+            return _answer("ok")
+
+        with caplog.at_level(logging.WARNING, logger="dmp.network.resolver_pool"):
+            with patch.object(
+                dns.resolver.Resolver,
+                "resolve",
+                autospec=True,
+                side_effect=router,
+            ):
+                pool = ResolverPool.discover(
+                    ["1.1.1.1", "dns.google", "not-an-ip", "9.9.9.9"],
+                    timeout=0.5,
+                )
+
+        # Only the valid IP literals made it into the pool.
+        assert [s["host"] for s in pool.snapshot()] == ["1.1.1.1", "9.9.9.9"]
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        # One warning per skipped non-literal.
+        assert any("dns.google" in msg for msg in warnings), warnings
+        assert any("not-an-ip" in msg for msg in warnings), warnings
+
+    def test_only_non_ip_entries_raises_value_error(self):
+        """No valid IP literals at all -> same empty-pool prohibition."""
+        with pytest.raises(ValueError, match="no candidates answered"):
+            ResolverPool.discover(["dns.google", "example.com"], timeout=0.1)
+
+    def test_nxdomain_probe_counts_as_responding(self):
+        """A resolver that authoritatively says "no record" is still
+        reachable and behaving — keep it in the pool.
+
+        The probe name is meant to be universally resolvable, but a
+        resolver returning NXDOMAIN for it is a weird case (split
+        horizon, lying resolver), and the oracle-demotion logic in the
+        normal query path will handle that later. Discovery only cares
+        about reachability.
+        """
+
+        def router(self, name, rdtype="A", *args, **kwargs):
+            host = self.nameservers[0]
+            if host == "1.1.1.1":
+                raise dns.resolver.NXDOMAIN()
+            raise AssertionError(f"unexpected {host!r}")
+
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True, side_effect=router
+        ):
+            pool = ResolverPool.discover(["1.1.1.1"], timeout=0.5)
+
+        assert [s["host"] for s in pool.snapshot()] == ["1.1.1.1"]
+
+    def test_returns_working_resolverpool_instance(self):
+        """Successful discovery returns a fully wired ResolverPool."""
+
+        def router(self, name, rdtype="A", *args, **kwargs):
+            return _answer("ok")
+
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True, side_effect=router
+        ):
+            pool = ResolverPool.discover(["1.1.1.1", "9.9.9.9"], timeout=0.5)
+
+        assert isinstance(pool, ResolverPool)
+        assert isinstance(pool, DNSRecordReader)
+        assert pool.healthy_hosts() == ["1.1.1.1", "9.9.9.9"]
