@@ -1,7 +1,8 @@
 # DNS Mesh Protocol
 
-**A censorship-resistant messaging protocol that rides on DNS — the one
-internet service almost nothing blocks.**
+**End-to-end encrypted messaging with no central server, no app store, no
+gatekeeper — delivered over DNS, on the relays and infrastructure the
+internet already runs on.**
 
 📖 **Full documentation → https://oscarvalenzuelab.github.io/DNSMeshProtocol/**
 
