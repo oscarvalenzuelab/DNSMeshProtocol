@@ -128,4 +128,4 @@ your source changes.
 
 ## Author
 
-Oscar Valenzuela B · oscar.valenzuela.b@gmail.com
+Oscar Valenzuela · AlkamoD
