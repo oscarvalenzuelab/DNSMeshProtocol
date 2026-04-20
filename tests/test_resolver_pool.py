@@ -112,6 +112,70 @@ class TestResolverPoolQuery:
 
         assert result == ["from-secondary"]
 
+    def test_nxdomain_does_not_demote_resolver(self):
+        """NXDOMAIN describes the name, not the resolver's health.
+
+        A lookup for a name that genuinely doesn't exist must leave
+        the primary resolver's health counters untouched — otherwise
+        a single absent-mailbox query would poison the pool and
+        divert every subsequent lookup to the secondary (or, with a
+        one-host pool, return None until cooldown_seconds expired).
+        """
+        routes = {
+            "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+            "9.9.9.9": lambda n, t: (_ for _ in ()).throw(dns.resolver.NXDOMAIN()),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], failure_threshold=1)
+            # All resolvers agree the name doesn't exist -> None.
+            assert pool.query_txt_record("absent.example.com") is None
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        assert snap["1.1.1.1"]["consecutive_failures"] == 0
+        assert snap["9.9.9.9"]["consecutive_failures"] == 0
+        # Both resolvers remain healthy after a legitimate NXDOMAIN.
+        assert pool.healthy_hosts() == ["1.1.1.1", "9.9.9.9"]
+
+    def test_noanswer_does_not_demote_resolver(self):
+        """NoAnswer (RRset empty) is a normal DNS outcome, not a fault."""
+        routes = {
+            "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.resolver.NoAnswer()),
+            "9.9.9.9": lambda n, t: (_ for _ in ()).throw(dns.resolver.NoAnswer()),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], failure_threshold=1)
+            assert pool.query_txt_record("x.example.com") is None
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        assert snap["1.1.1.1"]["consecutive_failures"] == 0
+        assert snap["9.9.9.9"]["consecutive_failures"] == 0
+        assert pool.healthy_hosts() == ["1.1.1.1", "9.9.9.9"]
+
+    def test_timeout_does_demote_resolver(self):
+        """A Timeout IS a resolver fault and must increment failures."""
+        routes = {
+            "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.exception.Timeout()),
+            "9.9.9.9": lambda n, t: _answer("ok"),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], failure_threshold=1)
+            assert pool.query_txt_record("x.example.com") == ["ok"]
+
+        snap = {s["host"]: s for s in pool.snapshot()}
+        assert snap["1.1.1.1"]["consecutive_failures"] == 1
+        # Primary exceeded its failure_threshold and is now in cooldown.
+        assert "1.1.1.1" not in pool.healthy_hosts()
+        assert "9.9.9.9" in pool.healthy_hosts()
+
     def test_primary_noanswer_fails_over(self):
         routes = {
             "1.1.1.1": lambda n, t: (_ for _ in ()).throw(dns.resolver.NoAnswer()),
@@ -163,7 +227,9 @@ class TestResolverPoolQuery:
             pool = ResolverPool(["1.1.1.1", "9.9.9.9"])
             assert pool.query_txt_record("x.example.com") == ["ok"]
 
-    def test_all_resolvers_down_returns_none(self):
+    def test_all_resolvers_nxdomain_returns_none(self):
+        """When every resolver authoritatively says "no such name," return None."""
+
         def boom(n, t):
             raise dns.resolver.NXDOMAIN()
 
@@ -174,6 +240,25 @@ class TestResolverPoolQuery:
             mock_resolve.side_effect = _route_by_nameserver(routes)
             pool = ResolverPool(["1.1.1.1", "9.9.9.9", "8.8.8.8"])
             assert pool.query_txt_record("x.example.com") is None
+
+    def test_all_resolvers_timeout_returns_none(self):
+        """When every resolver is unreachable, return None (and demote them)."""
+
+        def boom(n, t):
+            raise dns.exception.Timeout()
+
+        routes = {"1.1.1.1": boom, "9.9.9.9": boom, "8.8.8.8": boom}
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9", "8.8.8.8"], failure_threshold=1)
+            assert pool.query_txt_record("x.example.com") is None
+
+        # Every resolver recorded one transport failure.
+        for snap in pool.snapshot():
+            assert snap["consecutive_failures"] == 1
+        assert pool.healthy_hosts() == []
 
     def test_multi_string_rdata_is_concatenated(self):
         """DNS allows multiple strings per TXT rdata; we join them."""
@@ -226,7 +311,7 @@ class TestResolverPoolHealth:
 
         def always_fail(n, t):
             down_call_count["n"] += 1
-            raise dns.resolver.NXDOMAIN()
+            raise dns.exception.Timeout()
 
         routes = {
             "1.1.1.1": always_fail,
@@ -263,7 +348,7 @@ class TestResolverPoolHealth:
         def primary_behavior(n, t):
             primary_calls["n"] += 1
             if primary_calls["n"] == 1:
-                raise dns.resolver.NXDOMAIN()
+                raise dns.exception.Timeout()
             return _answer("primary-back")
 
         routes = {
