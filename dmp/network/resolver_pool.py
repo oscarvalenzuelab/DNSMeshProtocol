@@ -51,7 +51,12 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
+
+# One entry in the `hosts=` argument to `ResolverPool`. Either a bare IP
+# literal (inherits the pool-wide `port=` default) or an (ip, port) tuple
+# that carries its own port. See `__init__` docstring for examples.
+HostSpec = Union[str, Tuple[str, int]]
 
 import dns.exception
 import dns.resolver
@@ -114,13 +119,30 @@ class ResolverPool(DNSRecordReader):
     Parameters
     ----------
     hosts:
-        List of resolver IP literals (v4 or v6) to query, in priority
-        order. Hostnames are NOT accepted — resolving them at startup
-        would reintroduce the DNS-ordering problem the pool exists to
-        solve. An empty list is rejected, as is any entry that is not
-        a valid IP literal.
+        List of resolver upstreams in priority order. Each entry is
+        either a bare IP literal (v4 or v6) that inherits the pool-wide
+        ``port=`` default, or an ``(ip, port)`` tuple that carries its
+        own port. The two shapes mix freely so callers can override the
+        port for only some upstreams::
+
+            # back-compat: all share the same port
+            ResolverPool(["8.8.8.8", "1.1.1.1"])                       # port=53
+            ResolverPool(["8.8.8.8", "1.1.1.1"], port=5353)
+
+            # per-host ports
+            ResolverPool([("8.8.8.8", 53), ("1.1.1.1", 5353)])
+
+            # mixed: bare entry inherits the `port=` default
+            ResolverPool(["8.8.8.8", ("1.1.1.1", 5353)], port=5300)
+            # -> 8.8.8.8 uses 5300, 1.1.1.1 uses 5353
+
+        Hostnames are NOT accepted (bare or inside a tuple) — resolving
+        them at startup would reintroduce the DNS-ordering problem the
+        pool exists to solve. An empty list is rejected, as is any
+        entry that is not a valid IP literal.
     port:
-        UDP/TCP port for every upstream. Defaults to 53.
+        UDP/TCP port used for any bare-host entry in ``hosts``. Tuple
+        entries override this per-upstream. Defaults to 53.
     timeout:
         Per-query socket timeout forwarded to `dns.resolver.Resolver`.
     lifetime:
@@ -166,7 +188,7 @@ class ResolverPool(DNSRecordReader):
 
     def __init__(
         self,
-        hosts: List[str],
+        hosts: Sequence[HostSpec],
         port: int = 53,
         timeout: float = 5.0,
         lifetime: float = 10.0,
@@ -178,19 +200,18 @@ class ResolverPool(DNSRecordReader):
         if failure_threshold < 1:
             raise ValueError("failure_threshold must be >= 1")
 
-        # `dns.resolver.Resolver.nameservers` accepts IP literals only.
-        # Reject hostnames at construction time with a clear message
-        # rather than failing later inside dnspython — and rather than
-        # resolving them via the system stub, which would reintroduce
-        # the DNS-ordering problem this pool exists to solve.
-        for host in hosts:
-            try:
-                ipaddress.ip_address(host)
-            except ValueError as exc:
-                raise ValueError(
-                    f"ResolverPool host {host!r} is not a valid IPv4 or "
-                    f"IPv6 literal; hostnames are not accepted"
-                ) from exc
+        # Normalize every entry to `(ip, port)`. Bare strings inherit the
+        # pool-wide `port=` default; tuples override it per-upstream.
+        # `dns.resolver.Resolver.nameservers` accepts IP literals only,
+        # so we reject hostnames at construction time (bare OR inside a
+        # tuple) with a clear message rather than failing later inside
+        # dnspython — and rather than resolving them via the system
+        # stub, which would reintroduce the DNS-ordering problem this
+        # pool exists to solve.
+        normalized: List[Tuple[str, int]] = []
+        for entry in hosts:
+            host, host_port = self._normalize_entry(entry, port)
+            normalized.append((host, host_port))
 
         self._port = port
         self._cooldown_seconds = cooldown_seconds
@@ -198,13 +219,64 @@ class ResolverPool(DNSRecordReader):
         self._lock = threading.Lock()
 
         self._states: List[_HostState] = []
-        for host in hosts:
+        for host, host_port in normalized:
             resolver = dns.resolver.Resolver(configure=False)
             resolver.nameservers = [host]
-            resolver.port = port
+            resolver.port = host_port
             resolver.timeout = timeout
             resolver.lifetime = lifetime
             self._states.append(_HostState(host=host, resolver=resolver))
+
+    @staticmethod
+    def _normalize_entry(entry: HostSpec, default_port: int) -> Tuple[str, int]:
+        """Validate and normalize one `hosts=` entry to `(ip, port)`.
+
+        Accepts either a bare IP-literal string (inherits `default_port`)
+        or a `(ip, port)` tuple. Anything else — hostname string, tuple
+        of wrong arity, non-integer port, port out of range — raises
+        ValueError with a user-facing message.
+        """
+        if isinstance(entry, tuple):
+            if len(entry) != 2:
+                raise ValueError(
+                    f"ResolverPool host entry {entry!r} must be (ip, port); "
+                    f"got a tuple of length {len(entry)}"
+                )
+            host, host_port = entry
+            if not isinstance(host, str):
+                raise ValueError(
+                    f"ResolverPool host entry {entry!r}: first element must "
+                    f"be a string IP literal"
+                )
+            # bool is a subclass of int — reject it explicitly so
+            # `(ip, True)` doesn't silently become port 1.
+            if not isinstance(host_port, int) or isinstance(host_port, bool):
+                raise ValueError(
+                    f"ResolverPool host entry {entry!r}: port must be an int"
+                )
+            if not 1 <= host_port <= 65535:
+                raise ValueError(
+                    f"ResolverPool host entry {entry!r}: port {host_port} "
+                    f"out of range (1-65535)"
+                )
+        elif isinstance(entry, str):
+            host = entry
+            host_port = default_port
+        else:
+            raise ValueError(
+                f"ResolverPool host entry {entry!r} must be a string IP "
+                f"literal or an (ip, port) tuple"
+            )
+
+        try:
+            ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError(
+                f"ResolverPool host {host!r} is not a valid IPv4 or "
+                f"IPv6 literal; hostnames are not accepted"
+            ) from exc
+
+        return host, host_port
 
     # ---------------------------------------------------------------
     # DNSRecordReader contract
