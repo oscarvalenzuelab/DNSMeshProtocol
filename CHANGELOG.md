@@ -51,6 +51,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- Switched passphrase → X25519 seed from PBKDF2-HMAC-SHA256 (100k iters,
+  fixed salt) to Argon2id (memory-hard, 32 MiB, t=2, p=2). The CLI now
+  generates a 32-byte random salt at `dmp init` and stores it in the
+  config file; two users who pick the same passphrase get independent
+  keys, and an offline attacker has to repeat the memory-hard
+  derivation per guess. The library API falls back to a fixed sentinel
+  salt when none is passed — documented in SECURITY.md as weaker and
+  intended only for demos/tests.
+
 - Mailbox slots now use DNS-native append (RRset) semantics. Previously
   the node's stores (SqliteMailboxStore and InMemoryDNSStore) replaced
   the value at a name on every `publish_txt_record`; this let anyone

@@ -71,6 +71,7 @@ class DMPClient:
         writer: Optional[DNSRecordWriter] = None,
         reader: Optional[DNSRecordReader] = None,
         replay_cache_path: Optional[str] = None,
+        kdf_salt: Optional[bytes] = None,
     ):
         if store is not None:
             if writer is None:
@@ -87,7 +88,7 @@ class DMPClient:
 
         self.username = username
         self.domain = domain
-        self.crypto = DMPCrypto.from_passphrase(passphrase)
+        self.crypto = DMPCrypto.from_passphrase(passphrase, salt=kdf_salt)
         self.user_id = hashlib.sha256(self.crypto.get_public_key_bytes()).digest()
 
         self.chunker = MessageChunker(enable_error_correction=True)

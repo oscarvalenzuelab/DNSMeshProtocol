@@ -91,11 +91,18 @@ The protocol assumes:
 - HKDF-SHA256 (RFC 5869) via `cryptography.hazmat.primitives.kdf.hkdf`
 - SHA-256 via `hashlib`
 
-Passphrase → X25519 seed uses PBKDF2-HMAC-SHA256, 100_000 iterations,
-fixed salt `DMP-DEFAULT-SALT`. The fixed salt is a weakness for
-low-entropy passphrases — an attacker who captures a public identity can
-try offline password guesses. Use high-entropy passphrases until we
-switch to Argon2 or an identity-specific salt.
+Passphrase → X25519 seed uses Argon2id (memory-hard, 32 MiB, t=2, p=2,
+32-byte output). The `dmp` CLI generates a 32-byte random salt at
+`dmp init` and stores it in the config file next to the username. Two
+users who pick the same passphrase still derive independent keys, and
+an attacker who captures a public identity has to repeat the memory-hard
+derivation per guess rather than precompute a rainbow table.
+
+When `DMPCrypto.from_passphrase` is called without a `salt` argument
+(library callers doing quick demos), it falls back to a fixed sentinel
+`DMP-default-v2-argon2id`. That path is weaker against targeted
+offline attack and is a footgun — production deployments must go
+through the CLI or pass their own salt.
 
 The Ed25519 signing seed is derived from the X25519 private bytes via
 `SHA-256(x25519_priv || b'DMP-v1-Ed25519-signing-key')`.

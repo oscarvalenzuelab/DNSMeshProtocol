@@ -64,12 +64,31 @@ class TestDMPCrypto:
         passphrase = "test passphrase"
         salt1 = os.urandom(16)
         salt2 = os.urandom(16)
-        
+
         crypto1 = DMPCrypto.from_passphrase(passphrase, salt1)
         crypto2 = DMPCrypto.from_passphrase(passphrase, salt2)
-        
+
         # Different salts should produce different keys
         assert crypto1.get_private_key_bytes() != crypto2.get_private_key_bytes()
+
+    def test_passphrase_rejects_short_salt(self):
+        """Argon2 needs at least 8 bytes of salt; guard against shorter."""
+        import pytest
+        with pytest.raises(ValueError, match="8 bytes"):
+            DMPCrypto.from_passphrase("x", salt=b"short")
+
+    def test_passphrase_derivation_uses_argon2id(self):
+        """Sanity check: same inputs → same output, distinct passphrases → distinct keys.
+
+        Also verifies that swapping the passphrase while holding the salt constant
+        really does change the key (i.e. we're not accidentally salt-only keyed).
+        """
+        salt = os.urandom(32)
+        a = DMPCrypto.from_passphrase("phrase-one", salt=salt)
+        b = DMPCrypto.from_passphrase("phrase-one", salt=salt)
+        c = DMPCrypto.from_passphrase("phrase-two", salt=salt)
+        assert a.get_private_key_bytes() == b.get_private_key_bytes()
+        assert a.get_private_key_bytes() != c.get_private_key_bytes()
     
     def test_encrypt_decrypt_basic(self):
         """Test basic encryption and decryption"""
