@@ -20,49 +20,8 @@ work queue.
 
 ---
 
-### M1.2 — CLI flag `--dns-resolvers`
-
-| Field | Value |
-|---|---|
-| **ID** | `M1.2` |
-| **Status** | `pending` |
-| **Owner** | — |
-| **Depends on** | `M1.1` |
-| **Blocks** | — |
-| **Estimated effort** | 1 day |
-| **Touch zones** | `dmp/cli.py`, `tests/test_cli.py` |
-
-**Acceptance criteria:**
-
-- [ ] `dmp init` accepts `--dns-resolvers host[:port],host[:port],...`.
-- [ ] Config file persists the list; single-host `--dns-host` still
-      supported for back-compat.
-- [ ] `_make_client` wires a `ResolverPool` when the config contains a
-      multi-resolver list; falls back to current `_DnsReader` otherwise.
-- [ ] Test covers list parsing + `_make_client` wiring the pool.
-
----
-
-### M1.3 — Dynamic resolver discovery
-
-| Field | Value |
-|---|---|
-| **ID** | `M1.3` |
-| **Status** | `pending` |
-| **Owner** | — |
-| **Depends on** | `M1.1` |
-| **Blocks** | — |
-| **Estimated effort** | 3 days |
-| **Touch zones** | `dmp/network/resolver_pool.py`, `tests/test_resolver_pool.py` |
-
-**Acceptance criteria:**
-
-- [ ] `ResolverPool.discover()` probes a set of well-known public
-      resolvers (8.8.8.8, 1.1.1.1, 9.9.9.9, 208.67.222.222) with a
-      short TTL test query.
-- [ ] Returns the working subset.
-- [ ] CLI exposes `dmp resolvers discover` which prints the pool and
-      optionally writes it to config via `--save`.
+### M1.2 — DONE (→ Done section)
+### M1.3 — DONE (→ Done section)
 
 ---
 
@@ -91,6 +50,17 @@ work queue.
 
 These come from `ROADMAP.md`. Pull only after M1 sprint closes.
 
+- **M1.5** — Per-host ports in `ResolverPool`. Extend the pool to accept
+  `List[Tuple[str, int]]` (or parallel `ports` list) so each upstream can
+  carry its own port. Drops the "first explicit port wins" workaround in
+  `dmp/cli.py::_make_reader`. Effort: ~0.5 day. Touch zones:
+  `dmp/network/resolver_pool.py`, `tests/test_resolver_pool.py`,
+  `dmp/cli.py`. Surfaced during M1.2 implementation.
+- **M1.retro-codex** — Retroactive Codex review of M1.2 (commit
+  `3096eb0`) and M1.3 (commit `d39cb56`). OpenAI API was returning 503
+  at merge time; self-review served as a reasonable substitute but
+  having an independent run is still valuable. Rerun once the API
+  recovers; file any findings as follow-up tasks.
 - **M2.1** Node cluster manifest (new record type, signed node list).
 - **M2.2** Client write-fan-out to N nodes with `r_w / 2` success rule.
 - **M2.3** Read-union across configured node set + dedupe.
@@ -102,3 +72,13 @@ These come from `ROADMAP.md`. Pull only after M1 sprint closes.
 - **M1.1** — `ResolverPool` with per-host health tracking, oracle-based
   demotion, and cooldown-as-preference fallback — commits `7cb8d7f`
   through `12376a4` (6 Codex review rounds, final clean pass).
+- **M1.2** — CLI `--dns-resolvers` multi-resolver pool wiring +
+  `_make_reader` factory + IP-literal parser (`host`, `ip:port`,
+  `[ipv6]:port`) + config persistence + back-compat with single-host
+  `--dns-host` — commit `3096eb0`. 12 new test cases. Codex review
+  pending (API unavailable at merge time; tracked under M1.retro-codex
+  in Backlog).
+- **M1.3** — `ResolverPool.discover()` classmethod + `WELL_KNOWN_RESOLVERS`
+  + `dmp resolvers discover [--save]` + `dmp resolvers list` CLI —
+  commit `d39cb56`. 18 new test cases. Codex review pending (see
+  M1.retro-codex).
