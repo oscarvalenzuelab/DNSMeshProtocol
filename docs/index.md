@@ -7,8 +7,9 @@ nav_order: 1
 # DNS Mesh Protocol
 {: .fs-9 }
 
-A censorship-resistant messaging protocol that rides on DNS — the one
-internet service almost nothing blocks.
+End-to-end encrypted messaging with no central server, no app store, no
+gatekeeper — delivered over DNS, on the relays and infrastructure the
+internet already runs on.
 {: .fs-6 .fw-300 }
 
 [Try it in 5 minutes]({{ site.baseurl }}/getting-started){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
