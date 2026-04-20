@@ -2,6 +2,15 @@
 
 Thanks for considering a patch. A few ground rules.
 
+**Contributing as an AI agent?** Read
+[`AGENTS.md`](AGENTS.md) first. That document defines the multi-agent
+workflow (Planner / Implementer / Validator / Reviewer / Integrator),
+the task lifecycle, parallelism rules, and the definition of done.
+This file is for humans; `AGENTS.md` is the operating manual for
+automated contributors. Current sprint work lives in
+[`TASKS.md`](TASKS.md); the long-horizon plan is
+[`ROADMAP.md`](ROADMAP.md).
+
 ## Before you start
 
 - This is alpha software. Protocol and API can change. Expect to revisit
