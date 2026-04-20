@@ -176,6 +176,54 @@ class TestResolverPoolPerHostPorts:
         assert pool._states[0].host == "2001:4860:4860::8888"
         assert pool._states[0].resolver.port == 5353
 
+    def test_snapshot_includes_port_per_entry(self):
+        """`snapshot()` surfaces the per-host port so debuggers / CLI
+        output can disambiguate two states sharing an IP.
+
+        A pool built with ``[("127.0.0.1", 5353), ("127.0.0.1", 5354)]``
+        produces two entries indistinguishable by host alone; the
+        ``"port"`` field is what tells them apart.
+        """
+        pool = ResolverPool([("127.0.0.1", 5353), ("127.0.0.1", 5354)])
+        snap = pool.snapshot()
+        assert len(snap) == 2
+        assert snap[0]["host"] == "127.0.0.1"
+        assert snap[0]["port"] == 5353
+        assert snap[1]["host"] == "127.0.0.1"
+        assert snap[1]["port"] == 5354
+
+    def test_snapshot_port_matches_pool_wide_default_for_bare_entries(self):
+        """Bare-IP entries record the pool-wide `port=` default in snapshot."""
+        pool = ResolverPool(["8.8.8.8", "1.1.1.1"], port=5300)
+        snap = pool.snapshot()
+        assert snap[0]["port"] == 5300
+        assert snap[1]["port"] == 5300
+
+    def test_healthy_upstreams_returns_ip_port_tuples(self):
+        """Port-aware variant of `healthy_hosts()` preserves both halves.
+
+        `healthy_hosts()` deliberately returns bare IPs for back-compat;
+        this test pins the new `healthy_upstreams()` surface that
+        callers reach for when they need the full upstream identity.
+        """
+        pool = ResolverPool([("127.0.0.1", 5353), ("127.0.0.1", 5354)])
+        upstreams = pool.healthy_upstreams()
+        assert upstreams == [("127.0.0.1", 5353), ("127.0.0.1", 5354)]
+
+    def test_healthy_hosts_unchanged_returns_strings(self):
+        """Back-compat: `healthy_hosts()` still yields bare host strings.
+
+        Callers that stringify or compare against IPs keep working
+        after the M1.5 snapshot-port addition; two loopback entries on
+        different ports do collapse in this view, which is why
+        `healthy_upstreams()` exists.
+        """
+        pool = ResolverPool(["8.8.8.8", "1.1.1.1"])
+        hosts = pool.healthy_hosts()
+        assert hosts == ["8.8.8.8", "1.1.1.1"]
+        # Every entry is a plain string, not a tuple.
+        assert all(isinstance(h, str) for h in hosts)
+
 
 # ---------------------------------------------------------------------
 # Happy path + failover
