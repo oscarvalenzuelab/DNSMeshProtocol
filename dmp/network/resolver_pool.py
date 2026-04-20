@@ -12,14 +12,19 @@ resolvers in priority order and demoting ones that misbehave.
 Health model
 ------------
 - Each host keeps `consecutive_failures` and `last_failure_ts`.
-- A host with `consecutive_failures >= failure_threshold` is skipped
-  while `now - last_failure_ts < cooldown_seconds`.
-- Once the cooldown elapses, the host is re-tried on the next query.
-  A success zeroes its failure counter; another failure just refreshes
-  the cooldown without stacking further.
-- Iteration is always in the original priority order; demotion is a
-  *skip*, not a permanent reorder. This keeps the "primary comes back
-  after cooldown" behavior the Milestone-1 spec asks for.
+- A host with `consecutive_failures >= failure_threshold` is
+  *deprioritized* while `now - last_failure_ts < cooldown_seconds` —
+  it still gets tried, but only after every non-cooled-down host has
+  been exhausted.
+- Once the cooldown elapses, the host returns to its normal priority
+  slot on the next query. A success zeroes its failure counter;
+  another failure just refreshes the cooldown without stacking further.
+- Cooldown is a *priority signal*, not a hard ban. If every resolver
+  is cooled down (or the pool has only one host), the lookup still
+  reaches them rather than blackholing for the full cooldown window.
+  Fallback-tier order is "least recent failure first," on the theory
+  that the resolver whose failure is oldest is most likely to have
+  recovered.
 
 NXDOMAIN/NoAnswer: the oracle rule
 ----------------------------------
@@ -179,21 +184,24 @@ class ResolverPool(DNSRecordReader):
     # ---------------------------------------------------------------
 
     def query_txt_record(self, name: str) -> Optional[List[str]]:
-        """Query `name` across all healthy upstreams in priority order.
+        """Query `name` across all upstreams in two-tier priority order.
 
-        Returns the first non-empty TXT answer. If every upstream
-        fails (or is in cooldown and all cooldowns have not yet
-        elapsed), returns None.
+        Returns the first non-empty TXT answer. Tries preferred
+        (not-cooled-down) resolvers first; if every one returns
+        not-found or errors, falls through to the cooled-down fallback
+        tier rather than blackholing. Returns None only if *every*
+        resolver — preferred and fallback combined — fails to produce
+        records.
 
         Demotion uses a later-resolver oracle: NXDOMAIN/NoAnswer from
-        an earlier resolver is a health failure *only if* a
-        lower-priority resolver produces a real TXT answer for the
-        same query. Otherwise the name is presumed genuinely absent
-        and no health bookkeeping touches the not-found resolvers.
+        an earlier resolver is a health failure *only if* a later
+        resolver produces a real TXT answer for the same query.
+        Otherwise the name is presumed genuinely absent and no health
+        bookkeeping touches the not-found resolvers.
         """
         tried_not_found: List[_HostState] = []
 
-        for state in self._iter_eligible():
+        for state in self._iter_ordered():
             try:
                 answers = state.resolver.resolve(name, "TXT")
             except self._NAME_NOT_FOUND_ERRORS:
@@ -245,10 +253,17 @@ class ResolverPool(DNSRecordReader):
     # ---------------------------------------------------------------
 
     def healthy_hosts(self) -> List[str]:
-        """Return the subset of hosts currently eligible for queries."""
+        """Return the hosts currently in the preferred (not-cooled-down) tier.
+
+        This matches "the ones we'd pick first if we had a choice." A
+        cooled-down host is *still reachable* via the fallback tier (see
+        `_iter_ordered`), but it is not "healthy" in the sense reported
+        here — the pool would rather route around it if any other host
+        can answer.
+        """
         now = time.monotonic()
         with self._lock:
-            return [s.host for s in self._states if self._is_eligible(s, now)]
+            return [s.host for s in self._states if self._is_preferred(s, now)]
 
     def snapshot(self) -> List[dict]:
         """Return a copy of per-host health for debugging / CLI display."""
@@ -267,8 +282,19 @@ class ResolverPool(DNSRecordReader):
     # Internals
     # ---------------------------------------------------------------
 
-    def _iter_eligible(self):
-        """Yield host states whose cooldown has elapsed, primary first.
+    def _iter_ordered(self):
+        """Yield host states in priority order: preferred tier, then fallback.
+
+        Preferred tier = resolvers not currently in cooldown, in
+        configured priority (insertion) order.
+
+        Fallback tier = resolvers currently in cooldown, ordered by
+        `last_failure_ts` ascending so the one that failed longest ago
+        is tried first (most likely to have recovered). The pool falls
+        through to this tier only after every preferred resolver
+        returned not-found or errored — cooldown is a deprioritization
+        signal, not a hard ban, so we never blackhole a lookup when
+        every host happens to be cooling down.
 
         We hold the lock only to snapshot the state list, not while
         the network I/O happens — otherwise one slow resolver would
@@ -276,11 +302,24 @@ class ResolverPool(DNSRecordReader):
         """
         now = time.monotonic()
         with self._lock:
-            eligible = [s for s in self._states if self._is_eligible(s, now)]
-        for state in eligible:
+            preferred: List[_HostState] = []
+            fallback: List[_HostState] = []
+            for state in self._states:
+                if self._is_preferred(state, now):
+                    preferred.append(state)
+                else:
+                    fallback.append(state)
+            # Oldest failure first: that resolver has had the most time
+            # to recover, so it's the most promising of the cooled-down
+            # set.
+            fallback.sort(key=lambda s: s.last_failure_ts)
+        for state in preferred:
+            yield state
+        for state in fallback:
             yield state
 
-    def _is_eligible(self, state: _HostState, now: float) -> bool:
+    def _is_preferred(self, state: _HostState, now: float) -> bool:
+        """True iff `state` is in the preferred tier (not cooled down)."""
         if state.consecutive_failures < self._failure_threshold:
             return True
         return (now - state.last_failure_ts) >= self._cooldown_seconds
