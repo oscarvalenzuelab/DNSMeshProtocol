@@ -47,9 +47,14 @@ The protocol assumes:
 
 ## Known limits
 
-1. **Replay cache is in-memory.** Process restart forgets the seen set.
-   An attacker who catches a restart can replay still-valid manifests
-   within their `exp` window. Persistence is future work.
+1. **Replay cache persists per-identity to disk.** The CLI writes to
+   `$DMP_CONFIG_HOME/replay_cache.json` on every `record()`; library
+   callers opt in via `replay_cache_path`. A long-lived server process
+   keeps its state in memory and survives as long as the process does.
+   Persistence is best-effort — a crash mid-write can't corrupt state
+   (atomic rename) but a crash mid-purge will keep an expired entry one
+   cycle longer than intended. The persisted cache is sized-bounded only
+   by the message TTL, not by an explicit cap.
 2. **Slot squatting DoS.** Signed manifests prevent impersonation but not
    denial-of-service: an attacker can publish their own valid manifest
    in every mailbox slot and block real messages until expiry. Real slot

@@ -27,15 +27,22 @@ def config_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def shared_store(monkeypatch):
-    """Force _make_client to use a shared in-memory store across test clients."""
+    """Force _make_client to use a shared in-memory store across test clients.
+
+    Preserves the real CLI's persistent-replay-cache path so tests exercise
+    that wiring too (one replay cache per config home / identity).
+    """
     store = InMemoryDNSStore()
 
     def fake_make_client(config, passphrase):
+        from dmp.cli import _config_path
+        replay_path = str(_config_path().parent / "replay_cache.json")
         client = DMPClient(
             config.username,
             passphrase,
             domain=config.domain,
             store=store,
+            replay_cache_path=replay_path,
         )
         for name, pubkey in config.contacts.items():
             client.add_contact(name, pubkey, domain=config.domain)
@@ -144,6 +151,36 @@ class TestSendRecv:
         monkeypatch.setenv("DMP_PASSPHRASE", "pw")
         cli.main(["recv"])
         assert "no new messages" in capsys.readouterr().out
+
+    def test_recv_twice_is_idempotent(self, config_home, shared_store, monkeypatch, capsys):
+        """Persistent replay cache: second `dmp recv` in a fresh process
+        doesn't re-deliver what was already delivered."""
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+
+        bob = DMPClient("bob", "bob-pass", domain="mesh.local", store=shared_store)
+        cli.main(["contacts", "add", "bob", bob.get_public_key_hex()])
+        capsys.readouterr()
+
+        # alice sends
+        cli.main(["send", "bob", "only-once"])
+        capsys.readouterr()
+
+        # bob's CLI reads once
+        cli.main(["init", "bob", "--endpoint", "http://x", "--force"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+        capsys.readouterr()
+        cli.main(["recv"])
+        out1 = capsys.readouterr().out
+        assert "only-once" in out1
+
+        # bob's CLI reads again — replay cache persists across the simulated
+        # second invocation, so no duplicate.
+        cli.main(["recv"])
+        out2 = capsys.readouterr().out
+        assert "only-once" not in out2
+        assert "no new messages" in out2
 
 
 class TestLoadWithoutConfig:

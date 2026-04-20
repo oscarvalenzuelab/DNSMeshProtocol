@@ -31,9 +31,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and demos.
 - `dmp.core.manifest.SlotManifest` — binary 164-byte slot manifest,
   Ed25519-signed. Compact enough for one DNS TXT string.
-- `dmp.core.manifest.ReplayCache` — in-memory `(sender_spk, msg_id)`
-  dedupe with split `has_seen` / `record` API so transient fetch failures
-  don't permanently blacklist a valid manifest.
+- `dmp.core.manifest.ReplayCache` — `(sender_spk, msg_id)` dedupe with
+  split `has_seen` / `record` API so transient fetch failures don't
+  permanently blacklist a valid manifest. Optionally persists to disk
+  via `persist_path`: writes are atomic (tmp + rename), expired entries
+  drop on load, and corrupt files are ignored (start from empty state).
+  The CLI wires this to `$DMP_CONFIG_HOME/replay_cache.json` by default
+  so `dmp recv` doesn't re-deliver already-seen messages across calls.
 - Dockerfile (multi-stage, non-root runtime user, healthcheck) and
   `docker-compose.yml`.
 - GitHub Actions CI: pytest matrix over 3.10/3.11/3.12, `black --check`,

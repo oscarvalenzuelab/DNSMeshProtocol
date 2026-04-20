@@ -164,12 +164,16 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
         )
     writer = _HttpWriter(config.endpoint, config.http_token)
     reader = _DnsReader(config.dns_host, config.dns_port)
+    # Persist the replay cache next to the config so repeated `dmp recv` calls
+    # across separate CLI processes don't re-deliver the same message.
+    replay_path = str(_config_path().parent / "replay_cache.json")
     client = DMPClient(
         config.username,
         passphrase,
         domain=config.domain,
         writer=writer,
         reader=reader,
+        replay_cache_path=replay_path,
     )
     for name, pubkey in config.contacts.items():
         client.add_contact(name, pubkey, domain=config.domain)
