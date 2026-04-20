@@ -26,6 +26,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `DMP_NODE_HOSTNAME=... docker compose -f docker-compose.yml -f
   docker-compose.prod.yml up -d`.
 
+### Added (zone-anchored identity)
+
+- `CLIConfig.identity_domain` + `dmp init --identity-domain <zone>`:
+  users who own a DNS zone can anchor identity there. `dmp identity
+  publish` writes `dmp.<identity_domain>` instead of the hash-based
+  shared-mesh name, and resolvers see a stable well-known name.
+- Address parsing: `dmp identity fetch alice@alice.example.com`
+  resolves `dmp.alice.example.com` and verifies the record's internal
+  `username` matches the address's left half — so the zone owner
+  can't publish a record for a different name and have it stored as
+  that name in fetchers' contact lists.
+- `dmp.core.identity.zone_anchored_identity_name` and
+  `dmp.core.identity.parse_address` encode the convention; new tests
+  in `test_identity.py` and `test_cli.py` exercise the publish/fetch
+  round-trip and the username-mismatch rejection.
+- Plain-username `dmp identity fetch alice` still uses the legacy
+  hash-based name under the shared mesh domain for TOFU onboarding.
+- SECURITY.md now calls zone-anchored identity out as the
+  recommended posture for real deployments; shared-mesh identity
+  is documented as TOFU-only.
+
 ### Added (forward secrecy)
 
 - `dmp.core.prekeys`: X3DH-style one-time X25519 prekeys. A recipient

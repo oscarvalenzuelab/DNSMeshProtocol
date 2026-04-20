@@ -48,9 +48,45 @@ def identity_domain(username: str, base_domain: str) -> str:
     Uses a SHA-256 hash of the username so the DNS label reveals only the
     hash, not the plaintext username. Matches the existing
     DNSEncoder.encode_identity_domain helper.
+
+    This is the *unanchored* form used under a shared mesh domain. Squatting
+    is only mitigated by signature verification plus the CLI's
+    `--accept-fingerprint` dance. For real squat resistance publish under
+    a domain you control — see `zone_anchored_identity_name`.
     """
     name_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:16]
     return f"id-{name_hash}.{base_domain.rstrip('.')}"
+
+
+def zone_anchored_identity_name(identity_domain_str: str) -> str:
+    """Identity DNS name under a user-controlled zone.
+
+    Convention: `dmp.<your-domain>` holds the TXT record. Anyone who can
+    resolve DNS reads it; squat resistance comes from the fact that only
+    the owner of `<your-domain>` can put records there. Works with any
+    standard DNS zone — Cloudflare, Route53, BIND, etc.
+
+    Addresses look like `alice@alice.example.com`: the left half is the
+    username carried in the record body, the right half is the zone that
+    anchors ownership. See `parse_address`.
+    """
+    return f"dmp.{identity_domain_str.rstrip('.')}"
+
+
+def parse_address(address: str) -> Optional[Tuple[str, str]]:
+    """Parse `user@host` into (user, host). Returns None on malformed input.
+
+    Used to turn the human-readable address from `dmp identity fetch
+    alice@alice.example.com` into the DNS name `dmp.alice.example.com`.
+    """
+    if "@" not in address:
+        return None
+    user, _, host = address.partition("@")
+    user = user.strip()
+    host = host.strip().rstrip(".")
+    if not user or not host:
+        return None
+    return user, host
 
 
 @dataclass

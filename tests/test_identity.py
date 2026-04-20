@@ -11,6 +11,8 @@ from dmp.core.identity import (
     RECORD_PREFIX,
     identity_domain,
     make_record,
+    parse_address,
+    zone_anchored_identity_name,
 )
 
 
@@ -97,3 +99,27 @@ class TestIdentityDomain:
         # DNS label should be the sha256 hex prefix, not the plaintext name.
         assert "alice" not in d
         assert d.startswith("id-")
+
+
+class TestZoneAnchoredIdentity:
+    def test_zone_anchored_name_format(self):
+        assert zone_anchored_identity_name("alice.example.com") == "dmp.alice.example.com"
+
+    def test_zone_anchored_strips_trailing_dot(self):
+        assert zone_anchored_identity_name("alice.example.com.") == "dmp.alice.example.com"
+
+    def test_parse_address_splits_user_and_host(self):
+        assert parse_address("alice@alice.example.com") == ("alice", "alice.example.com")
+
+    def test_parse_address_strips_whitespace_and_dot(self):
+        assert parse_address("  alice @ alice.example.com. ") == (
+            "alice",
+            "alice.example.com",
+        )
+
+    def test_parse_address_rejects_malformed(self):
+        assert parse_address("no-at-sign") is None
+        assert parse_address("@nohost.example.com") is None
+        assert parse_address("nouser@") is None
+        assert parse_address("@") is None
+        assert parse_address("") is None
