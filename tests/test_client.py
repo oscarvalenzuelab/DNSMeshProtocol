@@ -289,6 +289,38 @@ class TestSendReceive:
         assert len(inbox) == 1
         assert inbox[0].plaintext == b"long-term path"
 
+    def test_consumed_prekey_is_removed_from_published_pool(self):
+        """The prekey_pub stays in DNS until consumed by the recipient.
+
+        Without the DELETE-on-consume path, senders keep picking from the
+        same RRset even after its sks have been eaten locally — so
+        increasing fractions of messages become undeliverable over time.
+        This test pins the invariant: after decrypt, the published pool
+        has one fewer entry.
+        """
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        bob.refresh_prekeys(count=3, ttl_seconds=3600)
+
+        from dmp.core.prekeys import prekey_rrset_name
+        pool_name = prekey_rrset_name("bob", "mesh.test")
+        assert len(store.query_txt_record(pool_name) or []) == 3
+
+        assert alice.send_message("bob", "consume me")
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+
+        # One prekey consumed both locally AND in DNS.
+        assert bob.prekey_store.count_live() == 2
+        assert len(store.query_txt_record(pool_name) or []) == 2
+
     def test_prekey_deleted_before_decrypt_drops_message(self):
         """If bob's prekey_sk is wiped (e.g. refresh rotated it out) before
         he polls, the ciphertext is undeliverable — the FS property working

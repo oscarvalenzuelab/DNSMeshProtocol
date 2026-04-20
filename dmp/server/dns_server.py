@@ -130,16 +130,51 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
 
 
 class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
-    """Per-request threaded UDP server; carries the reader + ttl on self."""
+    """Per-packet threaded UDP server with a bounded worker semaphore.
+
+    Same rationale as the HTTP server: a raw `ThreadingMixIn` makes a
+    thread per packet. A UDP flood (amplified off this server or just
+    ordinary spam) would pre-create threads before the rate limiter
+    runs. The semaphore caps concurrent handler threads; when saturated
+    we drop the packet. On UDP there's no connection to close, so
+    "drop" just means we don't spawn a handler.
+    """
 
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, server_address, handler_cls, reader, ttl, rate_limiter):
+    def __init__(
+        self,
+        server_address,
+        handler_cls,
+        reader,
+        ttl,
+        rate_limiter,
+        max_concurrency,
+    ):
         super().__init__(server_address, handler_cls)
         self.reader = reader
         self.ttl = ttl
         self.rate_limiter = rate_limiter
+        self.max_concurrency = max_concurrency
+        self._semaphore = threading.Semaphore(max_concurrency)
+
+    def process_request(self, request, client_address):
+        if not self._semaphore.acquire(blocking=False):
+            return
+        t = threading.Thread(
+            target=self._handle_with_release,
+            args=(request, client_address),
+            name="dmp-dns-handler",
+            daemon=self.daemon_threads,
+        )
+        t.start()
+
+    def _handle_with_release(self, request, client_address):
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            self._semaphore.release()
 
 
 class DMPDnsServer:
@@ -157,6 +192,7 @@ class DMPDnsServer:
         port: int = 5353,
         ttl: int = DEFAULT_TTL,
         rate_limit: Optional[RateLimit] = None,
+        max_concurrency: int = 128,
     ):
         self.reader = reader
         self.host = host
@@ -165,6 +201,7 @@ class DMPDnsServer:
         self.rate_limiter = (
             TokenBucketLimiter(rate_limit) if rate_limit and rate_limit.enabled else None
         )
+        self.max_concurrency = int(max_concurrency)
         self._server: Optional[_ThreadingUDPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -183,6 +220,7 @@ class DMPDnsServer:
             self.reader,
             self.ttl,
             self.rate_limiter,
+            self.max_concurrency,
         )
         # If the caller asked for port 0, pick up the actual bound port.
         self.port = self._server.server_address[1]

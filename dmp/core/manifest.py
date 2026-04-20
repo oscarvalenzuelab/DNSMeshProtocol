@@ -56,6 +56,14 @@ DEFAULT_MANIFEST_TTL = 300
 # long-term X25519 key — no forward secrecy for this message."
 NO_PREKEY = 0
 
+# Protocol-level cap on chunk count in a signed manifest. Without a cap,
+# a signature-valid manifest can ask the receiver to fetch ~2^32 chunks
+# and the DNS-query loop pins the process. 1024 chunks at DATA_PER_CHUNK
+# bytes each = ~128 KiB of plaintext, which is well past anything the
+# rest of the stack is sized for. Operators who need bigger messages
+# should raise this knob uniformly across sender + receiver.
+MAX_TOTAL_CHUNKS = 1024
+
 
 @dataclass
 class SlotManifest:
@@ -84,6 +92,11 @@ class SlotManifest:
             raise ValueError("recipient_id must be 32 bytes")
         if self.data_chunks <= 0 or self.data_chunks > self.total_chunks:
             raise ValueError("data_chunks must be in 1..total_chunks")
+        if self.total_chunks > MAX_TOTAL_CHUNKS:
+            raise ValueError(
+                f"total_chunks {self.total_chunks} exceeds protocol max "
+                f"{MAX_TOTAL_CHUNKS}"
+            )
         if not (0 <= self.prekey_id < (1 << 32)):
             raise ValueError("prekey_id out of range")
         return (
@@ -106,6 +119,11 @@ class SlotManifest:
         prekey_id = int.from_bytes(body[88:92], "big")
         if data_chunks <= 0 or data_chunks > total_chunks:
             raise ValueError("data_chunks out of range")
+        if total_chunks > MAX_TOTAL_CHUNKS:
+            raise ValueError(
+                f"total_chunks {total_chunks} exceeds protocol max "
+                f"{MAX_TOTAL_CHUNKS}"
+            )
         return cls(
             msg_id=body[0:16],
             sender_spk=body[16:48],

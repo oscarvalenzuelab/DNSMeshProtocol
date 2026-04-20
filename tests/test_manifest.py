@@ -67,6 +67,31 @@ class TestSlotManifest:
         record = manifest.sign(impostor)
         assert SlotManifest.parse_and_verify(record) is None
 
+    def test_rejects_total_chunks_over_protocol_cap(self):
+        """A signed manifest claiming an enormous total_chunks is rejected
+        on parse, so the receiver cannot be pinned in an ~2^32 DNS-fetch
+        loop by a single valid signer."""
+        import base64
+        from dmp.core.manifest import MAX_TOTAL_CHUNKS, SlotManifest, _BODY_LEN
+
+        sender = DMPCrypto()
+        # Hand-build a body with total_chunks past the cap so we bypass
+        # to_body_bytes' outbound validation.
+        body = (
+            uuid.uuid4().bytes
+            + sender.get_signing_public_key_bytes()
+            + b"\x01" * 32
+            + (MAX_TOTAL_CHUNKS + 1).to_bytes(4, "big")   # total_chunks
+            + (1).to_bytes(4, "big")                       # data_chunks
+            + (0).to_bytes(4, "big")                       # prekey_id
+            + int(time.time()).to_bytes(8, "big")          # ts
+            + (int(time.time()) + 300).to_bytes(8, "big")  # exp
+        )
+        assert len(body) == _BODY_LEN
+        sig = sender.sign_data(body)
+        wire = "v=dmp1;t=manifest;d=" + base64.b64encode(body + sig).decode("ascii")
+        assert SlotManifest.parse_and_verify(wire) is None
+
     def test_malformed_record_returns_none(self):
         assert SlotManifest.parse_and_verify("not-a-dmp-record") is None
         assert SlotManifest.parse_and_verify("v=dmp1;t=manifest") is None

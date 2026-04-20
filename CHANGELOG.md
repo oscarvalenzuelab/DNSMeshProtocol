@@ -26,6 +26,39 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `DMP_NODE_HOSTNAME=... docker compose -f docker-compose.yml -f
   docker-compose.prod.yml up -d`.
 
+### Changed (second-pass audit fixes)
+
+Codex ran a second audit before beta and flagged two new P1s plus three
+smaller issues introduced while fixing the first audit. All now fixed:
+
+- `SlotManifest` enforces `MAX_TOTAL_CHUNKS = 1024` on parse and
+  construction. Previously a signature-valid manifest could claim
+  `total_chunks = 2^32 - 1` and the receiver's `range(total_chunks)`
+  fetch loop would pin the process.
+- Prekey consumption now deletes the matching published TXT record
+  from the node's store, not just the local sqlite row. Otherwise
+  consumed prekeys rotted in DNS and senders kept picking them,
+  turning an increasing fraction of messages undecryptable.
+  `PrekeyStore` gains a `wire_record` column and `record_wire` /
+  `get_wire` helpers; `DMPClient._consume_prekey` does the
+  local-sqlite drop + DNS DELETE together.
+- `prekey_id` is now bound into the AEAD AAD. A lying sender who
+  encrypts with one prekey but writes a different `prekey_id` in
+  the manifest is caught at AEAD tag verification, not by a lower-
+  level ECDH mismatch.
+- Both the HTTP API and UDP DNS server enforce a bounded worker
+  semaphore. New connections/packets beyond `http_max_concurrency`
+  (default 64) or `dns_max_concurrency` (default 128) are dropped
+  rather than spawning unbounded threads. Env vars
+  `DMP_HTTP_MAX_CONCURRENCY` and `DMP_DNS_MAX_CONCURRENCY` override.
+- README's "sender authentication pinned to contacts" bullet
+  replaced with honest "pinned-or-TOFU" language. `dmp contacts add`
+  without `--signing-key` now prints a multi-line stderr warning
+  making the TOFU fallback explicit.
+- Default rate limits raised: HTTP 10/s burst 100 (was 5/s burst 20).
+  `dmp identity refresh-prekeys --count` default lowered from 50 to
+  25 so a full pool fits in a single burst window.
+
 ### Added (zone-anchored identity)
 
 - `CLIConfig.identity_domain` + `dmp init --identity-domain <zone>`:

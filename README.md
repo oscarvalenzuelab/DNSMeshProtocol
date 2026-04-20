@@ -14,9 +14,15 @@ Decentralized peer-to-peer messaging that tunnels encrypted messages through DNS
   long-term X25519 key cannot recover past messages. Fallback to the
   long-term key when no prekey pool is available; no FS for that
   message. See [SECURITY.md](SECURITY.md) for the full model.
-- **Sender authentication pinned to contacts.** Every slot manifest is
-  Ed25519-signed; on receive, the `sender_spk` must match a signing key
-  already pinned in the contact list. Unknown-sender manifests are dropped.
+- **Sender authentication, pinned-or-TOFU.** Every slot manifest is
+  Ed25519-signed. When you have at least one contact with a pinned
+  signing key (`dmp contacts add --signing-key ...` or `dmp identity
+  fetch user --add`), unknown-signer manifests are dropped. With zero
+  pinned contacts, receive falls back to **trust-on-first-use** and
+  delivers any signature-valid message — useful for onboarding, but
+  you are trusting the first signer to show up. Always pin contacts
+  before treating incoming messages as authenticated. See
+  [SECURITY.md](SECURITY.md).
 - **AEAD binds a canonical header subset** (`version`, `message_type`,
   `msg_id`, `sender_id`, `recipient_id`, `timestamp`, `ttl`). On receive,
   the decrypted inner header is cross-checked against the signed manifest

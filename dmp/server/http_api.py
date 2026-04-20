@@ -285,9 +285,21 @@ def _consteq(a: str, b: str) -> bool:
     return result == 0
 
 
-class _DMPHttpServer(ThreadingMixIn, HTTPServer):
+class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTPServer with a per-process cap on concurrent handler threads.
+
+    Vanilla `ThreadingMixIn.process_request` spawns a thread per request
+    with no ceiling. Under a socket flood, thread creation happens before
+    the handler's token-bucket rate limiter gets a chance to run — and
+    you can exhaust address space, file descriptors, or memory well
+    before per-IP limits engage. We gate every new handler on a semaphore
+    whose initial value is `max_concurrency`; once saturated, new
+    connections are closed immediately instead of stacking threads.
+    """
+
     allow_reuse_address = True
     daemon_threads = True
+    max_concurrency = 64
 
     def __init__(
         self,
@@ -299,6 +311,7 @@ class _DMPHttpServer(ThreadingMixIn, HTTPServer):
         max_ttl,
         max_value_bytes,
         max_values_per_name,
+        max_concurrency,
     ):
         super().__init__(addr, handler)
         self.store = store
@@ -307,6 +320,35 @@ class _DMPHttpServer(ThreadingMixIn, HTTPServer):
         self.max_ttl = max_ttl
         self.max_value_bytes = max_value_bytes
         self.max_values_per_name = max_values_per_name
+        self.max_concurrency = max_concurrency
+        self._semaphore = threading.Semaphore(max_concurrency)
+
+    def process_request(self, request, client_address):
+        if not self._semaphore.acquire(blocking=False):
+            # At the concurrency ceiling — drop the connection rather
+            # than queue another thread.
+            try:
+                self.shutdown_request(request)
+            except Exception:
+                pass
+            return
+        t = threading.Thread(
+            target=self._handle_with_release,
+            args=(request, client_address),
+            name="dmp-http-handler",
+            daemon=self.daemon_threads,
+        )
+        t.start()
+
+    def _handle_with_release(self, request, client_address):
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            self._semaphore.release()
+
+
+# Back-compat alias; tests and old callers imported the old class name.
+_DMPHttpServer = _BoundedThreadingHTTPServer
 
 
 class DMPHttpApi:
@@ -323,6 +365,7 @@ class DMPHttpApi:
         max_ttl: int = DEFAULT_MAX_TTL,
         max_value_bytes: int = DEFAULT_MAX_VALUE_BYTES,
         max_values_per_name: int = DEFAULT_MAX_VALUES_PER_NAME,
+        max_concurrency: int = 64,
     ):
         self.store = store
         self.host = host
@@ -334,6 +377,7 @@ class DMPHttpApi:
         self.max_ttl = int(max_ttl)
         self.max_value_bytes = int(max_value_bytes)
         self.max_values_per_name = int(max_values_per_name)
+        self.max_concurrency = int(max_concurrency)
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -355,6 +399,7 @@ class DMPHttpApi:
             self.max_ttl,
             self.max_value_bytes,
             self.max_values_per_name,
+            self.max_concurrency,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(

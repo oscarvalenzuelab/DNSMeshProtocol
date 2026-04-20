@@ -202,6 +202,63 @@ class TestHttpOps:
             a.stop()
 
 
+class TestBoundedConcurrency:
+    def test_http_drops_connection_past_ceiling(self):
+        """When the concurrency ceiling is hit, new TCP connections are
+        closed immediately instead of spawning more handler threads.
+
+        The raw ThreadingMixIn would create threads without bound — a
+        socket flood would exhaust memory before the rate limiter engaged.
+        The bounded pool caps simultaneous handlers.
+        """
+        import threading
+        import requests
+
+        # A handler that blocks until the test releases it. Max concurrency
+        # of 1 means the second connection should be dropped.
+        blocker = threading.Event()
+        # Piggy-back a custom store whose query blocks the /health handler.
+        class SlowStore(InMemoryDNSStore):
+            def query_txt_record(self, name):
+                if name == "__dmp_health_probe__":
+                    blocker.wait(timeout=2.0)
+                return super().query_txt_record(name)
+
+        store = SlowStore()
+        api = DMPHttpApi(
+            store, host="127.0.0.1", port=_free_port(), max_concurrency=1
+        )
+        api.start()
+        base = f"http://127.0.0.1:{api.port}"
+        try:
+            # First request occupies the single slot.
+            first = threading.Thread(
+                target=lambda: requests.get(f"{base}/health", timeout=5),
+                daemon=True,
+            )
+            first.start()
+            time.sleep(0.1)  # let the first handler pin the slot
+
+            # Second request should be dropped (connection closed).
+            # requests raises ConnectionError when the peer closes before
+            # sending bytes.
+            dropped = False
+            try:
+                requests.get(f"{base}/health", timeout=1)
+            except requests.exceptions.ConnectionError:
+                dropped = True
+            except Exception:
+                dropped = True
+            assert dropped, "expected the second connection to be dropped"
+
+            # Release the first handler.
+            blocker.set()
+            first.join(timeout=3.0)
+        finally:
+            blocker.set()
+            api.stop()
+
+
 class TestDnsRateLimit:
     def test_dns_rate_limit_drops_query(self):
         import dns.exception
