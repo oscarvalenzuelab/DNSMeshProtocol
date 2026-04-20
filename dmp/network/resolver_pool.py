@@ -46,16 +46,43 @@ happen — preserving the "true missing record" behavior.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import socket
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 import dns.exception
 import dns.resolver
 
 from dmp.network.base import DNSRecordReader
+
+log = logging.getLogger(__name__)
+
+
+# Four operator-diverse public resolvers, IPv4 only. Discovery probes each
+# one with a TXT lookup for a stable well-known name and keeps only the
+# ones that answer quickly. Operator diversity is the point: if one
+# provider is blocked or tampering, the others provide independent paths.
+# IPv6 entries are deliberately excluded — many networks still lack
+# IPv6 connectivity, and a silently unreachable v6 literal would burn
+# the probe budget for no gain.
+WELL_KNOWN_RESOLVERS: tuple[str, ...] = (
+    "8.8.8.8",  # Google
+    "8.8.4.4",  # Google
+    "1.1.1.1",  # Cloudflare
+    "1.0.0.1",  # Cloudflare
+    "9.9.9.9",  # Quad9
+    "149.112.112.112",  # Quad9
+    "208.67.222.222",  # OpenDNS
+    "208.67.220.220",  # OpenDNS
+)
+
+# A query name with stable TXT records on every big public resolver. We
+# don't care about the answer's content — just that the resolver
+# responded without erroring or timing out.
+_DISCOVER_PROBE_NAME = "google.com"
 
 
 @dataclass
@@ -352,3 +379,86 @@ class ResolverPool(DNSRecordReader):
     def _mark_failure(self, state: _HostState) -> None:
         with self._lock:
             state.record_failure(time.monotonic())
+
+    # ---------------------------------------------------------------
+    # Discovery
+    # ---------------------------------------------------------------
+
+    @classmethod
+    def discover(
+        cls,
+        candidates: Iterable[str],
+        timeout: float = 2.0,
+    ) -> "ResolverPool":
+        """Probe `candidates` and return a pool of the ones that answered.
+
+        Each candidate is asked for the TXT records of a well-known
+        name (`google.com` by default — it has stable TXT records on
+        every big public resolver). A candidate that returns without
+        erroring within `timeout` seconds is considered working.
+
+        Candidates that are not IPv4/IPv6 literals are skipped with a
+        logged warning rather than rejecting the whole batch; callers
+        commonly pass mixed-provenance lists (CLI flag, config file,
+        `WELL_KNOWN_RESOLVERS` hardcoded list) and one typo shouldn't
+        abort discovery entirely.
+
+        Raises `ValueError` if zero candidates pass (either because
+        none were valid IP literals, or every probe failed). An empty
+        pool would construct successfully only to fail every future
+        query — callers would much rather see the failure now, at the
+        discovery boundary, than silently at first use.
+        """
+        # `dict.fromkeys` preserves order while deduplicating — keeping
+        # the caller's implied priority and skipping wasted probes if
+        # the same host appears twice.
+        valid_hosts: List[str] = []
+        for candidate in dict.fromkeys(candidates):
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                log.warning(
+                    "ResolverPool.discover: skipping %r (not a valid IPv4 "
+                    "or IPv6 literal)",
+                    candidate,
+                )
+                continue
+            valid_hosts.append(candidate)
+
+        working: List[str] = []
+        for host in valid_hosts:
+            probe = dns.resolver.Resolver(configure=False)
+            probe.nameservers = [host]
+            probe.timeout = timeout
+            # lifetime bounds the total wall-clock budget dnspython will
+            # spend retrying before giving up; match it to `timeout` so a
+            # slow resolver can't stretch discovery well past the caller's
+            # expected window.
+            probe.lifetime = timeout
+            try:
+                probe.resolve(_DISCOVER_PROBE_NAME, "TXT")
+            except cls._TRANSPORT_ERRORS:
+                # Resolver is unreachable, too slow, or otherwise
+                # misbehaving — drop it from the pool.
+                continue
+            except cls._NAME_NOT_FOUND_ERRORS:
+                # Unexpected for a name with stable TXT everywhere, but
+                # a resolver that authoritatively says "no such record"
+                # IS still responding healthily — keep it. The real
+                # query surface in production isn't `google.com`; what
+                # we're testing is reachability and basic behavior.
+                pass
+            except dns.exception.DNSException:
+                # Any other dnspython error (malformed response,
+                # unexpected EDNS failure, etc.) means this resolver
+                # isn't giving us clean answers — skip it.
+                continue
+            working.append(host)
+
+        if not working:
+            raise ValueError(
+                "ResolverPool.discover: no candidates answered within "
+                f"{timeout}s (of {len(valid_hosts)} valid IP literals out "
+                f"of the batch)"
+            )
+        return cls(working)

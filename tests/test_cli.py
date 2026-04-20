@@ -622,3 +622,108 @@ class TestDnsResolvers:
 
         with pytest.raises(ValueError):
             _parse_resolver_entry("[2001:4860:4860::8888")
+
+class TestResolversCommand:
+    """`dmp resolvers discover` + `dmp resolvers list`.
+
+    Network probes are mocked out via a stub ResolverPool that returns
+    a fixed host list, so the tests run offline and deterministically.
+    """
+
+    def _stub_discover(self, monkeypatch, hosts):
+        """Replace ResolverPool.discover with one that returns a stub pool."""
+        from dmp.network.resolver_pool import ResolverPool
+
+        class _StubPool:
+            def snapshot(self):
+                return [{"host": h} for h in hosts]
+
+        def fake_discover(candidates, timeout=2.0):
+            if not hosts:
+                raise ValueError(
+                    "ResolverPool.discover: no candidates answered "
+                    f"within {timeout}s"
+                )
+            return _StubPool()
+
+        # Patch the symbol the CLI imported, not just ResolverPool itself.
+        monkeypatch.setattr(cli.ResolverPool, "discover", staticmethod(fake_discover))
+
+    def test_discover_prints_working_list(self, config_home, monkeypatch, capsys):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9"])
+
+        rc = cli.main(["resolvers", "discover"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "discovered 2 working resolver(s)" in out
+        assert "1.1.1.1" in out
+        assert "9.9.9.9" in out
+
+    def test_discover_without_save_does_not_touch_config(
+        self, config_home, monkeypatch, capsys
+    ):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        cfg_path = config_home / "config.yaml"
+        before = yaml.safe_load(cfg_path.read_text())
+        assert before.get("dns_resolvers", []) == []
+
+        self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9"])
+        cli.main(["resolvers", "discover"])
+
+        after = yaml.safe_load(cfg_path.read_text())
+        assert after.get("dns_resolvers", []) == []
+
+    def test_discover_with_save_writes_config(self, config_home, monkeypatch, capsys):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9", "8.8.8.8"])
+
+        rc = cli.main(["resolvers", "discover", "--save"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "saved 3 resolvers" in out
+
+        cfg = yaml.safe_load((config_home / "config.yaml").read_text())
+        assert cfg["dns_resolvers"] == ["1.1.1.1", "9.9.9.9", "8.8.8.8"]
+
+    def test_discover_save_then_list_shows_them(self, config_home, monkeypatch, capsys):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9"])
+        cli.main(["resolvers", "discover", "--save"])
+        capsys.readouterr()
+
+        cli.main(["resolvers", "list"])
+        out = capsys.readouterr().out
+        assert "1.1.1.1" in out
+        assert "9.9.9.9" in out
+
+    def test_list_without_saved_resolvers_prints_hint(self, config_home, capsys):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        cli.main(["resolvers", "list"])
+        out = capsys.readouterr().out
+        assert "no dns_resolvers configured" in out
+
+    def test_discover_save_without_config_errors(
+        self, config_home, monkeypatch, capsys
+    ):
+        """`--save` on a fresh machine (no `dmp init` yet) fails cleanly."""
+        self._stub_discover(monkeypatch, ["1.1.1.1"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["resolvers", "discover", "--save"])
+        assert exc.value.code == 1
+
+    def test_discover_all_failures_exits_with_network_error(
+        self, config_home, monkeypatch
+    ):
+        """Every probe failed -> ResolverPool.discover raises ValueError,
+        CLI surfaces it as exit code 2 (network/backend error)."""
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        self._stub_discover(monkeypatch, [])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["resolvers", "discover"])
+        assert exc.value.code == 2
