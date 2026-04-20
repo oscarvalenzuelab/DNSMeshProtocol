@@ -19,12 +19,20 @@ services:
       DMP_DNS_HOST: 0.0.0.0
       DMP_DNS_PORT: "5353"
       DMP_DNS_TTL: "60"
+      # Enable per-IP DNS rate limits for public-facing deployments:
+      # DMP_DNS_RATE: "50"    # queries/sec per source IP
+      # DMP_DNS_BURST: "200"  # burst budget
       DMP_HTTP_HOST: 0.0.0.0
       DMP_HTTP_PORT: "8053"
       # Set DMP_HTTP_TOKEN to require bearer auth on the HTTP API:
       # DMP_HTTP_TOKEN: ${DMP_HTTP_TOKEN:-}
+      # HTTP rate limits, same idea as DNS:
+      # DMP_HTTP_RATE: "5"
+      # DMP_HTTP_BURST: "20"
       DMP_CLEANUP_INTERVAL: "60"
       DMP_LOG_LEVEL: INFO
+      # Set DMP_LOG_FORMAT: json for structured logs ingestion:
+      # DMP_LOG_FORMAT: json
 
     volumes:
       - dmp-data:/var/lib/dmp
