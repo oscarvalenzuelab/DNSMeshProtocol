@@ -298,22 +298,19 @@ def _make_reader(config: CLIConfig) -> DNSRecordReader:
     fall back to the single-host `_DnsReader` for back-compat with
     existing configs.
 
-    Per-host ports: today `ResolverPool` is single-port. When the parsed
-    entries carry mixed ports, the first entry's explicit port wins and
-    the rest of the pool inherits it; unspecified ports default to 53
-    (the standard DNS port and what `ResolverPool` itself defaults to).
-    The `_DnsReader` fallback still honors `dns_port` unchanged, so
+    Per-host ports: `ResolverPool` accepts `(ip, port)` tuples so each
+    entry carries its own port. Entries without an explicit port inherit
+    `ResolverPool`'s default (53 — the standard DNS port). The
+    `_DnsReader` fallback still honors `dns_port` unchanged, so
     upgrading from the legacy single-host setup is transparent.
     """
     if config.dns_resolvers:
         parsed = _parse_resolver_list(",".join(config.dns_resolvers))
-        hosts = [h for h, _ in parsed]
-        # First explicit port wins; if none of the entries carried a
-        # port we fall through to ResolverPool's own default (53).
-        ports = [p for _, p in parsed if p is not None]
-        if ports:
-            return ResolverPool(hosts, port=ports[0])
-        return ResolverPool(hosts)
+        # Hand each upstream through with its own port, or a bare IP
+        # when the entry was portless (ResolverPool inherits its own
+        # default of 53 for those).
+        pool_hosts = [(h, p) if p is not None else h for h, p in parsed]
+        return ResolverPool(pool_hosts)
     return _DnsReader(config.dns_host, config.dns_port)
 
 
