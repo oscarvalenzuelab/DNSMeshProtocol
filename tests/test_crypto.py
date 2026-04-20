@@ -170,15 +170,40 @@ class TestDMPCrypto:
         assert user_id == user_id2
     
     def test_sign_verify_data(self):
-        """Test data signing and verification"""
+        """Ed25519 signing and verification."""
         crypto = DMPCrypto()
         data = b"Data to sign"
-        
+
         signature = crypto.sign_data(data)
-        assert len(signature) == 32
-        
-        # Verify signature (simplified for MVP)
-        assert crypto.verify_signature(data, signature, crypto.public_key)
+        # Ed25519 signatures are always 64 bytes
+        assert len(signature) == 64
+
+        # Valid signature verifies
+        assert DMPCrypto.verify_signature(data, signature, crypto.signing_public_key)
+        # Also accepts raw 32-byte pubkey
+        assert DMPCrypto.verify_signature(
+            data, signature, crypto.get_signing_public_key_bytes()
+        )
+
+        # Tampered data fails
+        assert not DMPCrypto.verify_signature(
+            b"Tampered data", signature, crypto.signing_public_key
+        )
+
+        # Wrong signer fails
+        other = DMPCrypto()
+        assert not DMPCrypto.verify_signature(
+            data, signature, other.signing_public_key
+        )
+
+    def test_signing_key_deterministic_from_passphrase(self):
+        """Same passphrase produces the same Ed25519 signing key."""
+        a = DMPCrypto.from_passphrase("my pass")
+        b = DMPCrypto.from_passphrase("my pass")
+        assert a.get_signing_public_key_bytes() == b.get_signing_public_key_bytes()
+
+        c = DMPCrypto.from_passphrase("different")
+        assert c.get_signing_public_key_bytes() != a.get_signing_public_key_bytes()
 
 
 class TestEncryptedMessage:
@@ -241,6 +266,36 @@ class TestMessageEncryption:
         
         assert decrypted == message
     
+    def test_encrypt_with_header_roundtrip(self):
+        """encrypt_with_header binds header bytes as AAD; round-trip works."""
+        sender = DMPCrypto()
+        recipient = DMPCrypto()
+        enc = MessageEncryption(sender)
+        dec = MessageEncryption(recipient)
+
+        plaintext = b"Header-bound message"
+        header_aad = b'{"v":1,"msg_id":"abc","sender":"s","recipient":"r"}'
+
+        encrypted = enc.encrypt_with_header(plaintext, recipient.public_key, header_aad)
+        assert dec.decrypt_with_header(encrypted, header_aad) == plaintext
+
+    def test_encrypt_with_header_rejects_mutation(self):
+        """Mutating the AAD header bytes causes decrypt to fail."""
+        from cryptography.exceptions import InvalidTag
+
+        sender = DMPCrypto()
+        recipient = DMPCrypto()
+        enc = MessageEncryption(sender)
+        dec = MessageEncryption(recipient)
+
+        plaintext = b"payload"
+        header_aad = b'{"v":1,"msg_id":"abc"}'
+        encrypted = enc.encrypt_with_header(plaintext, recipient.public_key, header_aad)
+
+        # Single-bit change in the AAD breaks authentication
+        with pytest.raises(InvalidTag):
+            dec.decrypt_with_header(encrypted, b'{"v":1,"msg_id":"abd"}')
+
     def test_message_decryption_wrong_metadata(self):
         """Test that wrong metadata causes decryption to fail"""
         sender = DMPCrypto()
