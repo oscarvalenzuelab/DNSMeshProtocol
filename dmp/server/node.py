@@ -55,7 +55,6 @@ from dmp.server.metrics import REGISTRY
 from dmp.server.rate_limit import RateLimit
 from dmp.storage.sqlite_store import SqliteMailboxStore
 
-
 log = logging.getLogger(__name__)
 
 
@@ -88,7 +87,7 @@ class DMPNodeConfig:
     dns_max_concurrency: int = 128
     cleanup_interval: float = 60.0
     log_level: str = "INFO"
-    log_format: str = "text"   # "text" or "json"
+    log_format: str = "text"  # "text" or "json"
 
     @classmethod
     def from_env(cls) -> "DMPNodeConfig":

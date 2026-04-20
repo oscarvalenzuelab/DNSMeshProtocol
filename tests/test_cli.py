@@ -623,6 +623,7 @@ class TestDnsResolvers:
         with pytest.raises(ValueError):
             _parse_resolver_entry("[2001:4860:4860::8888")
 
+
 class TestResolversCommand:
     """`dmp resolvers discover` + `dmp resolvers list`.
 

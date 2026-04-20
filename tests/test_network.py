@@ -14,9 +14,7 @@ class TestInMemoryDNSStore:
     def test_publish_and_query(self):
         store = InMemoryDNSStore()
         assert store.publish_txt_record("mb-abc.example.com", "v=dmp1;t=chunk;d=xxx")
-        assert store.query_txt_record("mb-abc.example.com") == [
-            "v=dmp1;t=chunk;d=xxx"
-        ]
+        assert store.query_txt_record("mb-abc.example.com") == ["v=dmp1;t=chunk;d=xxx"]
 
     def test_missing_returns_none(self):
         store = InMemoryDNSStore()
@@ -76,16 +74,19 @@ class TestDNSPublisherInheritance:
 
     def test_cloudflare_is_writer(self):
         from dmp.network.dns_publisher import CloudflarePublisher
+
         pub = CloudflarePublisher(zone_id="zzz", api_token="t")
         assert isinstance(pub, DNSRecordWriter)
 
     def test_local_is_writer(self):
         from dmp.network.dns_publisher import LocalDNSPublisher
+
         pub = LocalDNSPublisher(config_file="/tmp/nonexistent")
         assert isinstance(pub, DNSRecordWriter)
 
     def test_multi_provider_aggregates(self):
         from dmp.network.dns_publisher import MultiProviderPublisher
+
         multi = MultiProviderPublisher()
         mem_a = InMemoryDNSStore()
         mem_b = InMemoryDNSStore()

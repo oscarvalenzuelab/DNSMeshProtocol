@@ -32,14 +32,15 @@ import zfec
 
 from dmp.core.chunking import MessageChunker
 
-
 DEFAULT_REDUNDANCY = 0.3
 
 # Internal: length of the original-message length prefix (big-endian u32).
 _LEN_PREFIX = 4
 
 
-def choose_kn(plaintext_size: int, redundancy: float = DEFAULT_REDUNDANCY) -> Tuple[int, int]:
+def choose_kn(
+    plaintext_size: int, redundancy: float = DEFAULT_REDUNDANCY
+) -> Tuple[int, int]:
     """Return (k, n) for a given plaintext size.
 
     Pure function; exposed so callers can compute n before they encode, e.g.
@@ -71,9 +72,7 @@ def encode(
     # Length-prefix and zero-pad to exactly k * block_size bytes.
     wrapped = len(plaintext).to_bytes(_LEN_PREFIX, "big") + plaintext
     padded = wrapped + b"\x00" * (k * block_size - len(wrapped))
-    data_blocks = [
-        padded[i * block_size : (i + 1) * block_size] for i in range(k)
-    ]
+    data_blocks = [padded[i * block_size : (i + 1) * block_size] for i in range(k)]
 
     # k == n is not legal in zfec (requires at least one parity). choose_kn
     # always adds at least one parity, so we never hit that case here.

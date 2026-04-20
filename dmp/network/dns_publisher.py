@@ -38,9 +38,9 @@ class DNSUpdatePublisher(DNSRecordWriter):
         nameserver: str,
         keyname: Optional[str] = None,
         secret: Optional[str] = None,
-        keyalgorithm: str = 'hmac-sha256',
+        keyalgorithm: str = "hmac-sha256",
     ):
-        self.zone = zone.rstrip('.')
+        self.zone = zone.rstrip(".")
         self.nameserver = nameserver
         self.keyring = None
         if keyname and secret:
@@ -48,10 +48,10 @@ class DNSUpdatePublisher(DNSRecordWriter):
 
     def _relative_name(self, name: str) -> str:
         """Strip the zone suffix from a FQDN to get the relative label."""
-        name = name.rstrip('.')
+        name = name.rstrip(".")
         if name == self.zone:
-            return '@'
-        if name.endswith('.' + self.zone):
+            return "@"
+        if name.endswith("." + self.zone):
             return name[: -(len(self.zone) + 1)]
         return name  # caller passed a relative label already
 
@@ -59,8 +59,8 @@ class DNSUpdatePublisher(DNSRecordWriter):
         try:
             update = dns.update.Update(self.zone, keyring=self.keyring)
             rel = self._relative_name(name)
-            update.delete(rel, 'TXT')
-            update.add(rel, ttl, 'TXT', f'"{value}"')
+            update.delete(rel, "TXT")
+            update.add(rel, ttl, "TXT", f'"{value}"')
             response = dns.query.tcp(update, self.nameserver, timeout=10)
             return response.rcode() == dns.rcode.NOERROR
         except Exception as e:
@@ -70,7 +70,7 @@ class DNSUpdatePublisher(DNSRecordWriter):
     def delete_txt_record(self, name: str, value: Optional[str] = None) -> bool:
         try:
             update = dns.update.Update(self.zone, keyring=self.keyring)
-            update.delete(self._relative_name(name), 'TXT')
+            update.delete(self._relative_name(name), "TXT")
             response = dns.query.tcp(update, self.nameserver, timeout=10)
             return response.rcode() == dns.rcode.NOERROR
         except Exception as e:
@@ -97,6 +97,7 @@ class CloudflarePublisher(DNSRecordWriter):
 
     def _requests(self):
         import requests
+
         return requests
 
     def publish_txt_record(
@@ -104,7 +105,7 @@ class CloudflarePublisher(DNSRecordWriter):
     ) -> bool:
         try:
             ttl = max(60, ttl)  # Cloudflare minimum TTL
-            existing = self._find_record(name, 'TXT')
+            existing = self._find_record(name, "TXT")
             payload = {
                 "type": "TXT",
                 "name": name,
@@ -117,8 +118,10 @@ class CloudflarePublisher(DNSRecordWriter):
                 url = f"{self.base_url}/{existing['id']}"
                 response = requests.put(url, headers=self.headers, json=payload)
             else:
-                response = requests.post(self.base_url, headers=self.headers, json=payload)
-            return response.json().get('success', False)
+                response = requests.post(
+                    self.base_url, headers=self.headers, json=payload
+                )
+            return response.json().get("success", False)
         except Exception as e:
             print(f"Cloudflare API error: {e}")
             return False
@@ -131,20 +134,20 @@ class CloudflarePublisher(DNSRecordWriter):
                 params={"name": name, "type": record_type},
             )
             result = response.json()
-            if result['success'] and result['result']:
-                return result['result'][0]
+            if result["success"] and result["result"]:
+                return result["result"][0]
             return None
         except Exception:
             return None
 
     def delete_txt_record(self, name: str, value: Optional[str] = None) -> bool:
         try:
-            record = self._find_record(name, 'TXT')
+            record = self._find_record(name, "TXT")
             if not record:
                 return True
             url = f"{self.base_url}/{record['id']}"
             response = self._requests().delete(url, headers=self.headers)
-            return response.json().get('success', False)
+            return response.json().get("success", False)
         except Exception as e:
             print(f"Cloudflare delete error: {e}")
             return False
@@ -159,9 +162,10 @@ class Route53Publisher(DNSRecordWriter):
 
     def __init__(self, hosted_zone_id: str, aws_access_key: str, aws_secret_key: str):
         import boto3
+
         self.hosted_zone_id = hosted_zone_id
         self.client = boto3.client(
-            'route53',
+            "route53",
             aws_access_key_id=aws_access_key,
             aws_secret_access_key=aws_secret_key,
         )
@@ -171,18 +175,20 @@ class Route53Publisher(DNSRecordWriter):
             response = self.client.change_resource_record_sets(
                 HostedZoneId=self.hosted_zone_id,
                 ChangeBatch={
-                    'Changes': [{
-                        'Action': 'UPSERT',
-                        'ResourceRecordSet': {
-                            'Name': name,
-                            'Type': 'TXT',
-                            'TTL': ttl,
-                            'ResourceRecords': [{'Value': f'"{value}"'}],
-                        },
-                    }]
+                    "Changes": [
+                        {
+                            "Action": "UPSERT",
+                            "ResourceRecordSet": {
+                                "Name": name,
+                                "Type": "TXT",
+                                "TTL": ttl,
+                                "ResourceRecords": [{"Value": f'"{value}"'}],
+                            },
+                        }
+                    ]
                 },
             )
-            return response['ResponseMetadata']['HTTPStatusCode'] == 200
+            return response["ResponseMetadata"]["HTTPStatusCode"] == 200
         except Exception as e:
             print(f"Route53 error: {e}")
             return False
@@ -195,18 +201,20 @@ class Route53Publisher(DNSRecordWriter):
             response = self.client.change_resource_record_sets(
                 HostedZoneId=self.hosted_zone_id,
                 ChangeBatch={
-                    'Changes': [{
-                        'Action': 'DELETE',
-                        'ResourceRecordSet': {
-                            'Name': name,
-                            'Type': 'TXT',
-                            'TTL': 300,
-                            'ResourceRecords': [{'Value': f'"{value}"'}],
-                        },
-                    }]
+                    "Changes": [
+                        {
+                            "Action": "DELETE",
+                            "ResourceRecordSet": {
+                                "Name": name,
+                                "Type": "TXT",
+                                "TTL": 300,
+                                "ResourceRecords": [{"Value": f'"{value}"'}],
+                            },
+                        }
+                    ]
                 },
             )
-            return response['ResponseMetadata']['HTTPStatusCode'] == 200
+            return response["ResponseMetadata"]["HTTPStatusCode"] == 200
         except Exception as e:
             print(f"Route53 delete error: {e}")
             return False
@@ -225,11 +233,12 @@ class LocalDNSPublisher(DNSRecordWriter):
 
     def _write_and_reload(self) -> bool:
         try:
-            with open(self.config_file, 'w') as f:
+            with open(self.config_file, "w") as f:
                 for d, v in self.records.items():
                     f.write(f'txt-record={d},"{v}"\n')
             import subprocess
-            subprocess.run(['sudo', 'systemctl', 'reload', 'dnsmasq'], check=False)
+
+            subprocess.run(["sudo", "systemctl", "reload", "dnsmasq"], check=False)
             return True
         except Exception as e:
             print(f"Local DNS error: {e}")

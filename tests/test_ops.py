@@ -217,6 +217,7 @@ class TestBoundedConcurrency:
         # A handler that blocks until the test releases it. Max concurrency
         # of 1 means the second connection should be dropped.
         blocker = threading.Event()
+
         # Piggy-back a custom store whose query blocks the /health handler.
         class SlowStore(InMemoryDNSStore):
             def query_txt_record(self, name):
@@ -225,9 +226,7 @@ class TestBoundedConcurrency:
                 return super().query_txt_record(name)
 
         store = SlowStore()
-        api = DMPHttpApi(
-            store, host="127.0.0.1", port=_free_port(), max_concurrency=1
-        )
+        api = DMPHttpApi(store, host="127.0.0.1", port=_free_port(), max_concurrency=1)
         api.start()
         base = f"http://127.0.0.1:{api.port}"
         try:

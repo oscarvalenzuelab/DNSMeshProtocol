@@ -91,9 +91,9 @@ class TestSendReceive:
 
         for name in store.list_names():
             for value in store.query_txt_record(name) or []:
-                assert len(value.encode("utf-8")) <= 255, (
-                    f"TXT record at {name} is {len(value)} bytes — exceeds DNS per-string limit"
-                )
+                assert (
+                    len(value.encode("utf-8")) <= 255
+                ), f"TXT record at {name} is {len(value)} bytes — exceeds DNS per-string limit"
 
     def test_transient_chunk_miss_does_not_blacklist(self):
         """Replay cache must not record a manifest until decrypt succeeds.
@@ -229,6 +229,7 @@ class TestSendReceive:
 
         # Find the manifest → prekey_id should be nonzero (FS path taken).
         from dmp.core.manifest import NO_PREKEY, SlotManifest
+
         manifest = None
         for name in store.list_names():
             if not name.startswith("slot-"):
@@ -270,6 +271,7 @@ class TestSendReceive:
         assert alice.send_message("bob", "long-term path")
 
         from dmp.core.manifest import NO_PREKEY, SlotManifest
+
         manifest = None
         for name in store.list_names():
             if not name.startswith("slot-"):
@@ -310,6 +312,7 @@ class TestSendReceive:
         bob.refresh_prekeys(count=3, ttl_seconds=3600)
 
         from dmp.core.prekeys import prekey_rrset_name
+
         pool_name = prekey_rrset_name("bob", "mesh.test")
         assert len(store.query_txt_record(pool_name) or []) == 3
 
@@ -365,6 +368,7 @@ class TestSendReceive:
             bytes.fromhex(bob.get_public_key_hex())
         ).digest()
         from dmp.core.manifest import SlotManifest
+
         manifest = None
         for name in store.list_names():
             if not name.startswith("slot-"):
@@ -404,6 +408,7 @@ class TestSendReceive:
             bytes.fromhex(bob.get_public_key_hex())
         ).digest()
         from dmp.core.manifest import SlotManifest
+
         manifest = None
         for name in store.list_names():
             if not name.startswith("slot-"):
@@ -524,6 +529,7 @@ class TestSendReceive:
         # past exp; since exp = sent_at + 1 and int() truncates, 2.2 s is the
         # smallest safe wait.
         import time
+
         time.sleep(2.2)
         inbox = bob.receive_messages()
         # Either the manifest expired (dropped by manifest.is_expired) or
@@ -570,9 +576,7 @@ class TestSendReceive:
                 ts=int(time.time()),
                 exp=int(time.time()) + 300,
             ).sign(eve.crypto)
-            store.publish_txt_record(
-                f"slot-{slot}.mb-{mb_hash}.mesh.test", junk
-            )
+            store.publish_txt_record(f"slot-{slot}.mb-{mb_hash}.mesh.test", junk)
 
         # Bob polls — he sees both alice's real manifest and eve's junk at
         # each slot. Alice's message still comes through.
@@ -593,7 +597,9 @@ class TestSendReceive:
         # Eve overwrites every one of Bob's slots with a manifest that claims
         # to be from Alice. Since Eve can't sign with Alice's Ed25519 key, the
         # manifest signature won't verify and Bob's poll drops it.
-        bob_recipient_id = hashlib.sha256(bytes.fromhex(bob.get_public_key_hex())).digest()
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
         forged = SlotManifest(
             msg_id=uuid.uuid4().bytes,
             sender_spk=alice.crypto.get_signing_public_key_bytes(),  # claims alice

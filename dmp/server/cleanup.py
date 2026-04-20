@@ -11,7 +11,6 @@ import logging
 import threading
 from typing import Callable, Optional
 
-
 log = logging.getLogger(__name__)
 
 

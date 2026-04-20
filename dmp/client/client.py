@@ -21,7 +21,6 @@ from dmp.core.prekeys import Prekey, PrekeyStore, prekey_rrset_name
 from dmp.network.base import DNSRecordReader, DNSRecordStore, DNSRecordWriter
 from dmp.network.memory import InMemoryDNSStore
 
-
 SLOT_COUNT = 10
 DEFAULT_TTL_SECONDS = 300
 
@@ -39,8 +38,10 @@ class Contact:
     """
 
     username: str
-    public_key_bytes: bytes   # X25519 encryption pubkey (32 bytes)
-    signing_key_bytes: bytes  # Ed25519 signing pubkey (32 bytes); may be b'' for legacy contacts
+    public_key_bytes: bytes  # X25519 encryption pubkey (32 bytes)
+    signing_key_bytes: (
+        bytes  # Ed25519 signing pubkey (32 bytes); may be b'' for legacy contacts
+    )
     domain: str
 
 
@@ -186,11 +187,11 @@ class DMPClient:
 
     def _known_signing_keys(self) -> set[bytes]:
         """Signing keys we've pinned; used to filter incoming manifests."""
-        return {c.signing_key_bytes for c in self.contacts.values() if c.signing_key_bytes}
+        return {
+            c.signing_key_bytes for c in self.contacts.values() if c.signing_key_bytes
+        }
 
-    def _pick_recipient_prekey(
-        self, contact: "Contact"
-    ) -> Tuple[int, Optional[bytes]]:
+    def _pick_recipient_prekey(self, contact: "Contact") -> Tuple[int, Optional[bytes]]:
         """Fetch a fresh prekey from DNS and return (prekey_id, x25519_pub).
 
         Returns (0, None) when:
@@ -457,9 +458,7 @@ class DMPClient:
                 # actually decode the message. Otherwise a transient DNS miss
                 # during chunk fetch would permanently suppress a still-valid
                 # manifest on later polls.
-                if self.replay_cache.has_seen(
-                    manifest.sender_spk, manifest.msg_id
-                ):
+                if self.replay_cache.has_seen(manifest.sender_spk, manifest.msg_id):
                     continue
                 decoded = self._fetch_and_decrypt(manifest)
                 if decoded is None:
@@ -468,12 +467,14 @@ class DMPClient:
                 self.replay_cache.record(
                     manifest.sender_spk, manifest.msg_id, manifest.exp
                 )
-                results.append(InboxMessage(
-                    sender_signing_pk=manifest.sender_spk,
-                    plaintext=plaintext,
-                    timestamp=ts,
-                    msg_id=msg_id,
-                ))
+                results.append(
+                    InboxMessage(
+                        sender_signing_pk=manifest.sender_spk,
+                        plaintext=plaintext,
+                        timestamp=ts,
+                        msg_id=msg_id,
+                    )
+                )
         return results
 
     def _fetch_and_decrypt(
@@ -515,9 +516,7 @@ class DMPClient:
         if len(shares) < manifest.data_chunks:
             return None
 
-        assembled = erasure.decode(
-            shares, manifest.data_chunks, manifest.total_chunks
-        )
+        assembled = erasure.decode(shares, manifest.data_chunks, manifest.total_chunks)
         if assembled is None:
             return None
 

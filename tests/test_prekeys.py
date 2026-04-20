@@ -27,9 +27,7 @@ class TestPrekeyRecord:
         assert wire.startswith(RECORD_PREFIX)
         assert len(wire.encode("utf-8")) <= 255
 
-        parsed = Prekey.parse_and_verify(
-            wire, identity.get_signing_public_key_bytes()
-        )
+        parsed = Prekey.parse_and_verify(wire, identity.get_signing_public_key_bytes())
         assert parsed is not None
         assert parsed.prekey_id == 42
         assert parsed.public_key == sk.get_public_key_bytes()
@@ -45,9 +43,10 @@ class TestPrekeyRecord:
         )
         wire = pk.sign(real)
         # Verify against the wrong Ed25519 key → None.
-        assert Prekey.parse_and_verify(
-            wire, impostor.get_signing_public_key_bytes()
-        ) is None
+        assert (
+            Prekey.parse_and_verify(wire, impostor.get_signing_public_key_bytes())
+            is None
+        )
 
     def test_tampered_wire_rejected(self):
         identity = DMPCrypto()
@@ -59,24 +58,34 @@ class TestPrekeyRecord:
         )
         wire = pk.sign(identity)
         # Flip a byte inside the signed body.
-        mangled = bytearray(base64.b64decode(wire[len(RECORD_PREFIX):]))
+        mangled = bytearray(base64.b64decode(wire[len(RECORD_PREFIX) :]))
         mangled[0] ^= 0xFF
         tampered = RECORD_PREFIX + base64.b64encode(bytes(mangled)).decode("ascii")
-        assert Prekey.parse_and_verify(
-            tampered, identity.get_signing_public_key_bytes()
-        ) is None
+        assert (
+            Prekey.parse_and_verify(tampered, identity.get_signing_public_key_bytes())
+            is None
+        )
 
     def test_malformed_wire_returns_none(self):
         identity = DMPCrypto()
-        assert Prekey.parse_and_verify("garbage", identity.get_signing_public_key_bytes()) is None
-        assert Prekey.parse_and_verify(
-            RECORD_PREFIX + "not-base64!!",
-            identity.get_signing_public_key_bytes(),
-        ) is None
+        assert (
+            Prekey.parse_and_verify("garbage", identity.get_signing_public_key_bytes())
+            is None
+        )
+        assert (
+            Prekey.parse_and_verify(
+                RECORD_PREFIX + "not-base64!!",
+                identity.get_signing_public_key_bytes(),
+            )
+            is None
+        )
         short = base64.b64encode(b"too short").decode("ascii")
-        assert Prekey.parse_and_verify(
-            RECORD_PREFIX + short, identity.get_signing_public_key_bytes()
-        ) is None
+        assert (
+            Prekey.parse_and_verify(
+                RECORD_PREFIX + short, identity.get_signing_public_key_bytes()
+            )
+            is None
+        )
 
     def test_expiry_flag(self):
         now = int(time.time())
@@ -101,6 +110,7 @@ class TestPrekeyStore:
                 # Can't compare X25519PrivateKey instances directly; compare
                 # via their derived pubkeys.
                 from cryptography.hazmat.primitives import serialization
+
                 fetched_pub = fetched.public_key().public_bytes(
                     encoding=serialization.Encoding.Raw,
                     format=serialization.PublicFormat.Raw,
@@ -133,8 +143,8 @@ class TestPrekeyStore:
     def test_cleanup_expired(self, tmp_path):
         store = PrekeyStore(str(tmp_path / "p.db"))
         try:
-            store.generate_pool(count=3, ttl_seconds=0)      # expired
-            store.generate_pool(count=2, ttl_seconds=3600)   # live
+            store.generate_pool(count=3, ttl_seconds=0)  # expired
+            store.generate_pool(count=2, ttl_seconds=3600)  # live
             deleted = store.cleanup_expired()
             assert deleted == 3
             assert store.count_live() == 2

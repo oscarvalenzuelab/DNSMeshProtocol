@@ -77,11 +77,18 @@ def node_container():
 
     subprocess.run(
         [
-            "docker", "run", "--rm", "-d",
-            "--name", name,
-            "-p", f"127.0.0.1:{dns_port}:5353/udp",
-            "-p", f"127.0.0.1:{http_port}:8053/tcp",
-            "-e", "DMP_LOG_LEVEL=WARNING",
+            "docker",
+            "run",
+            "--rm",
+            "-d",
+            "--name",
+            name,
+            "-p",
+            f"127.0.0.1:{dns_port}:5353/udp",
+            "-p",
+            f"127.0.0.1:{http_port}:8053/tcp",
+            "-e",
+            "DMP_LOG_LEVEL=WARNING",
             "dmp-node:latest",
         ],
         check=True,
@@ -92,9 +99,7 @@ def node_container():
     deadline = time.time() + 10.0
     while time.time() < deadline:
         try:
-            r = requests.get(
-                f"http://127.0.0.1:{http_port}/health", timeout=1
-            )
+            r = requests.get(f"http://127.0.0.1:{http_port}/health", timeout=1)
             if r.status_code == 200:
                 break
         except Exception:
@@ -123,6 +128,7 @@ class _HttpWriter:
 
     def __init__(self, base_url: str, token: str | None = None):
         import requests
+
         self._requests = requests
         self._base = base_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -161,9 +167,7 @@ class _DnsReader:
 
         request = dns.message.make_query(name, dns.rdatatype.TXT)
         try:
-            response = dns.query.udp(
-                request, self._host, port=self._port, timeout=3.0
-            )
+            response = dns.query.udp(request, self._host, port=self._port, timeout=3.0)
         except Exception:
             return None
         if response.rcode() != 0 or not response.answer:
@@ -183,12 +187,18 @@ def test_container_roundtrip(node_container):
     reader = _DnsReader("127.0.0.1", node_container["dns_port"])
 
     alice = DMPClient(
-        "alice", "alice-pass", domain="mesh.docker",
-        writer=writer, reader=reader,
+        "alice",
+        "alice-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
     )
     bob = DMPClient(
-        "bob", "bob-pass", domain="mesh.docker",
-        writer=writer, reader=reader,
+        "bob",
+        "bob-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
     )
     alice.add_contact("bob", bob.get_public_key_hex())
 
@@ -197,10 +207,7 @@ def test_container_roundtrip(node_container):
     inbox = bob.receive_messages()
     assert len(inbox) == 1
     assert inbox[0].plaintext == b"hello from a real container"
-    assert (
-        inbox[0].sender_signing_pk
-        == alice.crypto.get_signing_public_key_bytes()
-    )
+    assert inbox[0].sender_signing_pk == alice.crypto.get_signing_public_key_bytes()
 
 
 def test_container_survives_client_restart(node_container):
@@ -211,12 +218,19 @@ def test_container_survives_client_restart(node_container):
     reader = _DnsReader("127.0.0.1", node_container["dns_port"])
 
     alice = DMPClient(
-        "alice", "alice-pass", domain="mesh.docker",
-        writer=writer, reader=reader,
+        "alice",
+        "alice-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
     )
     # Grab bob's pubkey without retaining the client instance.
     bob_pubkey = DMPClient(
-        "bob", "bob-pass", domain="mesh.docker", writer=writer, reader=reader,
+        "bob",
+        "bob-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
     ).get_public_key_hex()
     alice.add_contact("bob", bob_pubkey)
 
@@ -224,8 +238,11 @@ def test_container_survives_client_restart(node_container):
 
     # A brand-new Bob process (fresh ReplayCache, no prior state) reads.
     bob_fresh = DMPClient(
-        "bob", "bob-pass", domain="mesh.docker",
-        writer=writer, reader=reader,
+        "bob",
+        "bob-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
     )
     inbox = bob_fresh.receive_messages()
     assert len(inbox) == 1
@@ -253,12 +270,20 @@ def test_container_forward_secrecy_end_to_end(node_container, tmp_path):
     bob_prekeys = str(tmp_path / "bob-prekeys.db")
 
     alice = DMPClient(
-        "alice-fs", "alice-fs-pass", domain="mesh.docker",
-        writer=writer, reader=reader, prekey_store_path=alice_prekeys,
+        "alice-fs",
+        "alice-fs-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
+        prekey_store_path=alice_prekeys,
     )
     bob = DMPClient(
-        "bob-fs", "bob-fs-pass", domain="mesh.docker",
-        writer=writer, reader=reader, prekey_store_path=bob_prekeys,
+        "bob-fs",
+        "bob-fs-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
+        prekey_store_path=bob_prekeys,
     )
     # Alice pins both of bob's keys — required to verify prekey signatures.
     alice.add_contact(
@@ -281,9 +306,8 @@ def test_container_forward_secrecy_end_to_end(node_container, tmp_path):
 
     # Find bob's manifest on the node; prekey_id should be nonzero.
     import hashlib
-    bob_recipient_id = hashlib.sha256(
-        bytes.fromhex(bob.get_public_key_hex())
-    ).digest()
+
+    bob_recipient_id = hashlib.sha256(bytes.fromhex(bob.get_public_key_hex())).digest()
     manifest = None
     for slot in range(10):
         domain = f"slot-{slot}.mb-{hashlib.sha256(bob_recipient_id).hexdigest()[:12]}.mesh.docker"
@@ -332,8 +356,11 @@ def test_container_zone_anchored_identity(node_container):
 
     # Alice creates her identity + publishes to dmp.alice.example.com.
     alice = DMPClient(
-        "alice-z", "alice-z-pass", domain="mesh.docker",
-        writer=writer, reader=reader,
+        "alice-z",
+        "alice-z-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
     )
     record = make_record(alice.crypto, "alice-z")
     wire = record.sign(alice.crypto)

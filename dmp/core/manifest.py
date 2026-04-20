@@ -45,11 +45,10 @@ from typing import Dict, Optional, Tuple
 
 from dmp.core.crypto import DMPCrypto
 
-
 RECORD_PREFIX = "v=dmp1;t=manifest;d="
-_BODY_LEN = 16 + 32 + 32 + 4 + 4 + 4 + 8 + 8   # 108 bytes (adds prekey_id)
+_BODY_LEN = 16 + 32 + 32 + 4 + 4 + 4 + 8 + 8  # 108 bytes (adds prekey_id)
 _SIG_LEN = 64
-_WIRE_LEN = _BODY_LEN + _SIG_LEN                # 172 bytes
+_WIRE_LEN = _BODY_LEN + _SIG_LEN  # 172 bytes
 DEFAULT_MANIFEST_TTL = 300
 
 # Sentinel for "sender did not use a prekey; ECDH used recipient's
@@ -73,14 +72,14 @@ class SlotManifest:
     field breaks verification.
     """
 
-    msg_id: bytes            # 16 bytes
-    sender_spk: bytes        # 32-byte Ed25519 signing public key of the sender
-    recipient_id: bytes      # 32-byte sha256 of recipient's X25519 pubkey
-    total_chunks: int        # n — chunks actually published
-    data_chunks: int         # k — chunks needed to reconstruct (erasure threshold)
-    prekey_id: int           # recipient prekey used for ECDH; 0 = long-term key
-    ts: int                  # unix seconds when the sender published
-    exp: int                 # unix seconds after which recipient should drop
+    msg_id: bytes  # 16 bytes
+    sender_spk: bytes  # 32-byte Ed25519 signing public key of the sender
+    recipient_id: bytes  # 32-byte sha256 of recipient's X25519 pubkey
+    total_chunks: int  # n — chunks actually published
+    data_chunks: int  # k — chunks needed to reconstruct (erasure threshold)
+    prekey_id: int  # recipient prekey used for ECDH; 0 = long-term key
+    ts: int  # unix seconds when the sender published
+    exp: int  # unix seconds after which recipient should drop
 
     def to_body_bytes(self) -> bytes:
         """Binary representation of the manifest fields, used as the signed payload."""
@@ -113,7 +112,9 @@ class SlotManifest:
     @classmethod
     def from_body_bytes(cls, body: bytes) -> "SlotManifest":
         if len(body) != _BODY_LEN:
-            raise ValueError(f"manifest body must be {_BODY_LEN} bytes, got {len(body)}")
+            raise ValueError(
+                f"manifest body must be {_BODY_LEN} bytes, got {len(body)}"
+            )
         total_chunks = int.from_bytes(body[80:84], "big")
         data_chunks = int.from_bytes(body[84:88], "big")
         prekey_id = int.from_bytes(body[88:92], "big")
@@ -143,9 +144,7 @@ class SlotManifest:
         return f"{RECORD_PREFIX}{base64.b64encode(wire).decode('ascii')}"
 
     @classmethod
-    def parse_and_verify(
-        cls, record: str
-    ) -> Optional[Tuple["SlotManifest", bytes]]:
+    def parse_and_verify(cls, record: str) -> Optional[Tuple["SlotManifest", bytes]]:
         """Parse and verify a manifest TXT record.
 
         Returns (manifest, raw_signature) on success, or None if the record is
@@ -156,7 +155,7 @@ class SlotManifest:
         if not record.startswith(RECORD_PREFIX):
             return None
         try:
-            wire = base64.b64decode(record[len(RECORD_PREFIX):])
+            wire = base64.b64decode(record[len(RECORD_PREFIX) :])
         except Exception:
             return None
         if len(wire) != _WIRE_LEN:
@@ -235,10 +234,7 @@ class ReplayCache:
     def _save(self) -> None:
         if not self.persist_path:
             return
-        data = [
-            [spk.hex(), mid.hex(), exp]
-            for (spk, mid), exp in self._seen.items()
-        ]
+        data = [[spk.hex(), mid.hex(), exp] for (spk, mid), exp in self._seen.items()]
         tmp = self.persist_path + ".tmp"
         parent = os.path.dirname(self.persist_path) or "."
         os.makedirs(parent, exist_ok=True)

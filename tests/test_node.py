@@ -43,9 +43,7 @@ def node(tmp_path):
 class TestDMPNode:
     def test_dns_and_http_both_up(self, node):
         # HTTP health
-        r = requests.get(
-            f"http://127.0.0.1:{node.config.http_port}/health", timeout=2
-        )
+        r = requests.get(f"http://127.0.0.1:{node.config.http_port}/health", timeout=2)
         assert r.status_code == 200
 
         # DNS answer for a record we publish via HTTP
@@ -80,12 +78,8 @@ class TestDMPNode:
         # Drive the client directly against the node's sqlite store. Exercises
         # the full send -> chunk -> publish -> poll -> decrypt path through a
         # real persistent store behind the same API the DNS + HTTP layers use.
-        alice = DMPClient(
-            "alice", "apass", domain="mesh.test", store=node.store
-        )
-        bob = DMPClient(
-            "bob", "bpass", domain="mesh.test", store=node.store
-        )
+        alice = DMPClient("alice", "apass", domain="mesh.test", store=node.store)
+        bob = DMPClient("bob", "bpass", domain="mesh.test", store=node.store)
         alice.add_contact("bob", bob.get_public_key_hex())
 
         assert alice.send_message("bob", "via node store")
