@@ -1,0 +1,124 @@
+---
+title: CLI reference
+layout: default
+parent: User Guide
+nav_order: 1
+---
+
+# CLI reference
+{: .no_toc }
+
+1. TOC
+{:toc}
+
+## Config and passphrase
+
+The CLI stores its per-identity config at `$DMP_CONFIG_HOME/config.yaml`
+(default `~/.dmp/config.yaml`), with file mode 0600. The config holds
+everything *except* the passphrase — that's read from:
+
+1. `DMP_PASSPHRASE` environment variable (preferred for scripting)
+2. `passphrase_file` entry in config pointing at a 0600 file
+3. Interactive prompt via `getpass` as a last resort
+
+The passphrase drives Argon2id key derivation against a per-identity
+random salt stored in the config. Losing the config means losing the
+identity even if you remember the passphrase.
+
+## Subcommands
+
+### `dmp init`
+
+Create a fresh config.
+
+```
+dmp init <username> [--domain D] [--endpoint URL] [--http-token T]
+                    [--dns-host H] [--dns-port P]
+                    [--identity-domain ZONE]
+                    [--force]
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--domain` | `mesh.local` | Shared mesh domain; slots/chunks live here |
+| `--endpoint` | — | HTTP API URL of the node you publish to |
+| `--http-token` | — | Bearer token for the HTTP API (optional) |
+| `--dns-host` | system | DNS resolver IP for queries |
+| `--dns-port` | 5353 | DNS resolver port |
+| `--identity-domain` | — | DNS zone you control — enables zone-anchored addresses |
+| `--force` | off | Overwrite existing config |
+
+### `dmp identity`
+
+| Subcommand | Purpose |
+|---|---|
+| `dmp identity show [--json]` | Print this identity's public keys |
+| `dmp identity publish [--ttl N]` | Publish the signed identity record to DNS |
+| `dmp identity refresh-prekeys [--count N] [--ttl S]` | Generate and publish a one-time prekey pool |
+| `dmp identity fetch <user> [--domain D] [--add] [--accept-fingerprint F] [--json]` | Resolve someone else's identity |
+
+`dmp identity fetch` accepts either a plain `<user>` (hash-based lookup
+under the shared mesh domain — TOFU) or a zone-anchored
+`<user>@<zone>` (queries `dmp.<zone>` — anchored to that DNS zone's
+ownership).
+
+When two valid identity records coexist at the same name, `--add` is
+refused and fingerprints are printed on stderr. Re-run with
+`--accept-fingerprint <16-hex>` after verifying out of band.
+
+### `dmp contacts`
+
+| Subcommand | Purpose |
+|---|---|
+| `dmp contacts add <name> <x25519_hex> [--signing-key <ed25519_hex>]` | Pin a contact |
+| `dmp contacts list` | Show pinned contacts; marks each pinned or UNPINNED |
+
+Adding a contact **without** `--signing-key` prints a stderr warning
+and leaves the client in TOFU mode for incoming messages. Prefer
+`dmp identity fetch <user> --add`, which pins both keys automatically.
+
+### `dmp send` / `dmp recv`
+
+```
+dmp send <recipient> <message>
+dmp recv
+```
+
+`send` auto-selects a forward-secret path when the contact has a
+pinned Ed25519 signing key and a live prekey pool; otherwise it
+falls back to the recipient's long-term X25519 key.
+
+`recv` polls every mailbox slot, verifies signatures, checks the
+replay cache, fetches chunks, runs cross-chunk erasure decode, and
+decrypts. Messages that pass all checks are printed; everything else
+is silently dropped.
+
+### `dmp node`
+
+Convenience launcher for a foreground DMP node, reading config from
+env vars.
+
+```
+dmp node [--db-path PATH] [--dns-port P] [--http-port P]
+```
+
+For real deployments use the docker-compose files — see
+[Deployment]({{ site.baseurl }}/deployment).
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DMP_CONFIG_HOME` | `~/.dmp` | Where the CLI stores config, replay cache, and prekey DB |
+| `DMP_PASSPHRASE` | — | Identity passphrase; feeds Argon2id KDF |
+
+Node env vars are documented separately under
+[Deployment → Production]({{ site.baseurl }}/deployment/production).
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | User / config error (missing config, bad flag, invalid hex) |
+| 2 | Network / backend error (publish failed, nothing to fetch) |

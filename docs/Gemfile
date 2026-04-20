@@ -1,0 +1,17 @@
+source "https://rubygems.org"
+
+# GitHub Pages builds with this gem; pinning to it keeps local preview in
+# lock-step with what Pages produces. `bundle exec jekyll serve` locally.
+gem "github-pages", "~> 231", group: :jekyll_plugins
+gem "just-the-docs", "~> 0.8"
+
+# Plugins Pages already ships; listed here so local preview matches.
+group :jekyll_plugins do
+  gem "jekyll-seo-tag"
+  gem "jekyll-sitemap"
+end
+
+# Native platform-specific gems on recent macOS / Ruby toolchains.
+gem "tzinfo-data", platforms: [:mingw, :mswin, :x64_mingw, :jruby]
+gem "wdm", "~> 0.1", platforms: [:mingw, :mswin, :x64_mingw]
+gem "http_parser.rb", "~> 0.6.0", platforms: [:jruby]
