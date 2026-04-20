@@ -14,16 +14,24 @@ Wire format (compact binary to fit in one 255-byte DNS TXT string):
     v=dmp1;t=manifest;d=<b64(body || sig)>
 
 body = msg_id(16) || sender_spk(32) || recipient_id(32) ||
-       total_chunks(4) || data_chunks(4) || ts(8) || exp(8)        =  104 bytes
+       total_chunks(4) || data_chunks(4) || prekey_id(4) ||
+       ts(8) || exp(8)                                              =  108 bytes
 sig  = Ed25519 signature over `body`                                =   64 bytes
-total                                                               =  168 bytes
-base64                                                              =  224 chars
+total                                                               =  172 bytes
+base64                                                              =  232 chars
 prefix `v=dmp1;t=manifest;d=`                                       =   20 chars
-wire total                                                          =  244 chars  (fits)
+wire total                                                          =  252 chars  (fits)
 
 `data_chunks` is the erasure threshold k: the recipient needs any k of the
 total_chunks to reconstruct the message. When the sender disables erasure
 (single-chunk legacy flow), data_chunks == total_chunks.
+
+`prekey_id` tells the recipient which one-time X25519 prekey to use for
+ECDH-based decryption. 0 (`NO_PREKEY`) means the sender fell back to the
+recipient's long-term X25519 key — forward secrecy is NOT in effect for
+that message, and the recipient should flag or surface that fact to the
+user (current client: drops the "pinned signer required" check for
+unpinned TOFU, but the long-term-key path is noted in the dataclass).
 """
 
 from __future__ import annotations
@@ -39,10 +47,14 @@ from dmp.core.crypto import DMPCrypto
 
 
 RECORD_PREFIX = "v=dmp1;t=manifest;d="
-_BODY_LEN = 16 + 32 + 32 + 4 + 4 + 8 + 8   # 104 bytes (adds data_chunks)
+_BODY_LEN = 16 + 32 + 32 + 4 + 4 + 4 + 8 + 8   # 108 bytes (adds prekey_id)
 _SIG_LEN = 64
-_WIRE_LEN = _BODY_LEN + _SIG_LEN            # 168 bytes
+_WIRE_LEN = _BODY_LEN + _SIG_LEN                # 172 bytes
 DEFAULT_MANIFEST_TTL = 300
+
+# Sentinel for "sender did not use a prekey; ECDH used recipient's
+# long-term X25519 key — no forward secrecy for this message."
+NO_PREKEY = 0
 
 
 @dataclass
@@ -58,6 +70,7 @@ class SlotManifest:
     recipient_id: bytes      # 32-byte sha256 of recipient's X25519 pubkey
     total_chunks: int        # n — chunks actually published
     data_chunks: int         # k — chunks needed to reconstruct (erasure threshold)
+    prekey_id: int           # recipient prekey used for ECDH; 0 = long-term key
     ts: int                  # unix seconds when the sender published
     exp: int                 # unix seconds after which recipient should drop
 
@@ -71,12 +84,15 @@ class SlotManifest:
             raise ValueError("recipient_id must be 32 bytes")
         if self.data_chunks <= 0 or self.data_chunks > self.total_chunks:
             raise ValueError("data_chunks must be in 1..total_chunks")
+        if not (0 <= self.prekey_id < (1 << 32)):
+            raise ValueError("prekey_id out of range")
         return (
             self.msg_id
             + self.sender_spk
             + self.recipient_id
             + self.total_chunks.to_bytes(4, "big")
             + self.data_chunks.to_bytes(4, "big")
+            + self.prekey_id.to_bytes(4, "big")
             + self.ts.to_bytes(8, "big")
             + self.exp.to_bytes(8, "big")
         )
@@ -87,6 +103,7 @@ class SlotManifest:
             raise ValueError(f"manifest body must be {_BODY_LEN} bytes, got {len(body)}")
         total_chunks = int.from_bytes(body[80:84], "big")
         data_chunks = int.from_bytes(body[84:88], "big")
+        prekey_id = int.from_bytes(body[88:92], "big")
         if data_chunks <= 0 or data_chunks > total_chunks:
             raise ValueError("data_chunks out of range")
         return cls(
@@ -95,8 +112,9 @@ class SlotManifest:
             recipient_id=body[48:80],
             total_chunks=total_chunks,
             data_chunks=data_chunks,
-            ts=int.from_bytes(body[88:96], "big"),
-            exp=int.from_bytes(body[96:104], "big"),
+            prekey_id=prekey_id,
+            ts=int.from_bytes(body[92:100], "big"),
+            exp=int.from_bytes(body[100:108], "big"),
         )
 
     def sign(self, sender_crypto: DMPCrypto) -> str:

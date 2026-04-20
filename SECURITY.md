@@ -58,12 +58,19 @@ The protocol assumes:
 - **Freshness:** the inner header's `timestamp + ttl` is enforced on
   receive. Stale messages are dropped.
 
+- **Forward secrecy (best-effort, prekey-based).** Recipients publish a
+  pool of signed one-time X25519 prekeys. Senders do ECDH against a
+  prekey instead of the long-term key and embed `prekey_id` in the
+  signed manifest. On successful decrypt the recipient deletes the
+  matching private key, so a later leak of the long-term X25519 key
+  cannot recover that message's session. The fallback path — no
+  pinned signing key or no live prekey pool — uses the long-term key
+  and does NOT give forward secrecy for those messages. This is not
+  Signal-grade: no double ratchet, no post-compromise security, and a
+  crash between decrypt and deletion leaves the prekey sk on disk.
+
 ## What is NOT protected
 
-- **Forward secrecy.** This was previously overclaimed. The recipient
-  decrypts with their long-term X25519 private key, so compromise of
-  that key allows decryption of past stored ciphertexts. We do not
-  implement prekeys or a double ratchet.
 - **Post-compromise sender authentication.** If the sender's Ed25519
   signing key leaks, an attacker can sign arbitrary future manifests
   as that sender. There is no key rotation or revocation channel.

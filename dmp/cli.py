@@ -189,6 +189,9 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
     # Persist the replay cache next to the config so repeated `dmp recv` calls
     # across separate CLI processes don't re-deliver the same message.
     replay_path = str(_config_path().parent / "replay_cache.json")
+    # Prekey store sits in the same config dir; forward-secrecy property
+    # depends on this file's permissions matching the passphrase file.
+    prekey_path = str(_config_path().parent / "prekeys.db")
     # Prefer the per-identity salt from config; fall back to the library
     # default only if this config predates the kdf_salt field.
     kdf_salt = bytes.fromhex(config.kdf_salt) if config.kdf_salt else None
@@ -200,6 +203,7 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
         reader=reader,
         replay_cache_path=replay_path,
         kdf_salt=kdf_salt,
+        prekey_store_path=prekey_path,
     )
     for name, entry in config.contacts.items():
         client.add_contact(
@@ -273,6 +277,30 @@ def cmd_identity_publish(args: argparse.Namespace) -> int:
         _die(2, "publish failed — see node logs")
     print(f"published identity to {name}")
     print(f"  others can resolve you with: dmp identity fetch {cfg.username}")
+    return 0
+
+
+def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
+    """Generate and publish a fresh pool of one-time prekeys.
+
+    Run this before you expect traffic and periodically afterward. Each
+    prekey is a single-use X25519 keypair; the recipient deletes its
+    private half after the first successful decrypt, so once consumed the
+    message is cryptographically unrecoverable without the original
+    ciphertext — that is the forward-secrecy property.
+    """
+    from dmp.core.prekeys import prekey_rrset_name
+
+    cfg = CLIConfig.load(_config_path())
+    passphrase = _load_passphrase(cfg)
+    client = _make_client(cfg, passphrase)
+
+    published = client.refresh_prekeys(count=args.count, ttl_seconds=args.ttl)
+    name = prekey_rrset_name(cfg.username, cfg.domain)
+    print(f"published {published}/{args.count} prekeys to {name}")
+    print(f"  local live prekey count: {client.prekey_store.count_live()}")
+    if published < args.count:
+        print("  (note: some publishes were rejected — check node rate limits and caps)")
     return 0
 
 
@@ -513,6 +541,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="TXT record TTL in seconds (default: 86400 = 1 day)",
     )
     p_id_pub.set_defaults(func=cmd_identity_publish)
+
+    p_id_pk = sub_id.add_parser(
+        "refresh-prekeys",
+        help="generate and publish a fresh pool of one-time X3DH prekeys",
+    )
+    p_id_pk.add_argument(
+        "--count", type=int, default=50,
+        help="number of prekeys to generate (default 50)",
+    )
+    p_id_pk.add_argument(
+        "--ttl", type=int, default=86400,
+        help="per-prekey TTL in seconds (default: 86400 = 1 day)",
+    )
+    p_id_pk.set_defaults(func=cmd_identity_refresh_prekeys)
 
     p_id_fetch = sub_id.add_parser(
         "fetch", help="resolve someone's identity record from DNS"

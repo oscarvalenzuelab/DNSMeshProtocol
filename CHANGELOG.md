@@ -26,6 +26,43 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `DMP_NODE_HOSTNAME=... docker compose -f docker-compose.yml -f
   docker-compose.prod.yml up -d`.
 
+### Added (forward secrecy)
+
+- `dmp.core.prekeys`: X3DH-style one-time X25519 prekeys. A recipient
+  generates a pool of single-use keypairs, stores the private halves
+  locally in a sqlite-backed `PrekeyStore`, signs the public halves
+  with their Ed25519 identity, and publishes them as a TXT RRset at
+  `prekeys.id-<username_hash>.<domain>`. Wire format: 108-byte
+  body || 64-byte signature, fits one 255-byte DNS TXT string.
+- `DMPClient.refresh_prekeys(count, ttl_seconds)`: generate, sign, and
+  publish a fresh pool. Call periodically so senders always find live
+  prekeys.
+- Sender picks a random verified prekey from the recipient's pool,
+  does ECDH against the prekey pubkey instead of the long-term key,
+  and records the `prekey_id` in the signed manifest. Falls back to
+  the long-term key when the contact isn't pinned or no prekeys are
+  reachable (no FS for that message, explicit in the manifest via
+  `prekey_id = 0`).
+- Recipient looks up the prekey sk in `PrekeyStore` during decrypt
+  and calls `PrekeyStore.consume(prekey_id)` after a successful
+  decrypt. That delete is the forward-secrecy property — once gone,
+  the sk is unrecoverable even with a later long-term-key compromise.
+- `SlotManifest` grows a `prekey_id` field. Wire size 168 → 172 bytes.
+  Still fits one 255-byte TXT string.
+- `DMPCrypto.decrypt_message` and `MessageEncryption.decrypt_with_header`
+  accept a `private_key=` override so the receive path can route
+  ECDH through a prekey sk instead of the instance's long-term key.
+- CLI: `dmp identity refresh-prekeys [--count 50] [--ttl 86400]`.
+- Prekey store path wired into the CLI via `_make_client` at
+  `$DMP_CONFIG_HOME/prekeys.db`, 0o600 perms. Library callers pass
+  `prekey_store_path=` to `DMPClient.__init__`; the default is
+  `:memory:` which is fine for tests but drops on process exit.
+- Tests (211 → 214 → 214): three end-to-end FS tests —
+  `test_prekey_forward_secrecy_roundtrip` proves the prekey_sk is
+  gone after decrypt; `test_fallback_to_long_term_when_no_prekeys`
+  proves the unpinned contact path; `test_prekey_deleted_before_decrypt_drops_message`
+  proves the FS property from the recipient side.
+
 ### Added (erasure coding)
 
 - `dmp.core.erasure`: cross-chunk Reed-Solomon erasure coding via zfec.
