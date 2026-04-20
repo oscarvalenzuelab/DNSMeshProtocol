@@ -1,4 +1,12 @@
-"""Cryptographic operations for DMP protocol using ChaCha20-Poly1305 and X25519"""
+"""Cryptographic operations for DMP protocol.
+
+Each DMP identity has TWO keypairs:
+- X25519 for ECDH key exchange + ChaCha20-Poly1305 message encryption
+- Ed25519 for sender authentication via signatures
+
+The Ed25519 signing key is deterministically derived from the X25519 private key
+bytes (domain-separated SHA-256), so a passphrase yields the same full identity.
+"""
 
 import os
 import hashlib
@@ -9,6 +17,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey, X25519PublicKey
 )
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey, Ed25519PublicKey
+)
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
@@ -41,12 +53,24 @@ class EncryptedMessage:
 class DMPCrypto:
     """Core cryptographic operations for DMP"""
     
+    # Domain separator for deriving the Ed25519 seed from the X25519 private key
+    ED25519_DOMAIN = b'DMP-v1-Ed25519-signing-key'
+
     def __init__(self, private_key: Optional[X25519PrivateKey] = None):
-        """Initialize crypto system with optional private key"""
+        """Initialize crypto system with optional X25519 private key.
+
+        The Ed25519 signing keypair is deterministically derived from the X25519
+        private bytes, so a passphrase produces both halves of the identity.
+        """
         if private_key is None:
             private_key = X25519PrivateKey.generate()
         self.private_key = private_key
         self.public_key = private_key.public_key()
+
+        x25519_bytes = self.get_private_key_bytes()
+        ed_seed = hashlib.sha256(x25519_bytes + self.ED25519_DOMAIN).digest()
+        self.signing_key = Ed25519PrivateKey.from_private_bytes(ed_seed)
+        self.signing_public_key = self.signing_key.public_key()
     
     @classmethod
     def generate_keypair(cls) -> Tuple[X25519PrivateKey, X25519PublicKey]:
@@ -194,63 +218,111 @@ class DMPCrypto:
         )
         return hashlib.sha256(public_bytes).digest()
     
+    def get_signing_public_key_bytes(self) -> bytes:
+        """Get Ed25519 signing public key as raw 32 bytes."""
+        return self.signing_public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+
     def sign_data(self, data: bytes) -> bytes:
-        """Create signature for data (simplified using HMAC for now)"""
-        # In production, use Ed25519 for signatures
-        # For MVP, we'll use HMAC with derived key
-        signing_key = hashlib.sha256(
-            self.get_private_key_bytes() + b'DMP-Signing'
-        ).digest()
-        return hashlib.blake2b(data, key=signing_key, digest_size=32).digest()
-    
+        """Create an Ed25519 signature over `data` (64 bytes)."""
+        return self.signing_key.sign(data)
+
+    @staticmethod
     def verify_signature(
-        self,
         data: bytes,
         signature: bytes,
-        public_key: X25519PublicKey
+        signing_public_key,
     ) -> bool:
-        """Verify signature (simplified for MVP)"""
-        # This is a placeholder - in production use Ed25519
-        # For now, we can't verify without the private key
-        # Return True for MVP, implement proper signatures later
-        return len(signature) == 32
+        """Verify an Ed25519 signature.
+
+        Accepts either an Ed25519PublicKey instance or raw 32 pubkey bytes.
+        """
+        if isinstance(signing_public_key, (bytes, bytearray)):
+            if len(signing_public_key) != 32:
+                return False
+            try:
+                signing_public_key = Ed25519PublicKey.from_public_bytes(
+                    bytes(signing_public_key)
+                )
+            except Exception:
+                return False
+        try:
+            signing_public_key.verify(signature, data)
+            return True
+        except InvalidSignature:
+            return False
+        except Exception:
+            return False
 
 
 class MessageEncryption:
-    """High-level encryption interface for DMP messages"""
-    
+    """High-level encryption interface for DMP messages.
+
+    Two AAD styles:
+    - encrypt_message / decrypt_message: AAD = msg_id + chunk_number (legacy path,
+      kept for backwards compatibility).
+    - encrypt_with_header / decrypt_with_header: AAD = full canonical header bytes
+      (binds sender_id, recipient_id, timestamp, ttl, total_chunks, and message
+      type so they cannot be silently mutated in transit).
+    """
+
     def __init__(self, crypto: DMPCrypto):
         self.crypto = crypto
-    
+
     def encrypt_message(
         self,
         message: bytes,
         recipient_public_key: X25519PublicKey,
         message_id: bytes,
         chunk_number: int = 0,
-        timestamp: int = 0
+        timestamp: int = 0,
     ) -> EncryptedMessage:
-        """Encrypt a message with additional metadata"""
-        # Create associated data for authentication
         associated_data = message_id + chunk_number.to_bytes(4, 'big')
-        
         return self.crypto.encrypt_for_recipient(
             plaintext=message,
             recipient_public_key=recipient_public_key,
-            associated_data=associated_data
+            associated_data=associated_data,
         )
-    
+
     def decrypt_message(
         self,
         encrypted_msg: EncryptedMessage,
         message_id: bytes,
-        chunk_number: int = 0
+        chunk_number: int = 0,
     ) -> bytes:
-        """Decrypt a message with metadata verification"""
-        # Create associated data for authentication
         associated_data = message_id + chunk_number.to_bytes(4, 'big')
-        
         return self.crypto.decrypt_message(
             encrypted_msg=encrypted_msg,
-            associated_data=associated_data
+            associated_data=associated_data,
+        )
+
+    def encrypt_with_header(
+        self,
+        message: bytes,
+        recipient_public_key: X25519PublicKey,
+        header_aad: bytes,
+    ) -> EncryptedMessage:
+        """Encrypt with the full canonical header as AAD.
+
+        `header_aad` should be `DMPHeader.to_bytes()` — the deterministic JSON
+        form already used as the header wire format. Any mutation of the header
+        fields in transit will cause decryption to fail.
+        """
+        return self.crypto.encrypt_for_recipient(
+            plaintext=message,
+            recipient_public_key=recipient_public_key,
+            associated_data=header_aad,
+        )
+
+    def decrypt_with_header(
+        self,
+        encrypted_msg: EncryptedMessage,
+        header_aad: bytes,
+    ) -> bytes:
+        """Decrypt a header-AAD ciphertext; raises InvalidTag on header mutation."""
+        return self.crypto.decrypt_message(
+            encrypted_msg=encrypted_msg,
+            associated_data=header_aad,
         )
