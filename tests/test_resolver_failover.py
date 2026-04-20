@@ -55,20 +55,6 @@ from dmp.server.dns_server import DMPDnsServer
 # ---------------------------------------------------------------------
 
 
-def _free_udp_port() -> int:
-    """Bind UDP port 0 on loopback, read assigned port, release.
-
-    A small race window exists between close() and re-bind, but it is
-    negligible for test setup where the caller re-binds within a few
-    microseconds.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 class _PerHostPortResolverPool(ResolverPool):
     """Test-only ResolverPool that accepts `(host, port)` pairs.
 
@@ -206,9 +192,13 @@ def shared_store():
 
 @pytest.fixture
 def good_stub(shared_store):
-    """DMPDnsServer instance serving real TXT records from shared_store."""
-    port = _free_udp_port()
-    server = DMPDnsServer(shared_store, host="127.0.0.1", port=port)
+    """DMPDnsServer instance serving real TXT records from shared_store.
+
+    Binds with port=0 so the kernel assigns an ephemeral port atomically;
+    `DMPDnsServer.start()` reads the actual bound port back into
+    `server.port`, so callers can reference it after start().
+    """
+    server = DMPDnsServer(shared_store, host="127.0.0.1", port=0)
     server.start()
     yield server
     server.stop()
@@ -216,8 +206,13 @@ def good_stub(shared_store):
 
 @pytest.fixture
 def bad_stub():
-    """UDP server that returns NXDOMAIN for every query."""
-    server = _NxdomainServer(host="127.0.0.1", port=_free_udp_port())
+    """UDP server that returns NXDOMAIN for every query.
+
+    Binds with port=0 so the kernel assigns an ephemeral port atomically;
+    `_NxdomainServer.start()` reads the actual bound port back into
+    `server.port`, so callers can reference it after start().
+    """
+    server = _NxdomainServer(host="127.0.0.1", port=0)
     server.start()
     yield server
     server.stop()
@@ -457,8 +452,10 @@ class TestResolverFailoverOracle:
         is the "absent mailbox" safety net — a lookup for a name that
         really doesn't exist anywhere must not poison the pool.
         """
-        # Spin up a SECOND NXDOMAIN stub so we have two.
-        second_bad = _NxdomainServer(host="127.0.0.1", port=_free_udp_port())
+        # Spin up a SECOND NXDOMAIN stub so we have two. Bind with
+        # port=0 and let `_NxdomainServer.start()` read back the OS-
+        # assigned port — no free-then-rebind race window.
+        second_bad = _NxdomainServer(host="127.0.0.1", port=0)
         second_bad.start()
         try:
             pool = _PerHostPortResolverPool(
