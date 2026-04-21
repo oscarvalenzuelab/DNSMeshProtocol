@@ -221,28 +221,51 @@ class SqliteMailboxStore(DNSRecordStore):
     # ---- anti-entropy support ---------------------------------------------
 
     def iter_records_since(
-        self, since_ts: int, *, limit: Optional[int] = None
+        self,
+        since_ts: int = 0,
+        *,
+        limit: Optional[int] = None,
+        cursor: Optional[Tuple[int, str]] = None,
     ) -> List[StoredRecord]:
-        """Return non-expired records whose `stored_ts` (ms) is strictly
-        greater than `since_ts` (ms), oldest first.
+        """Return non-expired records strictly past the given cursor,
+        oldest first, ordered by (stored_ts ASC, name ASC, value ASC).
 
-        Used by the anti-entropy digest endpoint. The peer passes the watermark
-        it last saw from this node; we return everything newer. Ordering by
-        stored_ts ASC lets the peer advance its watermark monotonically even if
-        it processes the result incrementally.
+        Used by the anti-entropy digest endpoint. There are two entry
+        shapes for historical reasons:
 
-        `limit` caps the batch size; None means no cap. The cap is enforced at
-        the SQL layer so a peer asking for 10 records on a million-row store
-        doesn't read the world into memory.
+        - ``cursor=(ts, name)`` — the compound cursor added in the M2.4
+          follow-up. Returns rows where ``stored_ts > ts`` OR
+          (``stored_ts == ts`` AND ``name > name``). This is the only
+          pagination shape that remains correct when > ``limit`` rows
+          land in the same millisecond: a plain ``stored_ts > cursor_ts``
+          either skips the tail (advance past the ms) or replays the
+          same page forever (keep the old ms).
+        - ``since_ts=<ms>`` — the legacy shape. Degenerates to
+          ``cursor=(since_ts, "")``; since every real name is strictly
+          greater than the empty string, the name comparison collapses
+          and we recover the original ``stored_ts > since_ts`` behavior.
+
+        Passing both raises ``ValueError`` so callers don't accidentally
+        double-dip.
+
+        `limit` caps the batch size; None means no cap. The cap is enforced
+        at the SQL layer so a peer asking for 10 records on a million-row
+        store doesn't read the world into memory.
         """
+        if cursor is not None and since_ts:
+            raise ValueError("pass cursor OR since_ts, not both")
+        if cursor is None:
+            cursor = (int(since_ts), "")
+        cur_ts, cur_name = int(cursor[0]), str(cursor[1])
         now = int(time.time())
         with self._lock:
             sql = (
                 "SELECT name, value, expires_at, stored_ts FROM records "
-                "WHERE stored_ts > ? AND expires_at > ? "
+                "WHERE (stored_ts > ? OR (stored_ts = ? AND name > ?)) "
+                "AND expires_at > ? "
                 "ORDER BY stored_ts ASC, name ASC, value ASC"
             )
-            params: Tuple = (int(since_ts), now)
+            params: Tuple = (cur_ts, cur_ts, cur_name, now)
             if limit is not None:
                 sql += " LIMIT ?"
                 params = params + (int(limit),)

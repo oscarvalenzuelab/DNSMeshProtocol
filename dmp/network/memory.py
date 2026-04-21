@@ -84,14 +84,33 @@ class InMemoryDNSStore(DNSRecordStore):
     # ---- anti-entropy support (parity with SqliteMailboxStore) -----------
 
     def iter_records_since(
-        self, since_ts: int, *, limit: Optional[int] = None
+        self,
+        since_ts: int = 0,
+        *,
+        limit: Optional[int] = None,
+        cursor: Optional[Tuple[int, str]] = None,
     ) -> List[StoredRecord]:
+        """Same semantics as ``SqliteMailboxStore.iter_records_since``.
+
+        Either ``cursor=(ts, name)`` (compound, M2.4-followup) or
+        ``since_ts=<ms>`` (legacy; equivalent to ``cursor=(since_ts, "")``)
+        may be passed — not both.
+        """
+        if cursor is not None and since_ts:
+            raise ValueError("pass cursor OR since_ts, not both")
+        if cursor is None:
+            cursor = (int(since_ts), "")
+        cur_ts, cur_name = int(cursor[0]), str(cursor[1])
         now = int(time.time())
         rows: List[StoredRecord] = []
         with self._lock:
             for name, entries in self._records.items():
                 for value, exp, ts in entries:
-                    if ts > since_ts and exp > now:
+                    if exp <= now:
+                        continue
+                    # (ts, name) > (cur_ts, cur_name) in lexicographic
+                    # order — match the SQL predicate exactly.
+                    if ts > cur_ts or (ts == cur_ts and name > cur_name):
                         rows.append(
                             StoredRecord(
                                 name=name,
