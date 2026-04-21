@@ -25,6 +25,40 @@ import dns.rcode
 
 from dmp.network.base import DNSRecordWriter
 
+# Per RFC 1035 a DNS TXT record's RDATA is a sequence of
+# <character-string>s, each prefixed by a single length byte, capping
+# the per-string payload at 255 bytes. A single value longer than 255
+# bytes MUST be emitted as multiple character-strings within the same
+# RR — not as a single over-long string (many authoritative servers and
+# client libs either reject or truncate that). The M2.1 cluster
+# manifest runs up to 1200 bytes post-base64, so every publisher has to
+# split before handing the value to its backend.
+_TXT_CHUNK_BYTES = 255
+
+
+def _split_txt_value(value: str, chunk_bytes: int = _TXT_CHUNK_BYTES) -> List[str]:
+    """Split a TXT value into <=chunk_bytes byte chunks for multi-string RDATA.
+
+    DNS TXT records can carry multiple character-strings per RR. Each
+    character-string has a 1-byte length prefix, so the maximum payload
+    per string is 255 bytes. Values under the cap return a single-element
+    list; longer values are split on byte boundaries.
+
+    The DMP wire format (``v=dmp1;...`` prefix + base64 body) is
+    all-ASCII, so splitting on byte boundaries and then UTF-8 decoding
+    each chunk is safe — a multi-byte UTF-8 sequence would never
+    straddle a 255-byte boundary in ASCII-only text. We still decode
+    with ``errors="strict"`` so a future non-ASCII wire format would
+    blow up loudly here rather than silently corrupt the record.
+    """
+    raw = value.encode("utf-8")
+    if len(raw) <= chunk_bytes:
+        return [value]
+    return [
+        raw[i : i + chunk_bytes].decode("utf-8", errors="strict")
+        for i in range(0, len(raw), chunk_bytes)
+    ]
+
 
 class DNSUpdatePublisher(DNSRecordWriter):
     """Publish DNS records via RFC 2136 DNS UPDATE.
@@ -60,7 +94,14 @@ class DNSUpdatePublisher(DNSRecordWriter):
             update = dns.update.Update(self.zone, keyring=self.keyring)
             rel = self._relative_name(name)
             update.delete(rel, "TXT")
-            update.add(rel, ttl, "TXT", f'"{value}"')
+            # A TXT RDATA can carry multiple quoted character-strings
+            # within a single RR; dnspython parses space-separated
+            # quoted strings as such. Values under 255 bytes come back
+            # as a single quoted string (identical to the prior
+            # behavior); longer values split across multiple strings.
+            chunks = _split_txt_value(value)
+            rdata_text = " ".join(f'"{c}"' for c in chunks)
+            update.add(rel, ttl, "TXT", rdata_text)
             response = dns.query.tcp(update, self.nameserver, timeout=10)
             return response.rcode() == dns.rcode.NOERROR
         except Exception as e:
@@ -106,10 +147,22 @@ class CloudflarePublisher(DNSRecordWriter):
         try:
             ttl = max(60, ttl)  # Cloudflare minimum TTL
             existing = self._find_record(name, "TXT")
+            # Cloudflare's v4 API accepts a ``content`` string that is
+            # served as-is. For values > 255 bytes we need to pass the
+            # multi-string "chunk1" "chunk2" form (space-separated
+            # quoted chunks) so Cloudflare emits a valid multi-string
+            # TXT RDATA on the wire. Values <= 255 bytes keep the prior
+            # raw-string behavior to avoid needlessly changing
+            # existing records.
+            chunks = _split_txt_value(value)
+            if len(chunks) == 1:
+                content = value
+            else:
+                content = " ".join(f'"{c}"' for c in chunks)
             payload = {
                 "type": "TXT",
                 "name": name,
-                "content": value,
+                "content": content,
                 "ttl": ttl,
                 "proxied": proxied,
             }
@@ -172,6 +225,15 @@ class Route53Publisher(DNSRecordWriter):
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
         try:
+            # Route53 represents multi-string TXT RDATA as a single
+            # ``Value`` field containing space-separated quoted chunks:
+            #     "chunk1" "chunk2" "chunk3"
+            # Each quoted chunk must be <= 255 bytes (the RFC 1035 TXT
+            # character-string cap). Values at or below the cap round-
+            # trip as a single quoted string, matching the prior
+            # behavior.
+            chunks = _split_txt_value(value)
+            record_value = " ".join(f'"{c}"' for c in chunks)
             response = self.client.change_resource_record_sets(
                 HostedZoneId=self.hosted_zone_id,
                 ChangeBatch={
@@ -182,7 +244,7 @@ class Route53Publisher(DNSRecordWriter):
                                 "Name": name,
                                 "Type": "TXT",
                                 "TTL": ttl,
-                                "ResourceRecords": [{"Value": f'"{value}"'}],
+                                "ResourceRecords": [{"Value": record_value}],
                             },
                         }
                     ]
@@ -198,6 +260,11 @@ class Route53Publisher(DNSRecordWriter):
             # Route53 delete requires the exact record value
             return False
         try:
+            # Must match the exact wire form we wrote — multi-string
+            # quoted chunks for long values, single quoted string for
+            # short ones. See publish_txt_record.
+            chunks = _split_txt_value(value)
+            record_value = " ".join(f'"{c}"' for c in chunks)
             response = self.client.change_resource_record_sets(
                 HostedZoneId=self.hosted_zone_id,
                 ChangeBatch={
@@ -208,7 +275,7 @@ class Route53Publisher(DNSRecordWriter):
                                 "Name": name,
                                 "Type": "TXT",
                                 "TTL": 300,
-                                "ResourceRecords": [{"Value": f'"{value}"'}],
+                                "ResourceRecords": [{"Value": record_value}],
                             },
                         }
                     ]
@@ -235,7 +302,16 @@ class LocalDNSPublisher(DNSRecordWriter):
         try:
             with open(self.config_file, "w") as f:
                 for d, v in self.records.items():
-                    f.write(f'txt-record={d},"{v}"\n')
+                    # dnsmasq's ``txt-record=name,str1,str2,...``
+                    # directive takes a comma-separated list of
+                    # character-strings, each of which becomes one TXT
+                    # character-string on the wire. Split long values
+                    # so dnsmasq emits a valid multi-string TXT RR
+                    # instead of rejecting / truncating at the 255-byte
+                    # cap.
+                    chunks = _split_txt_value(v)
+                    quoted = ",".join(f'"{c}"' for c in chunks)
+                    f.write(f"txt-record={d},{quoted}\n")
             import subprocess
 
             subprocess.run(["sudo", "systemctl", "reload", "dnsmasq"], check=False)
