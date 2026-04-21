@@ -656,33 +656,40 @@ class AntiEntropyWorker:
         # hold the watermark at the last handled entry and let the next
         # tick retry. A truly dead row will eventually expire and fall
         # out of the digest entirely.
-        handled_cursors: List[Cursor] = [
-            (int(e["ts"]), e["name"], e["hash"])
-            for e in valid_entries
-            if (e["name"], e["hash"]) in handled_pairs
-        ]
-        if handled_cursors:
-            max_handled = max(handled_cursors)
+        # Walk `valid_entries` IN ORDER and advance only through the
+        # contiguous handled prefix from the front. If entry B at index
+        # i is unhandled, we stop BEFORE it — even if entry C at index
+        # i+1 was handled, we must leave C behind too, because the next
+        # tick's `since=<cursor>` query would otherwise skip past B.
+        # max-of-handled would lose B forever.
+        contiguous_handled: List[Cursor] = []
+        for e in valid_entries:
+            if (e["name"], e["hash"]) in handled_pairs:
+                contiguous_handled.append((int(e["ts"]), e["name"], e["hash"]))
+            else:
+                break
+        if contiguous_handled:
+            max_handled = contiguous_handled[-1]
         else:
             max_handled = watermark
 
-        # Peer's next_cursor is a pagination hint. We only trust it when:
-        #   - every validated (name, hash) pair was handled (so no entry
-        #     is being skipped), AND
-        #   - it does not point STRICTLY PAST max_handled (so the peer
-        #     isn't fabricating a future cursor to poke our watermark
-        #     ahead of any real data we've verified).
-        # If the peer lied about where pagination ends, we ignore the
-        # cursor and advance only to max_handled — the next tick will
-        # still re-request from there and see any rows we missed.
+        # Watermark is always ``max_handled`` — the deepest point we can
+        # justify from records we actually validated and wrote.
+        #
+        # Peer's next_cursor is NOT trusted for watermark advancement.
+        # It can be:
+        #   - ahead of max_handled (peer fabricating a forged-future
+        #     pointer to skip us past real rows), OR
+        #   - behind max_handled (stale/buggy peer, which would drag the
+        #     watermark backward from the page tail we just handled and
+        #     wedge the loop replaying the same rows), OR
+        #   - equal to max_handled (fine but adds nothing).
+        # In all cases taking max_handled is safe; no peer lie can
+        # advance us past data we validated. The peer's cursor is still
+        # used as the _next request cursor_ (see _fetch_digest) so a
+        # busy peer's pagination remains cheap, but it never touches
+        # the watermark directly.
         new_watermark = max_handled
-        if (
-            peer_next_cursor is not None
-            and len(handled_pairs) == len(seen_pairs)
-            and _cursor_ge(peer_next_cursor, watermark)
-            and not _cursor_gt(peer_next_cursor, max_handled)
-        ):
-            new_watermark = peer_next_cursor
 
         if _cursor_gt(new_watermark, watermark):
             self._watermarks[peer.node_id] = new_watermark
