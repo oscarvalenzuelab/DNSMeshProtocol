@@ -741,3 +741,122 @@ class TestExecutorResize:
             assert fw.install_manifest(m2) is True
             # Pool size unchanged (or at least not shrunk below 10).
             assert fw._executor._max_workers == initial_max
+
+
+class TestRemovedWriterRetention:
+    def test_removed_node_writer_not_closed_prematurely(self) -> None:
+        """Removed node writers go to the retention list, not close()'d.
+
+        The scenario exercised: quorum-return leaves a slow publish
+        still running against node "a". We then drop "a" from the
+        manifest. The slow publish must complete without interference
+        and its close() must not be called until FanoutWriter.close().
+        """
+        op = DMPCrypto()
+        # 3-node cluster. "n00" is slow (500ms latency); "n01" and
+        # "n02" are fast, so quorum (2 of 3) lands immediately and
+        # publish returns before n00's publish finishes.
+        writers: dict = {
+            "n00": FakeWriter(latency_ms=500),
+            "n01": FakeWriter(),
+            "n02": FakeWriter(),
+        }
+        m1 = _manifest(3, seq=1, operator=op)
+        with FanoutWriter(m1, _make_keyed_factory(writers), timeout=5.0) as fw:
+            t0 = time.monotonic()
+            ok = fw.publish_txt_record("a", "b")
+            elapsed = time.monotonic() - t0
+            assert ok is True
+            # Quorum-return: we're back before n00's latency elapsed.
+            assert elapsed < 0.3
+
+            # Drop n00 while its publish is still running.
+            m2 = ClusterManifest(
+                cluster_name=m1.cluster_name,
+                operator_spk=m1.operator_spk,
+                nodes=[m1.nodes[1], m1.nodes[2]],
+                seq=2,
+                exp=m1.exp,
+            )
+            assert fw.install_manifest(m2) is True
+
+            # Writer for n00 is retained, NOT closed yet.
+            assert writers["n00"].close_calls == 0
+
+            # Give the slow publish time to complete normally.
+            _poll_until(lambda: len(writers["n00"].publish_calls) == 1, timeout=2.0)
+
+            # Still retained, still not closed.
+            assert writers["n00"].close_calls == 0
+
+        # After FanoutWriter.close(), the retained writer is drained.
+        assert writers["n00"].close_calls == 1
+
+    def test_close_drains_retention_list_across_refreshes(self) -> None:
+        op = DMPCrypto()
+        # Start with 4 nodes, drop one on each of three refreshes.
+        all_writers: dict = {f"n{i:02d}": FakeWriter() for i in range(4)}
+        m1 = _manifest(4, seq=1, operator=op)
+        fw = FanoutWriter(m1, _make_keyed_factory(all_writers))
+
+        # Refresh 1: drop n00.
+        m2 = ClusterManifest(
+            cluster_name=m1.cluster_name,
+            operator_spk=m1.operator_spk,
+            nodes=[m1.nodes[1], m1.nodes[2], m1.nodes[3]],
+            seq=2,
+            exp=m1.exp,
+        )
+        assert fw.install_manifest(m2) is True
+        # Refresh 2: drop n01.
+        m3 = ClusterManifest(
+            cluster_name=m1.cluster_name,
+            operator_spk=m1.operator_spk,
+            nodes=[m1.nodes[2], m1.nodes[3]],
+            seq=3,
+            exp=m1.exp,
+        )
+        assert fw.install_manifest(m3) is True
+        # Refresh 3: drop n02.
+        m4 = ClusterManifest(
+            cluster_name=m1.cluster_name,
+            operator_spk=m1.operator_spk,
+            nodes=[m1.nodes[3]],
+            seq=4,
+            exp=m1.exp,
+        )
+        assert fw.install_manifest(m4) is True
+
+        # None of the removed writers have been closed yet.
+        assert all_writers["n00"].close_calls == 0
+        assert all_writers["n01"].close_calls == 0
+        assert all_writers["n02"].close_calls == 0
+        # Live node's writer never closed either.
+        assert all_writers["n03"].close_calls == 0
+
+        fw.close()
+
+        # All three retained writers drained.
+        assert all_writers["n00"].close_calls == 1
+        assert all_writers["n01"].close_calls == 1
+        assert all_writers["n02"].close_calls == 1
+        # Live writer stays open (FanoutWriter does not own its lifecycle).
+        assert all_writers["n03"].close_calls == 0
+
+    def test_close_is_idempotent_with_retained_writers(self) -> None:
+        """Calling close() twice must not double-close retained writers."""
+        op = DMPCrypto()
+        writers: dict = {f"n{i:02d}": FakeWriter() for i in range(2)}
+        m1 = _manifest(2, seq=1, operator=op)
+        fw = FanoutWriter(m1, _make_keyed_factory(writers))
+        m2 = ClusterManifest(
+            cluster_name=m1.cluster_name,
+            operator_spk=m1.operator_spk,
+            nodes=[m1.nodes[1]],
+            seq=2,
+            exp=m1.exp,
+        )
+        assert fw.install_manifest(m2) is True
+        fw.close()
+        fw.close()  # Must not raise, must not double-close.
+        assert writers["n00"].close_calls == 1
