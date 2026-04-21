@@ -365,8 +365,9 @@ class TestWorkerTick:
         worker.tick_once()
         assert worker.stats.records_written == 1
 
-        # Need to advance time so the NEXT record has stored_ts > watermark.
-        time.sleep(1.1)
+        # Publish a second record. stored_ts is millisecond-resolution so
+        # a short sleep is enough for it to land above the watermark.
+        time.sleep(0.01)
         peer_fake.store.publish_txt_record("b.mesh.test", "v2", ttl=300)
 
         worker.tick_once()

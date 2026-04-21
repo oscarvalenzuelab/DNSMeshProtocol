@@ -9,13 +9,15 @@ worker reaps them. The cleanup worker is a separate concern
 Thread-safe via a per-store RLock around a single shared connection. Sqlite's
 WAL journaling is enabled so readers don't block a long writer.
 
-Each row also carries a `stored_ts` column — the unix-seconds moment at which
-the local node first accepted the write. Distinct from `created_at`
-(effectively the same value today; kept as a separate column so a future
-schema change can carry the *authoritative publisher's* timestamp in
-`created_at` while `stored_ts` remains the local receiver's view). The
-anti-entropy sync worker uses `stored_ts` as the watermark so a peer catching
-up sees records ordered by local arrival, not by upstream publish time.
+Each row also carries a `stored_ts` column — the unix-**milliseconds** moment
+at which the local node first accepted the write. Distinct from `created_at`
+(the same moment in seconds; kept as a separate column so a future schema
+change can carry the *authoritative publisher's* timestamp in `created_at`
+while `stored_ts` remains the local receiver's view). The anti-entropy sync
+worker uses `stored_ts` as the watermark so a peer catching up sees records
+ordered by local arrival, not by upstream publish time. Millisecond
+resolution keeps pagination correct even when >limit records land in the
+same second.
 """
 
 from __future__ import annotations
@@ -90,11 +92,17 @@ class SqliteMailboxStore(DNSRecordStore):
     def _migrate(self) -> None:
         """Best-effort schema migrations.
 
-        `stored_ts` was added in M2.4 for the anti-entropy sync worker.
-        Older databases created before this release don't have the
-        column. We add it here (and its index) so reopening a pre-M2.4
-        db doesn't crash. The DEFAULT 0 in _SCHEMA covers fresh rows;
-        the ALTER handles the existing ones.
+        Two evolutions land here:
+
+        - `stored_ts` was added in M2.4 for the anti-entropy sync
+          worker. Older DBs created before M2.4 don't have the column;
+          we add it (and its index) so reopening a pre-M2.4 DB doesn't
+          crash. Initial rows are backfilled from `created_at`.
+        - M2.4-followup: `stored_ts` was upgraded from unix-seconds to
+          unix-milliseconds. Rows that were written by the interim
+          M2.4-seconds code carry small values (< ~10^12). We detect
+          that and multiply in place so same-second pagination stays
+          correct going forward. Fresh DBs skip this branch entirely.
         """
         with self._lock:
             cols = {
@@ -102,8 +110,8 @@ class SqliteMailboxStore(DNSRecordStore):
                 for row in self._conn.execute("PRAGMA table_info(records)").fetchall()
             }
             if "stored_ts" not in cols:
-                # Older DB; add the column, backfill from created_at so
-                # existing rows have a sane watermark, then index it.
+                # Pre-M2.4 DB. Add the column and backfill from created_at
+                # (seconds), which the next step will upgrade to ms.
                 self._conn.execute(
                     "ALTER TABLE records ADD COLUMN stored_ts INTEGER NOT NULL "
                     "DEFAULT 0"
@@ -116,11 +124,24 @@ class SqliteMailboxStore(DNSRecordStore):
                     "ON records(stored_ts)"
                 )
 
+            # Seconds→ms detection. Any stored_ts below the year-2001-in-ms
+            # threshold (10^12) must be a seconds value from the interim
+            # M2.4 code, so bump it. Zero values (which _SCHEMA defaults to)
+            # are left alone — they mean "never synced" and must stay a
+            # valid below-all-watermarks sentinel.
+            _MS_THRESHOLD = 1_000_000_000_000  # year 2001 in ms
+            self._conn.execute(
+                "UPDATE records SET stored_ts = stored_ts * 1000 "
+                "WHERE stored_ts > 0 AND stored_ts < ?",
+                (_MS_THRESHOLD,),
+            )
+
     # ---- DNSRecordStore contract ------------------------------------------
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
-        now = int(time.time())
-        expires = now + int(ttl)
+        now_s = int(time.time())
+        now_ms = int(time.time() * 1000)
+        expires = now_s + int(ttl)
         with self._lock:
             # Append semantics. DNS natively supports multiple TXT records at
             # one name (an RRset); the prior "replace all" behavior let an
@@ -129,13 +150,15 @@ class SqliteMailboxStore(DNSRecordStore):
             # append, an attacker can *add* records but cannot *remove*
             # legitimate ones. The PRIMARY KEY (name, value) means an honest
             # duplicate republish refreshes the TTL without growing the row
-            # set. `stored_ts` records the moment this *node* accepted the
-            # write; sync peers use it as their cursor.
+            # set. `stored_ts` records the millisecond at which this *node*
+            # accepted the write; sync peers use it as their cursor and the
+            # ms resolution keeps pagination correct even when many writes
+            # land inside the same second.
             self._conn.execute(
                 "INSERT OR REPLACE INTO records "
                 "(name, value, ttl, created_at, expires_at, stored_ts) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (name, value, int(ttl), now, expires, now),
+                (name, value, int(ttl), now_s, expires, now_ms),
             )
         return True
 
@@ -200,8 +223,8 @@ class SqliteMailboxStore(DNSRecordStore):
     def iter_records_since(
         self, since_ts: int, *, limit: Optional[int] = None
     ) -> List[StoredRecord]:
-        """Return non-expired records whose `stored_ts` is strictly greater than
-        `since_ts`, oldest first.
+        """Return non-expired records whose `stored_ts` (ms) is strictly
+        greater than `since_ts` (ms), oldest first.
 
         Used by the anti-entropy digest endpoint. The peer passes the watermark
         it last saw from this node; we return everything newer. Ordering by
