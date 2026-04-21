@@ -148,13 +148,12 @@ def cluster_rrset_name(cluster_name: str) -> str:
     evolve it (e.g., to `_dmp-cluster.<cluster_name>` SRV-style) without
     churning call sites.
 
-    A single trailing dot is stripped (canonical FQDN form). Doubled
-    trailing dots indicate an empty final label — we refuse to silently
-    rewrite them into a different owner name, which would mask a caller
-    typo and publish to the wrong RRset.
+    Applies the same DNS-name validation ClusterManifest enforces, so a
+    direct caller gets the same early rejection (empty, leading dot,
+    doubled trailing dots, non-ASCII, bad characters, over-long labels)
+    instead of silently constructing an invalid owner name.
     """
-    if cluster_name.endswith(".."):
-        raise ValueError("cluster_name contains empty label at the end")
+    _validate_dns_name(cluster_name)
     normalized = cluster_name[:-1] if cluster_name.endswith(".") else cluster_name
     return f"cluster.{normalized}"
 
@@ -383,10 +382,16 @@ class ClusterManifest:
         off += _OPERATOR_SPK_LEN
         name_len = body[off]
         off += 1
-        if name_len == 0 or name_len > MAX_CLUSTER_NAME_LEN:
-            raise ValueError("invalid cluster_name length")
+        # Length cap is on the normalized (trailing-dot-stripped) form,
+        # matching sign()'s behavior. An externally produced manifest
+        # may preserve the canonical FQDN dot, so allow MAX+1 bytes on
+        # the wire when the last byte is a '.'.
         if off + name_len > len(body):
             raise ValueError("truncated cluster_name")
+        has_trailing_dot = name_len > 0 and body[off + name_len - 1] == 0x2E
+        effective_len = name_len - (1 if has_trailing_dot else 0)
+        if effective_len == 0 or effective_len > MAX_CLUSTER_NAME_LEN:
+            raise ValueError("invalid cluster_name length")
         try:
             cluster_name = body[off : off + name_len].decode("utf-8")
         except UnicodeDecodeError as e:
