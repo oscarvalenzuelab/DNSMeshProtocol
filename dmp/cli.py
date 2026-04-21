@@ -1846,6 +1846,16 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
             )
     signer_spk = _decode_signer_spk(signer_hex, field_name="signer_spk")
 
+    # parse_address only asserts user@host shape; host can still be a
+    # malformed DNS name. Validate before fetch so bad input is a clean
+    # CLI exit instead of a traceback out of bootstrap_rrset_name.
+    from dmp.core.cluster import _validate_dns_name as _validate_discover_host
+
+    try:
+        _validate_discover_host(host)
+    except ValueError as exc:
+        _die(1, f"invalid host in address: {exc}")
+
     bootstrap_reader = _make_reader(cfg)
     record = fetch_bootstrap_record(host, signer_spk, bootstrap_reader)
     if record is None:
