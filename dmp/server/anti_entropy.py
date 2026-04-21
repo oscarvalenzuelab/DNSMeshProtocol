@@ -452,13 +452,55 @@ class AntiEntropyWorker:
         if to_pull:
             self._pull_and_write(peer, to_pull)
 
-        # Advance watermark even if there was nothing to pull — we've
-        # observed the peer up to max(entries.ts). If has_more is true we
-        # deliberately advance only to the last entry's ts, so the next
-        # tick picks up the rest.
-        max_ts = max((int(e.get("ts", 0) or 0) for e in entries), default=watermark)
-        if max_ts > watermark:
-            self._watermarks[peer.node_id] = max_ts
+        # Watermark advance.
+        #
+        # The hard safety property: never advance past a digest entry we
+        # *declined to request* this tick. If a batch lists more missing
+        # names than we could pull in one request (pull_batch_limit), the
+        # tail was deferred to the next tick; advancing past its stored_ts
+        # would skip those names forever (peer's stored_ts hasn't moved,
+        # so they'd be below the next `since=` cutoff).
+        #
+        # Failures *after* we requested — peer declined to return the
+        # name, or we rejected the value — are handled differently:
+        # holding the watermark there forever would leave us stuck, since
+        # on the next tick the digest likely won't list the same bad
+        # name either. We advance past those so the loop makes progress;
+        # if the peer later republishes with a fresher stored_ts, we'll
+        # pick it up normally.
+        #
+        # has_more just means "there are more rows past this page"; it
+        # does NOT affect safety because those tail rows have stored_ts
+        # strictly greater than everything in this page by the ORDER BY
+        # contract, so they're still visible with a higher watermark.
+        deferred_names = set(to_pull[self._pull_limit :])
+        if deferred_names:
+            # Cap advance below the first deferred entry's ts. Entries
+            # are ordered by ts ASC from the digest endpoint, so the
+            # deferred-min ts dominates.
+            deferred_ts_values = [
+                int(e.get("ts", 0) or 0)
+                for e in entries
+                if isinstance(e.get("name"), str) and e["name"] in deferred_names
+            ]
+            min_deferred_ts = min(deferred_ts_values, default=0)
+            # Advance to max ts *strictly less than* min_deferred_ts so
+            # the deferred names stay above the cutoff.
+            safe_ts_values = [
+                int(e.get("ts", 0) or 0)
+                for e in entries
+                if int(e.get("ts", 0) or 0) < min_deferred_ts
+            ]
+            new_watermark = max(safe_ts_values, default=watermark)
+        else:
+            # Nothing was deferred — either everything we needed was
+            # pulled, or everything in the page was already in our store.
+            # Safe to advance to the end of the observed page.
+            new_watermark = max(
+                (int(e.get("ts", 0) or 0) for e in entries), default=watermark
+            )
+        if new_watermark > watermark:
+            self._watermarks[peer.node_id] = new_watermark
 
     def _fetch_digest(
         self, peer: SyncPeer, watermark: int
