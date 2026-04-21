@@ -1198,7 +1198,10 @@ def cmd_cluster_fetch(args: argparse.Namespace) -> int:
     dir. Future offline-bootstrap work may consume that cache on
     startup when DNS is unavailable.
     """
-    cfg = CLIConfig.load(_config_path())
+    path = _config_path()
+    if not path.exists():
+        _die(1, f"no config at {path} — run `dmp init <username>` first")
+    cfg = CLIConfig.load(path)
     if not _cluster_mode_enabled(cfg):
         _die(
             1,
@@ -1274,7 +1277,10 @@ def cmd_cluster_status(args: argparse.Namespace) -> int:
     down immediately after printing — no background refresh thread
     is left running.
     """
-    cfg = CLIConfig.load(_config_path())
+    path = _config_path()
+    if not path.exists():
+        _die(1, f"no config at {path} — run `dmp init <username>` first")
+    cfg = CLIConfig.load(path)
     if not _cluster_mode_enabled(cfg):
         _die(
             1,
