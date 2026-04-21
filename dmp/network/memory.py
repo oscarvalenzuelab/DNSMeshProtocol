@@ -18,9 +18,12 @@ class InMemoryDNSStore(DNSRecordStore):
 
     def __init__(self) -> None:
         self._lock = RLock()
-        # name -> list[(value, expires_at, stored_ts)]. We carry the same
-        # metadata SqliteMailboxStore does so the anti-entropy sync worker
-        # can run in unit tests against this store.
+        # name -> list[(value, expires_at_seconds, stored_ts_ms)]. We carry
+        # the same metadata SqliteMailboxStore does so the anti-entropy
+        # sync worker can run in unit tests against this store. Note the
+        # mixed resolutions: expires_at stays in seconds (it's compared
+        # against time.time() as a cutoff); stored_ts is milliseconds so
+        # that same-second bursts paginate cleanly.
         self._records: Dict[str, List[Tuple[str, int, int]]] = {}
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
@@ -31,17 +34,18 @@ class InMemoryDNSStore(DNSRecordStore):
         so an attacker who reaches the publish endpoint can add records but
         cannot evict legitimate ones. Identical re-publishes are idempotent.
         """
-        now = int(time.time())
-        expires = now + int(ttl)
+        now_s = int(time.time())
+        now_ms = int(time.time() * 1000)
+        expires = now_s + int(ttl)
         with self._lock:
             entries = self._records.setdefault(name, [])
             for i, (v, _exp, _ts) in enumerate(entries):
                 if v == value:
-                    # Refresh TTL + stored_ts, same as the sqlite store's
-                    # INSERT OR REPLACE.
-                    entries[i] = (v, expires, now)
+                    # Refresh TTL + stored_ts (ms), same as the sqlite
+                    # store's INSERT OR REPLACE.
+                    entries[i] = (v, expires, now_ms)
                     return True
-            entries.append((value, expires, now))
+            entries.append((value, expires, now_ms))
         return True
 
     def delete_txt_record(self, name: str, value: Optional[str] = None) -> bool:

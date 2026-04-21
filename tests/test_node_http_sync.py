@@ -139,19 +139,19 @@ class TestDigest:
                 assert e["hash"] == hashlib.sha256(b"v1").hexdigest()
             elif e["name"] == "b.mesh.test":
                 assert e["hash"] == hashlib.sha256(b"v2").hexdigest()
-            assert isinstance(e["ts"], int) and e["ts"] > 0
+            # ts is ms-resolution since M2.4-followup; a fresh row must
+            # have well more than 10^12 (year 2001 in ms) on any clock.
+            assert isinstance(e["ts"], int) and e["ts"] > 1_000_000_000_000
 
     def test_filters_by_since(self, api_store_with_sync):
         api, store = api_store_with_sync
         store.publish_txt_record("old.mesh.test", "old", ttl=300)
-        # Sleep past the second boundary so the next write has a strictly
-        # greater stored_ts than the cursor we'll pass.
-        time.sleep(1.1)
-        # Pick the cursor as "the moment before the new write". iter_records_since
-        # uses strict >, so old-at-t0 <= t0 is excluded and new-at-t0+1 > t0
-        # is included.
-        cursor = int(time.time())
-        time.sleep(1.1)
+        # stored_ts is ms-resolution; a short sleep is enough to get a
+        # cursor strictly between the two writes. iter_records_since uses
+        # strict >, so the pre-cursor row is excluded.
+        time.sleep(0.01)
+        cursor = int(time.time() * 1000)
+        time.sleep(0.01)
         store.publish_txt_record("new.mesh.test", "new", ttl=300)
 
         r = requests.get(
