@@ -451,6 +451,7 @@ class ClusterManifest:
         operator_spk: bytes,
         *,
         now: Optional[int] = None,
+        expected_cluster_name: Optional[str] = None,
     ) -> Optional["ClusterManifest"]:
         """Parse and verify. Returns the manifest or None on any failure.
 
@@ -461,11 +462,21 @@ class ClusterManifest:
         - operator_spk in the wire doesn't match the expected operator_spk arg
         - Expiry in the past (if `now` provided; defaults to time.time())
         - Malformed fields (wrong types, truncation, etc.)
+        - `expected_cluster_name` (if provided) doesn't match the signed
+          cluster_name after trailing-dot normalization
 
         Parse order enforces the security invariant that the signature is
         the only trust anchor: prefix → base64 → split body|sig → verify
         sig with the caller's `operator_spk` arg → THEN unpack body fields
-        → THEN cross-check the embedded operator_spk matches the arg.
+        → THEN cross-check the embedded operator_spk matches the arg →
+        THEN bind to the expected cluster name if the caller supplied one.
+
+        Binding the manifest to the expected cluster name defends against
+        an operator accidentally (or maliciously) publishing a manifest
+        signed for cluster A under cluster B's RRset — without the bind,
+        a client pinning only the operator key would accept the wrong
+        node set. Callers that fetched by DNS name should pass that name
+        here.
         """
         # 1. Prefix.
         if not isinstance(wire, str) or not wire.startswith(RECORD_PREFIX):
@@ -516,6 +527,13 @@ class ClusterManifest:
         now_ts = int(time.time()) if now is None else int(now)
         if manifest.exp < now_ts:
             return None
+
+        # 8. If the caller specified the expected cluster name, bind the
+        # parsed manifest to it. Normalize the trailing dot on both sides
+        # so canonical FQDN and bare-label forms compare equal.
+        if expected_cluster_name is not None:
+            if manifest.cluster_name != expected_cluster_name.rstrip("."):
+                return None
 
         return manifest
 

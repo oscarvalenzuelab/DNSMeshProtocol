@@ -425,6 +425,44 @@ class TestClusterManifestSecurity:
         wire = RECORD_PREFIX + base64.b64encode(body + sig).decode("ascii")
         assert ClusterManifest.parse_and_verify(wire, opk) is None
 
+    def test_expected_cluster_name_bind_accepts_match(self):
+        operator = _make_operator()
+        mf = _make_manifest(operator, cluster_name="mesh.example.com")
+        wire = mf.sign(operator)
+        parsed = ClusterManifest.parse_and_verify(
+            wire,
+            operator.get_signing_public_key_bytes(),
+            expected_cluster_name="mesh.example.com",
+        )
+        assert parsed is not None
+
+    def test_expected_cluster_name_bind_rejects_mismatch(self):
+        """A correctly-signed manifest for cluster A must be rejected
+        when the caller fetched it expecting cluster B. Defends against
+        an operator reusing the same Ed25519 key across clusters (or
+        publishing under the wrong RRset by mistake)."""
+        operator = _make_operator()
+        mf = _make_manifest(operator, cluster_name="mesh.a.example.com")
+        wire = mf.sign(operator)
+        parsed = ClusterManifest.parse_and_verify(
+            wire,
+            operator.get_signing_public_key_bytes(),
+            expected_cluster_name="mesh.b.example.com",
+        )
+        assert parsed is None
+
+    def test_expected_cluster_name_bind_normalizes_trailing_dot(self):
+        operator = _make_operator()
+        mf = _make_manifest(operator, cluster_name="mesh.example.com")
+        wire = mf.sign(operator)
+        # Caller passes FQDN form; should still bind.
+        parsed = ClusterManifest.parse_and_verify(
+            wire,
+            operator.get_signing_public_key_bytes(),
+            expected_cluster_name="mesh.example.com.",
+        )
+        assert parsed is not None
+
 
 # ---- expiry ---------------------------------------------------------------
 
