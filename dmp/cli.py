@@ -1265,10 +1265,9 @@ def cmd_cluster_pin(args: argparse.Namespace) -> int:
     cfg.cluster_enabled = False
     cfg.save(path)
     print(f"pinned cluster operator key and base domain {args.base_domain}")
-    print(
-        "next: `dmp cluster fetch` to confirm the manifest is "
-        "published and verifiable"
-    )
+    print("next:")
+    print("  1. `dmp cluster fetch` to verify the manifest resolves")
+    print("  2. `dmp cluster enable` to cut over from the legacy endpoint")
     return 0
 
 
@@ -1487,6 +1486,11 @@ def cmd_cluster_status(args: argparse.Namespace) -> int:
     try:
         m = cc.manifest
         print(f"cluster: {m.cluster_name} (seq={m.seq}, exp={m.exp})")
+        # Surface the activation flag so operators running `status` can
+        # tell whether commands are actually using cluster mode. A
+        # snapshot showing pinned anchors + enabled=False is a common
+        # pre-cutover state we want to make visible.
+        print(f"cluster_enabled: {cfg.cluster_enabled}")
         print("fan-out writer snapshot:")
         for row in cc.writer.snapshot():  # type: ignore[attr-defined]
             print(
