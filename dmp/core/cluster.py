@@ -285,13 +285,16 @@ class ClusterManifest:
     def _validate(self) -> None:
         if not isinstance(self.cluster_name, str) or not self.cluster_name:
             raise ValueError("cluster_name must be a non-empty string")
-        # A canonical FQDN form like "example.com." normalizes to
-        # "example.com" — the trailing dot is not part of the name's
-        # label content. Strip it for the length check so a 63-byte
-        # name + trailing dot (64 utf-8 bytes) is accepted, matching
-        # the same normalization _validate_dns_name performs.
-        name_for_length = self.cluster_name.rstrip(".")
-        name_bytes = name_for_length.encode("utf-8")
+        # Canonicalize: strip an optional trailing dot so "example.com."
+        # and "example.com" both normalize to the same stored form. Doing
+        # this in _validate (rather than only for the length check) keeps
+        # the sign/parse round-trip symmetric — the wire carries the
+        # normalized name, so receivers get the same bytes senders
+        # serialized.
+        self.cluster_name = self.cluster_name.rstrip(".")
+        if not self.cluster_name:
+            raise ValueError("cluster_name must be a non-empty string")
+        name_bytes = self.cluster_name.encode("utf-8")
         if len(name_bytes) > MAX_CLUSTER_NAME_LEN:
             raise ValueError(
                 f"cluster_name too long (max {MAX_CLUSTER_NAME_LEN} utf-8 bytes)"
