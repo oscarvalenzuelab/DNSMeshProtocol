@@ -73,6 +73,16 @@ operator signing key through a KMS / HSM / offline-signing workflow
 for getting the sample cluster up, not a production key-management
 story.
 
+{: .note }
+`docker/cluster/operator-ed25519.hex` and
+`docker/cluster/cluster-manifest.wire` are listed in the repo's
+`.gitignore` so a generated operator seed cannot be committed by
+accident. For extra safety, operators can point `--operator-key-out`
+and `--manifest-out` at paths OUTSIDE the checkout (e.g.
+`~/.dmp/operator-ed25519.hex`) and mount them into the compose
+services via a bind-mount override rather than the default relative
+path.
+
 ## Step 2 — wire the peer anchor into each node env file
 
 Each `docker/cluster/node-{a,b,c}.env` has a commented-out

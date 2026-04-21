@@ -83,31 +83,40 @@ def _peer_id_from_url(url: str) -> str:
     """Derive a short stable peer id from an HTTP URL.
 
     Used when DMP_SYNC_PEERS feeds the worker directly — there is no
-    ``node_id`` to key on, so we synthesize one from the URL's hostname
-    (falling back to the whole URL if parsing fails). The id shows up in
-    logs and as the watermark key, so stability across restarts of the
-    same peer matters; port + path are dropped so a peer that moves
-    between ports on the same host keeps its watermark.
+    ``node_id`` to key on, so we synthesize one. The id shows up in
+    logs and as the watermark key, so stability across restarts of
+    the same peer matters AND distinctness across peers on the same
+    host is mandatory. If two peers collapse onto one watermark,
+    anti-entropy advances past records that exist only on the other
+    endpoint.
 
-    Ids are truncated to 16 ASCII chars to match the
-    ``MAX_NODE_ID_LEN`` cap in ``dmp.core.cluster``; over-long hostnames
-    get a short sha256 suffix so two peers at ``very-long-hostname-a``
-    and ``very-long-hostname-b`` don't collide after truncation.
+    Key includes host AND port AND path — two nodes on the same host
+    at different ports are distinct peers. A short sha256 suffix of
+    the full URL keeps the id under the ``MAX_NODE_ID_LEN`` cap in
+    ``dmp.core.cluster`` while guaranteeing uniqueness.
     """
     import hashlib
     from urllib.parse import urlparse
 
     try:
-        host = urlparse(url).hostname or url
+        parsed = urlparse(url)
+        host = (parsed.hostname or url).strip().lower()
+        port = parsed.port
+        path = parsed.path or ""
     except Exception:
-        host = url
-    host = host.strip().lower()
+        host = url.strip().lower()
+        port = None
+        path = ""
     if not host:
         host = "peer"
-    if len(host) <= 16:
-        return host
-    digest = hashlib.sha256(host.encode("utf-8")).hexdigest()[:6]
-    return f"{host[:9]}-{digest}"
+    # Full-URL digest ensures peers on the same host but different
+    # ports/paths never share a watermark key.
+    key = f"{host}:{port or ''}{path}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:6]
+    # Keep a human-readable host prefix for log legibility; cap the
+    # total id at 16 chars (MAX_NODE_ID_LEN).
+    prefix_len = max(1, 16 - 1 - len(digest))  # 1 for the '-' separator
+    return f"{host[:prefix_len]}-{digest}"
 
 
 def _peers_from_url_list(
