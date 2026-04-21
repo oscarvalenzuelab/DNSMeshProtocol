@@ -404,37 +404,38 @@ class _NodeDnsReader(DNSRecordReader):
         import dns.rcode
         import dns.rdatatype
 
-        try:
-            request = dns.message.make_query(name, dns.rdatatype.TXT)
-            response = dns.query.udp(
-                request,
-                self._host,
-                port=self._port,
-                timeout=self._timeout,
-            )
-        except Exception:
-            # Any transport-level error (socket, timeout, malformed
-            # packet) coalesces to "not seen" for this node. The
-            # UnionReader counts this as a per-node failure and keeps
-            # going with the other nodes.
-            return None
+        # Distinguish "successful empty answer" (return None — healthy
+        # miss, UnionReader treats as not-an-error) from "transport or
+        # protocol failure" (raise — UnionReader counts as per-node
+        # failure and increments consecutive_failures). Coalescing both
+        # to None would make dead DNS endpoints look perpetually
+        # healthy in `cluster status` and defeat the pool's demotion.
+        request = dns.message.make_query(name, dns.rdatatype.TXT)
+        response = dns.query.udp(
+            request,
+            self._host,
+            port=self._port,
+            timeout=self._timeout,
+        )
         # Real DMP RRsets (prekey sets, multi-chunk slot manifests) can
         # exceed the UDP 512-byte ceiling. When that happens the node
         # sets the TC (truncated) bit and the answer section is useless;
         # we MUST retry over TCP to see the full rrset. Reuse the same
         # request so the question section + id matches.
         if response.flags & dns.flags.TC:
-            try:
-                response = dns.query.tcp(
-                    request,
-                    self._host,
-                    port=self._port,
-                    timeout=self._timeout,
-                )
-            except Exception:
-                return None
-        if response.rcode() != dns.rcode.NOERROR:
-            return None
+            response = dns.query.tcp(
+                request,
+                self._host,
+                port=self._port,
+                timeout=self._timeout,
+            )
+        rcode = response.rcode()
+        if rcode == dns.rcode.NXDOMAIN:
+            return None  # Healthy "no such name" answer.
+        if rcode != dns.rcode.NOERROR:
+            raise RuntimeError(
+                f"DNS rcode {dns.rcode.to_text(rcode)} from {self._host}"
+            )
         values: List[str] = []
         for rrset in response.answer:
             for rdata in rrset:
