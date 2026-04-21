@@ -122,6 +122,39 @@ re-deliver the same message — the replay cache persists to
    that message is now forward-secret even if alice's or bob's long-term
    key leaks.
 
+## Running against a cluster
+
+For resilience against single-node failure, point the CLI at a
+multi-node *cluster* instead of one endpoint. The operator publishes
+a signed `ClusterManifest` at `cluster.<base>` TXT listing the node
+set; the client pins the operator's Ed25519 pubkey + the base domain
+and fans every write to a majority of nodes while unioning every read.
+
+```bash
+# Pin the operator key + base domain once.
+dmp cluster pin 3c6a...the32byteoperatorpubkeyinhex mesh.example.com
+
+# Sanity-check that the signed manifest is published and verifiable.
+dmp cluster fetch
+# cluster: mesh.example.com
+#   seq:   7
+#   exp:   1816000000
+#   nodes: 3
+#     n01  http=https://n1.mesh.example.com:8053  dns=203.0.113.10:53
+#     ...
+
+# From here on every `dmp send` / `dmp recv` / `dmp identity publish`
+# fans writes across ceil(N/2) nodes and unions reads across all N.
+# Manifests refresh in the background on `cluster_refresh_interval`
+# (default 3600 seconds).
+```
+
+When either `cluster_operator_spk` or `cluster_base_domain` is unset
+the CLI falls back to the legacy single-endpoint mode, so existing
+configs keep working unchanged. See
+[User Guide → CLI reference → `dmp cluster`]({{ site.baseurl }}/guide/cli)
+for the full subcommand list.
+
 ## Next
 
 - [User Guide → CLI reference]({{ site.baseurl }}/guide/cli)

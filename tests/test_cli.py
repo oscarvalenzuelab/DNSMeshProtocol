@@ -36,7 +36,14 @@ def shared_store(monkeypatch):
     """
     store = InMemoryDNSStore()
 
-    def fake_make_client(config, passphrase):
+    def fake_make_client(config, passphrase, *, requires_network=True):
+        # `requires_network` is accepted but ignored — the shared in-memory
+        # store stands in for both cluster and legacy network paths, so
+        # local-only commands and networked commands exercise the same
+        # fake. The real _make_client uses the flag to decide whether to
+        # call fetch_cluster_manifest; that branch is covered separately
+        # in TestLocalOnlyClusterBootstrap.
+        del requires_network
         from dmp.cli import _config_path
 
         replay_path = str(_config_path().parent / "replay_cache.json")
@@ -814,3 +821,569 @@ class TestResolversCommand:
         with pytest.raises(SystemExit) as exc:
             cli.main(["resolvers", "discover"])
         assert exc.value.code == 2
+
+
+class TestClusterCommand:
+    """`dmp cluster pin` / `dmp cluster fetch` / `dmp cluster status`.
+
+    Network reads are redirected at the shared in-memory store via a
+    monkeypatched `_make_reader`; that's the same anchor the real CLI
+    uses to build both the legacy single-host reader and the cluster
+    bootstrap reader.
+    """
+
+    def _patch_reader(self, monkeypatch, store):
+        """Force `_make_reader` to return a reader backed by `store`."""
+
+        class _StoreReader:
+            def query_txt_record(self, name):
+                return store.query_txt_record(name)
+
+        monkeypatch.setattr(cli, "_make_reader", lambda cfg: _StoreReader())
+
+    def _build_signed_manifest(
+        self, *, cluster_name="mesh.example.com", seq=1, n_nodes=2
+    ):
+        """Return `(operator, wire_string, manifest)` for test use."""
+        import time as _time
+
+        from dmp.core.cluster import ClusterManifest, ClusterNode
+        from dmp.core.crypto import DMPCrypto
+
+        op = DMPCrypto()
+        nodes = [
+            ClusterNode(
+                node_id=f"n{i:02d}",
+                http_endpoint=f"https://n{i}.example.com:8053",
+                dns_endpoint=f"203.0.113.{i}:53",
+            )
+            for i in range(1, n_nodes + 1)
+        ]
+        manifest = ClusterManifest(
+            cluster_name=cluster_name,
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=nodes,
+            seq=seq,
+            exp=int(_time.time()) + 3600,
+        )
+        return op, manifest.sign(op), manifest
+
+    def test_cluster_pin_writes_config(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        rc = cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+        assert rc == 0
+        cfg = yaml.safe_load((config_home / "config.yaml").read_text())
+        assert cfg["cluster_operator_spk"] == hex_spk
+        assert cfg["cluster_base_domain"] == "mesh.example.com"
+
+    def test_cluster_pin_rejects_bad_hex(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["cluster", "pin", "not-hex", "mesh.example.com"])
+        assert exc.value.code == 1
+
+    def test_cluster_pin_rejects_wrong_length(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        # 16-byte hex (too short for Ed25519)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["cluster", "pin", "aa" * 16, "mesh.example.com"])
+        assert exc.value.code == 1
+
+    def test_cluster_fetch_prints_summary(self, config_home, monkeypatch, capsys):
+        from dmp.core.cluster import cluster_rrset_name
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+
+        op, wire, manifest = self._build_signed_manifest(n_nodes=2)
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+        capsys.readouterr()
+
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+        self._patch_reader(monkeypatch, store)
+
+        rc = cli.main(["cluster", "fetch"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "cluster: mesh.example.com" in out
+        assert "seq:   1" in out
+        assert "nodes: 2" in out
+        assert "n01" in out
+        assert "n02" in out
+
+    def test_cluster_fetch_without_pin_errors(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["cluster", "fetch"])
+        assert exc.value.code == 1
+
+    def test_cluster_fetch_nothing_published_exits_2(self, config_home, monkeypatch):
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+
+        store = InMemoryDNSStore()  # nothing published
+        self._patch_reader(monkeypatch, store)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["cluster", "fetch"])
+        assert exc.value.code == 2
+
+    def test_cluster_fetch_save_writes_wire_cache(
+        self, config_home, monkeypatch, capsys
+    ):
+        from dmp.core.cluster import cluster_rrset_name
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+        self._patch_reader(monkeypatch, store)
+
+        cli.main(["cluster", "fetch", "--save"])
+        wire_path = config_home / "cluster_manifest.wire"
+        assert wire_path.exists()
+        assert wire_path.read_text() == wire
+
+    def test_cluster_status_prints_snapshots(self, config_home, monkeypatch, capsys):
+        from dmp.core.cluster import cluster_rrset_name
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        op, wire, manifest = self._build_signed_manifest(n_nodes=3)
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+        capsys.readouterr()
+
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+        self._patch_reader(monkeypatch, store)
+
+        rc = cli.main(["cluster", "status"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "cluster: mesh.example.com" in out
+        assert "fan-out writer snapshot" in out
+        assert "union reader snapshot" in out
+        # All three nodes appear in the snapshot.
+        for i in range(1, 4):
+            assert f"n{i:02d}" in out
+
+
+class TestClusterConfigPersistence:
+    """CLIConfig round-trips the new cluster_* fields."""
+
+    def test_defaults_present_on_fresh_init(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cfg = yaml.safe_load((config_home / "config.yaml").read_text())
+        # Empty / default values should be present in the serialized
+        # config so post-upgrade loads don't KeyError.
+        assert cfg.get("cluster_base_domain", "") == ""
+        assert cfg.get("cluster_operator_spk", "") == ""
+        assert cfg.get("cluster_refresh_interval", 3600) == 3600
+
+    def test_load_tolerates_absent_cluster_fields(self, config_home):
+        """An older config (pre-M2.wire) without cluster_* keys loads cleanly."""
+        # Write a minimal config omitting the new fields entirely.
+        cfg_path = config_home / "config.yaml"
+        config_home.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(
+            yaml.safe_dump(
+                {
+                    "username": "alice",
+                    "domain": "mesh.local",
+                    "endpoint": "http://x",
+                    "kdf_salt": "aa" * 32,
+                }
+            )
+        )
+        # Load via the public classmethod and verify defaults.
+        loaded = cli.CLIConfig.load(cfg_path)
+        assert loaded.cluster_base_domain == ""
+        assert loaded.cluster_operator_spk == ""
+        assert loaded.cluster_refresh_interval == 3600
+
+
+class TestClusterModeInMakeClient:
+    """`_make_client` wires the cluster path when both anchors are pinned."""
+
+    def test_make_client_uses_cluster_when_both_anchors_set(
+        self, config_home, monkeypatch
+    ):
+        import time as _time
+
+        from dmp.core.cluster import (
+            ClusterManifest,
+            ClusterNode,
+            cluster_rrset_name,
+        )
+        from dmp.core.crypto import DMPCrypto
+        from dmp.network.memory import InMemoryDNSStore
+
+        op = DMPCrypto()
+        manifest = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=[
+                ClusterNode(
+                    node_id="n01",
+                    http_endpoint="https://n1.example.com:8053",
+                    dns_endpoint="127.0.0.1:9999",
+                ),
+            ],
+            seq=1,
+            exp=int(_time.time()) + 3600,
+        )
+        wire = manifest.sign(op)
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+
+        class _StoreReader:
+            def query_txt_record(self, name):
+                return store.query_txt_record(name)
+
+        monkeypatch.setattr(cli, "_make_reader", lambda cfg: _StoreReader())
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(
+            [
+                "cluster",
+                "pin",
+                op.get_signing_public_key_bytes().hex(),
+                "mesh.example.com",
+            ]
+        )
+
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        client = cli._make_client(cfg, "pw")
+        try:
+            # Cluster handle must be attached when cluster mode kicks in.
+            assert client._cluster_client is not None
+            # Writer is a FanoutWriter and reader is a UnionReader.
+            from dmp.network.fanout_writer import FanoutWriter
+            from dmp.network.union_reader import UnionReader
+
+            assert isinstance(client.writer, FanoutWriter)
+            assert isinstance(client.reader, UnionReader)
+            # Mailbox RRsets must live under the cluster's base domain,
+            # not the legacy config.domain (default "mesh.local"). Using
+            # the wrong domain here would silently target the wrong zone.
+            assert client.domain == "mesh.example.com"
+        finally:
+            cli._close_client(client)
+
+    def test_make_client_legacy_path_unchanged(self, config_home, monkeypatch):
+        """A config WITHOUT cluster_base_domain still uses single-endpoint mode."""
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_base_domain == ""
+        # Build a client — should not attempt cluster fetch.
+        client = cli._make_client(cfg, "pw")
+        try:
+            # No cluster handle in legacy mode.
+            assert client._cluster_client is None
+        finally:
+            cli._close_client(client)
+
+
+class TestNodeDnsReaderTruncation:
+    """`_NodeDnsReader` retries over TCP when the UDP response is truncated.
+
+    DMP RRsets that carry prekey pools or multi-chunk slot manifests can
+    easily exceed the 512-byte UDP DNS limit. Nodes return the TC
+    (truncated) flag with an empty answer; a client that trusts UDP
+    alone silently drops these rrsets and the union reader sees no data.
+    The reader must detect TC and retry over TCP.
+    """
+
+    def _build_truncated_udp_response(self, request):
+        """Return a response with TC set and an empty answer section."""
+        import dns.flags
+        import dns.message
+
+        response = dns.message.make_response(request)
+        response.flags |= dns.flags.TC
+        return response
+
+    def _build_tcp_answer_response(self, request, name, values):
+        """Return a full (non-truncated) TXT response carrying `values`."""
+        import dns.message
+        import dns.rdataclass
+        import dns.rdatatype
+        import dns.rrset
+
+        response = dns.message.make_response(request)
+        rrset = dns.rrset.from_text_list(
+            name,
+            300,
+            dns.rdataclass.IN,
+            dns.rdatatype.TXT,
+            [f'"{v}"' for v in values],
+        )
+        response.answer.append(rrset)
+        return response
+
+    def test_udp_truncation_triggers_tcp_retry(self, monkeypatch):
+        """UDP returns TC with empty answer → TCP retry is issued, its
+        answer is returned."""
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", timeout=1.0)
+        captured = {"udp_calls": 0, "tcp_calls": 0, "tcp_request": None}
+
+        def fake_udp(request, host, port, timeout):
+            captured["udp_calls"] += 1
+            return self._build_truncated_udp_response(request)
+
+        def fake_tcp(request, host, port, timeout):
+            captured["tcp_calls"] += 1
+            captured["tcp_request"] = request
+            return self._build_tcp_answer_response(
+                request, "example.com.", ["hello-big-rrset"]
+            )
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        monkeypatch.setattr(dns.query, "tcp", fake_tcp)
+
+        result = reader.query_txt_record("example.com.")
+        assert captured["udp_calls"] == 1
+        assert captured["tcp_calls"] == 1
+        assert result == ["hello-big-rrset"]
+
+    def test_no_tcp_retry_when_udp_not_truncated(self, monkeypatch):
+        """Non-truncated UDP response → TCP must NOT be called."""
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", timeout=1.0)
+        captured = {"udp_calls": 0, "tcp_calls": 0}
+
+        def fake_udp(request, host, port, timeout):
+            captured["udp_calls"] += 1
+            return self._build_tcp_answer_response(
+                request, "example.com.", ["small-rrset"]
+            )
+
+        def fake_tcp(request, host, port, timeout):  # pragma: no cover
+            captured["tcp_calls"] += 1
+            raise AssertionError("TCP should not be called for a non-truncated reply")
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        monkeypatch.setattr(dns.query, "tcp", fake_tcp)
+
+        result = reader.query_txt_record("example.com.")
+        assert captured["udp_calls"] == 1
+        assert captured["tcp_calls"] == 0
+        assert result == ["small-rrset"]
+
+    def test_tcp_retry_failure_returns_none(self, monkeypatch):
+        """UDP truncated + TCP blows up → None (per-node failure, not a crash)."""
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", timeout=1.0)
+
+        def fake_udp(request, host, port, timeout):
+            return self._build_truncated_udp_response(request)
+
+        def fake_tcp(request, host, port, timeout):
+            raise OSError("tcp connect refused")
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        monkeypatch.setattr(dns.query, "tcp", fake_tcp)
+
+        assert reader.query_txt_record("example.com.") is None
+
+
+class TestLocalOnlyClusterBootstrap:
+    """Local-only CLI commands must not crash on cluster bootstrap failure.
+
+    `dmp identity show` prints only local-config state + keys derived
+    from the passphrase. In cluster mode, _make_client used to call
+    fetch_cluster_manifest unconditionally and die with exit 2 when DNS
+    was unreachable — breaking offline use. The fix routes local-only
+    commands through _make_client(..., requires_network=False) so they
+    skip the manifest fetch entirely.
+    """
+
+    def _pin_cluster_unreachable(self, monkeypatch):
+        """Make `fetch_cluster_manifest` behave as if DNS is offline."""
+        import dmp.cli as cli_mod
+
+        def failing_fetch(*args, **kwargs):
+            return None  # simulates "nothing verifying / DNS unreachable"
+
+        monkeypatch.setattr(cli_mod, "fetch_cluster_manifest", failing_fetch)
+
+    def test_identity_show_works_when_cluster_fetch_fails(
+        self, config_home, monkeypatch, capsys
+    ):
+        """`dmp identity show` must print local identity even when the
+        pinned cluster manifest is unreachable."""
+        from dmp.core.crypto import DMPCrypto
+
+        # Pin a cluster (both anchors set -> cluster mode on).
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op = DMPCrypto()
+        cli.main(
+            [
+                "cluster",
+                "pin",
+                op.get_signing_public_key_bytes().hex(),
+                "mesh.unreachable.example",
+            ]
+        )
+        capsys.readouterr()
+
+        # Simulate DNS outage — manifest fetch returns None.
+        self._pin_cluster_unreachable(monkeypatch)
+
+        monkeypatch.setenv("DMP_PASSPHRASE", "pw")
+        rc = cli.main(["identity", "show"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "username: alice" in out
+        assert "public_key:" in out
+
+    def test_identity_show_json_works_when_cluster_fetch_fails(
+        self, config_home, monkeypatch, capsys
+    ):
+        """JSON variant of the same: offline identity show still succeeds."""
+        import json as _json
+
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op = DMPCrypto()
+        cli.main(
+            [
+                "cluster",
+                "pin",
+                op.get_signing_public_key_bytes().hex(),
+                "mesh.unreachable.example",
+            ]
+        )
+        capsys.readouterr()
+
+        self._pin_cluster_unreachable(monkeypatch)
+
+        monkeypatch.setenv("DMP_PASSPHRASE", "pw")
+        rc = cli.main(["identity", "show", "--json"])
+        assert rc == 0
+        parsed = _json.loads(capsys.readouterr().out)
+        assert parsed["username"] == "alice"
+        assert len(parsed["public_key"]) == 64
+
+    def test_send_still_fails_loudly_when_cluster_fetch_fails(
+        self, config_home, monkeypatch, capsys
+    ):
+        """A networked command (`dmp send`) MUST still fail loudly with a
+        clear error + non-zero exit when bootstrap fails. Silencing that
+        would hide real breakage."""
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op = DMPCrypto()
+        cli.main(
+            [
+                "cluster",
+                "pin",
+                op.get_signing_public_key_bytes().hex(),
+                "mesh.unreachable.example",
+            ]
+        )
+        # Stash a contact so send gets past the unknown-contact check.
+        cli.main(["contacts", "add", "bob", "aa" * 32])
+        capsys.readouterr()
+
+        self._pin_cluster_unreachable(monkeypatch)
+
+        monkeypatch.setenv("DMP_PASSPHRASE", "pw")
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["send", "bob", "hi"])
+        # Exit 2 is the network/backend error code per cli.py docstring.
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "cluster manifest fetch failed" in err
+
+    def test_offline_writer_raises_on_publish(self):
+        """The offline placeholder writer must raise loudly on use, not
+        silently return success — otherwise a buggy command could think
+        it had published a record when in reality nothing went out."""
+        from dmp.cli import _OfflineWriter
+
+        w = _OfflineWriter()
+        with pytest.raises(RuntimeError, match="network unavailable"):
+            w.publish_txt_record("example.com.", "value")
+        with pytest.raises(RuntimeError, match="network unavailable"):
+            w.delete_txt_record("example.com.")
+
+    def test_offline_reader_raises_on_query(self):
+        """Same for the placeholder reader: raise, don't return None."""
+        from dmp.cli import _OfflineReader
+
+        r = _OfflineReader()
+        with pytest.raises(RuntimeError, match="network unavailable"):
+            r.query_txt_record("example.com.")
+
+    def test_make_client_skips_fetch_when_requires_network_false(
+        self, config_home, monkeypatch
+    ):
+        """Direct unit-level check: `requires_network=False` must not
+        invoke fetch_cluster_manifest at all, even when cluster mode is
+        pinned."""
+        import dmp.cli as cli_mod
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op = DMPCrypto()
+        cli.main(
+            [
+                "cluster",
+                "pin",
+                op.get_signing_public_key_bytes().hex(),
+                "mesh.never.fetched.example",
+            ]
+        )
+
+        called = {"fetch_calls": 0}
+
+        def boom_fetch(*args, **kwargs):
+            called["fetch_calls"] += 1
+            raise AssertionError(
+                "fetch_cluster_manifest must NOT be called in local-only mode"
+            )
+
+        monkeypatch.setattr(cli_mod, "fetch_cluster_manifest", boom_fetch)
+
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        client = cli._make_client(cfg, "pw", requires_network=False)
+        try:
+            assert called["fetch_calls"] == 0
+            # Cluster handle is NOT created in local-only mode (we skipped
+            # the manifest → no ClusterClient to attach).
+            assert client._cluster_client is None
+            # Writer/reader are the offline placeholders — local ops like
+            # get_user_info() still work, but any accidental network call
+            # raises loudly.
+            assert isinstance(client.writer, cli_mod._OfflineWriter)
+            assert isinstance(client.reader, cli_mod._OfflineReader)
+        finally:
+            cli._close_client(client)
