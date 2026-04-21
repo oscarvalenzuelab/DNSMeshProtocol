@@ -858,9 +858,42 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
     )
 
     cfg = CLIConfig.load(_config_path())
-    # Fetch is read-only — no passphrase needed. Build a minimal reader path
-    # without going through _make_client (which loads the identity key).
-    reader = _make_reader(cfg)
+    # Fetch is read-only — no passphrase needed. Build a minimal reader
+    # path without going through _make_client (which loads the identity
+    # key). In cluster mode the identity record lives inside the
+    # cluster's zone and is fanned across the node set, so we read via
+    # the union reader for read-after-write consistency — reading only
+    # the bootstrap resolver can miss a just-published record until
+    # recursive DNS catches up.
+    bootstrap_reader = _make_reader(cfg)
+    cluster_handle: Optional[ClusterClient] = None
+    if _cluster_mode_enabled(cfg):
+        try:
+            op_spk = bytes.fromhex(cfg.cluster_operator_spk)
+        except ValueError:
+            _die(1, "cluster_operator_spk in config is not valid hex")
+        if len(op_spk) != 32:
+            _die(1, "cluster_operator_spk must be 32 bytes (64 hex chars)")
+        manifest = fetch_cluster_manifest(
+            cfg.cluster_base_domain, op_spk, bootstrap_reader
+        )
+        if manifest is None:
+            _die(
+                2,
+                f"cluster manifest fetch failed for {cfg.cluster_base_domain}",
+            )
+        cluster_handle = ClusterClient(
+            manifest,
+            operator_spk=op_spk,
+            base_domain=cfg.cluster_base_domain,
+            bootstrap_reader=bootstrap_reader,
+            writer_factory=_build_cluster_writer_factory(cfg),
+            reader_factory=_make_cluster_reader_factory(cfg, bootstrap_reader),
+            refresh_interval=None,  # one-shot; no background thread.
+        )
+        reader = cluster_handle.reader
+    else:
+        reader = bootstrap_reader
 
     parsed_addr = parse_address(args.username)
     if parsed_addr is not None:
@@ -871,7 +904,11 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         resolved_username = args.username
         name = identity_domain(args.username, args.domain or _effective_domain(cfg))
 
-    records = reader.query_txt_record(name)
+    try:
+        records = reader.query_txt_record(name)
+    finally:
+        if cluster_handle is not None:
+            cluster_handle.close()
     if not records:
         _die(2, f"no identity record at {name}")
 

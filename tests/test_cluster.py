@@ -174,15 +174,15 @@ class TestClusterManifestRoundtrip:
             assert parsed_node.http_endpoint == original_node.http_endpoint
             assert parsed_node.dns_endpoint == original_node.dns_endpoint
 
-    def test_empty_node_list_roundtrips(self):
+    def test_empty_node_list_rejected(self):
+        """An empty node list has no operational meaning and is a silent
+        data-loss footgun (FanoutWriter quorum of 0 nodes is 0, so
+        every publish reports success without contacting any node).
+        Reject at _validate time so a buggy publisher cannot install
+        one into a client."""
         operator = _make_operator()
-        original = _make_manifest(operator, nodes=[])
-        wire = original.sign(operator)
-        parsed = ClusterManifest.parse_and_verify(
-            wire, operator.get_signing_public_key_bytes()
-        )
-        assert parsed is not None
-        assert parsed.nodes == []
+        with pytest.raises(ValueError, match="at least one node"):
+            _make_manifest(operator, nodes=[]).sign(operator)
 
     def test_sign_mismatched_operator_spk_raises(self):
         operator = _make_operator()
@@ -621,15 +621,12 @@ class TestClusterManifestExpiry:
 
 
 class TestClusterManifestSize:
-    def test_zero_nodes_valid(self):
+    def test_zero_nodes_rejected(self):
+        """Zero-node manifests are silent-data-loss footguns; sign()
+        must refuse to produce one."""
         operator = _make_operator()
-        mf = _make_manifest(operator, nodes=[])
-        wire = mf.sign(operator)
-        assert len(wire.encode("utf-8")) <= MAX_WIRE_LEN
-        parsed = ClusterManifest.parse_and_verify(
-            wire, operator.get_signing_public_key_bytes()
-        )
-        assert parsed is not None and parsed.nodes == []
+        with pytest.raises(ValueError, match="at least one node"):
+            _make_manifest(operator, nodes=[]).sign(operator)
 
     def test_one_node_fits(self):
         operator = _make_operator()
