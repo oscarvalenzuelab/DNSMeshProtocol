@@ -98,8 +98,12 @@ def _validate_dns_name(name: str) -> None:
     """
     if not isinstance(name, str) or not name:
         raise ValueError("cluster_name must be a non-empty string")
-    # Accept a single trailing dot (canonical FQDN form); strip for checks.
-    # Leading dots and embedded empty labels are rejected below.
+    # A single trailing dot is the canonical FQDN form; accept and strip
+    # it for per-label checks. Two or more trailing dots ("example.com..")
+    # mean the publisher typo'd an empty final label — reject here rather
+    # than silently collapsing them, which would hide the typo.
+    if name.endswith(".."):
+        raise ValueError("cluster_name contains empty label at the end")
     normalized = name[:-1] if name.endswith(".") else name
     if not normalized:
         raise ValueError("cluster_name must have at least one label")
@@ -285,13 +289,14 @@ class ClusterManifest:
     def _validate(self) -> None:
         if not isinstance(self.cluster_name, str) or not self.cluster_name:
             raise ValueError("cluster_name must be a non-empty string")
-        # Canonicalize: strip an optional trailing dot so "example.com."
-        # and "example.com" both normalize to the same stored form. Doing
-        # this in _validate (rather than only for the length check) keeps
-        # the sign/parse round-trip symmetric — the wire carries the
-        # normalized name, so receivers get the same bytes senders
-        # serialized.
-        self.cluster_name = self.cluster_name.rstrip(".")
+        # Canonicalize: strip at most ONE trailing dot so "example.com."
+        # and "example.com" both normalize to the same stored form. A
+        # doubled trailing dot ("example.com..") is malformed (empty
+        # final label) and must be rejected here rather than collapsed.
+        if self.cluster_name.endswith(".."):
+            raise ValueError("cluster_name contains empty label at the end")
+        if self.cluster_name.endswith("."):
+            self.cluster_name = self.cluster_name[:-1]
         if not self.cluster_name:
             raise ValueError("cluster_name must be a non-empty string")
         name_bytes = self.cluster_name.encode("utf-8")
@@ -529,10 +534,17 @@ class ClusterManifest:
             return None
 
         # 8. If the caller specified the expected cluster name, bind the
-        # parsed manifest to it. Normalize the trailing dot on both sides
-        # so canonical FQDN and bare-label forms compare equal.
+        # parsed manifest to it. Normalize a single trailing dot on both
+        # sides so canonical FQDN and bare-label forms compare equal —
+        # but preserve any leading/interior weirdness so we catch
+        # typos like "mesh.example.com..".
         if expected_cluster_name is not None:
-            if manifest.cluster_name != expected_cluster_name.rstrip("."):
+            expected_norm = (
+                expected_cluster_name[:-1]
+                if expected_cluster_name.endswith(".")
+                else expected_cluster_name
+            )
+            if manifest.cluster_name != expected_norm:
                 return None
 
         return manifest
