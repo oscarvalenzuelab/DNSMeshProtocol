@@ -323,6 +323,17 @@ class ClusterManifest:
             raise ValueError("operator_spk must be 32 bytes")
         if not isinstance(self.nodes, list):
             raise ValueError("nodes must be a list")
+        # An empty node list has no legitimate operational meaning
+        # (there is nowhere for clients to publish or read) and allowing
+        # it is a silent data-loss footgun: FanoutWriter's quorum of a
+        # 0-node cluster is 0, so every publish returns True vacuously.
+        # Downstream send / identity publish / prekey refresh would then
+        # report success while dropping every record.
+        if len(self.nodes) == 0:
+            raise ValueError(
+                "cluster manifest must contain at least one node; "
+                "publish an empty cluster by not publishing the manifest at all"
+            )
         if len(self.nodes) > MAX_NODE_COUNT:
             raise ValueError(
                 f"too many nodes (max {MAX_NODE_COUNT}); "
