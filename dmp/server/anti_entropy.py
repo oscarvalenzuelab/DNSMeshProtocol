@@ -691,46 +691,43 @@ class AntiEntropyWorker:
     def _current_installed_seq(self) -> int:
         """Return the highest seq currently visible to this worker.
 
-        Consults the in-memory ``_installed_seq`` first (fast path,
-        moved on every install). If the worker has never installed
-        anything in-process, falls back to reading
-        ``cluster.<base_domain>`` TXT from the local store and picking
-        the max verifying seq. That covers the startup case where
-        _publish_cluster_manifest_from_file populated the store before
-        the worker started, so a peer at seq == disk seq doesn't loop.
-        """
-        if self._installed_seq >= 0:
-            return self._installed_seq
-        if not self._base_domain or self._cluster_operator_spk is None:
-            return -1
-        from dmp.core.cluster import cluster_rrset_name
+        Returns ``max(in-memory-cached seq, local-store max-verified
+        seq)``. Re-reading the store on every call is deliberate: the
+        operator rollout path pushes a new manifest to one node via
+        ``/v1/records/cluster.<base>`` (NOT through install_gossiped_
+        manifest), which means the worker's cache is blind to that
+        fresh value. Caching only would let a peer at seq == cache but
+        > disk sneak in a downgrade. Ground truth lives in the store.
 
-        try:
-            rrset = cluster_rrset_name(self._base_domain)
-        except ValueError:
-            return -1
-        reader = self._store
-        if not hasattr(reader, "query_txt_record"):
-            return -1
-        try:
-            values = reader.query_txt_record(rrset)
-        except Exception:
-            return -1
-        if not values:
-            return -1
-        best = -1
-        for wire in values:
-            if not isinstance(wire, str):
-                continue
-            m = ClusterManifest.parse_and_verify(
-                wire,
-                self._cluster_operator_spk,
-                expected_cluster_name=self._base_domain,
-            )
-            if m is not None and m.seq > best:
-                best = m.seq
-        self._installed_seq = best
-        return best
+        The cache IS still useful: it captures in-process installs
+        whose wire hasn't been fully flushed / isn't yet visible to
+        query_txt_record via expiry semantics. We take the max of
+        both sources.
+        """
+        disk_best = -1
+        if self._base_domain and self._cluster_operator_spk is not None:
+            from dmp.core.cluster import cluster_rrset_name
+
+            try:
+                rrset = cluster_rrset_name(self._base_domain)
+            except ValueError:
+                rrset = None
+            if rrset is not None and hasattr(self._store, "query_txt_record"):
+                try:
+                    values = self._store.query_txt_record(rrset)
+                except Exception:
+                    values = None
+                for wire in values or []:
+                    if not isinstance(wire, str):
+                        continue
+                    m = ClusterManifest.parse_and_verify(
+                        wire,
+                        self._cluster_operator_spk,
+                        expected_cluster_name=self._base_domain,
+                    )
+                    if m is not None and m.seq > disk_best:
+                        disk_best = m.seq
+        return max(self._installed_seq, disk_best)
 
     def _install_gossiped_manifest(
         self, manifest: "ClusterManifest", wire: str
@@ -783,10 +780,20 @@ class AntiEntropyWorker:
 
         Called by the gossip path when a higher-seq manifest lands,
         but also safe to call from tests or operator tooling. Preserves
-        watermarks for peers still in the new set (keyed on
-        ``node_id``) so anti-entropy does not re-scan records it
-        already validated. New peers start at the ``(0, "", "")``
-        sentinel. Dropped peers have their watermark entry removed.
+        watermarks for peers retained across the swap. New peers start
+        at the ``(0, "", "")`` sentinel. Dropped peers have their
+        watermark entry removed.
+
+        Identity for retention is the PAIR (node_id, normalized
+        http_endpoint). Same-node_id-different-endpoint counts as
+        a genuinely new peer (endpoint rotation → fresh state).
+        Same-endpoint-different-node_id ALSO counts as retained:
+        this is the DMP_SYNC_PEERS → gossiped-manifest handoff path,
+        where peers were initially seeded with URL-derived synthetic
+        ids and then reappear under operator-defined ids. Without
+        that cross-key match the first gossip install would drop
+        every synthetic watermark and force a full rescan of records
+        we already validated.
 
         Self-exclusion is re-applied so callers don't have to
         pre-filter.
@@ -800,21 +807,39 @@ class AntiEntropyWorker:
                 continue
             seen.add(p.node_id)
             deduped.append(p)
+
+        def _norm_endpoint(url: str) -> str:
+            # Same normalization _peer_id_from_url uses — strip trailing
+            # slashes, lowercase. Keeps url-synthetic and operator-pinned
+            # peers matchable by stable key.
+            return url.strip().rstrip("/").lower()
+
         with self._lock:
-            new_ids = {p.node_id for p in deduped}
-            # Drop watermarks for peers no longer in the set.
-            for nid in list(self._watermarks.keys()):
-                if nid not in new_ids:
-                    del self._watermarks[nid]
-            # Seed watermarks for new peers.
+            old_by_endpoint: Dict[str, Cursor] = {}
+            for old_pid, old_peer in zip(self._watermarks.keys(), self._peers):
+                if old_peer.node_id != old_pid:
+                    # defensive: keep the pairing explicit via _peers
+                    continue
+                old_by_endpoint[_norm_endpoint(old_peer.http_endpoint)] = (
+                    self._watermarks[old_pid]
+                )
+
+            new_watermarks: Dict[str, Cursor] = {}
             for p in deduped:
-                if p.node_id not in self._watermarks:
-                    self._watermarks[p.node_id] = (0, "", "")
+                key_ep = _norm_endpoint(p.http_endpoint)
+                if p.node_id in self._watermarks:
+                    # Exact node_id match — preserve cursor.
+                    new_watermarks[p.node_id] = self._watermarks[p.node_id]
+                elif key_ep in old_by_endpoint:
+                    # Node_id changed but endpoint is the same physical
+                    # peer (e.g. DMP_SYNC_PEERS synthetic id →
+                    # operator-defined id from the gossiped manifest).
+                    # Carry the cursor forward under the new id.
+                    new_watermarks[p.node_id] = old_by_endpoint[key_ep]
+                else:
+                    new_watermarks[p.node_id] = (0, "", "")
+            self._watermarks = new_watermarks
             self._peers = deduped
-            # Reset rr index so round-robin doesn't point past the end
-            # of the new list. Modulo handles the normal case, but
-            # shrinking below the old index leaves a correct-by-construction
-            # starting point at 0.
             if self._peers:
                 self._rr_index = self._rr_index % len(self._peers)
             else:
