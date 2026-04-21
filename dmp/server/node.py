@@ -135,16 +135,27 @@ def _peers_from_url_list(
     urls: List[str],
     *,
     self_node_id: Optional[str] = None,
+    self_http_endpoint: Optional[str] = None,
 ) -> List[SyncPeer]:
     """Build a ``SyncPeer`` list from a raw URL list (DMP_SYNC_PEERS).
 
     Skips empty / duplicate entries so a stray ``"a,,b"`` or ``"a,a"``
     doesn't wedge the round-robin index on a phantom peer. Also drops
-    any URL whose synthesized peer id matches ``self_node_id`` — the
-    compose sample writes symmetric env files, so node-a's copy lists
-    ``[node-b, node-c]`` with no self entry, but a future config
-    generator that includes self should not create a self-sync loop.
+    any URL matching ``self_http_endpoint`` (case-insensitive,
+    trailing-slash-normalized) or whose synthesized peer id matches
+    ``self_node_id``.
+
+    The URL-based check is the one that actually fires for the common
+    DMP_SYNC_PEERS configuration: ``_peer_id_from_url`` produces
+    synthetic ids like ``host-abc123``, while ``self_node_id`` is the
+    operator-defined manifest id (``node-a``). Comparing the two never
+    matches, so without the URL check an operator who accidentally
+    includes their own URL in DMP_SYNC_PEERS would have the worker
+    sync with itself indefinitely.
     """
+    self_ep_norm = (
+        self_http_endpoint.rstrip("/").lower() if self_http_endpoint else None
+    )
     seen_urls: set = set()
     peers: List[SyncPeer] = []
     for raw in urls:
@@ -154,6 +165,8 @@ def _peers_from_url_list(
         if url in seen_urls:
             continue
         seen_urls.add(url)
+        if self_ep_norm and url.lower() == self_ep_norm:
+            continue
         peer_id = _peer_id_from_url(url)
         if self_node_id and peer_id == self_node_id:
             continue
@@ -570,7 +583,9 @@ class DMPNode:
         peer_source: str
         if self.config.sync_peers:
             peers = _peers_from_url_list(
-                self.config.sync_peers, self_node_id=self.config.node_id
+                self.config.sync_peers,
+                self_node_id=self.config.node_id,
+                self_http_endpoint=self.config.sync_self_endpoint,
             )
             peer_source = f"DMP_SYNC_PEERS ({len(self.config.sync_peers)} urls)"
         else:
@@ -609,7 +624,17 @@ class DMPNode:
         # we can still derive it from the on-disk manifest.
         base_domain = self.config.cluster_base_domain
         if operator_spk is not None and not base_domain:
-            base_domain = self._derive_cluster_base_domain()
+            # Three-tier derivation: env var → on-disk cluster file →
+            # previously-gossiped manifest in the local sqlite store.
+            # The last tier is the restart-recovery path for gossip-only
+            # nodes (DMP_SYNC_PEERS + DMP_SYNC_OPERATOR_SPK, no file,
+            # no env). Without it, a node that learned the cluster via
+            # gossip would come back from restart with gossip disabled
+            # even though a valid manifest was already persisted.
+            base_domain = (
+                self._derive_cluster_base_domain()
+                or self._derive_cluster_base_domain_from_store()
+            )
 
         # Operator wiring check: if DMP_SYNC_PEERS was used (so there's
         # no signed manifest on disk to derive trust from) AND the

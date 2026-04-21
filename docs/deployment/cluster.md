@@ -155,9 +155,13 @@ All three must be set on every node:
 - `DMP_CLUSTER_BASE_DOMAIN` — the cluster name (e.g.
   `mesh.example.com`). Binds each gossiped manifest to the expected
   cluster; a manifest correctly signed by the operator but naming a
-  different cluster is rejected. Defaults to the cluster name
-  embedded in the on-disk manifest, so existing compose deployments
-  get gossip for free once they pin `DMP_SYNC_OPERATOR_SPK`.
+  different cluster is rejected. If unset, the node derives the
+  base_domain from (in order): the on-disk cluster manifest file
+  (verified under `DMP_SYNC_OPERATOR_SPK`), then the highest-seq
+  verifying manifest already persisted in the local sqlite store
+  (restart-recovery for gossip-only nodes). Existing compose
+  deployments get gossip for free once they pin
+  `DMP_SYNC_OPERATOR_SPK`.
 - `DMP_SYNC_PEER_TOKEN` — as for other sync endpoints. The
   `/v1/sync/cluster-manifest` endpoint shares this token with
   `/v1/sync/digest` and `/v1/sync/pull`.
