@@ -61,6 +61,13 @@ same RRset. dnspython callers already reassemble with
 split at any 255-byte boundary; readers do not care where the splits
 land.
 
+All built-in writers (`DNSUpdatePublisher`, `CloudflarePublisher`,
+`Route53Publisher`, `LocalDNSPublisher`) split values longer than 255
+bytes into multi-string TXT RDATA on publish, so a cluster manifest up
+to the 1200-byte cap round-trips cleanly end-to-end. Short values (≤
+255 bytes) continue to be written as a single character-string —
+unchanged from earlier releases.
+
 ## Wire format
 
 `v=dmp1;t=cluster;` prefix (17 bytes) followed by base64-encoded
