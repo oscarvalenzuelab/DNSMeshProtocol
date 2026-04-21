@@ -9,11 +9,17 @@ Endpoints:
     POST   /v1/records/{name}    body: {"value": "...", "ttl": 300}
     DELETE /v1/records/{name}    optional body: {"value": "..."}
     GET    /v1/records/{name}    debug; returns {"values": [...]}
+    GET    /v1/sync/digest       anti-entropy: (name, hash, ts) index
+    POST   /v1/sync/pull         anti-entropy: pull values by name list
     GET    /health
     GET    /stats
 
-Auth (optional): if `bearer_token` is set, all /v1/* endpoints require
-`Authorization: Bearer <token>`. /health and /stats stay open.
+Auth (optional): if `bearer_token` is set, all /v1/records/* endpoints
+require `Authorization: Bearer <token>`. /health and /stats stay open.
+The /v1/sync/* endpoints use a SEPARATE shared token
+(`sync_peer_token`) so an operator can leave the publish API open to
+users while gating the bulk-dump sync surface to peer nodes only. If
+no sync token is configured the sync endpoints return 403.
 
 Zero third-party deps — stdlib http.server only. Not a production webserver;
 front it with nginx or caddy if you care about performance or TLS.
@@ -21,6 +27,7 @@ front it with nginx or caddy if you care about performance or TLS.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -28,7 +35,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Optional
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from dmp.network.base import DNSRecordReader, DNSRecordStore, DNSRecordWriter
 from dmp.server.metrics import REGISTRY
@@ -37,6 +44,12 @@ from dmp.server.rate_limit import RateLimit, TokenBucketLimiter
 log = logging.getLogger(__name__)
 
 _NAME_PATH_RE = re.compile(r"^/v1/records/(?P<name>[^/]+)/?$")
+
+# Anti-entropy sync — caps mirror dmp.server.anti_entropy so a reasonable
+# operator misconfig (e.g. accidental limit=10_000_000) doesn't DoS the node.
+_SYNC_DIGEST_DEFAULT_LIMIT = 1000
+_SYNC_DIGEST_MAX_LIMIT = 10_000
+_SYNC_PULL_MAX_NAMES = 256
 
 # Cap request body size to catch obviously-abusive clients before JSON parsing.
 MAX_BODY_BYTES = 16 * 1024
@@ -82,6 +95,22 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         # Use constant-time compare to keep token-guessing timing-free.
         return len(header) == len(expected) and _consteq(header, expected)
 
+    def _sync_authorized(self) -> bool:
+        """Check the cluster-operator shared token for peer-to-peer sync.
+
+        Separate from the public publish token: an operator can leave the
+        publish endpoint open to their users while locking sync to known
+        peers only. If no sync token is configured we refuse — the sync
+        endpoints leak bulk record data (hashes + values) and should not
+        be open to anonymous callers in any deployment.
+        """
+        token = self.server.sync_peer_token
+        if not token:
+            return False
+        header = self.headers.get("Authorization", "")
+        expected = f"Bearer {token}"
+        return len(header) == len(expected) and _consteq(header, expected)
+
     def _read_json_body(self) -> Optional[dict]:
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length <= 0:
@@ -121,6 +150,9 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             count = getattr(self.server.store, "record_count", lambda: None)()
             self._send_json(200, {"records": count})
             return 200
+        parsed = urlsplit(self.path)
+        if parsed.path == "/v1/sync/digest":
+            return self._handle_sync_digest(parsed.query)
         if self._match_name() is not None:
             if not self._check_rate_limit():
                 return 429
@@ -161,6 +193,9 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         self._record_request("POST", status)
 
     def _handle_post(self) -> int:
+        parsed = urlsplit(self.path)
+        if parsed.path == "/v1/sync/pull":
+            return self._handle_sync_pull()
         if self._match_name() is None:
             self._send_json(404, {"error": "not found"})
             return 404
@@ -248,6 +283,202 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         self._send_empty(status)
         return status
 
+    # ---- anti-entropy sync routes -----------------------------------------
+
+    def _handle_sync_digest(self, query_string: str) -> int:
+        """GET /v1/sync/digest?cursor=<opaque>&limit=<int>
+
+        Preferred entry point for the M2.4-followup worker. ``cursor`` is
+        an opaque ``"<ts>:<name>:<value_hash>"`` string the server
+        previously emitted as ``next_cursor`` in a digest response —
+        carrying all three halves of the compound
+        ``(stored_ts, name, value_hash)`` watermark makes pagination
+        correct even when > ``limit`` values land at the same
+        ``(stored_ts, name)`` (a multi-value RRset burst: e.g. 5 prekey
+        TXT entries under ``prekeys.id-xxx``).
+
+        Legacy ``?since=<ts>`` is still accepted (the original M2.4 shape);
+        it is equivalent to ``cursor="<ts>::"`` and logs a one-line warning
+        so operators can see when a stale peer is still calling it. The
+        ``"<ts>:<name>"`` (two-field) cursor shape emitted by the
+        followup-1 worker is also still accepted — treated as
+        ``"<ts>:<name>:"`` — so mid-upgrade peers aren't broken.
+
+        Returns compact hash-per-record entries the peer can diff against.
+        ``next_cursor`` is always emitted — terminal pages carry the
+        cursor of the last row so the peer can persist it as the final
+        watermark. Expired records are not returned (same cutoff as
+        query_txt_record). Rate limiting applies to the caller's IP.
+        """
+        if not self._check_rate_limit():
+            return 429
+        if not self._sync_authorized():
+            self._send_json(403, {"error": "forbidden"})
+            return 403
+
+        store = self.server.store
+        iter_fn = getattr(store, "iter_records_since", None)
+        if iter_fn is None:
+            # Store predates M2.4. A public gate rather than 500 lets an
+            # operator swap in a new store without downtime.
+            self._send_json(501, {"error": "store does not support sync"})
+            return 501
+
+        params = parse_qs(query_string or "")
+        cursor_tuple: Optional[tuple] = None
+        if "cursor" in params:
+            raw = params["cursor"][0]
+            parsed = _parse_digest_cursor(raw)
+            if parsed is None:
+                self._send_json(
+                    400,
+                    {"error": "cursor must be '<ts>:<name>:<value_hash>'"},
+                )
+                return 400
+            cursor_tuple = parsed
+        elif "since" in params:
+            # Legacy shape. Still supported, but warn so an operator can
+            # see when their peer is still on the old wire.
+            try:
+                since = int(params.get("since", ["0"])[0])
+            except (ValueError, TypeError):
+                self._send_json(400, {"error": "since must be an integer"})
+                return 400
+            if since < 0:
+                self._send_json(400, {"error": "since must be >= 0"})
+                return 400
+            log.warning(
+                "anti-entropy: legacy since=<ts> digest call from %s; "
+                "peer should upgrade to cursor=<opaque>",
+                self.address_string(),
+            )
+            # Legacy `since` carries strict-greater-than semantics —
+            # rows AT `since` must be excluded. With the compound
+            # cursor (ts, name, value_hash), a tuple of (since, "", "")
+            # would instead match anything at stored_ts == since AND
+            # name > "" — i.e. any real row, effectively >= since.
+            # Use sentinel values that sort greater than any real
+            # DNS name (0xFF byte) and any real value_hash (hex chars
+            # max out at 'f', so 'g' is a clean upper bound). This
+            # forces the OR-branches to never match same-ts rows.
+            cursor_tuple = (since, "\xff", "g")
+        else:
+            cursor_tuple = (0, "", "")
+
+        try:
+            limit = int(params.get("limit", [_SYNC_DIGEST_DEFAULT_LIMIT])[0])
+        except (ValueError, TypeError):
+            self._send_json(400, {"error": "limit must be an integer"})
+            return 400
+        if limit <= 0:
+            self._send_json(400, {"error": "limit must be > 0"})
+            return 400
+        if limit > _SYNC_DIGEST_MAX_LIMIT:
+            limit = _SYNC_DIGEST_MAX_LIMIT
+
+        # Over-fetch by one to detect whether more rows exist without
+        # paying for a count query. Trim before serializing.
+        rows = iter_fn(cursor=cursor_tuple, limit=limit + 1)
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+
+        entries = []
+        for r in rows:
+            # Use StoredRecord.record_hash when available (sqlite + memory
+            # stores both expose it); fall back to hashing the value here
+            # for defensive portability against a future store.
+            h = getattr(r, "record_hash", None)
+            if not h:
+                h = hashlib.sha256(r.value.encode("utf-8")).hexdigest()
+            # `ttl` is carried separately from `hash` so the diff can
+            # detect TTL-refresh-only republishes (identical value, fresh
+            # expiry). Hashing (value, ttl) would collapse them in a way
+            # that's harder to debug via the digest response.
+            entries.append(
+                {
+                    "name": r.name,
+                    "hash": h,
+                    "ts": r.stored_ts,
+                    "ttl": max(1, int(r.ttl_remaining)),
+                }
+            )
+
+        # next_cursor: the (ts, name, value_hash) of the last row emitted,
+        # encoded as "<ts>:<name>:<value_hash>". Emitted even on the
+        # terminal page so the worker persists it as its watermark. If
+        # the store was empty, echo the caller's input cursor back —
+        # there is nowhere newer to advance.
+        if entries:
+            last = entries[-1]
+            next_cursor = f"{int(last['ts'])}:{last['name']}:{last['hash']}"
+        else:
+            cur_hash = cursor_tuple[2] if len(cursor_tuple) >= 3 else ""
+            next_cursor = f"{int(cursor_tuple[0])}:{cursor_tuple[1]}:{cur_hash}"
+
+        self._send_json(
+            200,
+            {
+                "records": entries,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            },
+        )
+        return 200
+
+    def _handle_sync_pull(self) -> int:
+        """POST /v1/sync/pull {"names": [...]} -> TXT values for those names.
+
+        Expired / unknown names are silently omitted. Cap is
+        _SYNC_PULL_MAX_NAMES; requests over the cap return 400 (not
+        truncated) so the caller knows to paginate.
+        """
+        if not self._check_rate_limit():
+            return 429
+        if not self._sync_authorized():
+            self._send_json(403, {"error": "forbidden"})
+            return 403
+
+        store = self.server.store
+        getter = getattr(store, "get_records_by_name", None)
+        if getter is None:
+            self._send_json(501, {"error": "store does not support sync"})
+            return 501
+
+        body = self._read_json_body()
+        if body is None:
+            self._send_json(400, {"error": "invalid body"})
+            return 400
+        names = body.get("names") if isinstance(body, dict) else None
+        if not isinstance(names, list):
+            self._send_json(400, {"error": "names must be a list"})
+            return 400
+        if len(names) > _SYNC_PULL_MAX_NAMES:
+            self._send_json(
+                400,
+                {"error": f"at most {_SYNC_PULL_MAX_NAMES} names per request"},
+            )
+            return 400
+        clean_names = []
+        for n in names:
+            if not isinstance(n, str):
+                self._send_json(400, {"error": "names must be strings"})
+                return 400
+            clean_names.append(n.strip().rstrip("."))
+
+        rows = getter(clean_names)
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "name": r.name,
+                    "value": r.value,
+                    "ttl": max(1, int(r.ttl_remaining)),
+                }
+            )
+        self._send_json(200, {"records": out})
+        return 200
+
     def _check_rate_limit(self) -> bool:
         limiter: Optional[TokenBucketLimiter] = self.server.rate_limiter
         if limiter is None or not limiter.enabled:
@@ -277,6 +508,57 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
     def _reader(self) -> Optional[DNSRecordReader]:
         store = self.server.store
         return store if isinstance(store, DNSRecordReader) else None
+
+
+def _parse_digest_cursor(raw: str) -> Optional[tuple]:
+    """Parse an opaque digest cursor into ``(int, str, str)``.
+
+    Accepted shapes (in order of preference):
+
+    - ``"<ts>:<name>:<value_hash>"`` — the followup-2 shape. value_hash
+      is 64 hex chars (sha256 of the row's TXT value).
+    - ``"<ts>:<name>"`` — the followup-1 shape, treated as
+      ``"<ts>:<name>:"`` (empty hash sorts below any real digest, so
+      the next page starts at the first value_hash for that name).
+
+    Returns ``None`` on malformed input so callers can 400. The ``:``
+    delimiter is safe because DNS names never contain colons (labels are
+    ``[a-zA-Z0-9-]`` separated by ``.``) and value_hash is lowercase hex.
+    We split on the first two colons only (``maxsplit=2``) so a stray
+    ``:`` can't silently corrupt the ts field; any further colons would
+    end up inside the value_hash check, which then rejects it as
+    non-hex.
+    """
+    if not isinstance(raw, str):
+        return None
+    parts = raw.split(":", 2)
+    if len(parts) == 2:
+        ts_str, name = parts
+        value_hash = ""
+    elif len(parts) == 3:
+        ts_str, name, value_hash = parts
+    else:
+        return None
+    try:
+        ts = int(ts_str)
+    except (ValueError, TypeError):
+        return None
+    if ts < 0:
+        return None
+    # name may be empty — that's the "from the beginning of this ms" form
+    # used by legacy since-only callers.
+    if len(name) > 253:
+        return None
+    # value_hash is either empty (start-of-name sentinel) or a 64-char
+    # lowercase hex digest. Anything else is garbage.
+    if value_hash and not _VALUE_HASH_RE.match(value_hash):
+        return None
+    return (ts, name, value_hash)
+
+
+# Cached regex for the hash half of the cursor. Module-level so every
+# digest request doesn't recompile it.
+_VALUE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _consteq(a: str, b: str) -> bool:
@@ -315,6 +597,7 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         max_value_bytes,
         max_values_per_name,
         max_concurrency,
+        sync_peer_token=None,
     ):
         super().__init__(addr, handler)
         self.store = store
@@ -324,6 +607,7 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.max_value_bytes = max_value_bytes
         self.max_values_per_name = max_values_per_name
         self.max_concurrency = max_concurrency
+        self.sync_peer_token = sync_peer_token
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -369,6 +653,7 @@ class DMPHttpApi:
         max_value_bytes: int = DEFAULT_MAX_VALUE_BYTES,
         max_values_per_name: int = DEFAULT_MAX_VALUES_PER_NAME,
         max_concurrency: int = 64,
+        sync_peer_token: Optional[str] = None,
     ):
         self.store = store
         self.host = host
@@ -383,6 +668,7 @@ class DMPHttpApi:
         self.max_value_bytes = int(max_value_bytes)
         self.max_values_per_name = int(max_values_per_name)
         self.max_concurrency = int(max_concurrency)
+        self.sync_peer_token = sync_peer_token
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -405,6 +691,7 @@ class DMPHttpApi:
             self.max_value_bytes,
             self.max_values_per_name,
             self.max_concurrency,
+            sync_peer_token=self.sync_peer_token,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
