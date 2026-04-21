@@ -1,21 +1,22 @@
 # Current sprint
 
-**Sprint status:** M2 — federation — **CLOSED + WIRED + POLISHED**
-(2026-04-20). M2.1/M2.2/M2.3 foundation + M2.wire integration + all
-three audit follow-ups (M2.wire-polish, cluster-composite-reader,
-cluster-atomic-refresh) merged. M3 discovery layer (M3.1 record type
-+ M3.2-wire CLI integration) also merged. 678 tests passing on main.
+**Sprint status:** **ROADMAP COMPLETE** (2026-04-21). Every milestone
+from the original M1..M4 plan has shipped and merged:
 
-Users now have end-to-end zero-config onboarding: given just
-`alice@example.com`, the CLI can auto-discover the cluster, verify
-two-hop trust (bootstrap signer → cluster operator), and cut over to
-cluster mode with `dmp bootstrap discover me@my-domain --auto-pin`.
+- **M1** — resolver resilience (failover, discovery, per-host ports)
+- **M2** — federation (cluster manifest + fan-out writer + union reader
+  + wire integration + 3 audit follow-ups)
+- **M3** — discovery (bootstrap record + CLI integration with two-hop
+  trust and priority-ordered fallback)
+- **M4** — formal protocol spec (six new docs pages, ~1500 lines,
+  every constant cross-verified against source)
 
-Next sprint TBD from ROADMAP backlog — M4.1 (protocol spec) is the
-remaining milestone item; M1.retro-codex-final is cheap cleanup.
+678 tests passing on main. The project now supports end-to-end
+zero-config onboarding (`dmp bootstrap discover me@my-domain --auto-pin`)
+and has a complete, interop-oriented protocol specification.
 
-See `ROADMAP.md` for the long-horizon view. This file is the active
-work queue.
+See `ROADMAP.md` for the long-horizon view. Any new sprint should be
+drafted against that plan.
 
 ## Conventions
 
@@ -27,25 +28,15 @@ work queue.
 
 ## Active
 
-_No tasks currently active. Promote from Backlog to open the next sprint._
+_No tasks currently active. The original roadmap is complete._
 
-## Backlog (promoted to active as bandwidth allows)
-
-### Ready to start (unblocked, small)
-
-- **M1.retro-codex-final** — Final retro Codex review of M1.1, M1.2, M1.3, M1.4, M1.5 commits. Most findings already landed via M1.5 polish; cheap insurance.
-
-### Ready to start (unblocked, small)
-
-- **M1.retro-codex-final** — Final retro Codex review of M1.1..M1.5 commits. Most findings already landed via M1.5 polish; cheap insurance.
-
-### Milestones
-
-- **M4.1** — Formal protocol spec document (expand `docs/protocol/`).
-
-### Known gaps to track
+## Backlog (known gaps, not yet prioritized)
 
 - **M2.2-polish / M2.3-polish** — both fan-out writer and union reader have "stragglers can saturate the executor pool" behavior when per-node writers/readers lack their own request timeouts. Mitigated by pending-future cancellation; not eliminated. Recommendation: document in the module docstrings that callers should pass writers/readers with per-request timeouts. If a real deployment hits the issue, revisit with per-request timeouts in the common factories.
+- **Spec ambiguities flagged during M4.1** (for a future refactor if desired):
+  - Wire-prefix asymmetry: `v=dmp1;t=cluster;` / `v=dmp1;t=bootstrap;` terminate at `;`; the older types carry an explicit `d=<b64>` key. Documented in `docs/protocol/spec.md §3` and `wire-encoding.md`. Unifying on one convention would be a v2 wire-break.
+  - Legacy `DNSEncoder.encode_mailbox_domain` (`dmp/core/dns.py`) returns `mb-<hash12>-<slot:02d>` but production uses `slot-<N>.mb-<hash12>`. The legacy form is unused; consider removing.
+  - Hash-truncation width mismatch: identity uses `[:16]` hex, prekey uses `[:12]`. Reason lost to history; unifying would be a routing-name change.
 
 ## Done
 
@@ -54,6 +45,7 @@ _No tasks currently active. Promote from Backlog to open the next sprint._
 - **M1.3** — `ResolverPool.discover()` + `WELL_KNOWN_RESOLVERS` + `dmp resolvers discover [--save]` + `dmp resolvers list` CLI — commit `d39cb56`.
 - **M1.4** — Integration test: resolver failover under partial block (8 tests) — commits `29c5c44`, `6108c66`.
 - **M1.5** — Per-host ports in `ResolverPool` + retro-Codex cleanup on M1.2/M1.3 — commits `9bfab67..f9d3dfa` plus `50ba3d7`, `8ab60e7`, `6267686`, `f9d3dfa`.
+- **M1.retro-codex-final** — Final retro Codex review across M1.1..M1.5 on 2026-04-21. No new findings.
 - **M2.1** — Cluster manifest record type: signed node-list TXT record, wire format, `parse_and_verify` with operator-key + expected-cluster-name binding, DNS-name validation, multi-string TXT support across publishers (dnsupdate/Cloudflare/Route53/dnsmasq/in-memory) — commits `548c5b7..b3bc8be` (14 commits, 10 Codex review rounds).
 - **M2.2** — Quorum write fan-out: `FanoutWriter` fans publish/delete across cluster nodes, returns True iff ≥ `ceil(N/2)` ack within timeout. Health tracking, manifest refresh with seq monotonicity + expiry + closed checks, fresh `_NodeState` on endpoint change (http OR dns), retired-writer retention list drained on `close()` after `shutdown(wait=True)`, user `max_workers` preserved across growth, submit-under-lock to avoid close/submit race, deepcopy of installed manifest, cancel pending futures on timeout/quorum — commits `9c71332..b55c93b` (7 commits, 5 Codex review rounds). 53 tests.
 - **M2.3** — Read union across cluster nodes: `UnionReader` queries every node concurrently, unions dedup'd TXT answers with first-completed-first ordering. Same manifest-refresh semantics as M2.2. None is healthy; only exceptions/timeouts count as failures. Expired/closed/seq-stale rejection on install. Deepcopy; drain-before-close; max_workers honored; pending futures cancelled on timeout — commits `7a0340e..f5e3776`, merged as `3e50b39`. 44 tests.
@@ -63,3 +55,4 @@ _No tasks currently active. Promote from Backlog to open the next sprint._
 - **cluster-atomic-refresh** — `ClusterClient.refresh_now` pre-runs both factories across every node in the new manifest before touching either `install_manifest`. If any factory raises, neither side advances; no more split-brain between reader and writer on malformed endpoints. Probe outputs are not closed (factories may return shared instances) — commits `bd2fb03..32a2553`, merged as `3ee9d6a`. 4 new tests.
 - **M3.1** — Bootstrap record type: signed DNS-discoverable pointer from a user domain to one or more clusters. Published at `_dmp.<user_domain>` TXT; carries sorted entries of (priority, cluster_base_domain, operator_spk). Mirrors the hardened `ClusterManifest` pattern: multi-string TXT support, wire-cap on both sides, embedded-signer-cross-check, expected_user_domain binding with casefold + trailing-dot normalization, DNS-name validation, empty-list rejection, duplicate-entry rejection — commits `cd2f383..5c33cd5`, merged as `441f58b`. Plus `81f1dd7` for parse-side 64-byte-FQDN boundary fix. 66 new tests.
 - **M3.2-wire** — Bootstrap CLI integration: `dmp bootstrap pin / fetch / discover [--auto-pin]` command group, `identity fetch --via-bootstrap` flag, `dmp.client.bootstrap_discovery.fetch_bootstrap_record`. Two-hop trust chain (bootstrap signer verifies the record → cluster operator verifies the manifest), priority-ordered fallback with factory dry-run, clears `cluster_node_token` + `http_token` on repin to avoid cross-trust-domain credential leaks, `--auto-pin` scope-guard requires discovered host to match pinned `bootstrap_user_domain`, DNS-name normalization for anchor comparisons. Shared `_pick_usable_bootstrap_entry` helper across discover/auto-pin/via-bootstrap so fallback semantics stay aligned — commits `20a83fe..d21c305` (8 commits, 7 Codex review rounds), merged as `7aae84e`. 31 new tests (12 bootstrap_discovery + 19 TestBootstrapCommand).
+- **M4.1** — Formal protocol specification: six new pages under `docs/protocol/` — `spec.md` (top-level), `wire-encoding.md`, `routing.md`, `flows.md`, `threat-model.md`, `README.md` (landing). ~1500 lines total. Every magic byte, wire cap, and trust invariant cross-verified against the source. Three implementation ambiguities flagged inline for future cleanup — commits `4380469..c4f18fc`, merged as `f317cc7`.
