@@ -646,11 +646,15 @@ def _make_client(
     # intentionally unintrusive — we do not modify DMPClient itself,
     # per the M2.wire hard-rules constraint.
     client._cluster_client = cluster_client  # type: ignore[attr-defined]
+    # Contacts must use the same effective domain as the client itself;
+    # otherwise send_message() builds prekey_rrset_name under the legacy
+    # domain while refresh_prekeys publishes under the cluster base,
+    # silently disabling forward secrecy on every send.
     for name, entry in config.contacts.items():
         client.add_contact(
             name,
             entry.get("pub", ""),
-            domain=config.domain,
+            domain=effective_domain,
             signing_key_hex=entry.get("spk", ""),
         )
     return client
@@ -1205,34 +1209,36 @@ def cmd_cluster_fetch(args: argparse.Namespace) -> int:
     if args.save:
         # Re-sign is not available from just the parsed manifest (we
         # don't have the operator private key here). Persist the raw
-        # wire string off the *first* matching TXT record so an offline
-        # bootstrap has something to load. We re-fetch the rrset rather
-        # than round-tripping through sign() to keep the original
-        # signed blob byte-identical.
+        # wire string. We re-fetch the rrset rather than round-tripping
+        # through sign() to keep the original signed blob byte-identical,
+        # then select the highest-seq valid record — matching what
+        # fetch_cluster_manifest returned above, so the persisted wire
+        # corresponds to the manifest summary we just printed.
         from dmp.core.cluster import cluster_rrset_name
 
         rrset = cluster_rrset_name(cfg.cluster_base_domain)
         raw_records = bootstrap_reader.query_txt_record(rrset)
         if raw_records:
             wire_path = _config_path().parent / "cluster_manifest.wire"
-            # Pick the first record that parses + verifies with the
-            # same constraints as fetch_cluster_manifest, to ensure we
-            # cache the same manifest the runtime would use.
             from dmp.core.cluster import ClusterManifest
 
+            best_wire: Optional[str] = None
+            best_seq: int = -1
             for wire in raw_records:
-                if (
-                    ClusterManifest.parse_and_verify(
-                        wire,
-                        operator_spk,
-                        expected_cluster_name=cfg.cluster_base_domain,
-                    )
-                    is not None
-                ):
-                    wire_path.parent.mkdir(parents=True, exist_ok=True)
-                    wire_path.write_text(wire)
-                    print(f"saved signed manifest wire to {wire_path}")
-                    break
+                parsed = ClusterManifest.parse_and_verify(
+                    wire,
+                    operator_spk,
+                    expected_cluster_name=cfg.cluster_base_domain,
+                )
+                if parsed is None:
+                    continue
+                if parsed.seq > best_seq:
+                    best_seq = parsed.seq
+                    best_wire = wire
+            if best_wire is not None:
+                wire_path.parent.mkdir(parents=True, exist_ok=True)
+                wire_path.write_text(best_wire)
+                print(f"saved signed manifest wire to {wire_path}")
     return 0
 
 
