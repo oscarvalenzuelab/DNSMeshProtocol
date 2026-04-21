@@ -1,19 +1,25 @@
 # Current sprint
 
-**Sprint status:** **ROADMAP COMPLETE** (2026-04-21). Every milestone
-from the original M1..M4 plan has shipped and merged:
+**Sprint status:** **M1 + M2 + M3.1/M3.2-wire + M4.1 COMPLETE**
+(2026-04-21). Node-side federation (M2.4 anti-entropy + M2.5/M2.6
+compose cluster) closed the gap surfaced in the doc-honesty audit.
 
 - **M1** — resolver resilience (failover, discovery, per-host ports)
-- **M2** — federation (cluster manifest + fan-out writer + union reader
-  + wire integration + 3 audit follow-ups)
-- **M3** — discovery (bootstrap record + CLI integration with two-hop
-  trust and priority-ordered fallback)
-- **M4** — formal protocol spec (six new docs pages, ~1500 lines,
-  every constant cross-verified against source)
+- **M2** — full federation: cluster manifest + fan-out writer + union
+  reader + wire integration + 3 audit follow-ups + node-side
+  anti-entropy + 3-node compose cluster (operator-facing)
+- **M3.1 + M3.2-wire** — discovery (bootstrap record + CLI integration
+  with two-hop trust and priority-ordered fallback)
+- **M4.1** — formal protocol spec
 
-678 tests passing on main. The project now supports end-to-end
-zero-config onboarding (`dmp bootstrap discover me@my-domain --auto-pin`)
-and has a complete, interop-oriented protocol specification.
+737 non-docker tests + 3 docker-compose cluster integration tests
+all passing on main. The project now delivers end-to-end zero-config
+onboarding AND real node-side federation (kill-and-rejoin tested
+against the compose cluster).
+
+Remaining ROADMAP items: M3.3 (node-to-node gossip), M4.2-M4.4
+(external cryptographic audit), M5 (PyPI, mobile, web, key rotation),
+M6 (traffic-analysis resistance).
 
 See `ROADMAP.md` for the long-horizon view. Any new sprint should be
 drafted against that plan.
@@ -56,3 +62,5 @@ _No tasks currently active. The original roadmap is complete._
 - **M3.1** — Bootstrap record type: signed DNS-discoverable pointer from a user domain to one or more clusters. Published at `_dmp.<user_domain>` TXT; carries sorted entries of (priority, cluster_base_domain, operator_spk). Mirrors the hardened `ClusterManifest` pattern: multi-string TXT support, wire-cap on both sides, embedded-signer-cross-check, expected_user_domain binding with casefold + trailing-dot normalization, DNS-name validation, empty-list rejection, duplicate-entry rejection — commits `cd2f383..5c33cd5`, merged as `441f58b`. Plus `81f1dd7` for parse-side 64-byte-FQDN boundary fix. 66 new tests.
 - **M3.2-wire** — Bootstrap CLI integration: `dmp bootstrap pin / fetch / discover [--auto-pin]` command group, `identity fetch --via-bootstrap` flag, `dmp.client.bootstrap_discovery.fetch_bootstrap_record`. Two-hop trust chain (bootstrap signer verifies the record → cluster operator verifies the manifest), priority-ordered fallback with factory dry-run, clears `cluster_node_token` + `http_token` on repin to avoid cross-trust-domain credential leaks, `--auto-pin` scope-guard requires discovered host to match pinned `bootstrap_user_domain`, DNS-name normalization for anchor comparisons. Shared `_pick_usable_bootstrap_entry` helper across discover/auto-pin/via-bootstrap so fallback semantics stay aligned — commits `20a83fe..d21c305` (8 commits, 7 Codex review rounds), merged as `7aae84e`. 31 new tests (12 bootstrap_discovery + 19 TestBootstrapCommand).
 - **M4.1** — Formal protocol specification: six new pages under `docs/protocol/` — `spec.md` (top-level), `wire-encoding.md`, `routing.md`, `flows.md`, `threat-model.md`, `README.md` (landing). ~1500 lines total. Every magic byte, wire cap, and trust invariant cross-verified against the source. Three implementation ambiguities flagged inline for future cleanup — commits `4380469..c4f18fc`, merged as `f317cc7`.
+- **M2.4** — Node-side anti-entropy: pull-based digest/pull worker with compound `(ts, name, value_hash)` cursor, TTL-refresh detection, contiguous-prefix watermark advancement, signed-record re-verify on receive, millisecond `stored_ts` with migration-safe ALTER TABLE on existing DBs. New `/v1/sync/digest` + `/v1/sync/pull` HTTP endpoints protected by `DMP_SYNC_PEER_TOKEN`. 50 new tests + 6 Codex review rounds — merged as `06405ce`.
+- **M2.5 + M2.6** — 3-node compose cluster: `docker-compose.cluster.yml` with `build:` fallback, `docker/cluster/node-{a,b,c}.env` per-node env files, `generate-cluster-manifest.py` operator helper (seq auto-increment, dev-only key warning), `.gitignore` for operator secrets, `docs/deployment/cluster.md` guide. Integration test `tests/test_compose_cluster.py` exercises convergence + kill-and-rejoin backfill + peer auth against real docker containers. Dockerfile fix: added argon2-cffi + zfec + build-essential so the image actually builds. Node startup now publishes the mounted cluster manifest at `cluster.<base>` TXT for DNS bootstrap. Unique peer IDs by full URL so same-host different-port peers don't collapse watermarks. 4 Codex review rounds — merged as `8f9ce95`.

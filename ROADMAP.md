@@ -5,11 +5,11 @@ This is the honest gap between what ships today and what the
 critical path for tagging `v0.2.0-beta` and then a `v1.0` that earns the
 word "decentralized" in the tagline.
 
-**Status (2026-04-21):** `v0.1.0-alpha`, pre-external-audit. M1 through
-M4.1 are shipped. Node-side federation backfill (M2.4/M2.5/M2.6),
-node-to-node gossip (M3.3), and the external cryptographic audit (M4.2–
-M4.4) are the remaining gates to `v0.2.0-beta`. See the per-milestone
-status below.
+**Status (2026-04-21):** `v0.1.0-alpha`, pre-external-audit. M1, M2
+(full, incl. node-side anti-entropy + compose cluster), M3.1/M3.2-wire,
+and M4.1 are shipped. Node-to-node gossip (M3.3) and the external
+cryptographic audit (M4.2–M4.4) are the remaining gates to
+`v0.2.0-beta`. See the per-milestone status below.
 
 Atomic tasks for the current sprint live in [`TASKS.md`](TASKS.md);
 long-horizon items stay here until they get lifted into a sprint.
@@ -34,13 +34,14 @@ or SERVFAIL for DMP-shaped names.
 - [x] **M1.5** Per-host ports in `ResolverPool` + retroactive Codex
       cleanup on M1.2 / M1.3 — commits `9bfab67..f9d3dfa`.
 
-### M2 — Client-side federation — SHIPPED (partial; see M2.4–M2.6)
+### M2 — Federation (client AND node side) — SHIPPED
 
-Clients can fan writes across multiple nodes and read-union across
-them. This is real, tested federation *from the client's perspective*.
-What's still missing is node-side backfill: if a node goes offline
-while a client wrote elsewhere, the node has no background sync to
-pick up what it missed.
+Clients fan writes across multiple nodes and read-union across them.
+Nodes themselves also run pull-based anti-entropy against their
+peers: a node that was offline comes back and catches up via
+digest-and-pull. A 3-node compose cluster is a checked-in operator
+starting point and is covered by integration tests that exercise
+convergence, kill-and-rejoin backfill, and peer-auth enforcement.
 
 - [x] **M2.1** `ClusterManifest` record type — signed TXT at
       `cluster.<base>` listing the cluster's nodes — commits
@@ -55,20 +56,24 @@ pick up what it missed.
       `94964d9..31eba4e`; plus polish (`M2.wire-polish`) +
       `cluster-composite-reader` (cross-domain reads) +
       `cluster-atomic-refresh` (no split-brain on manifest refresh).
-- [ ] **M2.4** *(NOT SHIPPED)* Inter-node anti-entropy: a node that was
-      offline catches up on records it missed by pulling from peers.
-      Without this, client-side fan-out masks the gap only as long as
-      clients keep writing.
-- [ ] **M2.5** *(NOT SHIPPED)* Federation integration test suite: spin
-      up 3 separate dmp-node containers in compose, kill one, verify no
-      message is lost. Today's cluster tests are in-process or
-      single-container.
-- [ ] **M2.6** *(NOT SHIPPED)* `docker-compose.cluster.yml` operator
-      sample.
+- [x] **M2.4** Inter-node anti-entropy: pull-based digest/pull worker
+      with compound `(ts, name, value_hash)` cursor, TTL-refresh
+      detection, contiguous-prefix watermark advancement, re-verify
+      of signed records against cluster operator key — merged as
+      `06405ce`. +50 tests.
+- [x] **M2.5** Federation integration test: `tests/test_compose_cluster.py`
+      boots the compose cluster, verifies convergence + kill-and-rejoin
+      backfill + peer-auth enforcement. Skips cleanly when docker is
+      unavailable — merged as `8f9ce95`.
+- [x] **M2.6** `docker-compose.cluster.yml` + `docker/cluster/*` env
+      files + `generate-cluster-manifest.py` operator helper +
+      `docs/deployment/cluster.md` guide. The compose file carries
+      `build: .` so a clean checkout can `up` without pre-building —
+      merged as `8f9ce95`.
 
 **Exit criteria for M2 *complete*:** three-node compose cluster; killing
 any one node at any time still delivers every message AND a node that
-rejoins catches up.
+rejoins catches up. **MET.**
 
 ### M3 — Bootstrap and discovery — SHIPPED (partial; see M3.3)
 
@@ -146,11 +151,11 @@ These appear in the design-intent docs but are unlikely to ship as-spec:
 
 The shortest remaining path:
 
-1. **M2.4 + M2.5 + M2.6** — node-side federation backfill + 3-node
-   compose test suite + operator-facing compose sample.
-2. **M3.3** — node-to-node gossip for peer discovery.
-3. **M4.2 → M4.4** — engage an auditor, fix findings, publish report.
-4. **M5.1** — PyPI release.
+1. **M3.3** — node-to-node gossip for peer discovery. Optional if
+   operators are OK managing the peer set manually via cluster
+   manifest + env files.
+2. **M4.2 → M4.4** — engage an auditor, fix findings, publish report.
+3. **M5.1** — PyPI release.
 
-Items 1–2 are weeks of focused work; item 3 is calendar time bounded by
-the auditor's schedule. Item 4 is a day once items 1–3 are done.
+Item 1 is days of focused work; item 2 is calendar time bounded by
+the auditor's schedule. Item 3 is a day once items 1–2 are done.

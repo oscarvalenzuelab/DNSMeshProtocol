@@ -163,10 +163,13 @@ Actively shipping:
 - **Resolver resilience** — a `ResolverPool` with oracle-based
   demotion survives a subset of upstream DNS resolvers lying about
   DMP-shaped names.
-- **Client-side multi-node federation** — `dmp cluster pin / enable`
-  switches the client onto a signed `ClusterManifest`; writes quorum
-  across the node set, reads union with dedup, refresh is atomic
-  across reader + writer.
+- **Multi-node federation** (client AND node side) — `dmp cluster
+  pin / enable` switches the client onto a signed `ClusterManifest`;
+  writes quorum across the node set, reads union with dedup, refresh
+  is atomic across reader + writer. Nodes run pull-based anti-entropy
+  against their peers so records propagate across the cluster even
+  after a node restart. `docker-compose.cluster.yml` is a
+  checked-in 3-node operator starting point.
 - **Bootstrap discovery** — `dmp bootstrap discover me@my-domain
   --auto-pin` resolves the cluster from a user domain via a signed
   `_dmp.<user_domain>` TXT record, verifies the two-hop trust chain
@@ -178,11 +181,9 @@ Actively shipping:
 
 Not yet shipped (tracked in [`ROADMAP.md`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md)):
 
-- **Node-side federation backfill** (M2.4 anti-entropy, M3.3 gossip).
-  A node that goes offline and comes back has no background sync yet;
-  the cluster works today because clients keep writing to every node.
-- **3-node compose test suite + `docker-compose.cluster.yml` operator
-  sample** (M2.5 / M2.6).
+- **Node-to-node gossip** (M3.3). Nodes don't yet exchange peer lists
+  among themselves; the cluster peer set is operator-managed via the
+  signed manifest + per-node env files.
 - **External cryptographic audit** (M4.2–M4.4). The gate for tagging
   `v0.2.0-beta` and for treating DMP as anything other than alpha
   software.

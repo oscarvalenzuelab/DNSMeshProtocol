@@ -70,11 +70,13 @@ Full walk-through with two users:
 - **Resolver resilience.** `ResolverPool` fans queries across multiple
   upstream resolvers with oracle-based demotion on lying resolvers.
   `dmp resolvers discover` auto-builds the pool from public resolvers.
-- **Client-side multi-node federation.** `FanoutWriter` publishes to
-  every cluster node (quorum = `ceil(N/2)`); `UnionReader` reads the
-  union with dedup. Manifest refresh is atomic across reader and
-  writer. *Node-side anti-entropy (the other half of federation) is
-  not yet shipped; see [ROADMAP.md](ROADMAP.md).*
+- **Multi-node federation** (client AND node side). `FanoutWriter`
+  publishes to every cluster node (quorum = `ceil(N/2)`); `UnionReader`
+  reads the union with dedup. Nodes run pull-based anti-entropy
+  against their peers so a node that was offline catches up when it
+  rejoins. A 3-node `docker-compose.cluster.yml` is a checked-in
+  operator starting point; see
+  [Clustered deployment](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/cluster).
 - **Zero-config onboarding via bootstrap discovery.** Given just
   `alice@example.com`, `dmp bootstrap discover me@my-domain --auto-pin`
   resolves the cluster, verifies the two-hop trust chain (bootstrap
