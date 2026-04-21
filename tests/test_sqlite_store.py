@@ -82,6 +82,56 @@ class TestSqliteMailboxStore:
         assert s2.query_txt_record("persisted.example.com") == ["hello"]
         s2.close()
 
+    def test_opens_pre_m24_db_without_new_columns(self, tmp_path):
+        """A DB created before M2.4 has no stored_ts or value_hash columns.
+        Opening it through the current SqliteMailboxStore must run the
+        ALTER TABLE migrations BEFORE creating the anti-entropy indexes —
+        otherwise CREATE INDEX on stored_ts or value_hash raises
+        `no such column` and every upgraded node is unable to start.
+        """
+        import sqlite3
+
+        db = str(tmp_path / "pre_m24.db")
+        # Hand-craft the pre-M2.4 schema: no stored_ts, no value_hash.
+        con = sqlite3.connect(db)
+        con.executescript("""
+            CREATE TABLE records (
+                name       TEXT NOT NULL,
+                value      TEXT NOT NULL,
+                ttl        INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                PRIMARY KEY (name, value)
+            );
+            CREATE INDEX idx_records_name    ON records(name);
+            CREATE INDEX idx_records_expires ON records(expires_at);
+            """)
+        import time as _time
+
+        now = int(_time.time())
+        con.execute(
+            "INSERT INTO records (name, value, ttl, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("legacy.example.com", "pre-m24-value", 300, now, now + 300),
+        )
+        con.commit()
+        con.close()
+
+        # Opening through the current store must succeed — migrations run
+        # first, then the indexes are created on the upgraded schema.
+        s = SqliteMailboxStore(db)
+        try:
+            # Legacy row still readable.
+            assert s.query_txt_record("legacy.example.com") == ["pre-m24-value"]
+            # New write works and carries a stored_ts.
+            s.publish_txt_record("fresh.example.com", "post-migration", ttl=300)
+            records = list(s.iter_records_since(cursor=(0, "", "")))
+            names = {r.name for r in records}
+            assert "legacy.example.com" in names
+            assert "fresh.example.com" in names
+        finally:
+            s.close()
+
 
 class TestClientOverSqlite:
     """Exercise the full client send/receive flow over the sqlite store."""

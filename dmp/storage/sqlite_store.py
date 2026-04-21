@@ -32,6 +32,11 @@ from typing import Iterable, List, Optional, Tuple
 
 from dmp.network.base import DNSRecordStore
 
+# The base schema only references columns that have existed in every
+# version of the store. The anti-entropy columns (stored_ts, value_hash)
+# and their indexes are created in _migrate() AFTER any ALTER TABLE
+# upgrade has run — otherwise opening a pre-M2.4 DB would fail on
+# CREATE INDEX against a column that doesn't exist yet.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
     name       TEXT NOT NULL,
@@ -43,10 +48,8 @@ CREATE TABLE IF NOT EXISTS records (
     value_hash TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (name, value)
 );
-CREATE INDEX IF NOT EXISTS idx_records_name      ON records(name);
-CREATE INDEX IF NOT EXISTS idx_records_expires   ON records(expires_at);
-CREATE INDEX IF NOT EXISTS idx_records_stored_ts ON records(stored_ts);
-CREATE INDEX IF NOT EXISTS idx_records_page      ON records(stored_ts, name, value_hash);
+CREATE INDEX IF NOT EXISTS idx_records_name    ON records(name);
+CREATE INDEX IF NOT EXISTS idx_records_expires ON records(expires_at);
 """
 
 
@@ -130,16 +133,14 @@ class SqliteMailboxStore(DNSRecordStore):
             if "stored_ts" not in cols:
                 # Pre-M2.4 DB. Add the column and backfill from created_at
                 # (seconds), which the next step will upgrade to ms.
+                # The stored_ts index is created below, after all
+                # ALTER TABLE migrations complete.
                 self._conn.execute(
                     "ALTER TABLE records ADD COLUMN stored_ts INTEGER NOT NULL "
                     "DEFAULT 0"
                 )
                 self._conn.execute(
                     "UPDATE records SET stored_ts = created_at WHERE stored_ts = 0"
-                )
-                self._conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_records_stored_ts "
-                    "ON records(stored_ts)"
                 )
 
             # Seconds→ms detection. Any stored_ts below the year-2001-in-ms
@@ -175,10 +176,20 @@ class SqliteMailboxStore(DNSRecordStore):
                         "UPDATE records SET value_hash = ? WHERE rowid = ?",
                         (_hash_value(value), rowid),
                     )
-                self._conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_records_page "
-                    "ON records(stored_ts, name, value_hash)"
-                )
+
+            # Anti-entropy indexes: create AFTER any ALTER TABLE above
+            # so pre-M2.4 DBs don't fail on CREATE INDEX against a
+            # column that doesn't exist yet. IF NOT EXISTS makes this
+            # idempotent on fresh DBs where the columns were added by
+            # _SCHEMA.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_stored_ts "
+                "ON records(stored_ts)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_page "
+                "ON records(stored_ts, name, value_hash)"
+            )
 
     # ---- DNSRecordStore contract ------------------------------------------
 
