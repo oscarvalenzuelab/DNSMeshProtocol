@@ -481,3 +481,263 @@ class TestExceptionSafety:
         fw.close()
         with pytest.raises(RuntimeError):
             fw.publish_txt_record("a", "b")
+
+
+# --------------------------------------------------------------------------- endpoint-change + resize + retention
+
+
+class _TrackingFactory:
+    """Factory that records every call and hands back a fresh FakeWriter each time.
+
+    Keeps each writer in a list keyed by node_id so tests can inspect
+    sequential writers for the same node_id across manifest refreshes.
+    """
+
+    def __init__(self) -> None:
+        self.writers: dict = {}  # node_id -> list[FakeWriter]
+        self.calls: List[tuple] = []  # (node_id, http_endpoint) per call
+
+    def __call__(self, node: ClusterNode) -> FakeWriter:
+        w = FakeWriter()
+        self.calls.append((node.node_id, node.http_endpoint))
+        self.writers.setdefault(node.node_id, []).append(w)
+        return w
+
+    def latest(self, node_id: str) -> FakeWriter:
+        return self.writers[node_id][-1]
+
+    def first(self, node_id: str) -> FakeWriter:
+        return self.writers[node_id][0]
+
+
+class TestEndpointChange:
+    def test_endpoint_change_triggers_new_writer(self) -> None:
+        op = DMPCrypto()
+        factory = _TrackingFactory()
+        # v1: "n00" @ E1
+        n00_v1 = ClusterNode(node_id="n00", http_endpoint="https://e1.example:8053")
+        m1 = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=[n00_v1],
+            seq=1,
+            exp=int(time.time()) + 3600,
+        )
+        with FanoutWriter(m1, factory) as fw:
+            fw.publish_txt_record("a", "b")
+            assert len(factory.first("n00").publish_calls) == 1
+
+            # v2: "n00" @ E2 — retained node_id, changed endpoint.
+            n00_v2 = ClusterNode(node_id="n00", http_endpoint="https://e2.example:8053")
+            m2 = ClusterManifest(
+                cluster_name=m1.cluster_name,
+                operator_spk=m1.operator_spk,
+                nodes=[n00_v2],
+                seq=2,
+                exp=m1.exp,
+            )
+            assert fw.install_manifest(m2) is True
+            # Factory should have been called again for the rebuilt writer.
+            assert factory.calls == [
+                ("n00", "https://e1.example:8053"),
+                ("n00", "https://e2.example:8053"),
+            ]
+            # Next publish hits E2's writer, not E1's.
+            fw.publish_txt_record("a", "c")
+            assert len(factory.first("n00").publish_calls) == 1  # E1 unchanged
+            assert len(factory.latest("n00").publish_calls) == 1  # E2 got the new one
+            # Snapshot reflects the new endpoint.
+            snap = fw.snapshot()
+            assert snap[0]["http_endpoint"] == "https://e2.example:8053"
+
+    def test_endpoint_unchanged_does_not_rebuild_writer(self) -> None:
+        """Refresh with identical node entry must not call the factory again."""
+        op = DMPCrypto()
+        factory = _TrackingFactory()
+        node = ClusterNode(node_id="n00", http_endpoint="https://e1.example:8053")
+        m1 = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=[node],
+            seq=1,
+            exp=int(time.time()) + 3600,
+        )
+        with FanoutWriter(m1, factory) as fw:
+            m2 = ClusterManifest(
+                cluster_name=m1.cluster_name,
+                operator_spk=m1.operator_spk,
+                nodes=[node],
+                seq=2,
+                exp=m1.exp,
+            )
+            assert fw.install_manifest(m2) is True
+            # One factory call only — the initial construction.
+            assert len(factory.calls) == 1
+
+    def test_dns_endpoint_change_triggers_new_writer(self) -> None:
+        op = DMPCrypto()
+        factory = _TrackingFactory()
+        n00_v1 = ClusterNode(
+            node_id="n00",
+            http_endpoint="https://e.example:8053",
+            dns_endpoint="203.0.113.1:53",
+        )
+        m1 = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=[n00_v1],
+            seq=1,
+            exp=int(time.time()) + 3600,
+        )
+        with FanoutWriter(m1, factory) as fw:
+            n00_v2 = ClusterNode(
+                node_id="n00",
+                http_endpoint="https://e.example:8053",
+                dns_endpoint="203.0.113.2:53",
+            )
+            m2 = ClusterManifest(
+                cluster_name=m1.cluster_name,
+                operator_spk=m1.operator_spk,
+                nodes=[n00_v2],
+                seq=2,
+                exp=m1.exp,
+            )
+            assert fw.install_manifest(m2) is True
+            # HTTP endpoint is the same but dns_endpoint changed; still
+            # expect the writer to be rebuilt.
+            assert len(factory.calls) == 2
+
+    def test_health_preserved_across_endpoint_change(self) -> None:
+        """consecutive_failures must survive the endpoint swap."""
+        op = DMPCrypto()
+
+        # Custom factory: first writer fails, second writer succeeds.
+        # We can't use _TrackingFactory alone because both writers it
+        # hands back start with fail=False.
+        made: List[FakeWriter] = []
+
+        def factory(node: ClusterNode) -> FakeWriter:
+            w = FakeWriter(fail=(len(made) == 0))
+            made.append(w)
+            return w
+
+        n00_v1 = ClusterNode(node_id="n00", http_endpoint="https://e1.example:8053")
+        m1 = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=[n00_v1],
+            seq=1,
+            exp=int(time.time()) + 3600,
+        )
+        with FanoutWriter(m1, factory) as fw:
+            # Drive consecutive_failures up on the E1 writer.
+            fw.publish_txt_record("a", "b")
+            fw.publish_txt_record("a", "b")
+            pre = fw.snapshot()[0]
+            assert pre["consecutive_failures"] == 2
+            pre_last_failure_ts = pre["last_failure_ts"]
+
+            # Refresh to E2. Health counters must survive.
+            n00_v2 = ClusterNode(node_id="n00", http_endpoint="https://e2.example:8053")
+            m2 = ClusterManifest(
+                cluster_name=m1.cluster_name,
+                operator_spk=m1.operator_spk,
+                nodes=[n00_v2],
+                seq=2,
+                exp=m1.exp,
+            )
+            assert fw.install_manifest(m2) is True
+            post = fw.snapshot()[0]
+            assert post["consecutive_failures"] == 2
+            assert post["last_failure_ts"] == pre_last_failure_ts
+            assert post["http_endpoint"] == "https://e2.example:8053"
+
+    def test_endpoint_change_retains_old_writer_until_close(self) -> None:
+        """The rebuilt writer must not be close()'d at swap time."""
+        op = DMPCrypto()
+        factory = _TrackingFactory()
+        n00_v1 = ClusterNode(node_id="n00", http_endpoint="https://e1.example:8053")
+        m1 = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=[n00_v1],
+            seq=1,
+            exp=int(time.time()) + 3600,
+        )
+        fw = FanoutWriter(m1, factory)
+        try:
+            n00_v2 = ClusterNode(node_id="n00", http_endpoint="https://e2.example:8053")
+            m2 = ClusterManifest(
+                cluster_name=m1.cluster_name,
+                operator_spk=m1.operator_spk,
+                nodes=[n00_v2],
+                seq=2,
+                exp=m1.exp,
+            )
+            assert fw.install_manifest(m2) is True
+            # The E1 writer is retained, not yet closed.
+            assert factory.first("n00").close_calls == 0
+        finally:
+            fw.close()
+        # After close, the retained E1 writer is drained.
+        assert factory.first("n00").close_calls == 1
+
+
+class TestExecutorResize:
+    def test_executor_grows_on_manifest_growth(self) -> None:
+        """Start with 1 node, grow to 10. Per-node latency ~50ms, timeout 500ms.
+
+        If the executor didn't grow, publishes would serialize in a
+        single worker and blow the timeout. This test fails without the
+        resize fix.
+        """
+        op = DMPCrypto()
+        factory = _TrackingFactory()
+        m1 = _manifest(1, seq=1, operator=op)
+        with FanoutWriter(m1, factory, timeout=0.5) as fw:
+            # Grow to 10 nodes; each publish sleeps 50ms.
+            nodes = [_node(i) for i in range(10)]
+            m2 = ClusterManifest(
+                cluster_name=m1.cluster_name,
+                operator_spk=m1.operator_spk,
+                nodes=nodes,
+                seq=2,
+                exp=m1.exp,
+            )
+            assert fw.install_manifest(m2) is True
+
+            # Configure every node's writer to have 50ms latency. The
+            # first writer (n00 at creation time from m1) stays as-is,
+            # but m2's endpoint for "n00" matches m1's so its writer is
+            # retained — set latency on the surviving one too.
+            for node_id in [f"n{i:02d}" for i in range(10)]:
+                factory.latest(node_id).latency_ms = 50
+
+            t0 = time.monotonic()
+            ok = fw.publish_txt_record("a", "b")
+            elapsed = time.monotonic() - t0
+
+        # With a pool big enough for 10 parallel calls: ~50ms + overhead.
+        # With a pool of 1: 10 * 50ms = 500ms, hitting the timeout.
+        assert ok is True
+        assert elapsed < 0.4, f"expected parallel fan-out, took {elapsed}s"
+
+    def test_executor_does_not_shrink_on_manifest_shrink(self) -> None:
+        """Shrinking a manifest should NOT shrink the executor.
+
+        This matches the design: we never shrink — the trade-off of a
+        slightly-too-large pool is trivial and shrinking would either
+        orphan in-flight work or force us to wait on it. No assertion
+        on _max_workers equality, just that shrinking doesn't break.
+        """
+        op = DMPCrypto()
+        factory = _TrackingFactory()
+        m1 = _manifest(10, seq=1, operator=op)
+        with FanoutWriter(m1, factory) as fw:
+            initial_max = fw._executor._max_workers
+            m2 = _manifest(2, seq=2, operator=op)
+            # Same factory hands back new nodes with same node_ids; we
+            # can just reuse _manifest.
+            assert fw.install_manifest(m2) is True
+            # Pool size unchanged (or at least not shrunk below 10).
+            assert fw._executor._max_workers == initial_max

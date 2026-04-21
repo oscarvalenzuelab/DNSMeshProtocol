@@ -27,9 +27,19 @@ Design summary
 * **Manifest refresh.** :meth:`install_manifest` replaces the active
   manifest if the new ``seq`` is strictly higher than the current
   ``seq`` and the new manifest is not already expired. Node state is
-  preserved across refresh for retained ``node_id``s; new nodes get
-  fresh state; removed nodes' writer instances are closed (if they
-  expose a ``close()`` method) and their state is dropped.
+  preserved across refresh for retained ``node_id``s — **including**
+  when only the endpoint changes (the writer is rebuilt but health
+  counters are kept). New nodes get fresh state. Removed nodes' writer
+  instances are closed (if they expose a ``close()`` method) and their
+  state is dropped. Old writers from endpoint-change swaps are parked
+  in a retention list and closed at :meth:`close` time, since
+  in-flight fan-outs may still be dispatching to them after a
+  quorum-return.
+* **Executor growth.** The executor is sized from the initial manifest
+  and grown when :meth:`install_manifest` installs a manifest with more
+  nodes than the current executor can run in parallel. Old executors
+  are retired to a list and drained on :meth:`close`; in-flight work
+  continues in their worker threads unmolested.
 
 Security boundary
 -----------------
@@ -89,6 +99,7 @@ class _NodeState:
     node_id: str
     http_endpoint: str
     writer: DNSRecordWriter
+    dns_endpoint: Optional[str] = None
     consecutive_failures: int = 0
     last_failure_ts: float = 0.0
     last_success_ts: float = 0.0
@@ -154,8 +165,17 @@ class FanoutWriter(DNSRecordWriter):
             self._nodes[node.node_id] = _NodeState(
                 node_id=node.node_id,
                 http_endpoint=node.http_endpoint,
+                dns_endpoint=node.dns_endpoint,
                 writer=self._factory(node),
             )
+        # Writers dropped by a manifest refresh (either because the
+        # node_id disappeared or because its endpoint changed and the
+        # writer was rebuilt) are moved here instead of being closed
+        # eagerly. The fan-out path can have slow-path futures still
+        # operating on those writers after it returned on quorum; calling
+        # close() on them mid-flight risks crashing the background call
+        # or corrupting state. We drain this list in :meth:`close`.
+        self._retired_writers: List[DNSRecordWriter] = []
         # Executor sized to accommodate the initial manifest; we keep at
         # least one worker so a manifest that grows from empty to N
         # nodes still has somewhere to schedule work without needing a
@@ -169,22 +189,54 @@ class FanoutWriter(DNSRecordWriter):
             max_workers=max_workers,
             thread_name_prefix="fanout-writer",
         )
+        # Executors that were superseded by an install_manifest call
+        # that grew the worker pool. Their in-flight futures keep
+        # running in their own threads (wait=False semantics); we hold
+        # onto them so close() can shut them all down, and so the
+        # running threads are not orphaned on GC of the superseded
+        # pool. See `install_manifest` for the resize logic.
+        self._retired_executors: List[ThreadPoolExecutor] = []
         self._closed = False
 
     # ------------------------------------------------------------------ lifecycle
 
     def close(self) -> None:
-        """Shut down the executor. Idempotent."""
+        """Shut down the executor and drain retained resources. Idempotent.
+
+        Closes every writer held in the retention list (removed or
+        superseded by a refresh) and every retired executor from a
+        resize. Current/live per-node writers are **not** closed — the
+        FanoutWriter does not own their lifecycle; the caller (client)
+        that supplied ``writer_factory`` decides when those shut down.
+        """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
             executor = self._executor
+            retired_writers = self._retired_writers
+            self._retired_writers = []
+            retired_executors = self._retired_executors
+            self._retired_executors = []
         # shutdown(wait=False) lets in-flight futures drain in the
         # background threads. We do not cancel because the per-node
         # writes have already been dispatched and their side effects
         # (HTTP requests, etc.) are out of our hands.
         executor.shutdown(wait=False)
+        for old in retired_executors:
+            try:
+                old.shutdown(wait=False)
+            except Exception:
+                pass
+        # Drain retained writers. A buggy close() on one must not
+        # block the others.
+        for writer in retired_writers:
+            closer = getattr(writer, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
 
     def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
         try:
@@ -225,10 +277,25 @@ class FanoutWriter(DNSRecordWriter):
         * ``manifest.is_expired()`` — installing a stale manifest would
           immediately strand the client.
 
-        On accept, per-node state is preserved for ``node_id``s that
-        appear in both manifests. Writers for nodes that dropped out
-        get their ``close()`` method invoked if they expose one (duck
-        typed; missing ``close`` is fine).
+        On accept:
+
+        * Per-node state is preserved for ``node_id``s that appear in
+          both manifests with the **same** ``http_endpoint`` and
+          ``dns_endpoint``.
+        * If a retained ``node_id``'s endpoint changed, a fresh writer
+          is built via ``writer_factory`` and swapped in. Health
+          counters (``consecutive_failures``, timestamps, last error)
+          are preserved across the swap — the node is semantically the
+          same, only its address moved. The old writer is retained
+          (not closed) so in-flight fan-outs that already dispatched to
+          it don't race with a ``close()``.
+        * New ``node_id``s get a fresh ``_NodeState`` and a new writer.
+        * Removed ``node_id``s have their writers closed (if they
+          expose a ``close()`` method) and their state dropped.
+        * If the new manifest has more nodes than the current executor
+          can run in parallel, the executor is replaced with a larger
+          one. The old executor is retired (shutdown deferred to
+          :meth:`close`) so in-flight fan-outs continue to run on it.
 
         Note: FanoutWriter does **not** re-verify the manifest
         signature. See the module docstring's security boundary note.
@@ -243,20 +310,34 @@ class FanoutWriter(DNSRecordWriter):
             new_states: Dict[str, _NodeState] = {}
             for node in manifest.nodes:
                 existing = old_states.get(node.node_id)
-                if existing is not None:
-                    # Preserve health state; refresh the recorded
-                    # endpoint in case it changed across the manifest
-                    # rev, but keep the writer instance so any
-                    # node-local state (HTTP keepalive pool, auth
-                    # token, etc.) stays warm.
-                    existing.http_endpoint = node.http_endpoint
-                    new_states[node.node_id] = existing
-                else:
+                if existing is None:
+                    # New node_id → fresh state + new writer.
                     new_states[node.node_id] = _NodeState(
                         node_id=node.node_id,
                         http_endpoint=node.http_endpoint,
+                        dns_endpoint=node.dns_endpoint,
                         writer=self._factory(node),
                     )
+                    continue
+
+                # Retained node_id. Compare endpoints; if either HTTP
+                # or DNS endpoint changed the old writer is pointing at
+                # a stale address and must be rebuilt. Node-level
+                # health counters survive the swap.
+                endpoint_changed = (
+                    existing.http_endpoint != node.http_endpoint
+                    or existing.dns_endpoint != node.dns_endpoint
+                )
+                if endpoint_changed:
+                    # Retain old writer rather than closing it: a
+                    # slow-path future may still be calling into it.
+                    self._retired_writers.append(existing.writer)
+                    existing.writer = self._factory(node)
+                    existing.http_endpoint = node.http_endpoint
+                    existing.dns_endpoint = node.dns_endpoint
+                # Otherwise the writer is fine; keep it warm (HTTP
+                # keepalive pool, auth token, etc.).
+                new_states[node.node_id] = existing
 
             # Nodes that disappeared: close their writer if possible,
             # then drop them. Suppress any exceptions; a buggy close()
@@ -270,6 +351,32 @@ class FanoutWriter(DNSRecordWriter):
                         closer()
                     except Exception:
                         pass
+
+            # Executor resize: grow the pool if the new manifest has
+            # more nodes than the current pool can run in parallel.
+            # We never shrink — shrinking would force us to wait for
+            # in-flight work (or orphan it) and the memory cost of a
+            # slightly-too-large pool is trivial. Approach chosen:
+            # retention list ("retired executors"), drained on close.
+            # Alternative considered: shutdown(wait=False) and drop
+            # the reference. Rejected because, although the Python
+            # threads keep running without an owning reference, we'd
+            # lose the ability to deterministically shut them down on
+            # close() — leaving daemon threads hanging past the
+            # client's lifetime. Retention is simpler and bounded in
+            # the same way as retired writers above.
+            new_n = len(new_states)
+            target_workers = max(1, min(new_n, 16))
+            if target_workers > self._executor._max_workers:  # type: ignore[attr-defined]
+                # Spin up the new executor BEFORE moving the old one
+                # aside, so no window exists where self._executor is
+                # unusable.
+                new_executor = ThreadPoolExecutor(
+                    max_workers=target_workers,
+                    thread_name_prefix="fanout-writer",
+                )
+                self._retired_executors.append(self._executor)
+                self._executor = new_executor
 
             self._manifest = manifest
             self._nodes = new_states
