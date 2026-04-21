@@ -14,6 +14,9 @@ Running a DMP node that other people publish to.
   volumes, ports. The default path.
 - [Production]({{ site.baseurl }}/deployment/production) — TLS via Caddy,
   rate limiting, per-name RRset caps, metrics scraping, env-var reference.
+- [Clustered deployment]({{ site.baseurl }}/deployment/cluster) — 3-node
+  federation with anti-entropy sync, for operators who need survival
+  across individual node failure.
 
 {: .note }
 You only need to run a node if you want other people to publish to *your*
