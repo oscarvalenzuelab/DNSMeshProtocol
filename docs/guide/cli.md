@@ -35,6 +35,19 @@ identity even if you remember the passphrase.
   non-empty it takes precedence over `dns_host` / `dns_port` for reads.
   Persisted in canonical form: bare IP for portless entries,
   `ip:port` for IPv4, `[ip]:port` for IPv6.
+- `cluster_base_domain` + `cluster_operator_spk`: anchors for
+  cluster (federation) mode. When both are set, the client resolves
+  `cluster.<cluster_base_domain>` TXT, verifies the signed
+  `ClusterManifest` under the operator pubkey, and builds a
+  `FanoutWriter` + `UnionReader` across the named nodes. Either field
+  empty falls back to legacy single-endpoint mode. See
+  [Cluster mode](#cluster-mode) below.
+- `cluster_refresh_interval`: seconds between background manifest
+  refresh ticks. Default 3600 (once/hour). Set to 0 to disable the
+  refresh thread (a manual `dmp cluster fetch` / restart is then
+  needed to pick up node-set changes).
+- `cluster_node_token`: optional bearer token for the per-node HTTP
+  publish writers. Falls back to `http_token` when empty.
 
 ## Subcommands
 
@@ -172,6 +185,93 @@ $ dmp resolvers list
 9.9.9.9
 208.67.222.222
 ```
+
+### `dmp cluster`
+
+Federation mode (M2.wire). A cluster is a set of nodes collectively
+serving the same mailbox data; a client that pins the operator's
+Ed25519 pubkey + the cluster base domain fans every write to a
+majority of nodes and unions every read across all of them. Single
+nodes can go down without the client caring.
+
+| Subcommand | Purpose |
+|---|---|
+| `dmp cluster pin <operator_spk_hex> <base_domain>` | Store trust anchors in config |
+| `dmp cluster fetch [--save]` | One-shot fetch + verify of the cluster manifest; print summary |
+| `dmp cluster status` | Build the cluster client; print per-node fan-out/union health |
+
+`pin` is the first step: it writes `cluster_operator_spk` and
+`cluster_base_domain` to config. The operator SPK must be 64 hex
+chars (32 bytes). `base_domain` is the DNS zone where the manifest
+lives; the actual TXT RRset is `cluster.<base_domain>`.
+
+`fetch` resolves that RRset via the same reader the CLI uses for
+other reads (`ResolverPool` when `dns_resolvers` is set, otherwise
+`_DnsReader`), then calls `ClusterManifest.parse_and_verify` to
+confirm the signature binds to the pinned operator key AND the
+signed cluster name matches the pinned base domain. `--save`
+caches the signed manifest wire to `cluster_manifest.wire` in the
+config dir (future offline-bootstrap use).
+
+`status` builds a short-lived `ClusterClient` (no background
+refresh thread) and prints both the `FanoutWriter.snapshot()` and
+`UnionReader.snapshot()` rows — one line per node with consecutive
+failure count, last error, and endpoint.
+
+Mode switch: `_make_client` (called by `dmp send`, `dmp recv`,
+`dmp identity publish`, etc.) reads `cluster_base_domain` and
+`cluster_operator_spk` at every invocation. When both are set, it
+fetches + verifies the manifest on the spot and wires a cluster
+client into the DMPClient. When either is empty it falls back to
+the legacy single-endpoint path — no behavioral change for existing
+configs.
+
+Refresh semantics: when `cluster_refresh_interval > 0` (default
+3600 seconds), a daemon thread re-fetches the manifest and installs
+it iff the `seq` is strictly higher than the currently installed
+one. A failed fetch (transport error, empty RRset, signature
+failure) logs a warning and leaves the previous manifest active —
+reads and writes keep working against the last known node set.
+
+Example:
+
+```
+$ dmp cluster pin 3c6a... mesh.example.com
+pinned cluster operator key and base domain mesh.example.com
+next: `dmp cluster fetch` to confirm the manifest is published and verifiable
+
+$ dmp cluster fetch
+cluster: mesh.example.com
+  seq:   7
+  exp:   1816000000
+  nodes: 3
+    n01  http=https://n1.mesh.example.com:8053  dns=203.0.113.10:53
+    n02  http=https://n2.mesh.example.com:8053  dns=203.0.113.11:53
+    n03  http=https://n3.mesh.example.com:8053  dns=(via bootstrap reader)
+
+$ dmp cluster status
+cluster: mesh.example.com (seq=7, exp=1816000000)
+fan-out writer snapshot:
+  n01  http=https://n1.mesh.example.com:8053  fails=0  err=None
+  n02  http=https://n2.mesh.example.com:8053  fails=0  err=None
+  n03  http=https://n3.mesh.example.com:8053  fails=0  err=None
+union reader snapshot:
+  n01  http=https://n1.mesh.example.com:8053  fails=0  err=None
+  n02  http=https://n2.mesh.example.com:8053  fails=0  err=None
+  n03  http=https://n3.mesh.example.com:8053  fails=0  err=None
+```
+
+#### Cluster mode
+
+When the two anchors above are set, publishes go to `ceil(N/2)`
+nodes (quorum write; `FanoutWriter`) and reads query every node
+concurrently and union-dedup the TXT answers (`UnionReader`). The
+per-node writer is an HTTP writer pointed at `node.http_endpoint`
+(authed by `cluster_node_token` if set, else `http_token`, else
+unauthenticated). The per-node reader is a UDP DNS reader pointed at
+`node.dns_endpoint`; nodes whose manifest entries omit
+`dns_endpoint` fall back to the configured bootstrap reader (the
+same resolver pool used to fetch the manifest).
 
 ### `dmp node`
 
