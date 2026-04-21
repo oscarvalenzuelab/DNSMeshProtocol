@@ -80,6 +80,12 @@ def fetch_cluster_manifest(
         return None
     if not records:
         return None
+    # Scan every TXT record in the RRset and return the manifest with
+    # the highest seq. Taking the first valid match would pin the
+    # client to a stale node set whenever both old and new manifests
+    # are briefly co-resident in DNS (e.g. during an operator rollout
+    # with append-semantics publishing or short-TTL resolver caching).
+    best: Optional[ClusterManifest] = None
     for wire in records:
         try:
             manifest = ClusterManifest.parse_and_verify(
@@ -93,9 +99,11 @@ def fetch_cluster_manifest(
             # modes and returns None; anything that escapes is unexpected.
             log.warning("cluster manifest parse raised: %s", exc)
             continue
-        if manifest is not None:
-            return manifest
-    return None
+        if manifest is None:
+            continue
+        if best is None or manifest.seq > best.seq:
+            best = manifest
+    return best
 
 
 class ClusterClient:

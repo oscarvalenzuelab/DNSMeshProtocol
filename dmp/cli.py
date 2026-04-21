@@ -621,10 +621,20 @@ def _make_client(
     # Prefer the per-identity salt from config; fall back to the library
     # default only if this config predates the kdf_salt field.
     kdf_salt = bytes.fromhex(config.kdf_salt) if config.kdf_salt else None
+    # In cluster mode, mailbox RRsets live under the cluster base domain
+    # (the same zone the operator controls and signs the manifest for).
+    # Using config.domain here would silently target the legacy mesh
+    # zone — fetching the cluster manifest from foo.com but then writing
+    # mailbox records under mesh.local would break send/recv entirely.
+    effective_domain = (
+        config.cluster_base_domain
+        if (cluster_client is not None and config.cluster_base_domain)
+        else config.domain
+    )
     client = DMPClient(
         config.username,
         passphrase,
-        domain=config.domain,
+        domain=effective_domain,
         writer=writer,
         reader=reader,
         replay_cache_path=replay_path,
