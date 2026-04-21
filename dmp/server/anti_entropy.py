@@ -210,6 +210,7 @@ def load_peers_from_cluster_json(
     path: str,
     *,
     self_node_id: Optional[str] = None,
+    self_http_endpoint: Optional[str] = None,
 ) -> List[SyncPeer]:
     """Parse an on-disk cluster.json into a SyncPeer list.
 
@@ -222,9 +223,16 @@ def load_peers_from_cluster_json(
     malformed — a node without peers is still a valid node; it just has
     nothing to sync with.
 
-    `self_node_id` filters the node's own entry out of the peer set so a
-    node doesn't try to sync with itself.
+    Self filter: both ``self_node_id`` (operator-defined) and
+    ``self_http_endpoint`` (normalized URL) are applied. Either alone
+    covers the common misconfig where a node appears in its own
+    manifest; honoring BOTH lets deployments that set only
+    DMP_SYNC_SELF_ENDPOINT still filter correctly when the file path
+    is used for peer discovery.
     """
+    self_ep_norm = (
+        self_http_endpoint.rstrip("/").lower() if self_http_endpoint else None
+    )
     try:
         with open(path, "r") as f:
             text = f.read()
@@ -238,7 +246,7 @@ def load_peers_from_cluster_json(
 
     # Try wire-record-in-a-string first.
     if text.startswith(_CLUSTER_PREFIX):
-        return _peers_from_wire(text, self_node_id)
+        return _peers_from_wire(text, self_node_id, self_ep_norm)
 
     try:
         parsed = json.loads(text)
@@ -247,7 +255,7 @@ def load_peers_from_cluster_json(
         return []
 
     if isinstance(parsed, dict) and isinstance(parsed.get("wire"), str):
-        return _peers_from_wire(parsed["wire"], self_node_id)
+        return _peers_from_wire(parsed["wire"], self_node_id, self_ep_norm)
 
     if isinstance(parsed, dict) and isinstance(parsed.get("nodes"), list):
         peers: List[SyncPeer] = []
@@ -260,6 +268,8 @@ def load_peers_from_cluster_json(
                 continue
             if self_node_id and nid == self_node_id:
                 continue
+            if self_ep_norm and http.rstrip("/").lower() == self_ep_norm:
+                continue
             peers.append(SyncPeer(node_id=nid, http_endpoint=http))
         return peers
 
@@ -267,7 +277,11 @@ def load_peers_from_cluster_json(
     return []
 
 
-def _peers_from_wire(wire: str, self_node_id: Optional[str]) -> List[SyncPeer]:
+def _peers_from_wire(
+    wire: str,
+    self_node_id: Optional[str],
+    self_ep_norm: Optional[str] = None,
+) -> List[SyncPeer]:
     """Parse a raw wire cluster manifest into peers (no signature check).
 
     We do NOT verify the cluster signature here — the operator deploying
@@ -294,6 +308,8 @@ def _peers_from_wire(wire: str, self_node_id: Optional[str]) -> List[SyncPeer]:
     peers: List[SyncPeer] = []
     for node in manifest.nodes:
         if self_node_id and node.node_id == self_node_id:
+            continue
+        if self_ep_norm and node.http_endpoint.rstrip("/").lower() == self_ep_norm:
             continue
         peers.append(SyncPeer(node_id=node.node_id, http_endpoint=node.http_endpoint))
     return peers
