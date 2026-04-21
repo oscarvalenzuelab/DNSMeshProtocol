@@ -18,7 +18,7 @@ from [spec.md](spec.md).
 1. TOC
 {:toc}
 
-## Message send (Alice → Bob)
+## Message send
 
 Pre-conditions:
 
@@ -96,7 +96,7 @@ Steps:
    prekey whose `sk` is gone. Best effort: a DELETE failure leaves the
    prekey record rotting until its `exp` elapses.
 
-## Message receive (Bob)
+## Message receive
 
 Bob's poll loop (`DMPClient.receive_messages`, `dmp/client/client.py:427`):
 
@@ -209,7 +209,7 @@ Source: `dmp/cli.py:1055-1100` (`cmd_identity_fetch`) plus the
      surface all fingerprints and require the user to resolve (e.g.
      `dmp identity fetch --accept-fingerprint <hex>`).
 
-## Cluster discovery (bootstrap → cluster manifest → client)
+## Cluster discovery
 
 Source: `dmp/client/bootstrap_discovery.py`,
 `dmp/client/cluster_bootstrap.py`, and `dmp/cli.py` (`cmd_bootstrap_discover`).

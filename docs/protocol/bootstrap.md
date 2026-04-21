@@ -210,7 +210,7 @@ Mirrors `ClusterManifest`:
   magic, base64 + signature placement.
 - [DNS name routing]({{ site.baseurl }}/protocol/routing#bootstrap-record)
   — why the owner name is `_dmp.<user_domain>`.
-- [End-to-end flows]({{ site.baseurl }}/protocol/flows#cluster-discovery-bootstrap--cluster-manifest--client)
+- [End-to-end flows]({{ site.baseurl }}/protocol/flows#cluster-discovery)
   — how a client fetches + verifies + walks entries from this record.
 - [Threat model]({{ site.baseurl }}/protocol/threat-model) — what a
   zone-operator compromise does (and does not) enable.

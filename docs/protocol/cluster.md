@@ -173,7 +173,7 @@ config typo) producing a false-accept.
   magic, base64 + signature placement.
 - [DNS name routing]({{ site.baseurl }}/protocol/routing#cluster-manifest)
   — why the owner name is `cluster.<cluster_base_domain>`.
-- [End-to-end flows]({{ site.baseurl }}/protocol/flows#cluster-discovery-bootstrap--cluster-manifest--client)
+- [End-to-end flows]({{ site.baseurl }}/protocol/flows#cluster-discovery)
   — how a client fetches + verifies + installs this record.
 - [Threat model]({{ site.baseurl }}/protocol/threat-model) — what a
   cluster-operator compromise does (and does not) enable.
