@@ -183,6 +183,29 @@ class TestFetchClusterManifest:
         assert got is not None
         assert got.seq == 1
 
+    def test_picks_highest_seq_when_multiple_valid(self):
+        """During an operator rollout the RRset can briefly carry both
+        the old and new signed manifests. Returning the first valid
+        one would pin the client to the stale node set; we must choose
+        the highest seq."""
+        op = DMPCrypto()
+        old = _build_manifest(op, seq=1)
+        new = _build_manifest(op, seq=5)
+        store = InMemoryDNSStore()
+        name = cluster_rrset_name("mesh.example.com")
+        # Insertion order: old first, then new — proves we're not just
+        # returning the first valid.
+        store.publish_txt_record(name, old.sign(op))
+        store.publish_txt_record(name, new.sign(op))
+
+        got = fetch_cluster_manifest(
+            "mesh.example.com",
+            op.get_signing_public_key_bytes(),
+            store,
+        )
+        assert got is not None
+        assert got.seq == 5
+
     def test_no_records_returns_none(self):
         op = DMPCrypto()
         store = InMemoryDNSStore()

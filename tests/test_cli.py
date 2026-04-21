@@ -1078,6 +1078,10 @@ class TestClusterModeInMakeClient:
 
             assert isinstance(client.writer, FanoutWriter)
             assert isinstance(client.reader, UnionReader)
+            # Mailbox RRsets must live under the cluster's base domain,
+            # not the legacy config.domain (default "mesh.local"). Using
+            # the wrong domain here would silently target the wrong zone.
+            assert client.domain == "mesh.example.com"
         finally:
             cli._close_client(client)
 
