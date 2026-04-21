@@ -1,15 +1,20 @@
 # DNS Mesh Protocol — Roadmap
 
-This is the honest gap between what ships today and what the
-[design-intent documents](docs/design-intent/) describe. It is also the
-critical path for tagging `v0.2.0-beta` and then a `v1.0` that earns the
-word "decentralized" in the tagline.
+Two tracks live on this roadmap:
 
-**Status (2026-04-21):** `v0.1.0-alpha`, pre-external-audit. M1, M2
-(full, incl. node-side anti-entropy + compose cluster), M3 (full, incl.
-bootstrap discovery + cluster manifest gossip), and M4.1 are shipped.
-The external cryptographic audit (M4.2–M4.4) is the remaining gate to
-`v0.2.0-beta`. See the per-milestone status below.
+1. **Shipped** — the functional surface that exists in the codebase
+   today, tested and documented.
+2. **Certification backlog** — the work that lands on the path to
+   `v1.0`. The external cryptographic audit, reach (mobile / web /
+   PyPI), long-term identity management (key rotation), and
+   traffic-analysis research. Post-beta by design: each piece is
+   work we intend to do, not a gap we failed to close.
+
+**Status (2026-04-21):** `v0.1.0-alpha`. M1, M2 (full, incl.
+node-side anti-entropy + compose cluster), M3 (full, incl. bootstrap
+discovery + cluster manifest gossip), and M4.1 (formal protocol
+spec) are shipped. The certification backlog (M4.2–M6) lands after
+the `v0.2.0-beta` tag. See per-milestone status below.
 
 Atomic tasks for the current sprint live in [`TASKS.md`](TASKS.md);
 long-horizon items stay here until they get lifted into a sprint.
@@ -100,35 +105,40 @@ cluster operator) verifies before any config is written.
 `--bootstrap <one-name>` can onboard AND the node set can evolve
 without manual manifest republishing per change. **MET.**
 
-### M4 — Formal spec + external audit — SHIPPED M4.1; M4.2–M4.4 BLOCKING BETA
+### M4 — Formal spec + external audit — M4.1 SHIPPED; M4.2–M4.4 in certification backlog
 
 - [x] **M4.1** Formal wire-format + protocol spec under
       `docs/protocol/` (spec.md, wire-encoding.md, routing.md, flows.md,
       threat-model.md, README.md — ~1500 lines, every constant
       cross-verified against source) — commits `4380469..c4f18fc`.
-- [ ] **M4.2** *(NOT SHIPPED)* Freeze the protocol surface for audit
-      (tag `v0.2.0-rc1`).
-- [ ] **M4.3** *(NOT SHIPPED)* Engage an independent cryptographic
-      auditor. Recommended scope: crypto composition, replay +
-      forward-secrecy claims, DoS surfaces, erasure-coding soundness,
-      cluster-mode trust model.
-- [ ] **M4.4** *(NOT SHIPPED)* Address findings. Retest. Publish the
-      report.
 
-**Exit criteria:** independent auditor's report published and acted on.
-This is the `v0.2.0-beta` gate.
+The remaining M4 work lands after `v0.2.0-beta` as part of the
+certification path:
 
-### M5 — Reach — NOT SHIPPED (post-beta work)
+- [ ] **M4.2** Freeze the protocol surface for audit (tag
+      `v0.2.0-rc1`).
+- [ ] **M4.3** Engage an independent cryptographic auditor.
+      Recommended scope: crypto composition, replay + forward-secrecy
+      claims, DoS surfaces, erasure-coding soundness, cluster-mode
+      trust model.
+- [ ] **M4.4** Address findings. Retest. Publish the report.
+
+**Certification outcome:** independent auditor's report published and
+acted on. This is what earns the `v1.0` tag.
+
+### M5 — Reach (certification backlog, post-beta)
 
 - [ ] **M5.1** PyPI release. `setup.py` exists; package is not yet
-      published on pypi.org. (1 day once the beta gate opens.)
+      published on pypi.org. (1 day once the beta tag is cut.)
 - [ ] **M5.2** React Native shell app wrapping the protocol core over
       gRPC or a local HTTP daemon. (2–3 months.)
 - [ ] **M5.3** Web client using WASM crypto + Fetch for HTTP API.
       (1 month.)
-- [ ] **M5.4** Key rotation + revocation records. (2 weeks.)
+- [ ] **M5.4** Key rotation + revocation records — tracked as
+      [GH issue #1](https://github.com/oscarvalenzuelab/DNSMeshProtocol/issues/1)
+      with the full design sketch.
 
-### M6 — Traffic-analysis resistance — NOT SHIPPED (research track)
+### M6 — Traffic-analysis resistance (certification backlog, research track)
 
 - [ ] **M6.1** Random per-message publish delays in a configurable
       window.
@@ -137,9 +147,10 @@ This is the `v0.2.0-beta` gate.
 - [ ] **M6.3** Chunk-ordering randomization (publish order ≠ chunk
       index).
 
-**Honest caveat:** strong traffic-analysis resistance against a
-state-level adversary is a research category, not a deliverable. M6 is
-best-effort.
+**Scope note:** strong traffic-analysis resistance against a
+state-level adversary is a research program, not a product
+deliverable. M6 defines concrete hardenings we commit to shipping;
+full resistance is an ongoing research track beyond `v1.0`.
 
 ## Deferred / unlikely
 
@@ -152,12 +163,22 @@ These appear in the design-intent docs but are unlikely to ship as-spec:
 - **All of DMP behaving as a relay for non-DMP traffic.** Out of scope
   — DMP is an application-layer protocol, not an overlay network.
 
-## Critical path to `v0.2.0-beta`
+## Critical path
 
-The shortest remaining path:
+**To `v0.2.0-beta`** (imminent): flip the repo public, publish the
+alpha to PyPI as a pre-release package, tag `v0.2.0-beta`. Functional
+scope is already shipped; this is a release-engineering step, not a
+code gate.
 
-1. **M4.2 → M4.4** — engage an auditor, fix findings, publish report.
-2. **M5.1** — PyPI release.
+**To `v1.0` (certification backlog)**: execute the items in M4.2–M6
+after beta is out and real users are exercising it.
 
-Item 1 is calendar time bounded by the auditor's schedule. Item 2
-is a day once item 1 is done.
+1. **M4.2 → M4.4** — freeze protocol surface, engage an auditor,
+   address findings, publish the report.
+2. **M5.2 / M5.3** — reach clients (React Native shell, WASM/web).
+3. **M6** — traffic-analysis hardening.
+
+M4 is calendar time bounded by the auditor's schedule; the rest
+parallelize. Individual post-beta items are tracked as GitHub
+issues under the `certification-backlog` label (e.g. key rotation
+is [issue #1](https://github.com/oscarvalenzuelab/DNSMeshProtocol/issues/1)).
