@@ -354,6 +354,12 @@ class ClusterManifest:
             cluster_name = body[off : off + name_len].decode("utf-8")
         except UnicodeDecodeError as e:
             raise ValueError("cluster_name not utf-8") from e
+        # Mirror sign-side DNS-name validation on receive. A correctly
+        # signed manifest from another (buggy or malicious) publisher
+        # can still carry a cluster_name that cannot be used as a DNS
+        # owner name; reject here rather than handing downstream code
+        # an unusable record.
+        _validate_dns_name(cluster_name)
         off += name_len
 
         if off + 1 > len(body):
