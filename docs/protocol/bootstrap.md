@@ -200,6 +200,20 @@ Mirrors `ClusterManifest`:
 
 ## Related records
 
+- [Spec overview]({{ site.baseurl }}/protocol/spec) — cross-cutting
+  invariants every signed record (including this one) respects:
+  `v=dmp1;t=<type>;` prefix, trailing 64-byte Ed25519 signature,
+  embedded-signer cross-check, 1200-byte wire cap, multi-string TXT,
+  DNS-name validation.
+- [Wire encoding conventions]({{ site.baseurl }}/protocol/wire-encoding)
+  — byte-level details on the `v=dmp1;t=bootstrap;` prefix, `DMPBS01`
+  magic, base64 + signature placement.
+- [DNS name routing]({{ site.baseurl }}/protocol/routing#bootstrap-record)
+  — why the owner name is `_dmp.<user_domain>`.
+- [End-to-end flows]({{ site.baseurl }}/protocol/flows#cluster-discovery-bootstrap--cluster-manifest--client)
+  — how a client fetches + verifies + walks entries from this record.
+- [Threat model]({{ site.baseurl }}/protocol/threat-model) — what a
+  zone-operator compromise does (and does not) enable.
 - [Cluster manifests]({{ site.baseurl }}/protocol/cluster) — the
   record a bootstrap entry points at. A client fetches the bootstrap
   record first, takes `best_entry()`, then fetches the matching
