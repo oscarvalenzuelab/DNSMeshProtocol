@@ -36,6 +36,7 @@ from dmp.client.client import DMPClient
 from dmp.client.cluster_bootstrap import ClusterClient, fetch_cluster_manifest
 from dmp.core.cluster import ClusterNode
 from dmp.network.base import DNSRecordReader, DNSRecordWriter
+from dmp.network.composite_reader import CompositeReader
 from dmp.network.resolver_pool import ResolverPool, WELL_KNOWN_RESOLVERS
 
 # ----------------------------- config ----------------------------------------
@@ -611,7 +612,18 @@ def _make_client(
                 refresh_interval=refresh_interval,
             )
             writer = cluster_client.writer
-            reader = cluster_client.reader
+            # Cross-domain reads (e.g. `dmp identity fetch
+            # alice@other-domain.com`) would NXDOMAIN through the
+            # cluster's authoritative nodes because those nodes have
+            # no delegation for the external zone. Wrap the union
+            # reader with a CompositeReader that routes cluster-local
+            # names to the union and external names through the
+            # bootstrap recursive resolver.
+            reader = CompositeReader(
+                cluster_reader=cluster_client.reader,
+                external_reader=bootstrap_reader,
+                cluster_base_domain=config.cluster_base_domain,
+            )
     else:
         if not config.endpoint:
             if not requires_network:
@@ -891,7 +903,17 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
             reader_factory=_make_cluster_reader_factory(cfg, bootstrap_reader),
             refresh_interval=None,  # one-shot; no background thread.
         )
-        reader = cluster_handle.reader
+        # Identity fetch is the cross-domain workflow — `dmp identity
+        # fetch alice@other-domain.com` queries a zone the pinned
+        # cluster doesn't own. Without the composite split, those
+        # queries NXDOMAIN through the authoritative cluster nodes.
+        # Route cluster-local names (the common cross-DMP case) to
+        # the union and external names to the bootstrap resolver.
+        reader = CompositeReader(
+            cluster_reader=cluster_handle.reader,
+            external_reader=bootstrap_reader,
+            cluster_base_domain=cfg.cluster_base_domain,
+        )
     else:
         reader = bootstrap_reader
 
