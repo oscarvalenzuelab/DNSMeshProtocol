@@ -875,9 +875,7 @@ class AntiEntropyWorker:
                         preserve = True
                     # Else: case 3 — operator-id change on same endpoint
                     # means a real node replacement. Fresh cursor.
-                new_watermarks[p.node_id] = (
-                    old_cursor if preserve else (0, "", "")
-                )
+                new_watermarks[p.node_id] = old_cursor if preserve else (0, "", "")
             self._watermarks = new_watermarks
             self._peers = deduped
             if self._peers:
