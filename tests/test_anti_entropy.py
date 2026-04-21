@@ -220,16 +220,21 @@ class FakePeerHTTP:
             return (403, b'{"error":"forbidden"}')
         if "/v1/sync/digest" in url:
             self.digest_calls += 1
-            # Parse ?since=&limit=
+            # Parse ?cursor=&limit= (primary) or legacy ?since=&limit=.
             q = url.split("?", 1)[1] if "?" in url else ""
-            since = 0
+            cursor: Tuple[int, str] = (0, "")
             limit = 1000
             for kv in q.split("&"):
-                if kv.startswith("since="):
-                    since = int(kv[len("since=") :])
+                if kv.startswith("cursor="):
+                    raw = kv[len("cursor=") :]
+                    parts = raw.split(":", 1)
+                    if len(parts) == 2:
+                        cursor = (int(parts[0]), parts[1])
+                elif kv.startswith("since="):
+                    cursor = (int(kv[len("since=") :]), "")
                 elif kv.startswith("limit="):
                     limit = int(kv[len("limit=") :])
-            rows = self.store.iter_records_since(since, limit=limit + 1)
+            rows = self.store.iter_records_since(cursor=cursor, limit=limit + 1)
             has_more = len(rows) > limit
             rows = rows[:limit]
             entries = [
@@ -241,9 +246,18 @@ class FakePeerHTTP:
                 }
                 for r in rows
             ]
-            body = json.dumps({"records": entries, "has_more": has_more}).encode(
-                "utf-8"
-            )
+            if entries:
+                last = entries[-1]
+                next_cursor = f"{int(last['ts'])}:{last['name']}"
+            else:
+                next_cursor = f"{int(cursor[0])}:{cursor[1]}"
+            body = json.dumps(
+                {
+                    "records": entries,
+                    "has_more": has_more,
+                    "next_cursor": next_cursor,
+                }
+            ).encode("utf-8")
             return (200, body)
         return (404, b'{"error":"not found"}')
 
@@ -355,10 +369,17 @@ class TestWorkerTick:
 
         peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
         worker = _make_worker(local, [(peer, peer_fake)])
-        assert worker.watermark("n2") == 0
+        # Initial watermark is the compound sentinel (0, "").
+        assert worker.watermark("n2") == (0, "")
 
         worker.tick_once()
-        assert worker.watermark("n2") > 0
+        # After the tick the watermark must have moved past the sentinel;
+        # comparing tuples gives us strict monotonicity in (ts, name).
+        wm = worker.watermark("n2")
+        assert isinstance(wm, tuple) and len(wm) == 2
+        assert wm > (0, "")
+        assert wm[0] > 0
+        assert wm[1] == "a.mesh.test"
 
     def test_second_tick_only_gets_new_records(self):
         local = InMemoryDNSStore()
@@ -556,3 +577,202 @@ class TestWorkerTick:
         rows = local.get_records_by_name(["x.mesh.test"])
         assert len(rows) == 1
         assert rows[0].ttl_remaining > 120
+
+    def test_cursor_advances_across_same_ms_burst(self):
+        """Regression: >pull_limit records published within the same ms.
+
+        Pre-fix, the watermark was a plain ms. Advancing past the ms
+        dropped the tail; holding the ms replayed the same page forever.
+        The compound (ts, name) cursor now keeps pagination correct
+        because the name half breaks ties within one millisecond.
+        """
+        import time as _time
+
+        local = InMemoryDNSStore()
+        peer_fake = FakePeerHTTP("n2")
+        # Force every publish onto the same millisecond by monkey-patching
+        # time.time for the duration of the burst. InMemoryDNSStore reads
+        # time.time() once per publish so one fixed value pins them all
+        # to one stored_ts.
+        pinned_ms = int(_time.time() * 1000)
+        real_time = _time.time
+
+        def _pinned_time() -> float:
+            return pinned_ms / 1000.0
+
+        total = 200  # > pull_batch_limit below
+        _time.time = _pinned_time
+        try:
+            for i in range(total):
+                peer_fake.store.publish_txt_record(
+                    f"r{i:04d}.mesh.test", f"v{i}", ttl=300
+                )
+        finally:
+            _time.time = real_time
+
+        # Sanity: all rows share the same stored_ts.
+        stored_ts_set = {
+            row.stored_ts for row in peer_fake.store.iter_records_since(cursor=(0, ""))
+        }
+        assert len(stored_ts_set) == 1
+
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_worker(
+            local,
+            [(peer, peer_fake)],
+            pull_batch_limit=64,
+            digest_batch_limit=total + 10,
+            interval_seconds=0.5,  # used only as a lower bound on sleep
+        )
+
+        # With interval_seconds=0.5 and the spec's "2 * sync_interval"
+        # budget we have 1.0s; tick_once is synchronous so do the loop
+        # directly for determinism. Bound retries so a regression fails
+        # loudly instead of hanging.
+        for _ in range(20):
+            worker.tick_once()
+            if len(local.list_names()) >= total:
+                break
+
+        for i in range(total):
+            assert local.query_txt_record(f"r{i:04d}.mesh.test") == [f"v{i}"]
+
+    def test_malformed_digest_entry_does_not_advance_watermark(self):
+        """Peer returns a digest entry with a far-future ts and an
+        unparseable name/hash. The local watermark MUST NOT advance to
+        that ts — if it did, legitimate lower-ts updates would live
+        forever below the poisoned cutoff."""
+        from typing import Optional
+
+        local = InMemoryDNSStore()
+
+        # Build a fake that returns a single malformed entry regardless
+        # of what we ask for.
+        far_future_ms = int(time.time() * 1000) + 10 * 365 * 24 * 3600 * 1000
+
+        def bad_get(url: str, token: Optional[str], timeout: float):
+            body = json.dumps(
+                {
+                    "records": [
+                        {
+                            "name": "bogus name with spaces!!!",
+                            "hash": "notsha256",
+                            "ts": far_future_ms,
+                            "ttl": 300,
+                        }
+                    ],
+                    "has_more": False,
+                    "next_cursor": f"{far_future_ms}:bogus name with spaces!!!",
+                }
+            ).encode("utf-8")
+            return (200, body)
+
+        def bad_post(url: str, token: Optional[str], body: bytes, timeout: float):
+            return (200, b'{"records": []}')
+
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = AntiEntropyWorker(
+            store=local,
+            peers=[peer],
+            sync_token="tok",
+            interval_seconds=1.0,
+            http_get=bad_get,
+            http_post=bad_post,
+        )
+
+        worker.tick_once()
+
+        # Watermark must still be the sentinel — peer poisoned it with
+        # unvalidated junk, so we refuse to move.
+        wm = worker.watermark("n2")
+        assert wm == (0, ""), (
+            f"watermark advanced past malformed entry: {wm}; "
+            f"far_future_ms was {far_future_ms}"
+        )
+        # The malformed entry should have been counted as rejected.
+        assert worker.stats.records_rejected >= 1
+
+    def test_peer_lying_about_next_cursor_ignored(self):
+        """Peer returns legitimate records but lies about next_cursor
+        pointing far past the last record. We must advance only to the
+        max (ts, name) of validated-and-handled records, never to the
+        peer's fabricated cursor."""
+        from typing import Optional
+
+        local = InMemoryDNSStore()
+        # The real-record ts the peer actually has.
+        real_ts_ms = int(time.time() * 1000)
+        # The lie: a cursor far past real_ts but still inside the
+        # clock-skew window (otherwise _parse_next_cursor would drop it
+        # entirely — we want to test the "cursor past validated set"
+        # branch, not the "cursor rejected as forged future" branch).
+        lying_ts_ms = real_ts_ms + 30_000  # +30s, inside 60s skew cap
+
+        # sha256("valid-value-1").hexdigest()
+        h1 = hashlib.sha256(b"valid-value-1").hexdigest()
+
+        def get_handler(url: str, token: Optional[str], timeout: float):
+            body = json.dumps(
+                {
+                    "records": [
+                        {
+                            "name": "real.mesh.test",
+                            "hash": h1,
+                            "ts": real_ts_ms,
+                            "ttl": 300,
+                        }
+                    ],
+                    "has_more": False,
+                    # Peer claims there's a much later cursor to
+                    # fast-forward past.
+                    "next_cursor": f"{lying_ts_ms}:xxxxx.mesh.test",
+                }
+            ).encode("utf-8")
+            return (200, body)
+
+        def post_handler(url: str, token: Optional[str], body: bytes, timeout: float):
+            doc = json.loads(body.decode("utf-8"))
+            out = []
+            for name in doc["names"]:
+                if name == "real.mesh.test":
+                    out.append({"name": name, "value": "valid-value-1", "ttl": 300})
+            return (200, json.dumps({"records": out}).encode("utf-8"))
+
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = AntiEntropyWorker(
+            store=local,
+            peers=[peer],
+            sync_token="tok",
+            interval_seconds=1.0,
+            http_get=get_handler,
+            http_post=post_handler,
+        )
+
+        worker.tick_once()
+
+        # The record was written.
+        assert local.query_txt_record("real.mesh.test") == ["valid-value-1"]
+        # And the watermark must have advanced to AT MOST the validated
+        # record's (ts, name), never to the lying cursor. The peer's
+        # next_cursor points to `(lying_ts_ms, "xxxxx.mesh.test")` which
+        # compares strictly greater than `(real_ts_ms, "real.mesh.test")`.
+        # Because all records were handled and next_cursor is past
+        # max_handled AND len(handled)==len(valid_entries), the current
+        # code *would* accept next_cursor... but the hard property is
+        # that a lying peer cannot push us past REAL data. Assert the
+        # watermark is not greater than what the real record could
+        # justify PLUS a safety margin: it must be <= (lying_ts_ms,
+        # "xxxxx.mesh.test") — but critically NOT advance by ts alone
+        # ahead of any record we actually saw. The safest contract is:
+        # if everything in the page was handled, trust next_cursor IF
+        # AND ONLY IF has_more=false. But the peer can still lie there.
+        # The test enforces that the watermark stays at or below the
+        # max of validated-and-handled entries.
+        wm = worker.watermark("n2")
+        # Compare tuples: wm must be <= (real_ts_ms, "real.mesh.test").
+        assert wm <= (real_ts_ms, "real.mesh.test"), (
+            f"watermark {wm} advanced past validated data "
+            f"({real_ts_ms}, 'real.mesh.test')"
+        )
+        # And it did advance at least that far.
+        assert wm >= (real_ts_ms, "real.mesh.test")
