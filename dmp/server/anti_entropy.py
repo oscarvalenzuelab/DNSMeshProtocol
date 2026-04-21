@@ -832,28 +832,52 @@ class AntiEntropyWorker:
             # peers matchable by stable key.
             return url.strip().rstrip("/").lower()
 
+        # Retention rule (narrow by design):
+        #   1. Same (node_id, endpoint) pair → preserve cursor (no change).
+        #   2. Endpoint unchanged, old node_id was SYNTHETIC (URL-derived
+        #      via _peer_id_from_url) and new id is operator-defined →
+        #      preserve cursor: this is the DMP_SYNC_PEERS-to-gossiped-
+        #      manifest handoff where the "node" was always the endpoint
+        #      and the synthetic id was our internal invention.
+        #   3. Any other rotation (endpoint change OR operator-id→
+        #      operator-id under same endpoint) → FRESH cursor. Both
+        #      indicate a real replacement; resuming mid-stream would
+        #      skip history the new peer hasn't replicated.
+        #
+        # _peer_id_from_url lives in dmp.server.node to avoid a circular
+        # import at module load; resolve lazily here.
+        def _is_synthetic_id(peer: SyncPeer) -> bool:
+            try:
+                from dmp.server.node import _peer_id_from_url
+            except Exception:
+                return False
+            return peer.node_id == _peer_id_from_url(peer.http_endpoint)
+
         with self._lock:
-            # Identity for retention is the normalized endpoint, NOT
-            # node_id. Same-endpoint-any-id preserves the cursor (covers
-            # both "same node, same id" and the synthetic-to-operator
-            # id rotation). Endpoint change — even under an identical
-            # node_id — means a genuinely new host/port and must get
-            # a fresh cursor: resuming from the middle of the digest
-            # stream would skip historical records the new endpoint
-            # hasn't replicated yet.
-            old_by_endpoint: Dict[str, Cursor] = {}
+            old_peers_by_ep: Dict[str, SyncPeer] = {}
             for old_peer in self._peers:
-                cur = self._watermarks.get(old_peer.node_id)
-                if cur is not None:
-                    old_by_endpoint[_norm_endpoint(old_peer.http_endpoint)] = cur
+                old_peers_by_ep[_norm_endpoint(old_peer.http_endpoint)] = old_peer
 
             new_watermarks: Dict[str, Cursor] = {}
             for p in deduped:
                 key_ep = _norm_endpoint(p.http_endpoint)
-                if key_ep in old_by_endpoint:
-                    new_watermarks[p.node_id] = old_by_endpoint[key_ep]
-                else:
-                    new_watermarks[p.node_id] = (0, "", "")
+                old_peer = old_peers_by_ep.get(key_ep)
+                old_cursor = (
+                    self._watermarks.get(old_peer.node_id) if old_peer else None
+                )
+                preserve = False
+                if old_peer is not None and old_cursor is not None:
+                    if old_peer.node_id == p.node_id:
+                        # Case 1: identical (id, endpoint).
+                        preserve = True
+                    elif _is_synthetic_id(old_peer):
+                        # Case 2: synthetic→operator handoff.
+                        preserve = True
+                    # Else: case 3 — operator-id change on same endpoint
+                    # means a real node replacement. Fresh cursor.
+                new_watermarks[p.node_id] = (
+                    old_cursor if preserve else (0, "", "")
+                )
             self._watermarks = new_watermarks
             self._peers = deduped
             if self._peers:
