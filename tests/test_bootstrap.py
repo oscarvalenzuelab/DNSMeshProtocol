@@ -737,6 +737,42 @@ class TestBootstrapRecordNameValidation:
         assert parsed is not None
         assert parsed.user_domain == "example.com"
 
+    def test_externally_produced_64byte_entry_with_trailing_dot_parses(self):
+        """Entry cluster_base_domain at the 64-byte boundary with a
+        canonical FQDN trailing dot (65 bytes on wire) must parse —
+        sign()'s cap is on the normalized form, parse must match so we
+        interoperate with publishers that preserve the dot."""
+        signer = _make_signer()
+        spk = signer.get_signing_public_key_bytes()
+        user_name = b"example.com"
+        # 63 bytes of label content + trailing dot = 64 byte normalized,
+        # 65 byte wire form.
+        core = "a" * 55 + ".bcd.efg"  # 55 + 1 + 3 + 1 + 3 = 63 bytes
+        entry_name_str = core + "a"  # 64 bytes of label content
+        assert len(entry_name_str) == 64
+        entry_wire_name = (entry_name_str + ".").encode("ascii")
+        assert len(entry_wire_name) == 65
+        entry_spk = _make_spk()
+        body = (
+            b"DMPBS01"
+            + (1).to_bytes(8, "big")
+            + (int(time.time()) + 3600).to_bytes(8, "big")
+            + spk
+            + len(user_name).to_bytes(1, "big")
+            + user_name
+            + (1).to_bytes(1, "big")
+            + (10).to_bytes(2, "big")
+            + len(entry_wire_name).to_bytes(1, "big")
+            + entry_wire_name
+            + entry_spk
+        )
+        sig = signer.sign_data(body)
+        wire = RECORD_PREFIX + base64.b64encode(body + sig).decode("ascii")
+        parsed = BootstrapRecord.parse_and_verify(wire, spk)
+        assert parsed is not None
+        # Trailing dot stripped so it compares equal to sign-side form.
+        assert parsed.entries[0].cluster_base_domain == entry_name_str
+
 
 # ---- expected_user_domain binding ----------------------------------------
 

@@ -159,10 +159,17 @@ class BootstrapEntry:
         offset += 2
         base_len = body[offset]
         offset += 1
-        if base_len == 0 or base_len > MAX_BASE_DOMAIN_LEN:
-            raise ValueError("invalid cluster_base_domain length")
+        # Apply the length cap to the NORMALIZED (trailing-dot-stripped)
+        # form, matching sign()'s behavior. An externally produced record
+        # may preserve the canonical FQDN dot, so allow MAX+1 on the wire
+        # when the last byte is a '.'. Same treatment as ClusterManifest
+        # and user_domain below.
         if offset + base_len > len(body):
             raise ValueError("truncated entry: cluster_base_domain")
+        has_trailing_dot = base_len > 0 and body[offset + base_len - 1] == 0x2E
+        effective_len = base_len - (1 if has_trailing_dot else 0)
+        if effective_len == 0 or effective_len > MAX_BASE_DOMAIN_LEN:
+            raise ValueError("invalid cluster_base_domain length")
         try:
             base_domain = body[offset : offset + base_len].decode("utf-8")
         except UnicodeDecodeError as e:
