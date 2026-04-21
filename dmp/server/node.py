@@ -40,6 +40,18 @@ Environment variables (all optional, sensible defaults for dev):
     DMP_SYNC_INTERVAL_SECONDS  alias for DMP_SYNC_INTERVAL (operator-facing name)
     DMP_SYNC_OPERATOR_SPK      hex ed25519 operator pubkey for
                                cluster-record re-verify             default: none
+    DMP_CLUSTER_BASE_DOMAIN    cluster_name (e.g. "mesh.example.com")
+                               gossiped manifests MUST bind to. When
+                               set together with DMP_SYNC_OPERATOR_SPK
+                               the anti-entropy worker also gossips the
+                               signed manifest across peers (M3.3).
+                               If unset, derived from the on-disk
+                               cluster manifest.                     default: none
+    DMP_SYNC_SELF_ENDPOINT     this node's HTTP URL on the peer
+                               network (e.g. "http://dmp-node-a:8053")
+                               used to filter self out of a gossiped
+                               manifest so a node never syncs with
+                               itself.                               default: none
 
 Peer URLs from DMP_SYNC_PEERS point at the OTHER nodes' HTTP base (e.g.
 ``http://dmp-node-b:8053``). The worker appends ``/v1/sync/digest`` and
@@ -193,6 +205,22 @@ class DMPNodeConfig:
     # fine for most operators (the node's own operator deployed the
     # cluster.json anyway).
     sync_cluster_operator_spk_hex: Optional[str] = None
+    # M3.3 manifest gossip. When cluster_base_domain is set AND
+    # sync_cluster_operator_spk_hex is set, the anti-entropy worker
+    # gossips the signed manifest across peers: one tick after the
+    # operator rolls a higher-seq manifest onto any one node, the rest
+    # install it automatically. Without base_domain the worker cannot
+    # bind the incoming manifest to the expected cluster_name, so
+    # gossip stays off. Derived from the manifest on disk when unset
+    # so existing deployments pick up the feature for free.
+    cluster_base_domain: Optional[str] = None
+    # Operator-facing URL this node exposes on the peer HTTP network.
+    # Used to filter self out of a gossiped manifest's node list — a
+    # node that lists itself in the peer set would otherwise create an
+    # infinite-tick self-sync loop. Defaults to None (self-exclusion
+    # then relies on ``node_id`` alone, which is correct for the
+    # compose-sample setup).
+    sync_self_endpoint: Optional[str] = None
     # M2.5/M2.6 direct-peer-list env wiring. When non-empty, these URLs
     # become the SyncPeer list directly and cluster_file is ignored. Each
     # entry is an HTTP base URL (no trailing path); the anti-entropy
@@ -235,6 +263,16 @@ class DMPNodeConfig:
         raw_peers = os.environ.get("DMP_SYNC_PEERS") or ""
         sync_peers = [p.strip() for p in raw_peers.split(",") if p.strip()]
 
+        # M3.3 gossip. ``DMP_CLUSTER_BASE_DOMAIN`` pins the cluster_name
+        # gossiped manifests must bind to. Without a pinned operator
+        # public key on top, gossip stays off regardless — a log warning
+        # fires in ``_make_anti_entropy_worker`` so operators catch the
+        # misconfig. ``DMP_SYNC_SELF_ENDPOINT`` is the URL this node
+        # exposes on the peer HTTP network; used to drop self out of a
+        # gossiped manifest's node list.
+        cluster_base_domain = os.environ.get("DMP_CLUSTER_BASE_DOMAIN") or None
+        sync_self_endpoint = os.environ.get("DMP_SYNC_SELF_ENDPOINT") or None
+
         return cls(
             db_path=os.environ.get("DMP_DB_PATH", cls.db_path),
             dns_host=os.environ.get("DMP_DNS_HOST", cls.dns_host),
@@ -273,6 +311,8 @@ class DMPNodeConfig:
                 os.environ.get("DMP_SYNC_OPERATOR_SPK") or None
             ),
             sync_peers=sync_peers,
+            cluster_base_domain=cluster_base_domain,
+            sync_self_endpoint=sync_self_endpoint,
         )
 
 
@@ -328,6 +368,14 @@ class DMPNode:
             ),
             max_concurrency=self.config.dns_max_concurrency,
         )
+        # Derive the cluster base domain for the gossip endpoint — same
+        # derivation path the anti-entropy worker uses. Configured
+        # override wins; fall back to the on-disk manifest's signed
+        # cluster_name so existing deployments pick the endpoint up
+        # without a config change.
+        gossip_base = (
+            self.config.cluster_base_domain or self._derive_cluster_base_domain()
+        )
         self.http = DMPHttpApi(
             self.store,
             host=self.config.http_host,
@@ -342,6 +390,7 @@ class DMPNode:
                 burst=self.config.http_burst,
             ),
             sync_peer_token=self.config.sync_peer_token,
+            cluster_base_domain=gossip_base,
         )
         self.cleanup = CleanupWorker(
             self.store.cleanup_expired,
@@ -508,13 +557,79 @@ class DMPNode:
             except ValueError as e:
                 log.warning("anti-entropy: invalid operator_spk hex: %s", e)
                 operator_spk = None
+
+        # M3.3 gossip anchors. The worker needs both (operator_spk,
+        # base_domain) to install a gossiped manifest; without base_domain
+        # we can still derive it from the on-disk manifest.
+        base_domain = self.config.cluster_base_domain
+        if operator_spk is not None and not base_domain:
+            base_domain = self._derive_cluster_base_domain()
+
+        # Operator wiring check: if DMP_SYNC_PEERS was used (so there's
+        # no signed manifest on disk to derive trust from) AND the
+        # operator didn't pin a signing key, manifest gossip is off. Log
+        # a warning so the operator notices they're missing the M3.3
+        # benefit — anti-entropy data sync still works.
+        if self.config.sync_peers and operator_spk is None:
+            log.warning(
+                "anti-entropy: DMP_SYNC_PEERS set but DMP_SYNC_OPERATOR_SPK "
+                "is not; manifest gossip is DISABLED. Operators must "
+                "continue to push new cluster manifests to each node "
+                "by hand. Pin an operator public key to enable gossip."
+            )
+        elif operator_spk is not None and not base_domain:
+            log.warning(
+                "anti-entropy: DMP_SYNC_OPERATOR_SPK set but no cluster "
+                "base domain could be determined (set DMP_CLUSTER_BASE_DOMAIN "
+                "or mount a cluster manifest file); manifest gossip is "
+                "DISABLED."
+            )
+
         return AntiEntropyWorker(
             store=self.store,
             peers=peers,
             sync_token=self.config.sync_peer_token,
             interval_seconds=self.config.sync_interval,
             cluster_operator_spk=operator_spk,
+            base_domain=base_domain,
+            self_node_id=self.config.node_id,
+            self_http_endpoint=self.config.sync_self_endpoint,
         )
+
+    def _derive_cluster_base_domain(self) -> Optional[str]:
+        """Best-effort extraction of the cluster_name from the on-disk
+        cluster file, when ``DMP_CLUSTER_BASE_DOMAIN`` is unset. Reads
+        ONLY the structural header — signature verification already
+        happened in ``_publish_cluster_manifest_from_file``. Returns
+        None on missing file / malformed content (gossip then stays
+        off).
+        """
+        path = self.config.cluster_file
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                wire = fh.read().strip()
+        except OSError:
+            return None
+        from dmp.core.cluster import RECORD_PREFIX as _CLUSTER_PREFIX
+
+        if not wire.startswith(_CLUSTER_PREFIX):
+            return None
+        try:
+            import base64 as _b64
+
+            blob = _b64.b64decode(wire[len(_CLUSTER_PREFIX) :], validate=True)
+        except Exception:
+            return None
+        if len(blob) < 56 + 64:
+            return None
+        body = blob[:-64]
+        try:
+            name_len = body[55]
+            return body[56 : 56 + name_len].decode("utf-8").rstrip(".")
+        except Exception:
+            return None
 
     def stop(self) -> None:
         log.info("DMP node shutting down")
