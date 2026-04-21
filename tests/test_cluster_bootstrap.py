@@ -561,3 +561,220 @@ class TestClusterClient:
             assert cc._refresh_thread is None
         finally:
             cc.close()
+
+    # ------------------------------------------------------------- atomic refresh
+
+    def test_refresh_now_atomic_on_writer_factory_failure(self):
+        """If writer_factory raises for a node in the new manifest, the refresh
+        is aborted: both writer AND reader stay at the old seq. Prevents
+        a split-brain where reads advance but writes stay on the old node
+        set (freshly published records would disappear)."""
+        op = DMPCrypto()
+        manifest_v1 = _build_manifest(op, seq=1)
+        store = InMemoryDNSStore()
+
+        # v2 introduces a node whose http_endpoint triggers the
+        # writer_factory to raise. The reader_factory is fine.
+        bad_node = ClusterNode(
+            node_id="n99",
+            http_endpoint="https://BROKEN.example.com:8053",
+            dns_endpoint=None,
+        )
+        manifest_v2 = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=[_node(1), bad_node],
+            seq=2,
+            exp=int(time.time()) + 3600,
+        )
+        store.publish_txt_record(
+            cluster_rrset_name("mesh.example.com"),
+            manifest_v2.sign(op),
+        )
+
+        def failing_writer_factory(node: ClusterNode) -> DNSRecordWriter:
+            if "BROKEN" in node.http_endpoint:
+                raise ValueError(f"cannot parse http_endpoint {node.http_endpoint}")
+            return _FakeWriter()
+
+        cc = ClusterClient(
+            manifest_v1,
+            operator_spk=op.get_signing_public_key_bytes(),
+            base_domain="mesh.example.com",
+            bootstrap_reader=store,
+            writer_factory=failing_writer_factory,
+            reader_factory=_reader_factory,
+        )
+        try:
+            assert cc.refresh_now() is False
+            # Both sides still at v1 — atomic rollback worked.
+            assert cc.writer.manifest.seq == 1  # type: ignore[attr-defined]
+            assert cc.reader.manifest.seq == 1  # type: ignore[attr-defined]
+            assert len(cc.writer.manifest.nodes) == 2  # type: ignore[attr-defined]
+            assert len(cc.reader.manifest.nodes) == 2  # type: ignore[attr-defined]
+        finally:
+            cc.close()
+
+    def test_refresh_now_atomic_on_reader_factory_failure(self):
+        """Symmetric: reader_factory raises for a node in v2. Neither side
+        advances."""
+        op = DMPCrypto()
+        manifest_v1 = _build_manifest(op, seq=1)
+        store = InMemoryDNSStore()
+
+        # v2 introduces a node whose dns_endpoint the reader factory
+        # can't parse. The writer factory is fine.
+        bad_node = ClusterNode(
+            node_id="n99",
+            http_endpoint="https://n99.example.com:8053",
+            dns_endpoint="not-a-real-endpoint",
+        )
+        manifest_v2 = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=[_node(1), bad_node],
+            seq=2,
+            exp=int(time.time()) + 3600,
+        )
+        store.publish_txt_record(
+            cluster_rrset_name("mesh.example.com"),
+            manifest_v2.sign(op),
+        )
+
+        def failing_reader_factory(node: ClusterNode) -> DNSRecordReader:
+            if node.dns_endpoint == "not-a-real-endpoint":
+                raise ValueError(f"cannot parse dns_endpoint {node.dns_endpoint!r}")
+            return _FakeReader()
+
+        cc = ClusterClient(
+            manifest_v1,
+            operator_spk=op.get_signing_public_key_bytes(),
+            base_domain="mesh.example.com",
+            bootstrap_reader=store,
+            writer_factory=_writer_factory,
+            reader_factory=failing_reader_factory,
+        )
+        try:
+            assert cc.refresh_now() is False
+            # Both sides still at v1.
+            assert cc.writer.manifest.seq == 1  # type: ignore[attr-defined]
+            assert cc.reader.manifest.seq == 1  # type: ignore[attr-defined]
+        finally:
+            cc.close()
+
+    def test_refresh_now_both_succeed_still_works(self):
+        """Happy path: both factories succeed on every node of the new
+        manifest. Both sides advance to the new seq."""
+        op = DMPCrypto()
+        manifest_v1 = _build_manifest(op, seq=1)
+        store = InMemoryDNSStore()
+        manifest_v2 = _build_manifest(op, seq=2, n_nodes=4)
+        store.publish_txt_record(
+            cluster_rrset_name("mesh.example.com"),
+            manifest_v2.sign(op),
+        )
+
+        # Counters to verify the probe factories were called AND the
+        # install_manifest internal factories were also called (the
+        # probes don't replace them).
+        writer_calls = {"n": 0}
+        reader_calls = {"n": 0}
+
+        def counting_writer_factory(node: ClusterNode) -> DNSRecordWriter:
+            writer_calls["n"] += 1
+            return _FakeWriter()
+
+        def counting_reader_factory(node: ClusterNode) -> DNSRecordReader:
+            reader_calls["n"] += 1
+            return _FakeReader()
+
+        cc = ClusterClient(
+            manifest_v1,
+            operator_spk=op.get_signing_public_key_bytes(),
+            base_domain="mesh.example.com",
+            bootstrap_reader=store,
+            writer_factory=counting_writer_factory,
+            reader_factory=counting_reader_factory,
+        )
+        try:
+            assert cc.refresh_now() is True
+            assert cc.writer.manifest.seq == 2  # type: ignore[attr-defined]
+            assert cc.reader.manifest.seq == 2  # type: ignore[attr-defined]
+            assert len(cc.writer.manifest.nodes) == 4  # type: ignore[attr-defined]
+            assert len(cc.reader.manifest.nodes) == 4  # type: ignore[attr-defined]
+            # The probe pass invokes each factory once per node (4 nodes)
+            # on top of install_manifest's own per-node builds. The
+            # exact count of install_manifest's internal calls depends
+            # on node-state reuse (n01,n02 reuse v1 state), but the
+            # probe pass always adds at least n_nodes calls.
+            assert writer_calls["n"] >= 4
+            assert reader_calls["n"] >= 4
+        finally:
+            cc.close()
+
+    def test_refresh_now_dry_run_closes_probes(self):
+        """If the probe instances have a close() method, the dry-run
+        cleans them up so we don't leak sockets / executors for every
+        refresh tick."""
+        op = DMPCrypto()
+        manifest_v1 = _build_manifest(op, seq=1)
+        store = InMemoryDNSStore()
+        manifest_v2 = _build_manifest(op, seq=2, n_nodes=3)
+        store.publish_txt_record(
+            cluster_rrset_name("mesh.example.com"),
+            manifest_v2.sign(op),
+        )
+
+        closed_writers: List["_CloseableWriter"] = []
+        closed_readers: List["_CloseableReader"] = []
+
+        class _CloseableWriter(_FakeWriter):
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+                closed_writers.append(self)
+
+        class _CloseableReader(_FakeReader):
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+                closed_readers.append(self)
+
+        def writer_factory(node: ClusterNode) -> DNSRecordWriter:
+            return _CloseableWriter()
+
+        def reader_factory(node: ClusterNode) -> DNSRecordReader:
+            return _CloseableReader()
+
+        cc = ClusterClient(
+            manifest_v1,
+            operator_spk=op.get_signing_public_key_bytes(),
+            base_domain="mesh.example.com",
+            bootstrap_reader=store,
+            writer_factory=writer_factory,
+            reader_factory=reader_factory,
+        )
+        try:
+            # Snapshot pre-refresh close counts: the initial
+            # FanoutWriter + UnionReader construction builds its own
+            # instances via these factories, and some of those may
+            # (depending on implementation) live out the lifetime of
+            # the ClusterClient — so we care only about NEW closes
+            # caused by the dry-run probe pass in refresh_now.
+            pre_w_closed = sum(1 for w in closed_writers if w.closed)
+            pre_r_closed = sum(1 for r in closed_readers if r.closed)
+
+            assert cc.refresh_now() is True
+
+            # 3 nodes in the new manifest → 3 probe-writer closes and
+            # 3 probe-reader closes from the dry-run pass alone.
+            post_w_closed = sum(1 for w in closed_writers if w.closed)
+            post_r_closed = sum(1 for r in closed_readers if r.closed)
+            assert post_w_closed - pre_w_closed >= 3
+            assert post_r_closed - pre_r_closed >= 3
+        finally:
+            cc.close()
