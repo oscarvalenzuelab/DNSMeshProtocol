@@ -181,9 +181,6 @@ Actively shipping:
 
 Not yet shipped (tracked in [`ROADMAP.md`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md)):
 
-- **Node-to-node gossip** (M3.3). Nodes don't yet exchange peer lists
-  among themselves; the cluster peer set is operator-managed via the
-  signed manifest + per-node env files.
 - **External cryptographic audit** (M4.2–M4.4). The gate for tagging
   `v0.2.0-beta` and for treating DMP as anything other than alpha
   software.

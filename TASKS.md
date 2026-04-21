@@ -1,25 +1,29 @@
 # Current sprint
 
-**Sprint status:** **M1 + M2 + M3.1/M3.2-wire + M4.1 COMPLETE**
-(2026-04-21). Node-side federation (M2.4 anti-entropy + M2.5/M2.6
-compose cluster) closed the gap surfaced in the doc-honesty audit.
+**Sprint status:** **M1 + M2 + M3 + M4.1 COMPLETE** (2026-04-21).
+All code milestones from the original roadmap are shipped. Only the
+external cryptographic audit (M4.2–M4.4) remains as the gate to
+`v0.2.0-beta`, plus the post-beta items (M5 reach, M6 traffic
+analysis).
 
 - **M1** — resolver resilience (failover, discovery, per-host ports)
 - **M2** — full federation: cluster manifest + fan-out writer + union
   reader + wire integration + 3 audit follow-ups + node-side
   anti-entropy + 3-node compose cluster (operator-facing)
-- **M3.1 + M3.2-wire** — discovery (bootstrap record + CLI integration
-  with two-hop trust and priority-ordered fallback)
+- **M3** — discovery (bootstrap record + CLI integration with two-hop
+  trust + priority-ordered fallback) and **node-to-node cluster
+  manifest gossip** so operator rollouts propagate via peers
 - **M4.1** — formal protocol spec
 
-737 non-docker tests + 3 docker-compose cluster integration tests
+759 non-docker tests + 3 docker-compose cluster integration tests
 all passing on main. The project now delivers end-to-end zero-config
-onboarding AND real node-side federation (kill-and-rejoin tested
-against the compose cluster).
+onboarding, real node-side federation (kill-and-rejoin tested against
+the compose cluster), AND live manifest rollouts (operator pushes
+seq++ to one node, rest pick it up within 1-2 sync ticks).
 
-Remaining ROADMAP items: M3.3 (node-to-node gossip), M4.2-M4.4
-(external cryptographic audit), M5 (PyPI, mobile, web, key rotation),
-M6 (traffic-analysis resistance).
+Remaining ROADMAP items: M4.2-M4.4 (external cryptographic audit),
+M5 (PyPI, mobile, web, key rotation), M6 (traffic-analysis
+resistance).
 
 See `ROADMAP.md` for the long-horizon view. Any new sprint should be
 drafted against that plan.
@@ -64,3 +68,4 @@ _No tasks currently active. The original roadmap is complete._
 - **M4.1** — Formal protocol specification: six new pages under `docs/protocol/` — `spec.md` (top-level), `wire-encoding.md`, `routing.md`, `flows.md`, `threat-model.md`, `README.md` (landing). ~1500 lines total. Every magic byte, wire cap, and trust invariant cross-verified against the source. Three implementation ambiguities flagged inline for future cleanup — commits `4380469..c4f18fc`, merged as `f317cc7`.
 - **M2.4** — Node-side anti-entropy: pull-based digest/pull worker with compound `(ts, name, value_hash)` cursor, TTL-refresh detection, contiguous-prefix watermark advancement, signed-record re-verify on receive, millisecond `stored_ts` with migration-safe ALTER TABLE on existing DBs. New `/v1/sync/digest` + `/v1/sync/pull` HTTP endpoints protected by `DMP_SYNC_PEER_TOKEN`. 50 new tests + 6 Codex review rounds — merged as `06405ce`.
 - **M2.5 + M2.6** — 3-node compose cluster: `docker-compose.cluster.yml` with `build:` fallback, `docker/cluster/node-{a,b,c}.env` per-node env files, `generate-cluster-manifest.py` operator helper (seq auto-increment, dev-only key warning), `.gitignore` for operator secrets, `docs/deployment/cluster.md` guide. Integration test `tests/test_compose_cluster.py` exercises convergence + kill-and-rejoin backfill + peer auth against real docker containers. Dockerfile fix: added argon2-cffi + zfec + build-essential so the image actually builds. Node startup now publishes the mounted cluster manifest at `cluster.<base>` TXT for DNS bootstrap. Unique peer IDs by full URL so same-host different-port peers don't collapse watermarks. 4 Codex review rounds — merged as `8f9ce95`.
+- **M3.3** — Node-to-node cluster manifest gossip: `GET /v1/sync/cluster-manifest` endpoint protected by the shared peer token + operator-spk-filtered highest-seq selection, `AntiEntropyWorker.try_gossip_manifest_from_peer` gated on pinned operator_spk + expected_cluster_name, atomic live peer-set swap with cursor retention for synthetic→operator id rotations, TTL tracks signed exp on both file publish and gossip install, base_domain recoverable from the local store on restart (gossip-only nodes survive restarts), case-insensitive self-endpoint match. 22 new tests across 7 Codex review rounds — merged as `7ffad67`.
