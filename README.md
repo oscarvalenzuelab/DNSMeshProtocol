@@ -8,10 +8,13 @@ internet already runs on.**
 
 ---
 
-> **Status: alpha, pre-audit.** Two rounds of independent code review
-> shipped. Third-party cryptographic audit is the gate to tagging
-> `v0.2.0-beta`. Do not route anything whose secrecy matters through
-> DMP until that audit is done. See [SECURITY.md](SECURITY.md).
+> **Status: alpha, pre-external-audit.** Client-side federation,
+> bootstrap discovery, and the formal protocol spec are shipped; the
+> node-side federation backfill (anti-entropy + gossip) and the
+> third-party cryptographic audit remain as gates to `v0.2.0-beta`.
+> Do not route anything whose secrecy matters through DMP until the
+> audit is done. See [SECURITY.md](SECURITY.md) and
+> [ROADMAP.md](ROADMAP.md).
 
 ## The pitch
 
@@ -55,18 +58,36 @@ Full walk-through with two users:
 
 ## What you get
 
-- **End-to-end encryption with forward secrecy.** Past messages stay
-  safe if long-term keys leak later.
+- **End-to-end encryption with forward secrecy** for prekey-consumed
+  messages. Past messages stay safe if long-term keys leak later; see
+  [Forward secrecy and prekeys](https://oscarvalenzuelab.github.io/DNSMeshProtocol/guide/forward-secrecy).
 - **Signed sender authentication.** With pinned contacts, unknown
   signers are dropped. Without, receive runs in trust-on-first-use.
 - **Zone-anchored identity addresses.** `alice@alice.example.com` —
   squatting requires compromising DNS for the zone.
 - **Cross-chunk erasure coding.** Loss of up to `n-k` chunks still
   reconstructs the message.
-- **Persistent, sized-bounded node.** sqlite storage, TTL cleanup,
+- **Resolver resilience.** `ResolverPool` fans queries across multiple
+  upstream resolvers with oracle-based demotion on lying resolvers.
+  `dmp resolvers discover` auto-builds the pool from public resolvers.
+- **Client-side multi-node federation.** `FanoutWriter` publishes to
+  every cluster node (quorum = `ceil(N/2)`); `UnionReader` reads the
+  union with dedup. Manifest refresh is atomic across reader and
+  writer. *Node-side anti-entropy (the other half of federation) is
+  not yet shipped; see [ROADMAP.md](ROADMAP.md).*
+- **Zero-config onboarding via bootstrap discovery.** Given just
+  `alice@example.com`, `dmp bootstrap discover me@my-domain --auto-pin`
+  resolves the cluster, verifies the two-hop trust chain (bootstrap
+  signer → cluster operator), and cuts over atomically.
+- **Persistent, size-bounded node.** sqlite storage, TTL cleanup,
   token-bucket rate limits, bounded concurrency, Prometheus metrics.
 - **Docker-first deploy.** `docker compose` for dev, Caddy + Let's
   Encrypt overlay for production.
+- **Formal protocol spec.** Wire format, routing, flows, and threat
+  model at
+  [docs/protocol/](https://oscarvalenzuelab.github.io/DNSMeshProtocol/protocol/)
+  — every constant cross-verified against the source; designed so a
+  third party can build an interoperable client.
 
 ## Running a node
 
@@ -96,7 +117,8 @@ dmp/
 └── cli.py      `dmp` command-line interface
 
 docs/          Jekyll docs site (Just the Docs theme, GitHub Pages)
-tests/         230+ unit, integration, and docker-in-the-loop tests
+               Includes docs/protocol/ — the formal wire spec
+tests/         670+ unit, integration, and docker-in-the-loop tests
 Dockerfile, docker-compose.yml, docker-compose.prod.yml, Caddyfile
 ```
 
@@ -104,7 +126,7 @@ Dockerfile, docker-compose.yml, docker-compose.prod.yml, Caddyfile
 
 ```bash
 pip install -e ".[dev]"
-pytest                                         # ~230 tests
+pytest                                         # ~678 tests
 docker build -t dmp-node:latest .
 pytest tests/test_docker_integration.py        # 4 docker tests
 ```
