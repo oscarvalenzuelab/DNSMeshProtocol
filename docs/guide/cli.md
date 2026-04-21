@@ -36,12 +36,19 @@ identity even if you remember the passphrase.
   Persisted in canonical form: bare IP for portless entries,
   `ip:port` for IPv4, `[ip]:port` for IPv6.
 - `cluster_base_domain` + `cluster_operator_spk`: anchors for
-  cluster (federation) mode. When both are set, the client resolves
+  cluster (federation) mode. Setting them is the first of two steps —
+  they pin *what* the client trusts but do not flip cluster mode on.
+  See `cluster_enabled` below and [Cluster mode](#cluster-mode).
+- `cluster_enabled`: explicit activation switch for cluster mode.
+  When True **and** both anchors are pinned, the client resolves
   `cluster.<cluster_base_domain>` TXT, verifies the signed
   `ClusterManifest` under the operator pubkey, and builds a
-  `FanoutWriter` + `UnionReader` across the named nodes. Either field
-  empty falls back to legacy single-endpoint mode. See
-  [Cluster mode](#cluster-mode) below.
+  `FanoutWriter` + `UnionReader` across the named nodes. When False
+  (the default on a fresh pin, and on any older config missing the
+  field), the client uses the legacy single-endpoint path regardless
+  of pinned anchors. Flip this on via `dmp cluster enable` (runs a
+  live manifest fetch sanity check first) and off via
+  `dmp cluster disable`.
 - `cluster_refresh_interval`: seconds between background manifest
   refresh ticks. Default 3600 (once/hour). Set to 0 to disable the
   refresh thread (a manual `dmp cluster fetch` / restart is then
@@ -196,14 +203,33 @@ nodes can go down without the client caring.
 
 | Subcommand | Purpose |
 |---|---|
-| `dmp cluster pin <operator_spk_hex> <base_domain>` | Store trust anchors in config |
+| `dmp cluster pin <operator_spk_hex> <base_domain>` | Store trust anchors in config (does NOT activate cluster mode) |
 | `dmp cluster fetch [--save]` | One-shot fetch + verify of the cluster manifest; print summary |
-| `dmp cluster status` | Build the cluster client; print per-node fan-out/union health |
+| `dmp cluster enable` | Activate cluster mode after a successful manifest fetch (flips `cluster_enabled=True`) |
+| `dmp cluster disable` | Deactivate cluster mode without clearing the pinned anchors (flips `cluster_enabled=False`) |
+| `dmp cluster status` | Build the cluster client; print per-node fan-out/union health + activation flag |
 
-`pin` is the first step: it writes `cluster_operator_spk` and
-`cluster_base_domain` to config. The operator SPK must be 64 hex
-chars (32 bytes). `base_domain` is the DNS zone where the manifest
-lives; the actual TXT RRset is `cluster.<base_domain>`.
+Activation is a two-step process so that pinning an operator whose
+manifest isn't yet published doesn't wedge every subsequent
+networked command. The flow is:
+
+1. `dmp cluster pin` — write the anchors. Leaves `cluster_enabled`
+   at its default (False).
+2. `dmp cluster fetch` — confirm the manifest is published, signed
+   by the pinned key, and not expired. Pure diagnostic; no state
+   change.
+3. `dmp cluster enable` — re-runs the fetch as a sanity check and,
+   on success, flips `cluster_enabled=True`. On failure, exits 2
+   and leaves the flag unchanged, so a failed enable never locks
+   the CLI out of its legacy endpoint.
+
+`pin` writes `cluster_operator_spk` and `cluster_base_domain` to
+config. The operator SPK must be 64 hex chars (32 bytes).
+`base_domain` is the DNS zone where the manifest lives; the actual
+TXT RRset is `cluster.<base_domain>`. `pin` also resets
+`cluster_enabled` to False even on an already-enabled config, so
+repinning against a new operator forces a fresh `cluster enable`
+sanity check before the cutover.
 
 `fetch` resolves that RRset via the same reader the CLI uses for
 other reads (`ResolverPool` when `dns_resolvers` is set, otherwise
@@ -211,20 +237,34 @@ other reads (`ResolverPool` when `dns_resolvers` is set, otherwise
 confirm the signature binds to the pinned operator key AND the
 signed cluster name matches the pinned base domain. `--save`
 caches the signed manifest wire to `cluster_manifest.wire` in the
-config dir (future offline-bootstrap use).
+config dir (future offline-bootstrap use). `fetch` works regardless
+of `cluster_enabled` — it only needs the anchors pinned, since its
+whole purpose is pre-enable verification.
+
+`enable` is idempotent: running it on an already-enabled config
+re-runs the fetch, prints the manifest summary, and reports
+"cluster mode already enabled" without changing state. Use this as
+a quick post-rollover health check.
+
+`disable` is also idempotent and leaves the pinned anchors alone.
+Running it is the fastest way back to the legacy single-endpoint
+path if cluster mode misbehaves; re-enabling later is a single
+`dmp cluster enable` call.
 
 `status` builds a short-lived `ClusterClient` (no background
-refresh thread) and prints both the `FanoutWriter.snapshot()` and
+refresh thread) and prints the activation flag (`cluster_enabled:
+True|False`) plus both the `FanoutWriter.snapshot()` and
 `UnionReader.snapshot()` rows — one line per node with consecutive
-failure count, last error, and endpoint.
+failure count, last error, and endpoint. Works regardless of
+`cluster_enabled`, so operators can inspect the cluster before
+cutting over.
 
 Mode switch: `_make_client` (called by `dmp send`, `dmp recv`,
-`dmp identity publish`, etc.) reads `cluster_base_domain` and
-`cluster_operator_spk` at every invocation. When both are set, it
-fetches + verifies the manifest on the spot and wires a cluster
-client into the DMPClient. When either is empty it falls back to
-the legacy single-endpoint path — no behavioral change for existing
-configs.
+`dmp identity publish`, etc.) reads `cluster_base_domain`,
+`cluster_operator_spk`, AND `cluster_enabled` at every invocation.
+When all three are set it fetches + verifies the manifest on the
+spot and wires a cluster client into the DMPClient. When any is
+missing it falls back to the legacy single-endpoint path.
 
 Refresh semantics: when `cluster_refresh_interval > 0` (default
 3600 seconds), a daemon thread re-fetches the manifest and installs
@@ -238,7 +278,9 @@ Example:
 ```
 $ dmp cluster pin 3c6a... mesh.example.com
 pinned cluster operator key and base domain mesh.example.com
-next: `dmp cluster fetch` to confirm the manifest is published and verifiable
+next:
+  1. `dmp cluster fetch` to verify the manifest resolves
+  2. `dmp cluster enable` to cut over from the legacy endpoint
 
 $ dmp cluster fetch
 cluster: mesh.example.com
@@ -249,8 +291,16 @@ cluster: mesh.example.com
     n02  http=https://n2.mesh.example.com:8053  dns=203.0.113.11:53
     n03  http=https://n3.mesh.example.com:8053  dns=(via bootstrap reader)
 
+$ dmp cluster enable
+cluster: mesh.example.com
+  seq:   7
+  exp:   1816000000
+  nodes: 3
+cluster mode enabled.
+
 $ dmp cluster status
 cluster: mesh.example.com (seq=7, exp=1816000000)
+cluster_enabled: True
 fan-out writer snapshot:
   n01  http=https://n1.mesh.example.com:8053  fails=0  err=None
   n02  http=https://n2.mesh.example.com:8053  fails=0  err=None
@@ -259,7 +309,30 @@ union reader snapshot:
   n01  http=https://n1.mesh.example.com:8053  fails=0  err=None
   n02  http=https://n2.mesh.example.com:8053  fails=0  err=None
   n03  http=https://n3.mesh.example.com:8053  fails=0  err=None
+
+$ dmp cluster disable
+cluster mode disabled — next commands will use the legacy endpoint path.
 ```
+
+#### Migration note: pre-polish configs
+
+An earlier version of this CLI flipped cluster mode on the moment
+both anchors were pinned — there was no `cluster_enabled` field.
+Upgrading a config from that era does **not** silently activate
+cluster mode. The CLI loads such configs with `cluster_enabled=False`,
+which means:
+
+- `dmp send` / `dmp recv` / `dmp identity publish` keep using the
+  legacy single-endpoint path (`config.endpoint`) even with both
+  cluster anchors present.
+- The operator must run `dmp cluster enable` once to cut over. That
+  call re-verifies the manifest against the pinned anchors; on
+  success it flips `cluster_enabled=True` and persists, so the
+  next networked command uses the cluster path.
+
+This deliberate one-time migration step avoids the "upgrade
+bricks every command if the manifest isn't reachable right now"
+failure mode the field was introduced to fix.
 
 #### Cluster mode
 
