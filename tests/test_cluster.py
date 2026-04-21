@@ -586,6 +586,74 @@ class TestClusterManifestSize:
         with pytest.raises(ValueError, match="cluster_name"):
             mf.sign(operator)
 
+    def test_oversized_wire_rejected_on_parse(self, monkeypatch):
+        """parse_and_verify enforces MAX_WIRE_LEN symmetrically with sign().
+
+        We can't naively produce an oversized wire: sign() refuses to
+        emit one, and appending raw bytes to a signed wire breaks both
+        base64 and the signature before the size check would be hit.
+
+        Cleanest reproducible construction: temporarily raise the
+        module-level MAX_WIRE_LEN so sign() accepts a bloated manifest
+        (MAX_NODE_COUNT nodes with max-length endpoints), then restore
+        the real cap and confirm parse_and_verify rejects the resulting
+        wire purely on length. This exercises the parse-side check in
+        isolation: signature, base64, and body structure are all valid;
+        only the wire size exceeds the cap.
+        """
+        import dmp.core.cluster as cluster_mod
+
+        operator = _make_operator()
+        # Build a wire that genuinely exceeds MAX_WIRE_LEN by filling
+        # MAX_NODE_COUNT nodes with max-length endpoints. That exceeds
+        # 1200 bytes comfortably while staying within the per-field
+        # caps (so signing is otherwise legal).
+        fat_http = "https://" + ("x" * (MAX_HTTP_ENDPOINT_LEN - len("https://")))
+        fat_dns = "y" * MAX_DNS_ENDPOINT_LEN
+        nodes = [
+            ClusterNode(
+                node_id=f"n{i:02d}",
+                http_endpoint=fat_http,
+                dns_endpoint=fat_dns,
+            )
+            for i in range(MAX_NODE_COUNT)
+        ]
+        mf = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=operator.get_signing_public_key_bytes(),
+            nodes=nodes,
+            seq=1,
+            exp=int(time.time()) + 3600,
+        )
+        # Step 1: relax MAX_WIRE_LEN during sign() so the bloated
+        # manifest can be serialized. MAX_NODE_COUNT stays put — we
+        # only need to unblock the wire-size check.
+        monkeypatch.setattr(cluster_mod, "MAX_WIRE_LEN", 100_000)
+        wire = mf.sign(operator)
+        assert (
+            len(wire.encode("utf-8")) > 1200
+        ), "test setup error: wire should exceed the real cap"
+
+        # Step 2: restore the real cap and confirm parse rejects.
+        monkeypatch.setattr(cluster_mod, "MAX_WIRE_LEN", 1200)
+        assert (
+            ClusterManifest.parse_and_verify(
+                wire, operator.get_signing_public_key_bytes()
+            )
+            is None
+        )
+
+        # Sanity: the same wire parses fine under the relaxed cap, so
+        # the ONLY failure above was the length check (not a latent
+        # bug in signing/parsing a 32-node manifest).
+        monkeypatch.setattr(cluster_mod, "MAX_WIRE_LEN", 100_000)
+        assert (
+            ClusterManifest.parse_and_verify(
+                wire, operator.get_signing_public_key_bytes()
+            )
+            is not None
+        )
+
 
 # ---- rrset naming ---------------------------------------------------------
 
