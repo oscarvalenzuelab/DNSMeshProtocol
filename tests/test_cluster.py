@@ -725,7 +725,8 @@ class TestClusterManifestNameValidation:
             wire, operator.get_signing_public_key_bytes()
         )
         assert parsed is not None
-        assert parsed.cluster_name == name
+        # _validate strips a trailing dot; parsed name is the normalized form.
+        assert parsed.cluster_name == name.rstrip(".")
 
     def test_trailing_dot_roundtrips_and_rrset_strips_it(self):
         # Canonical FQDN form is accepted on sign/parse; cluster_rrset_name
@@ -744,12 +745,10 @@ class TestClusterManifestNameValidation:
         # The 64-byte UTF-8 cap is about label content, not the canonical
         # trailing dot. A 63-byte name with a trailing dot is 64 bytes of
         # utf-8 but normalizes to 63 bytes of labels — which is inside
-        # MAX_CLUSTER_NAME_LEN. Without this normalization, the
-        # sign/parse path would reject canonical FQDNs at the boundary.
+        # MAX_CLUSTER_NAME_LEN. _validate() strips the trailing dot
+        # in-place so sign and parse see the same normalized form.
         operator = _make_operator()
         # Construct a 63-byte name (exactly at the cap) + trailing dot.
-        # Labels must each be <= 63 chars, letters/digits/hyphens; use
-        # shorter labels that total 63 bytes.
         name = "a" * 55 + ".bcd.ef"  # 55 + 1 + 3 + 1 + 2 = 62 bytes
         name = name + "g"  # pad to 63 bytes
         assert len(name) == 63
@@ -761,7 +760,9 @@ class TestClusterManifestNameValidation:
             wire, operator.get_signing_public_key_bytes()
         )
         assert parsed is not None
-        assert parsed.cluster_name == fqdn
+        # Normalized: trailing dot stripped on sign, so the parsed
+        # result carries the canonical no-dot form.
+        assert parsed.cluster_name == name
 
     @pytest.mark.parametrize(
         "bad_name,reason_substr",
