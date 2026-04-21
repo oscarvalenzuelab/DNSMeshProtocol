@@ -163,8 +163,25 @@ config typo) producing a false-accept.
 
 ## Related records
 
+- [Spec overview]({{ site.baseurl }}/protocol/spec) — cross-cutting
+  invariants every signed record (including this one) respects:
+  `v=dmp1;t=<type>;` prefix, trailing 64-byte Ed25519 signature,
+  embedded-signer cross-check, 1200-byte wire cap, multi-string TXT,
+  DNS-name validation.
+- [Wire encoding conventions]({{ site.baseurl }}/protocol/wire-encoding)
+  — byte-level details on the `v=dmp1;t=cluster;` prefix, `DMPCL01`
+  magic, base64 + signature placement.
+- [DNS name routing]({{ site.baseurl }}/protocol/routing#cluster-manifest)
+  — why the owner name is `cluster.<cluster_base_domain>`.
+- [End-to-end flows]({{ site.baseurl }}/protocol/flows#cluster-discovery)
+  — how a client fetches + verifies + installs this record.
+- [Threat model]({{ site.baseurl }}/protocol/threat-model) — what a
+  cluster-operator compromise does (and does not) enable.
 - [Slot manifests]({{ site.baseurl }}/protocol/wire-format#slot-manifests)
   — per-message records that sit *inside* a cluster.
 - [Identity records]({{ site.baseurl }}/protocol/wire-format#identity-records)
   — per-user records. Orthogonal to cluster manifests; a user's
   identity is not tied to a particular cluster.
+- [Bootstrap records]({{ site.baseurl }}/protocol/bootstrap) — the
+  upstream pointer that (optionally) directs a client at this
+  cluster manifest.
