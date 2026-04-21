@@ -400,6 +400,31 @@ class TestClusterManifestSecurity:
         wire = RECORD_PREFIX + base64.b64encode(body + sig).decode("ascii")
         assert ClusterManifest.parse_and_verify(wire, opk) is None
 
+    def test_invalid_cluster_name_rejected_on_parse(self):
+        """A correctly-signed manifest whose cluster_name is not a valid
+        DNS name must be rejected on parse. Mirrors sign()'s validation
+        — without this, a buggy/malicious publisher could distribute
+        records we could never republish ourselves.
+        """
+        operator = _make_operator()
+        opk = operator.get_signing_public_key_bytes()
+        # `mesh..example.com` has an empty middle label — valid UTF-8,
+        # under the byte cap, passes signature, but invalid as a DNS
+        # name.
+        bad_name = b"mesh..example.com"
+        body = (
+            b"DMPCL01"
+            + (1).to_bytes(8, "big")
+            + (int(time.time()) + 3600).to_bytes(8, "big")
+            + opk
+            + len(bad_name).to_bytes(1, "big")
+            + bad_name
+            + (0).to_bytes(1, "big")
+        )
+        sig = operator.sign_data(body)
+        wire = RECORD_PREFIX + base64.b64encode(body + sig).decode("ascii")
+        assert ClusterManifest.parse_and_verify(wire, opk) is None
+
 
 # ---- expiry ---------------------------------------------------------------
 
