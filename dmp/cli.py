@@ -1714,6 +1714,18 @@ def _pick_usable_bootstrap_entry(
     discover / auto-pin / identity fetch --via-bootstrap so all three
     code paths agree on the fallback semantics and don't diverge on
     "manifest verifies but is unusable" cases.
+
+    Note: a manifest where every node has ``dns_endpoint=None`` IS
+    considered usable. ``_make_cluster_reader_factory`` falls back to
+    the shared bootstrap reader for such nodes, which means
+    ``--via-bootstrap`` reads for ``dmp.<host>`` land on whatever
+    resolver the bootstrap layer is configured with (typically the
+    public DNS system). That is a legitimate deployment shape — the
+    cluster may publish via ``nsupdate`` to a public zone and have no
+    per-node DNS ingress — but it does mean cluster-routed reads in
+    that case are only as fresh as public DNS propagation. Operators
+    who want guaranteed cluster-local reads should publish manifests
+    where at least one node has a ``dns_endpoint``.
     """
     for entry in record.entries:
         m = fetch_cluster_manifest(
