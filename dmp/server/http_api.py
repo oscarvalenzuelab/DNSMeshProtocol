@@ -352,7 +352,16 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
                 "peer should upgrade to cursor=<opaque>",
                 self.address_string(),
             )
-            cursor_tuple = (since, "", "")
+            # Legacy `since` carries strict-greater-than semantics —
+            # rows AT `since` must be excluded. With the compound
+            # cursor (ts, name, value_hash), a tuple of (since, "", "")
+            # would instead match anything at stored_ts == since AND
+            # name > "" — i.e. any real row, effectively >= since.
+            # Use sentinel values that sort greater than any real
+            # DNS name (0xFF byte) and any real value_hash (hex chars
+            # max out at 'f', so 'g' is a clean upper bound). This
+            # forces the OR-branches to never match same-ts rows.
+            cursor_tuple = (since, "\xff", "g")
         else:
             cursor_tuple = (0, "", "")
 
