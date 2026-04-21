@@ -158,6 +158,11 @@ class FanoutWriter(DNSRecordWriter):
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be > 0")
+        # Match install_manifest's expiry check: an already-expired
+        # manifest handed to the constructor would otherwise silently
+        # publish to stale nodes until the next refresh.
+        if manifest.is_expired():
+            raise ValueError("cluster manifest is expired")
         self._factory = writer_factory
         self._timeout = float(timeout)
         self._lock = threading.Lock()
@@ -186,6 +191,12 @@ class FanoutWriter(DNSRecordWriter):
         # nodes still has somewhere to schedule work without needing a
         # pool recreate. 16 is the same cap used across the stdlib's
         # default pool heuristic and is plenty for typical clusters.
+        # Remember whether the caller pinned a worker cap. On manifest
+        # growth we honor that cap rather than reverting to the default
+        # heuristic — a deployment that capped concurrency for rate
+        # limits or fd budget must not have that cap quietly erased by
+        # a refresh.
+        self._user_max_workers: Optional[int] = max_workers
         if max_workers is None:
             max_workers = max(1, min(len(manifest.nodes), 16))
         if max_workers < 1:
@@ -208,9 +219,15 @@ class FanoutWriter(DNSRecordWriter):
     def close(self) -> None:
         """Shut down the executor and drain retained resources. Idempotent.
 
-        Closes every writer held in the retention list (removed or
-        superseded by a refresh) and every retired executor from a
-        resize. Current/live per-node writers are **not** closed — the
+        Waits for every in-flight fan-out future (current + retired
+        executors) to complete before closing retained writers. This
+        preserves the mid-flight-safety invariant: a background fan-out
+        that survived a manifest refresh must finish its call on the
+        retired writer before that writer's ``close()`` runs. Without
+        the wait, ``close()`` would reintroduce the exact race the
+        retention list was designed to prevent.
+
+        Current/live per-node writers are **not** closed here — the
         FanoutWriter does not own their lifecycle; the caller (client)
         that supplied ``writer_factory`` decides when those shut down.
         """
@@ -223,18 +240,17 @@ class FanoutWriter(DNSRecordWriter):
             self._retired_writers = []
             retired_executors = self._retired_executors
             self._retired_executors = []
-        # shutdown(wait=False) lets in-flight futures drain in the
-        # background threads. We do not cancel because the per-node
-        # writes have already been dispatched and their side effects
-        # (HTTP requests, etc.) are out of our hands.
-        executor.shutdown(wait=False)
+        # shutdown(wait=True) waits for in-flight futures to finish, so
+        # any background fan-out still operating on a retired writer
+        # completes before we close that writer below.
+        executor.shutdown(wait=True)
         for old in retired_executors:
             try:
-                old.shutdown(wait=False)
+                old.shutdown(wait=True)
             except Exception:
                 pass
-        # Drain retained writers. A buggy close() on one must not
-        # block the others.
+        # All futures have drained; it is now safe to close retained
+        # writers. A buggy close() on one must not block the others.
         for writer in retired_writers:
             closer = getattr(writer, "close", None)
             if callable(closer):
@@ -374,7 +390,14 @@ class FanoutWriter(DNSRecordWriter):
             # client's lifetime. Retention is simpler and bounded in
             # the same way as retired writers above.
             new_n = len(new_states)
-            target_workers = max(1, min(new_n, 16))
+            # Honor the caller's max_workers cap if they pinned one.
+            # Otherwise fall back to the default heuristic. Growing
+            # beyond a user-supplied cap would silently defeat a rate
+            # limit / fd budget set at construction time.
+            if self._user_max_workers is not None:
+                target_workers = max(1, min(new_n or 1, self._user_max_workers))
+            else:
+                target_workers = max(1, min(new_n, 16))
             if target_workers > self._executor._max_workers:  # type: ignore[attr-defined]
                 # Spin up the new executor BEFORE moving the old one
                 # aside, so no window exists where self._executor is

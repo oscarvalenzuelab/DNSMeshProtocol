@@ -860,3 +860,115 @@ class TestRemovedWriterRetention:
         fw.close()
         fw.close()  # Must not raise, must not double-close.
         assert writers["n00"].close_calls == 1
+
+
+class TestConstructorExpiryCheck:
+    def test_expired_manifest_rejected_on_init(self) -> None:
+        """An already-expired manifest must be rejected on construction,
+        mirroring install_manifest's invariant. Otherwise a direct call
+        or reload path silently publishes to stale nodes until the next
+        refresh."""
+        op = DMPCrypto()
+        mf = ClusterManifest(
+            cluster_name="mesh.example.com",
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=[_node(0)],
+            seq=1,
+            exp=int(time.time()) - 60,
+        )
+        with pytest.raises(ValueError, match="expired"):
+            FanoutWriter(mf, _make_keyed_factory({"n00": FakeWriter()}))
+
+
+class TestUserMaxWorkersRespectedOnResize:
+    def test_user_cap_preserved_across_manifest_growth(self) -> None:
+        """max_workers=2 caller must still get 2 threads even when a
+        manifest refresh grows from 1 node to 10."""
+        op = DMPCrypto()
+        writers: dict = {f"n{i:02d}": FakeWriter() for i in range(10)}
+        m1 = _manifest(1, seq=1, operator=op)
+        fw = FanoutWriter(m1, _make_keyed_factory(writers), max_workers=2)
+        try:
+            m2 = ClusterManifest(
+                cluster_name=m1.cluster_name,
+                operator_spk=m1.operator_spk,
+                nodes=[_node(i) for i in range(10)],
+                seq=2,
+                exp=m1.exp,
+            )
+            assert fw.install_manifest(m2) is True
+            # The active executor must still honor the caller's cap.
+            # (private-attribute access is acceptable in tests.)
+            assert fw._executor._max_workers == 2  # type: ignore[attr-defined]
+        finally:
+            fw.close()
+
+    def test_default_heuristic_when_user_did_not_pin(self) -> None:
+        """When max_workers is None, the default heuristic min(N, 16)
+        applies on resize — confirms the user-cap guard doesn't regress
+        the default growth path."""
+        op = DMPCrypto()
+        writers: dict = {f"n{i:02d}": FakeWriter() for i in range(8)}
+        m1 = _manifest(1, seq=1, operator=op)
+        fw = FanoutWriter(m1, _make_keyed_factory(writers))
+        try:
+            m2 = ClusterManifest(
+                cluster_name=m1.cluster_name,
+                operator_spk=m1.operator_spk,
+                nodes=[_node(i) for i in range(8)],
+                seq=2,
+                exp=m1.exp,
+            )
+            assert fw.install_manifest(m2) is True
+            assert fw._executor._max_workers == 8  # type: ignore[attr-defined]
+        finally:
+            fw.close()
+
+
+class TestCloseDrainsBeforeClosingWriters:
+    def test_close_waits_for_inflight_before_closing_retired_writers(self) -> None:
+        """close() must wait for in-flight fan-out futures to finish
+        before closing retained (retired) writers. Otherwise the mid-
+        flight race the retention list was supposed to fix reappears
+        at teardown time.
+        """
+        op = DMPCrypto()
+        # The slow writer will be retired by install_manifest. We
+        # record the exact ordering of its publish-completion and its
+        # close() call — publish must complete first.
+        order: list = []
+
+        class OrderingWriter(FakeWriter):
+            def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
+                if self.latency_ms:
+                    time.sleep(self.latency_ms / 1000.0)
+                order.append("publish-done")
+                return super().publish_txt_record(name, value, ttl)
+
+            def close(self) -> None:
+                order.append("close")
+                super().close()
+
+        slow = OrderingWriter(latency_ms=200)
+        fast = FakeWriter()
+        writers = {"n00": slow, "n01": fast}
+        m1 = _manifest(2, seq=1, operator=op)
+        fw = FanoutWriter(m1, _make_keyed_factory(writers), timeout=2.0)
+        # Kick off a publish; quorum=1 so it returns as soon as the
+        # fast writer succeeds, leaving slow's future in flight.
+        assert fw.publish_txt_record("x.mesh.test", "v=dmp1", ttl=60) is True
+        # Retire the slow node by dropping it from the manifest.
+        m2 = ClusterManifest(
+            cluster_name=m1.cluster_name,
+            operator_spk=m1.operator_spk,
+            nodes=[m1.nodes[1]],
+            seq=2,
+            exp=m1.exp,
+        )
+        assert fw.install_manifest(m2) is True
+        # close() must drain slow's in-flight publish before calling
+        # its close(). Ordering assertion proves the race is fixed.
+        fw.close()
+        assert "publish-done" in order
+        assert "close" in order
+        assert order.index("publish-done") < order.index("close")
