@@ -1192,9 +1192,16 @@ class TestNodeDnsReaderTruncation:
         assert captured["tcp_calls"] == 0
         assert result == ["small-rrset"]
 
-    def test_tcp_retry_failure_returns_none(self, monkeypatch):
-        """UDP truncated + TCP blows up → None (per-node failure, not a crash)."""
+    def test_tcp_retry_failure_raises(self, monkeypatch):
+        """UDP truncated + TCP blows up → raises.
+
+        UnionReader distinguishes "healthy missing" (None return) from
+        "transport failure" (raised exception) — a TCP connect refused
+        is the latter, so the per-node failure counter must fire
+        instead of silently succeeding with an empty answer.
+        """
         import dns.query
+        import pytest
 
         from dmp.cli import _NodeDnsReader
 
@@ -1209,7 +1216,8 @@ class TestNodeDnsReaderTruncation:
         monkeypatch.setattr(dns.query, "udp", fake_udp)
         monkeypatch.setattr(dns.query, "tcp", fake_tcp)
 
-        assert reader.query_txt_record("example.com.") is None
+        with pytest.raises(OSError, match="tcp connect refused"):
+            reader.query_txt_record("example.com.")
 
 
 class TestLocalOnlyClusterBootstrap:

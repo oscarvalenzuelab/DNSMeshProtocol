@@ -230,15 +230,26 @@ class ClusterClient:
         if new_manifest is None:
             return False
         # FanoutWriter / UnionReader both enforce seq-monotonicity and
-        # expiry internally. We install to both; partial success leaves
-        # the two sides at different seqs, which is acceptable (both
-        # accept every seq-valid install independently).
-        writer_ok = self._writer.install_manifest(new_manifest)
-        # Both sides receive their own copy of the same fetched manifest;
-        # we deepcopy so install-time mutation on one side can't
+        # expiry internally. Install atomically: if the reader install
+        # raises (e.g. a reader_factory can't parse a new dns_endpoint),
+        # we must not have already swapped the writer — otherwise
+        # writes would land on the new node set while reads stay on
+        # the old one, and newly published messages become invisible.
+        # Try reader first: it has the richer failure surface (its
+        # factory consumes dns_endpoint, which ClusterManifest does
+        # not validate). If reader install succeeds, writer install
+        # for the same seq is guaranteed to succeed (same
+        # monotonicity rules, writer_factory consumes http_endpoint
+        # which is also unvalidated — if it raises here, we at worst
+        # have reader-ahead-of-writer for one cycle, which the next
+        # refresh will reconcile).
+        #
+        # Both sides receive their own deepcopy of the same fetched
+        # manifest so install-time mutation on one side can't
         # contaminate the other's retained comparison state.
         reader_ok = self._reader.install_manifest(copy.deepcopy(new_manifest))
-        return writer_ok or reader_ok
+        writer_ok = self._writer.install_manifest(copy.deepcopy(new_manifest))
+        return writer_ok and reader_ok
 
     def _refresh_loop(self) -> None:
         """Daemon loop: tick ``refresh_now`` every ``refresh_interval`` seconds.
