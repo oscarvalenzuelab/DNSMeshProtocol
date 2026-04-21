@@ -313,6 +313,22 @@ def _parse_resolver_list(raw: str) -> List[Tuple[str, Optional[int]]]:
     return [_parse_resolver_entry(e) for e in entries]
 
 
+def _effective_domain(config: CLIConfig) -> str:
+    """Return the mailbox/identity/prekey zone for this config.
+
+    When cluster mode is pinned, every DMP-addressable RRset (mailbox
+    slots, identity records, prekeys) lives under the cluster base
+    domain — the same zone the operator signs the cluster manifest
+    for. Without this, a fresh config that keeps the default
+    ``mesh.local`` would publish identities and prekeys into one
+    zone while fanning mailbox writes into another, silently breaking
+    every cross-command flow.
+    """
+    if config.cluster_base_domain and config.cluster_operator_spk:
+        return config.cluster_base_domain
+    return config.domain
+
+
 def _make_reader(config: CLIConfig) -> DNSRecordReader:
     """Build the reader backend from config.
 
@@ -626,11 +642,7 @@ def _make_client(
     # Using config.domain here would silently target the legacy mesh
     # zone — fetching the cluster manifest from foo.com but then writing
     # mailbox records under mesh.local would break send/recv entirely.
-    effective_domain = (
-        config.cluster_base_domain
-        if (cluster_client is not None and config.cluster_base_domain)
-        else config.domain
-    )
+    effective_domain = _effective_domain(config)
     client = DMPClient(
         config.username,
         passphrase,
@@ -784,7 +796,7 @@ def cmd_identity_publish(args: argparse.Namespace) -> int:
             name = zone_anchored_identity_name(cfg.identity_domain)
             resolve_hint = f"dmp identity fetch {cfg.username}@{cfg.identity_domain}"
         else:
-            name = identity_domain(cfg.username, cfg.domain)
+            name = identity_domain(cfg.username, _effective_domain(cfg))
             resolve_hint = f"dmp identity fetch {cfg.username}"
 
         ok = client.writer.publish_txt_record(name, wire, ttl=args.ttl)
@@ -813,7 +825,7 @@ def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
     client = _make_client(cfg, passphrase)
     try:
         published = client.refresh_prekeys(count=args.count, ttl_seconds=args.ttl)
-        name = prekey_rrset_name(cfg.username, cfg.domain)
+        name = prekey_rrset_name(cfg.username, _effective_domain(cfg))
         print(f"published {published}/{args.count} prekeys to {name}")
         print(f"  local live prekey count: {client.prekey_store.count_live()}")
         if published < args.count:
@@ -856,7 +868,7 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         name = zone_anchored_identity_name(host)
     else:
         resolved_username = args.username
-        name = identity_domain(args.username, args.domain or cfg.domain)
+        name = identity_domain(args.username, args.domain or _effective_domain(cfg))
 
     records = reader.query_txt_record(name)
     if not records:
