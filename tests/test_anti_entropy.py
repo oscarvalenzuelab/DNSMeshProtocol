@@ -888,3 +888,81 @@ class TestWorkerTick:
             values
         ), f"expected all 5 values synced; got {local_vals}"
         assert worker.stats.records_written == 5
+
+    def test_peer_returns_wrong_value_rejected(self):
+        """Regression for Codex P1 (hash-verify pulled value vs digest).
+
+        A buggy/malicious peer that advertises hash H1 for a name and
+        returns a value hashing to H2 on /pull must be rejected.
+        Accepting would both write the wrong value AND advance the
+        watermark past H1 (the write's stored_ts would leap forward),
+        so H1 would never be retried.
+        """
+        local = InMemoryDNSStore()
+        # real_ts inside the clock-skew window so _valid_digest_entry
+        # accepts the entry as structurally sound.
+        real_ts_ms = int(time.time() * 1000)
+        # Peer *advertises* hash H1 (sha256("real-value")) — what the
+        # digest wire says the name carries.
+        h1 = hashlib.sha256(b"real-value").hexdigest()
+
+        def get_handler(url, token, timeout):
+            body = json.dumps(
+                {
+                    "records": [
+                        {
+                            "name": "target.mesh.test",
+                            "hash": h1,
+                            "ts": real_ts_ms,
+                            "ttl": 300,
+                        }
+                    ],
+                    "has_more": False,
+                    "next_cursor": f"{real_ts_ms}:target.mesh.test:{h1}",
+                }
+            ).encode("utf-8")
+            return (200, body)
+
+        # Peer *returns* a different value (whose hash is H2) on /pull.
+        def post_handler(url, token, body, timeout):
+            doc = json.loads(body.decode("utf-8"))
+            out = []
+            for name in doc["names"]:
+                if name == "target.mesh.test":
+                    out.append(
+                        {
+                            "name": name,
+                            "value": "WRONG-VALUE-hash-mismatch",
+                            "ttl": 300,
+                        }
+                    )
+            return (200, json.dumps({"records": out}).encode("utf-8"))
+
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = AntiEntropyWorker(
+            store=local,
+            peers=[peer],
+            sync_token="tok",
+            interval_seconds=1.0,
+            http_get=get_handler,
+            http_post=post_handler,
+        )
+
+        worker.tick_once()
+
+        # Local write did NOT happen. The wrong value was rejected.
+        assert local.query_txt_record("target.mesh.test") is None
+        assert worker.stats.records_written == 0
+        assert worker.stats.records_rejected >= 1
+
+        # Watermark did NOT advance past the unhandled pair. Pre-fix
+        # it would have sat at (real_ts_ms, "target.mesh.test", h1);
+        # post-fix it must stay at the initial sentinel because the
+        # only digest entry went unhandled.
+        wm = worker.watermark("n2")
+        # Strict: the watermark cannot have advanced to anything at or
+        # past (real_ts_ms, "target.mesh.test", h1).
+        assert wm < (real_ts_ms, "target.mesh.test", h1), (
+            f"watermark {wm} advanced past a pair we never actually "
+            f"wrote — next tick will never retry that (name, hash)"
+        )
