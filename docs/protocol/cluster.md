@@ -91,9 +91,11 @@ Per-node entry:
 | var | `dns_endpoint` | UTF-8; omitted when length is 0 |
 
 Absolute wire-length cap: **1200 bytes** (post-base64, post-prefix).
-`sign()` raises `ValueError` if the encoded record exceeds it.
-Operators who genuinely need larger clusters should shard across
-multiple manifests (M3 territory).
+`sign()` raises `ValueError` if the encoded record exceeds it, and
+`parse_and_verify` returns `None` for any oversized wire (symmetric
+with sign so peers cannot push a larger-than-limit manifest past
+receivers). Operators who genuinely need larger clusters should shard
+across multiple manifests (M3 territory).
 
 A realistic 6-node manifest
 (cluster_name=`mesh.example.com`, node_ids=`n01..n06`,

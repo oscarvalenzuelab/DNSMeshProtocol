@@ -431,6 +431,12 @@ class ClusterManifest:
         if not isinstance(wire, str) or not wire.startswith(RECORD_PREFIX):
             return None
 
+        # 1a. Wire-length cap — symmetric with sign(). A peer (or a
+        # hand-crafted but correctly-signed manifest) could otherwise
+        # push a larger-than-limit wire past receivers; reject on parse.
+        if len(wire.encode("utf-8")) > MAX_WIRE_LEN:
+            return None
+
         # 2. Base64.
         try:
             blob = base64.b64decode(wire[len(RECORD_PREFIX) :], validate=True)
