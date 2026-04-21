@@ -978,19 +978,30 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
                 2,
                 f"--via-bootstrap: no verifying bootstrap record at _dmp.{host}",
             )
-        best = record.best_entry()
         # Second trust hop: the cluster manifest must verify under the
-        # operator_spk carried by the bootstrap entry. Compromising the
+        # operator_spk carried by each bootstrap entry. Compromising the
         # zone signer cannot silently impersonate a legitimate cluster
         # (the cluster's own operator key is the gate there).
-        manifest = fetch_cluster_manifest(
-            best.cluster_base_domain, best.operator_spk, bootstrap_reader
-        )
-        if manifest is None:
+        #
+        # Walk entries in priority order — a backup cluster in the
+        # bootstrap record should serve the lookup if the primary is
+        # unreachable. Matches auto-pin's fallback behavior.
+        manifest = None
+        best = None
+        for entry in record.entries:
+            m = fetch_cluster_manifest(
+                entry.cluster_base_domain, entry.operator_spk, bootstrap_reader
+            )
+            if m is not None:
+                manifest = m
+                best = entry
+                break
+        if manifest is None or best is None:
             _die(
                 2,
-                f"--via-bootstrap: cluster manifest fetch failed for "
-                f"{best.cluster_base_domain}",
+                f"--via-bootstrap: no cluster manifest reachable for any "
+                f"entry in the bootstrap record for {host} "
+                f"(tried {len(record.entries)} in priority order)",
             )
         # One-shot ClusterClient: no refresh thread. It lives only for
         # the duration of this identity fetch and is closed in the
@@ -1892,18 +1903,30 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     #    (below, via fetch_cluster_manifest).
     # Only after BOTH succeed do we persist. A half-written config
     # (bootstrap pinned but no cluster) is worse than none at all —
-    # `dmp send` would wedge on cluster-mode enabled with no
-    # manifest.
-    manifest = fetch_cluster_manifest(
-        best.cluster_base_domain, best.operator_spk, bootstrap_reader
-    )
-    if manifest is None:
+    # `dmp send` would wedge on cluster-mode enabled with no manifest.
+    #
+    # Walk the entries in priority order: if the preferred cluster's
+    # manifest is unreachable (node down, not yet published, etc.) we
+    # fall through to the next verified entry. A bootstrap record
+    # carrying a backup cluster is useless if clients don't try it.
+    manifest = None
+    chosen = None
+    for entry in record.entries:
+        m = fetch_cluster_manifest(
+            entry.cluster_base_domain, entry.operator_spk, bootstrap_reader
+        )
+        if m is not None:
+            manifest = m
+            chosen = entry
+            break
+    if manifest is None or chosen is None:
         _die(
             2,
-            f"cluster manifest fetch failed for {best.cluster_base_domain}. "
-            "Bootstrap pointed here, but the manifest is not published, "
-            "the signature did not verify under the entry's operator_spk, "
-            "or the manifest is expired. No config written.",
+            f"no cluster manifest reachable for any entry in the bootstrap "
+            f"record (tried {len(record.entries)} in priority order). "
+            "Either no preferred cluster is published yet, a signer key "
+            "rotation is mid-flight, or all entries are expired. "
+            "No config written.",
         )
 
     # Both records verified: commit both to config atomically.
@@ -1911,10 +1934,17 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     # discover/fetch calls don't need --signer-spk. Pin the cluster
     # anchors and set cluster_enabled=True so the next `dmp send` /
     # `dmp recv` routes through the federation path.
+    #
+    # Clear cluster_node_token: it was scoped to the previous cluster
+    # operator and sending it to the newly pinned cluster would leak
+    # a credential to a different trust domain (and likely fail auth
+    # anyway). The operator can repopulate via `dmp config set` or
+    # editing the config file if the new cluster requires a token.
     cfg.bootstrap_user_domain = host.rstrip(".")
     cfg.bootstrap_signer_spk = signer_hex.lower()
-    cfg.cluster_base_domain = best.cluster_base_domain
-    cfg.cluster_operator_spk = best.operator_spk.hex()
+    cfg.cluster_base_domain = chosen.cluster_base_domain
+    cfg.cluster_operator_spk = chosen.operator_spk.hex()
+    cfg.cluster_node_token = ""
     cfg.cluster_enabled = True
     cfg.save(path)
 
