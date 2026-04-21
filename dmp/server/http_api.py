@@ -341,7 +341,18 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             h = getattr(r, "record_hash", None)
             if not h:
                 h = hashlib.sha256(r.value.encode("utf-8")).hexdigest()
-            entries.append({"name": r.name, "hash": h, "ts": r.stored_ts})
+            # `ttl` is carried separately from `hash` so the diff can
+            # detect TTL-refresh-only republishes (identical value, fresh
+            # expiry). Hashing (value, ttl) would collapse them in a way
+            # that's harder to debug via the digest response.
+            entries.append(
+                {
+                    "name": r.name,
+                    "hash": h,
+                    "ts": r.stored_ts,
+                    "ttl": max(1, int(r.ttl_remaining)),
+                }
+            )
         self._send_json(200, {"records": entries, "has_more": has_more})
         return 200
 

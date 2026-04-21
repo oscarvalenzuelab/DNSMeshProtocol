@@ -233,7 +233,13 @@ class FakePeerHTTP:
             has_more = len(rows) > limit
             rows = rows[:limit]
             entries = [
-                {"name": r.name, "hash": r.record_hash, "ts": r.stored_ts} for r in rows
+                {
+                    "name": r.name,
+                    "hash": r.record_hash,
+                    "ts": r.stored_ts,
+                    "ttl": max(1, int(r.ttl_remaining)),
+                }
+                for r in rows
             ]
             body = json.dumps({"records": entries, "has_more": has_more}).encode(
                 "utf-8"
@@ -511,3 +517,42 @@ class TestWorkerTick:
         # All rows should have landed.
         for i in range(total):
             assert local.query_txt_record(f"r{i:04d}.mesh.test") == [f"v{i}"]
+
+    def test_ttl_refresh_triggers_pull(self):
+        """Peer republishes an identical value with a fresher TTL.
+
+        The old hash-only diff missed this (hash(value) is identical),
+        leaving the offline node with the stale expiry. With TTL carried
+        alongside the hash, the worker detects the drift and issues a
+        pull that refreshes the local expiry.
+        """
+        local = InMemoryDNSStore()
+        peer_fake = FakePeerHTTP("n2")
+        # Both sides publish the same value with a short ttl.
+        peer_fake.store.publish_txt_record("x.mesh.test", "shared", ttl=60)
+        local.publish_txt_record("x.mesh.test", "shared", ttl=60)
+
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_worker(local, [(peer, peer_fake)])
+
+        # First tick: hashes match and ttls match, so nothing to pull.
+        worker.tick_once()
+        assert peer_fake.pull_calls == 0
+
+        # Peer republishes the SAME value with a much bigger ttl — the
+        # new expiry is what the anti-entropy loop must propagate. Sleep
+        # a tick so the refreshed stored_ts is strictly above the
+        # watermark the worker captured on the previous digest.
+        time.sleep(0.01)
+        peer_fake.store.publish_txt_record("x.mesh.test", "shared", ttl=600)
+        pulls_before = peer_fake.pull_calls
+
+        worker.tick_once()
+
+        # Second tick must notice the TTL jump and pull.
+        assert peer_fake.pull_calls == pulls_before + 1
+        # Local expiry should have been refreshed — remaining TTL comfortably
+        # above the original 60s cap.
+        rows = local.get_records_by_name(["x.mesh.test"])
+        assert len(rows) == 1
+        assert rows[0].ttl_remaining > 120
