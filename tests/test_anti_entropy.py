@@ -222,16 +222,20 @@ class FakePeerHTTP:
             self.digest_calls += 1
             # Parse ?cursor=&limit= (primary) or legacy ?since=&limit=.
             q = url.split("?", 1)[1] if "?" in url else ""
-            cursor: Tuple[int, str] = (0, "")
+            cursor: Tuple[int, str, str] = (0, "", "")
             limit = 1000
             for kv in q.split("&"):
                 if kv.startswith("cursor="):
                     raw = kv[len("cursor=") :]
-                    parts = raw.split(":", 1)
+                    # Accept either "<ts>:<name>" (legacy) or
+                    # "<ts>:<name>:<value_hash>" (followup-2).
+                    parts = raw.split(":", 2)
                     if len(parts) == 2:
-                        cursor = (int(parts[0]), parts[1])
+                        cursor = (int(parts[0]), parts[1], "")
+                    elif len(parts) == 3:
+                        cursor = (int(parts[0]), parts[1], parts[2])
                 elif kv.startswith("since="):
-                    cursor = (int(kv[len("since=") :]), "")
+                    cursor = (int(kv[len("since=") :]), "", "")
                 elif kv.startswith("limit="):
                     limit = int(kv[len("limit=") :])
             rows = self.store.iter_records_since(cursor=cursor, limit=limit + 1)
@@ -248,9 +252,9 @@ class FakePeerHTTP:
             ]
             if entries:
                 last = entries[-1]
-                next_cursor = f"{int(last['ts'])}:{last['name']}"
+                next_cursor = f"{int(last['ts'])}:{last['name']}:{last['hash']}"
             else:
-                next_cursor = f"{int(cursor[0])}:{cursor[1]}"
+                next_cursor = f"{int(cursor[0])}:{cursor[1]}:{cursor[2]}"
             body = json.dumps(
                 {
                     "records": entries,
@@ -369,17 +373,21 @@ class TestWorkerTick:
 
         peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
         worker = _make_worker(local, [(peer, peer_fake)])
-        # Initial watermark is the compound sentinel (0, "").
-        assert worker.watermark("n2") == (0, "")
+        # Initial watermark is the compound sentinel (0, "", "").
+        assert worker.watermark("n2") == (0, "", "")
 
         worker.tick_once()
         # After the tick the watermark must have moved past the sentinel;
-        # comparing tuples gives us strict monotonicity in (ts, name).
+        # comparing tuples gives us strict monotonicity in
+        # (ts, name, value_hash).
         wm = worker.watermark("n2")
-        assert isinstance(wm, tuple) and len(wm) == 2
-        assert wm > (0, "")
+        assert isinstance(wm, tuple) and len(wm) == 3
+        assert wm > (0, "", "")
         assert wm[0] > 0
         assert wm[1] == "a.mesh.test"
+        # value_hash is sha256(value) — 64 hex chars for the one real row
+        assert len(wm[2]) == 64
+        assert wm[2] == hashlib.sha256(b"v").hexdigest()
 
     def test_second_tick_only_gets_new_records(self):
         local = InMemoryDNSStore()
@@ -685,7 +693,7 @@ class TestWorkerTick:
         # Watermark must still be the sentinel — peer poisoned it with
         # unvalidated junk, so we refuse to move.
         wm = worker.watermark("n2")
-        assert wm == (0, ""), (
+        assert wm == (0, "", ""), (
             f"watermark advanced past malformed entry: {wm}; "
             f"far_future_ms was {far_future_ms}"
         )
@@ -769,10 +777,79 @@ class TestWorkerTick:
         # The test enforces that the watermark stays at or below the
         # max of validated-and-handled entries.
         wm = worker.watermark("n2")
-        # Compare tuples: wm must be <= (real_ts_ms, "real.mesh.test").
-        assert wm <= (real_ts_ms, "real.mesh.test"), (
-            f"watermark {wm} advanced past validated data "
-            f"({real_ts_ms}, 'real.mesh.test')"
+        # Compare 3-tuples: the watermark now carries (ts, name,
+        # value_hash). It MUST be pinned to the real record — anything
+        # past that would mean the peer's lying next_cursor was trusted.
+        expected_hash = hashlib.sha256(b"valid-value-1").hexdigest()
+        assert wm == (real_ts_ms, "real.mesh.test", expected_hash), (
+            f"watermark {wm} did not land at the validated record; "
+            f"expected ({real_ts_ms}, 'real.mesh.test', {expected_hash!r})"
         )
-        # And it did advance at least that far.
-        assert wm >= (real_ts_ms, "real.mesh.test")
+
+    # ---- M2.4 follow-up-2: multi-value RRset cursor pagination ---------
+
+    def test_cursor_with_valuehash_paginates_same_name_burst(self):
+        """Regression for Codex P2 (cursor value_hash tiebreaker).
+
+        Force > ``limit`` distinct values at the SAME
+        ``(stored_ts, name)`` — a multi-value RRset burst all landing
+        inside one ms at one name — and make the store emit them across
+        multiple pages via a small ``limit``. Pre-fix the cursor was
+        (ts, name); the next page started with ``name > cur_name`` and
+        silently dropped the remaining values at that very (ts, name).
+        Post-fix the cursor carries value_hash too, so
+        ``value_hash > cur_hash`` keeps pagination correct.
+
+        This hits the store's ``iter_records_since`` directly because
+        that is where the cursor tiebreaker lives — the worker-level
+        test_multi_value_rrset_all_values_synced exercises the Codex-P1
+        (name, hash) diff in tandem.
+        """
+        import time as _time
+
+        peer_store = InMemoryDNSStore()
+        pinned_ms = int(_time.time() * 1000)
+        real_time = _time.time
+
+        def _pinned_time() -> float:
+            return pinned_ms / 1000.0
+
+        shared_name = "burst.mesh.test"
+        total = 50
+
+        _time.time = _pinned_time
+        try:
+            for i in range(total):
+                peer_store.publish_txt_record(shared_name, f"value-{i:04d}", ttl=300)
+        finally:
+            _time.time = real_time
+
+        # Sanity: all rows share one (stored_ts, name) but different
+        # value_hashes.
+        all_rows = peer_store.iter_records_since(cursor=(0, "", ""))
+        assert len(all_rows) == total
+        assert {r.stored_ts for r in all_rows} == {pinned_ms}
+        assert {r.name for r in all_rows} == {shared_name}
+
+        # Walk the cursor across multiple small pages, same as a peer
+        # worker would. Pre-fix this loop would drop values at the
+        # same (ts, name) on every page boundary.
+        page_limit = 7
+        collected: List[str] = []
+        cursor: Tuple[int, str, str] = (0, "", "")
+        for _ in range(50):  # bounded
+            page = peer_store.iter_records_since(cursor=cursor, limit=page_limit)
+            if not page:
+                break
+            for r in page:
+                collected.append(r.value)
+            last = page[-1]
+            # Advance to the last row's (ts, name, value_hash).
+            last_hash = hashlib.sha256(last.value.encode("utf-8")).hexdigest()
+            cursor = (last.stored_ts, last.name, last_hash)
+            if len(page) < page_limit:
+                break
+
+        assert sorted(collected) == sorted(
+            f"value-{i:04d}" for i in range(total)
+        ), f"paginated walk lost values: got {len(collected)} of {total}"
