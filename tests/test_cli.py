@@ -2318,9 +2318,36 @@ class TestBootstrapCommand:
                 )
             ],
         )
-        # 2. Cluster manifest at cluster.mesh.example.com.
-        self._publish_cluster_manifest(
-            store, cluster_name="mesh.example.com", operator=cluster_op, n_nodes=2
+        # 2. Cluster manifest at cluster.mesh.example.com. Use
+        #    dns_endpoint=None on every node so _make_cluster_reader_factory
+        #    falls back to the shared bootstrap_reader (the patched store)
+        #    — that simulates a real deployment where the cluster nodes
+        #    are authoritative for the user's zone and the union reader
+        #    queries them for dmp.example.com directly.
+        import time as _time2
+        from dmp.core.cluster import (
+            ClusterManifest as _CM,
+            ClusterNode as _CN,
+            cluster_rrset_name as _crn,
+        )
+
+        nodes = [
+            _CN(
+                node_id=f"n{i:02d}",
+                http_endpoint=f"https://n{i}.mesh.example.com:8053",
+                dns_endpoint=None,  # falls back to bootstrap_reader in the factory
+            )
+            for i in range(1, 3)
+        ]
+        cluster_manifest = _CM(
+            cluster_name="mesh.example.com",
+            operator_spk=cluster_op.get_signing_public_key_bytes(),
+            nodes=nodes,
+            seq=1,
+            exp=int(_time2.time()) + 3600,
+        )
+        store.publish_txt_record(
+            _crn("mesh.example.com"), cluster_manifest.sign(cluster_op)
         )
         # 3. Alice's identity record published under the cluster zone
         #    (zone-anchored: dmp.example.com TXT). The bootstrap-

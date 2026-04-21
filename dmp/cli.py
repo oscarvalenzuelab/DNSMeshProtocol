@@ -953,6 +953,16 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
                 f"got {args.username!r}",
             )
         _, host = parsed_addr
+        # parse_address only asserts `user@host` shape; host can still be
+        # a malformed DNS name like ".example.com" or "bad_host" that
+        # would raise ValueError out of bootstrap_rrset_name below.
+        # Validate here so bad input surfaces as a clean CLI exit.
+        from dmp.core.cluster import _validate_dns_name as _validate_host_dns
+
+        try:
+            _validate_host_dns(host)
+        except ValueError as exc:
+            _die(1, f"--via-bootstrap: invalid host in address: {exc}")
         if cfg.bootstrap_user_domain.casefold() != host.casefold():
             _die(
                 1,
@@ -995,11 +1005,15 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
             reader_factory=_make_cluster_reader_factory(cfg, bootstrap_reader),
             refresh_interval=None,
         )
-        reader = CompositeReader(
-            cluster_reader=cluster_handle.reader,
-            external_reader=bootstrap_reader,
-            cluster_base_domain=best.cluster_base_domain,
-        )
+        # Route the identity lookup DIRECTLY through the union reader.
+        # The identity record for `alice@host` lives at `dmp.<host>`,
+        # which is NOT under the cluster's `cluster_base_domain`
+        # (e.g. mesh.example.com). A CompositeReader would therefore
+        # route it to the external resolver, defeating the whole point
+        # of --via-bootstrap. We trust the cluster's nodes to be
+        # authoritative (or delegated) for the user's zone — that's
+        # the deployment contract a bootstrap record implies.
+        reader = cluster_handle.reader
     elif _cluster_mode_enabled(cfg):
         try:
             op_spk = bytes.fromhex(cfg.cluster_operator_spk)
@@ -1721,6 +1735,16 @@ def _resolve_bootstrap_anchors(
             "pass --signer-spk to override the trust anchor too",
         )
     signer_spk = _decode_signer_spk(signer_hex, field_name="signer_spk")
+    # Validate the user_domain as a DNS name before handing it off to
+    # any downstream code that assumes it's publishable (bootstrap_rrset_name
+    # will raise ValueError with a traceback otherwise on malformed
+    # input like ".example.com" or "bad_host").
+    from dmp.core.cluster import _validate_dns_name as _validate_bootstrap_dns
+
+    try:
+        _validate_bootstrap_dns(user_domain)
+    except ValueError as exc:
+        _die(1, f"invalid bootstrap user_domain: {exc}")
     return user_domain, signer_spk
 
 
