@@ -680,6 +680,104 @@ class TestClusterManifestSize:
         )
 
 
+# ---- node_id uniqueness ---------------------------------------------------
+
+
+class TestClusterManifestNodeIdUniqueness:
+    """The node_id is a dedupe/log handle across the cluster. A manifest
+    with two entries sharing an id is a publisher bug the signed record
+    should not paper over — fan-out writers (M2.2) and union readers
+    (M2.3) key on node_id and would collide silently.
+
+    Enforced on BOTH sign (to stop publishers emitting bad records) and
+    parse (to stop a buggy/malicious publisher distributing records we
+    could never produce ourselves).
+    """
+
+    def test_duplicate_node_ids_rejected_on_sign(self):
+        operator = _make_operator()
+        dup_nodes = [
+            ClusterNode(
+                node_id="dup",
+                http_endpoint="https://a.example.com:8053",
+            ),
+            ClusterNode(
+                node_id="dup",
+                http_endpoint="https://b.example.com:8053",
+            ),
+        ]
+        mf = _make_manifest(operator, nodes=dup_nodes)
+        with pytest.raises(ValueError, match="duplicate node_id"):
+            mf.sign(operator)
+
+    def test_three_way_duplicate_rejected_on_sign(self):
+        operator = _make_operator()
+        nodes = [
+            _make_node(1),
+            ClusterNode(node_id="x", http_endpoint="https://a.example.com:8053"),
+            _make_node(2),
+            ClusterNode(node_id="x", http_endpoint="https://b.example.com:8053"),
+            ClusterNode(node_id="x", http_endpoint="https://c.example.com:8053"),
+        ]
+        mf = _make_manifest(operator, nodes=nodes)
+        with pytest.raises(ValueError, match="duplicate node_id"):
+            mf.sign(operator)
+
+    def test_unique_node_ids_accepted(self):
+        operator = _make_operator()
+        nodes = [_make_node(1), _make_node(2), _make_node(3)]
+        mf = _make_manifest(operator, nodes=nodes)
+        # No raise.
+        wire = mf.sign(operator)
+        parsed = ClusterManifest.parse_and_verify(
+            wire, operator.get_signing_public_key_bytes()
+        )
+        assert parsed is not None
+        assert [n.node_id for n in parsed.nodes] == [
+            "node01",
+            "node02",
+            "node03",
+        ]
+
+    def test_duplicate_node_ids_rejected_on_parse(self):
+        """A correctly-signed body with duplicate node_ids must not
+        parse. We hand-craft the body (sign-side uniqueness check would
+        otherwise block us from producing this wire) and sign it
+        directly, then assert parse_and_verify returns None.
+        """
+        operator = _make_operator()
+        opk = operator.get_signing_public_key_bytes()
+        cluster_name = b"mesh.example.com"
+
+        def _node_bytes(node_id: str, http: str) -> bytes:
+            id_bytes = node_id.encode("ascii")
+            http_bytes = http.encode("utf-8")
+            return (
+                len(id_bytes).to_bytes(1, "big")
+                + id_bytes
+                + len(http_bytes).to_bytes(2, "big")
+                + http_bytes
+                + (0).to_bytes(2, "big")  # no dns_endpoint
+            )
+
+        body = (
+            b"DMPCL01"
+            + (1).to_bytes(8, "big")
+            + (int(time.time()) + 3600).to_bytes(8, "big")
+            + opk
+            + len(cluster_name).to_bytes(1, "big")
+            + cluster_name
+            + (2).to_bytes(1, "big")  # node_count = 2
+            + _node_bytes("dup", "https://a.example.com:8053")
+            + _node_bytes("dup", "https://b.example.com:8053")
+        )
+        sig = operator.sign_data(body)
+        wire = RECORD_PREFIX + base64.b64encode(body + sig).decode("ascii")
+        # Sanity: the signature is actually valid — rejection is purely
+        # from the duplicate-id check, not signature failure.
+        assert ClusterManifest.parse_and_verify(wire, opk) is None
+
+
 # ---- rrset naming ---------------------------------------------------------
 
 

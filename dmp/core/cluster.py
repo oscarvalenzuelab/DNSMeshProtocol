@@ -316,6 +316,21 @@ class ClusterManifest:
                 f"too many nodes (max {MAX_NODE_COUNT}); "
                 "shard the cluster across multiple manifests"
             )
+        # node_id uniqueness. The id is a dedupe/log handle; two entries
+        # with the same id break fan-out writers (M2.2) and union readers
+        # (M2.3) that key on it, and they encode a publisher mistake a
+        # signed record should not be able to paper over. We check after
+        # per-node validation so each node's individual ValueError surfaces
+        # first. Comparing the ASCII node_id directly (not the utf-8
+        # encoding) is fine because _validate on ClusterNode already
+        # enforces ASCII.
+        seen_ids: set[str] = set()
+        for node in self.nodes:
+            if node.node_id in seen_ids:
+                raise ValueError(
+                    f"duplicate node_id {node.node_id!r} in cluster manifest"
+                )
+            seen_ids.add(node.node_id)
         if not (0 <= self.seq < (1 << 64)):
             raise ValueError("seq out of range")
         if not (0 <= self.exp < (1 << 64)):
@@ -379,8 +394,18 @@ class ClusterManifest:
             raise ValueError("node_count exceeds protocol max")
 
         nodes: List[ClusterNode] = []
+        seen_ids: set[str] = set()
         for _ in range(node_count):
             node, off = ClusterNode.from_body_bytes(body, off)
+            # Mirror sign-side uniqueness check. A correctly-signed manifest
+            # from another publisher can still carry duplicate node_ids;
+            # reject here rather than handing downstream code a manifest
+            # whose entries collide on the dedupe/log key.
+            if node.node_id in seen_ids:
+                raise ValueError(
+                    f"duplicate node_id {node.node_id!r} in cluster manifest"
+                )
+            seen_ids.add(node.node_id)
             nodes.append(node)
 
         if off != len(body):
