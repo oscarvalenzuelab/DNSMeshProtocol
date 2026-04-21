@@ -356,12 +356,35 @@ class FanoutWriter(DNSRecordWriter):
                     # Retain old writer rather than closing it: a
                     # slow-path future may still be calling into it.
                     self._retired_writers.append(existing.writer)
-                    existing.writer = self._factory(node)
-                    existing.http_endpoint = node.http_endpoint
-                    existing.dns_endpoint = node.dns_endpoint
-                # Otherwise the writer is fine; keep it warm (HTTP
-                # keepalive pool, auth token, etc.).
-                new_states[node.node_id] = existing
+                    # Build a FRESH _NodeState rather than mutating
+                    # `existing` in place. In-flight futures captured
+                    # `existing` at submit-time and still reference it
+                    # for health updates; if we overwrote
+                    # `existing.writer` they would either (a) route a
+                    # write scheduled for the old endpoint to the new
+                    # endpoint on late execution, or (b) record the
+                    # old call's late success/failure against the new
+                    # endpoint's health counters. Snapshotting into a
+                    # new object isolates old-future effects to the
+                    # retained _NodeState (which is now orphaned from
+                    # self._nodes but still alive while those futures
+                    # hold a reference). Health counters are copied
+                    # forward so the new endpoint inherits a sensible
+                    # starting position.
+                    new_states[node.node_id] = _NodeState(
+                        node_id=existing.node_id,
+                        http_endpoint=node.http_endpoint,
+                        dns_endpoint=node.dns_endpoint,
+                        writer=self._factory(node),
+                        consecutive_failures=existing.consecutive_failures,
+                        last_failure_ts=existing.last_failure_ts,
+                        last_success_ts=existing.last_success_ts,
+                        last_error=existing.last_error,
+                    )
+                else:
+                    # Endpoints unchanged; keep the writer warm (HTTP
+                    # keepalive pool, auth token, etc.).
+                    new_states[node.node_id] = existing
 
             # Nodes that disappeared: retain their writers; close
             # them at FanoutWriter.close() time. Rationale: _fanout
