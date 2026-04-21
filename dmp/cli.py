@@ -1693,6 +1693,13 @@ def cmd_bootstrap_pin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _norm_dns_name(name: str) -> str:
+    """Canonicalize a DNS owner name for comparison: strip a single
+    trailing dot and casefold. DNS names are case-insensitive, and
+    ``example.com.`` / ``example.com`` denote the same zone."""
+    return name.rstrip(".").casefold()
+
+
 def _pick_usable_bootstrap_entry(
     record,
     cfg: CLIConfig,
@@ -1759,10 +1766,15 @@ def _resolve_bootstrap_anchors(
         _die(1, "--user-domain given but no --signer-spk and no pinned anchor")
     if cli_signer_spk and not cli_user_domain and not cfg.bootstrap_user_domain:
         _die(1, "--signer-spk given but no --user-domain and no pinned anchor")
+    # DNS names are case-insensitive and a trailing dot is canonical —
+    # normalize both sides before rejecting the mismatch so users can
+    # pass `--user-domain EXAMPLE.com` or `--user-domain example.com.`
+    # against a config pinned to `example.com` without being forced to
+    # redundantly re-pass --signer-spk.
     if (
         cli_user_domain
         and cfg.bootstrap_user_domain
-        and cli_user_domain != cfg.bootstrap_user_domain
+        and _norm_dns_name(cli_user_domain) != _norm_dns_name(cfg.bootstrap_user_domain)
         and not cli_signer_spk
     ):
         # User supplied a CLI domain that differs from the pinned one
@@ -1938,8 +1950,37 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
         print("or re-run with --auto-pin to do all of the above atomically.")
         return 0
 
-    # --auto-pin path: verify the cluster manifest at the returned
-    # anchor BEFORE writing any config. Two-hop trust chain:
+    # --auto-pin mutates the caller's own global cluster_* config and
+    # flips cluster_enabled=True, which rehomes every subsequent
+    # `dmp send` / `dmp recv` / `identity publish` onto the discovered
+    # cluster. Running it against ANY address (e.g. to look at a
+    # recipient alice@example.com) would rehome the operator's local
+    # mailbox state to someone else's cluster — a silent hijack.
+    #
+    # Guard: require the discovered host to match bootstrap_user_domain
+    # pinned in config. That makes auto-pin an explicit two-step flow:
+    #   1. `dmp bootstrap pin <my-domain> <my-signer-spk>`  — acknowledge
+    #      trust anchor for the zone you actually live on
+    #   2. `dmp bootstrap discover me@my-domain --auto-pin`
+    # Inspecting a recipient's cluster is still possible without
+    # --auto-pin (diagnostic mode) or via --via-bootstrap on
+    # identity fetch.
+    if not cfg.bootstrap_user_domain or _norm_dns_name(
+        host
+    ) != _norm_dns_name(cfg.bootstrap_user_domain):
+        _die(
+            1,
+            f"--auto-pin refuses to rehome config onto {host!r}: it is "
+            f"not the bootstrap_user_domain pinned in config "
+            f"({cfg.bootstrap_user_domain!r}). Pin your own home domain "
+            f"first with `dmp bootstrap pin {host} <signer_spk_hex>`, "
+            f"then re-run --auto-pin. For one-off discovery of a "
+            f"recipient's cluster, omit --auto-pin (diagnostic mode) "
+            f"or use `dmp identity fetch alice@host --via-bootstrap`.",
+        )
+
+    # Verify the cluster manifest at the returned anchor BEFORE writing
+    # any config. Two-hop trust chain:
     # 1. bootstrap record verified against pinned bootstrap_signer_spk
     #    (above, via fetch_bootstrap_record).
     # 2. cluster manifest verified against the entry's operator_spk
@@ -1948,10 +1989,6 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     # (bootstrap pinned but no cluster) is worse than none at all —
     # `dmp send` would wedge on cluster-mode enabled with no manifest.
     #
-    # Walk the entries in priority order: if the preferred cluster's
-    # manifest is unreachable (node down, not yet published, etc.) we
-    # fall through to the next verified entry. A bootstrap record
-    # carrying a backup cluster is useless if clients don't try it.
     # Walk entries in priority order. Accept only an entry whose
     # cluster manifest verifies AND whose per-node factories can
     # actually build writer/reader instances — dry-run matches the
