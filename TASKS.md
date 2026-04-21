@@ -33,9 +33,12 @@ _No tasks currently active. Promote from Backlog to open the next sprint._
 
 - **M1.retro-codex-final** — Final retro Codex review of M1.1, M1.2, M1.3, M1.4, M1.5 commits. Most findings already landed via M1.5 polish; cheap insurance.
 
+### Ready to start (unblocked, small)
+
+- **M3.2-wire** — Wire `BootstrapRecord` (M3.1) into the CLI so a user given just `alice@example.com` auto-discovers the cluster. Add `dmp bootstrap fetch <user_domain> [--signer-spk <hex>]` (one-shot verify), `dmp bootstrap pin <user_domain> <signer_spk_hex>` (save trust anchor), and integrate discovery into `dmp identity fetch alice@example.com` so the client auto-pins the highest-priority cluster returned. Effort: ~1 day. Touch zones: `dmp/cli.py`, `dmp/client/bootstrap_discovery.py` (new), `tests/test_cli.py`, `docs/guide/cli.md`.
+
 ### Milestones
 
-- **M3.1** — Bootstrap-domain record type (SRV-like discovery so clients find the cluster manifest name given just a user's email/address domain).
 - **M4.1** — Formal protocol spec document (expand `docs/protocol/`).
 
 ### Known gaps to track
@@ -56,3 +59,4 @@ _No tasks currently active. Promote from Backlog to open the next sprint._
 - **M2.wire-polish** — Decoupled `dmp cluster pin` from cluster-mode activation. New `cluster_enabled: bool` flag (default False, back-compat for existing configs requires explicit `cluster enable`). New `dmp cluster enable` / `dmp cluster disable` commands; enable runs a live manifest fetch before flipping. `dmp cluster fetch` / `status` work regardless of enable state as pre-enable diagnostics — commits `775c22b..3879663`, merged as `012552a`. 11 new tests.
 - **cluster-composite-reader** — `CompositeReader` routes cluster-local names (suffix match on `cluster_base_domain`) to the union reader and external names to the bootstrap resolver. Fixes cross-domain identity/prekey lookups in cluster mode. Label-boundary-safe suffix match (casefold + trailing-dot normalized). Wired into both `_make_client` and `cmd_identity_fetch` — commits `ef5dee4..a47a78c`, merged as `6060bbf`. 20 new tests.
 - **cluster-atomic-refresh** — `ClusterClient.refresh_now` pre-runs both factories across every node in the new manifest before touching either `install_manifest`. If any factory raises, neither side advances; no more split-brain between reader and writer on malformed endpoints. Probe outputs are not closed (factories may return shared instances) — commits `bd2fb03..32a2553`, merged as `3ee9d6a`. 4 new tests.
+- **M3.1** — Bootstrap record type: signed DNS-discoverable pointer from a user domain to one or more clusters. Published at `_dmp.<user_domain>` TXT; carries sorted entries of (priority, cluster_base_domain, operator_spk). Mirrors the hardened `ClusterManifest` pattern: multi-string TXT support, wire-cap on both sides, embedded-signer-cross-check, expected_user_domain binding with casefold + trailing-dot normalization, DNS-name validation, empty-list rejection, duplicate-entry rejection — commits `cd2f383..5c33cd5`, merged as `441f58b`. 65 new tests. Wiring into CLI/client is M3.2-wire (backlog).
