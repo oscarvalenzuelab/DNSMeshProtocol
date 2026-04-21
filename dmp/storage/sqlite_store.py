@@ -237,9 +237,7 @@ class SqliteMailboxStore(DNSRecordStore):
             )
         return out
 
-    def get_records_by_name(
-        self, names: Iterable[str]
-    ) -> List[StoredRecord]:
+    def get_records_by_name(self, names: Iterable[str]) -> List[StoredRecord]:
         """Return all non-expired records whose name is in `names`.
 
         Used by the anti-entropy pull endpoint. Expired records are
