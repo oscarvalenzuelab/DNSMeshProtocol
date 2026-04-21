@@ -137,3 +137,24 @@ resolver can filter on prefix. Types seen on the wire:
 | `manifest` | Signed slot manifest |
 | `identity` | Signed identity record |
 | `prekey` | Signed one-time prekey |
+
+See [Spec overview]({{ site.baseurl }}/protocol/spec#3-record-type-registry)
+for the full registry including `cluster` and `bootstrap`, and
+[Wire encoding conventions]({{ site.baseurl }}/protocol/wire-encoding)
+for the cross-record prefix / base64 / signature rules.
+
+## Related reading
+
+- [Spec overview]({{ site.baseurl }}/protocol/spec) — cross-cutting
+  invariants every record on this page respects.
+- [DNS name routing]({{ site.baseurl }}/protocol/routing) — owner-name
+  helpers for chunks, manifests, identities, and prekeys.
+- [End-to-end flows]({{ site.baseurl }}/protocol/flows) — how these
+  records are produced and consumed during send / receive / identity
+  publish.
+- [Threat model]({{ site.baseurl }}/protocol/threat-model) — what the
+  signatures on these records defend against, and what they don't.
+- [Cluster manifest]({{ site.baseurl }}/protocol/cluster) and
+  [Bootstrap record]({{ site.baseurl }}/protocol/bootstrap) — the
+  two signed-record types introduced in M2 + M3 that live alongside
+  the records on this page.
