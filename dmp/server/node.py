@@ -283,7 +283,15 @@ class DMPNodeConfig:
         # misconfig. ``DMP_SYNC_SELF_ENDPOINT`` is the URL this node
         # exposes on the peer HTTP network; used to drop self out of a
         # gossiped manifest's node list.
-        cluster_base_domain = os.environ.get("DMP_CLUSTER_BASE_DOMAIN") or None
+        # DNS names are case-insensitive; the sqlite store matches
+        # owner names byte-for-byte. Normalize (strip trailing dot,
+        # lowercase) so Mesh.Example.COM and mesh.example.com resolve
+        # to the same cluster.* rrset for both the endpoint and the
+        # worker's seq check.
+        _raw_base_domain = os.environ.get("DMP_CLUSTER_BASE_DOMAIN") or None
+        cluster_base_domain = (
+            _raw_base_domain.rstrip(".").lower() if _raw_base_domain else None
+        )
         sync_self_endpoint = os.environ.get("DMP_SYNC_SELF_ENDPOINT") or None
 
         return cls(
@@ -592,7 +600,11 @@ class DMPNode:
             path = self.config.cluster_file
             if not path or not os.path.isfile(path):
                 return None
-            peers = load_peers_from_cluster_json(path, self_node_id=self.config.node_id)
+            peers = load_peers_from_cluster_json(
+                path,
+                self_node_id=self.config.node_id,
+                self_http_endpoint=self.config.sync_self_endpoint,
+            )
             peer_source = path
         if not peers:
             return None
