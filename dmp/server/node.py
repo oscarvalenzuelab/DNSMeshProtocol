@@ -29,12 +29,21 @@ Environment variables (all optional, sensible defaults for dev):
     DMP_LOG_LEVEL          python logging level              default: INFO
     DMP_LOG_FORMAT         "text" (default) or "json"        default: text
 
-    DMP_CLUSTER_FILE       on-disk cluster.json (peer list)  default: /var/lib/dmp/cluster.json
-    DMP_NODE_ID            this node's id in the cluster     default: none (skip self-filter)
-    DMP_SYNC_PEER_TOKEN    shared token for /v1/sync/*       default: none (endpoints 403)
-    DMP_SYNC_INTERVAL      seconds between sync ticks        default: 10
-    DMP_SYNC_OPERATOR_SPK  hex ed25519 operator pubkey for
-                           cluster-record re-verify         default: none
+    DMP_CLUSTER_FILE           on-disk cluster.json (peer list)     default: /var/lib/dmp/cluster.json
+    DMP_CLUSTER_MANIFEST_PATH  alias for DMP_CLUSTER_FILE (operator-facing name)
+    DMP_NODE_ID                this node's id in the cluster        default: none (skip self-filter)
+    DMP_SYNC_PEERS             comma-separated HTTP peer URLs       default: none (falls back to cluster file)
+                               e.g. "http://dmp-node-b:8053,http://dmp-node-c:8053".
+                               Takes precedence over DMP_CLUSTER_FILE when set.
+    DMP_SYNC_PEER_TOKEN        shared token for /v1/sync/*          default: none (endpoints 403)
+    DMP_SYNC_INTERVAL          seconds between sync ticks           default: 10
+    DMP_SYNC_INTERVAL_SECONDS  alias for DMP_SYNC_INTERVAL (operator-facing name)
+    DMP_SYNC_OPERATOR_SPK      hex ed25519 operator pubkey for
+                               cluster-record re-verify             default: none
+
+Peer URLs from DMP_SYNC_PEERS point at the OTHER nodes' HTTP base (e.g.
+``http://dmp-node-b:8053``). The worker appends ``/v1/sync/digest`` and
+``/v1/sync/pull`` itself; callers should not include those suffixes.
 
 Port 53 is privileged on Linux. In a container, publish with
 `-p 53:5353/udp` or run with CAP_NET_BIND_SERVICE.
@@ -46,10 +55,14 @@ import logging
 import os
 import signal
 import threading
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-from dmp.server.anti_entropy import AntiEntropyWorker, load_peers_from_cluster_json
+from dmp.server.anti_entropy import (
+    AntiEntropyWorker,
+    SyncPeer,
+    load_peers_from_cluster_json,
+)
 from dmp.server.cleanup import CleanupWorker
 from dmp.server.dns_server import DMPDnsServer
 from dmp.server.http_api import (
@@ -64,6 +77,67 @@ from dmp.server.rate_limit import RateLimit
 from dmp.storage.sqlite_store import SqliteMailboxStore
 
 log = logging.getLogger(__name__)
+
+
+def _peer_id_from_url(url: str) -> str:
+    """Derive a short stable peer id from an HTTP URL.
+
+    Used when DMP_SYNC_PEERS feeds the worker directly — there is no
+    ``node_id`` to key on, so we synthesize one from the URL's hostname
+    (falling back to the whole URL if parsing fails). The id shows up in
+    logs and as the watermark key, so stability across restarts of the
+    same peer matters; port + path are dropped so a peer that moves
+    between ports on the same host keeps its watermark.
+
+    Ids are truncated to 16 ASCII chars to match the
+    ``MAX_NODE_ID_LEN`` cap in ``dmp.core.cluster``; over-long hostnames
+    get a short sha256 suffix so two peers at ``very-long-hostname-a``
+    and ``very-long-hostname-b`` don't collide after truncation.
+    """
+    import hashlib
+    from urllib.parse import urlparse
+
+    try:
+        host = urlparse(url).hostname or url
+    except Exception:
+        host = url
+    host = host.strip().lower()
+    if not host:
+        host = "peer"
+    if len(host) <= 16:
+        return host
+    digest = hashlib.sha256(host.encode("utf-8")).hexdigest()[:6]
+    return f"{host[:9]}-{digest}"
+
+
+def _peers_from_url_list(
+    urls: List[str],
+    *,
+    self_node_id: Optional[str] = None,
+) -> List[SyncPeer]:
+    """Build a ``SyncPeer`` list from a raw URL list (DMP_SYNC_PEERS).
+
+    Skips empty / duplicate entries so a stray ``"a,,b"`` or ``"a,a"``
+    doesn't wedge the round-robin index on a phantom peer. Also drops
+    any URL whose synthesized peer id matches ``self_node_id`` — the
+    compose sample writes symmetric env files, so node-a's copy lists
+    ``[node-b, node-c]`` with no self entry, but a future config
+    generator that includes self should not create a self-sync loop.
+    """
+    seen_urls: set = set()
+    peers: List[SyncPeer] = []
+    for raw in urls:
+        url = raw.strip().rstrip("/")
+        if not url:
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        peer_id = _peer_id_from_url(url)
+        if self_node_id and peer_id == self_node_id:
+            continue
+        peers.append(SyncPeer(node_id=peer_id, http_endpoint=url))
+    return peers
 
 
 @dataclass
@@ -110,9 +184,48 @@ class DMPNodeConfig:
     # fine for most operators (the node's own operator deployed the
     # cluster.json anyway).
     sync_cluster_operator_spk_hex: Optional[str] = None
+    # M2.5/M2.6 direct-peer-list env wiring. When non-empty, these URLs
+    # become the SyncPeer list directly and cluster_file is ignored. Each
+    # entry is an HTTP base URL (no trailing path); the anti-entropy
+    # worker appends /v1/sync/* itself. Peer ids default to the URL host
+    # so logs stay readable in docker-compose deployments where node
+    # names are container DNS names.
+    sync_peers: List[str] = field(default_factory=list)
 
     @classmethod
     def from_env(cls) -> "DMPNodeConfig":
+        # M2.5/M2.6: accept operator-facing aliases alongside the older
+        # names. Aliases exist so the docker-compose.cluster sample's env
+        # files read naturally ("_SECONDS", "_PATH") while keeping the
+        # short historical forms working for older deployments. The older
+        # name wins when BOTH are set — we log a warning there so the
+        # operator can clean up, but we don't fail to start.
+        cluster_file_default = os.environ.get("DMP_CLUSTER_FILE")
+        cluster_manifest_path = os.environ.get("DMP_CLUSTER_MANIFEST_PATH")
+        if cluster_file_default and cluster_manifest_path:
+            log.warning(
+                "both DMP_CLUSTER_FILE and DMP_CLUSTER_MANIFEST_PATH set; "
+                "using DMP_CLUSTER_FILE"
+            )
+        cluster_file = cluster_file_default or cluster_manifest_path or cls.cluster_file
+
+        sync_interval_default = os.environ.get("DMP_SYNC_INTERVAL")
+        sync_interval_seconds = os.environ.get("DMP_SYNC_INTERVAL_SECONDS")
+        if sync_interval_default and sync_interval_seconds:
+            log.warning(
+                "both DMP_SYNC_INTERVAL and DMP_SYNC_INTERVAL_SECONDS set; "
+                "using DMP_SYNC_INTERVAL"
+            )
+        sync_interval_raw = (
+            sync_interval_default or sync_interval_seconds or str(cls.sync_interval)
+        )
+
+        # DMP_SYNC_PEERS parses as a comma-separated URL list. Empty /
+        # unset / whitespace-only values yield an empty list, which is
+        # the "no direct peer wiring; fall back to cluster file" path.
+        raw_peers = os.environ.get("DMP_SYNC_PEERS") or ""
+        sync_peers = [p.strip() for p in raw_peers.split(",") if p.strip()]
+
         return cls(
             db_path=os.environ.get("DMP_DB_PATH", cls.db_path),
             dns_host=os.environ.get("DMP_DNS_HOST", cls.dns_host),
@@ -143,13 +256,14 @@ class DMPNodeConfig:
             ),
             log_level=os.environ.get("DMP_LOG_LEVEL", cls.log_level),
             log_format=os.environ.get("DMP_LOG_FORMAT", cls.log_format),
-            cluster_file=os.environ.get("DMP_CLUSTER_FILE", cls.cluster_file),
+            cluster_file=cluster_file,
             node_id=os.environ.get("DMP_NODE_ID") or None,
             sync_peer_token=os.environ.get("DMP_SYNC_PEER_TOKEN") or None,
-            sync_interval=float(os.environ.get("DMP_SYNC_INTERVAL", cls.sync_interval)),
+            sync_interval=float(sync_interval_raw),
             sync_cluster_operator_spk_hex=(
                 os.environ.get("DMP_SYNC_OPERATOR_SPK") or None
             ),
+            sync_peers=sync_peers,
         )
 
 
@@ -236,10 +350,30 @@ class DMPNode:
         )
 
     def _make_anti_entropy_worker(self) -> Optional[AntiEntropyWorker]:
-        path = self.config.cluster_file
-        if not path or not os.path.isfile(path):
-            return None
-        peers = load_peers_from_cluster_json(path, self_node_id=self.config.node_id)
+        # Two peer-discovery modes, checked in order:
+        #
+        # 1. ``sync_peers`` (DMP_SYNC_PEERS) — direct URL list. Preferred
+        #    for docker-compose deployments where every node already
+        #    knows the others by container DNS name. No signed manifest
+        #    needed for peer discovery; the operator's env file IS the
+        #    source of truth for who is in the cluster.
+        # 2. ``cluster_file`` (DMP_CLUSTER_FILE / DMP_CLUSTER_MANIFEST_PATH)
+        #    — signed cluster manifest on disk. Used when the operator
+        #    already keeps their manifest under config management.
+        #
+        # If neither produces peers, the worker is skipped (solo node).
+        peer_source: str
+        if self.config.sync_peers:
+            peers = _peers_from_url_list(
+                self.config.sync_peers, self_node_id=self.config.node_id
+            )
+            peer_source = f"DMP_SYNC_PEERS ({len(self.config.sync_peers)} urls)"
+        else:
+            path = self.config.cluster_file
+            if not path or not os.path.isfile(path):
+                return None
+            peers = load_peers_from_cluster_json(path, self_node_id=self.config.node_id)
+            peer_source = path
         if not peers:
             return None
         if not self.config.sync_peer_token:
@@ -247,10 +381,10 @@ class DMPNode:
             # anything; without one every outbound sync would bounce 403.
             # Log loudly so the operator notices the misconfig.
             log.warning(
-                "anti-entropy: %d peer(s) in %s but no sync_peer_token "
-                "configured — worker not started",
+                "anti-entropy: %d peer(s) from %s but no sync_peer_token "
+                "configured; worker not started",
                 len(peers),
-                path,
+                peer_source,
             )
             return None
         operator_spk = None
