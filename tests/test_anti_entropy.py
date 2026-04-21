@@ -853,3 +853,38 @@ class TestWorkerTick:
         assert sorted(collected) == sorted(
             f"value-{i:04d}" for i in range(total)
         ), f"paginated walk lost values: got {len(collected)} of {total}"
+
+    def test_multi_value_rrset_all_values_synced(self):
+        """Regression for Codex P1 (diff on (name, hash) pairs).
+
+        A name with multiple TXT values under it (e.g. a prekey set:
+        5 entries at ``prekeys.id-xxx``) must sync *every* value to
+        the offline node, not just the first one. Pre-fix, the diff
+        keyed on ``name`` alone — so the second through fifth digest
+        entries for the same name were marked "seen" by the first
+        and silently dropped.
+        """
+        local = InMemoryDNSStore()
+        peer_fake = FakePeerHTTP("n2")
+        # Publish one name with five distinct TXT values at node A.
+        prekey_name = "prekeys.id-xxx.mesh.test"
+        values = [f"prekey-value-{i}" for i in range(5)]
+        for v in values:
+            peer_fake.store.publish_txt_record(prekey_name, v, ttl=300)
+            # Space writes so stored_ts differs — in the real sqlite
+            # path writes inside one ms collapse to one stored_ts but
+            # each sits at a distinct value_hash so pagination still
+            # orders them.
+            time.sleep(0.001)
+
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_worker(local, [(peer, peer_fake)])
+
+        worker.tick_once()
+
+        local_vals = local.query_txt_record(prekey_name)
+        assert local_vals is not None
+        assert sorted(local_vals) == sorted(
+            values
+        ), f"expected all 5 values synced; got {local_vals}"
+        assert worker.stats.records_written == 5

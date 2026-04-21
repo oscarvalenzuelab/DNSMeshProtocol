@@ -47,13 +47,14 @@ Security invariants:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -578,39 +579,39 @@ class AntiEntropyWorker:
             # next_cursor either — they already demonstrated they'll lie.
             return
 
-        # Build local (hash -> ttl_remaining) index for just the names the
-        # peer lists. We only need to hash the values at those names, not
-        # the whole store, so this is cheap even with a big store. The
-        # TTL side of the tuple powers the TTL-refresh detection further
-        # down: when value hashes match but the peer's TTL is materially
-        # higher than ours, the peer has seen a republish we missed.
+        # Build local {name -> {hash -> ttl_remaining}} index for just
+        # the names the peer lists. We only need to hash the values at
+        # those names, not the whole store, so this is cheap even with
+        # a big store. The TTL side of the value powers TTL-refresh
+        # detection further down: when value hashes match but the peer's
+        # TTL is materially higher than ours, the peer has seen a
+        # republish we missed.
         peer_names = [e["name"] for e in valid_entries]
         local_by_name: Dict[str, Dict[str, int]] = {}
         local_store_records = self._store.get_records_by_name(peer_names)
         for r in local_store_records:
             local_by_name.setdefault(r.name, {})[r.record_hash] = int(r.ttl_remaining)
 
-        # Names to pull: those where the peer has a (name, hash) we don't,
-        # OR the peer has the same (name, hash) but a materially fresher
-        # TTL than us. The TTL_REFRESH_SLOP handles the unavoidable drift
-        # between when the peer hashed its row and when we measured ours
-        # (RTT + clock skew); without slop every digest would report a
-        # false refresh on in-sync rows.
-        to_pull: List[str] = []
-        seen: set = set()
-        # Also track entries considered "handled" — those we either
-        # pulled successfully OR already had at the same hash with a
-        # close-enough TTL. Only handled entries can advance the
-        # watermark.
-        handled_names: set = set()
+        # Diff on (name, hash) PAIRS, not name. A single name with
+        # multiple values (e.g. a prekey set: 5 TXT entries under
+        # ``prekeys.id-xxx``) surfaces in the digest as 5 entries sharing
+        # a name but with distinct hashes. Keying only on ``name`` would
+        # mark the first one seen and silently drop the rest — the bug
+        # this fix closes.
+        to_pull: List[Tuple[str, str]] = []
+        seen_pairs: Set[Tuple[str, str]] = set()
+        # Also track pairs considered "handled" — those we either pulled
+        # successfully OR already had at the same hash with a
+        # close-enough TTL. Only handled pairs can advance the watermark.
+        handled_pairs: Set[Tuple[str, str]] = set()
         for entry in valid_entries:
             name = entry["name"]
             h = entry["hash"]
-            if name in seen:
-                # Duplicate entry in the page — the peer repeated a name
-                # at a new hash. We already queued/handled the first
-                # occurrence; skip.
+            if (name, h) in seen_pairs:
+                # Duplicate (name, hash) in the page. Skip; we already
+                # processed it above.
                 continue
+            seen_pairs.add((name, h))
             local_hashes = local_by_name.get(name, {})
             if h in local_hashes:
                 # Same value hash — check for a TTL-only refresh. The peer's
@@ -622,45 +623,43 @@ class AntiEntropyWorker:
                     local_ttl = local_hashes[h]
                     if peer_ttl <= local_ttl + _TTL_REFRESH_SLOP_SECONDS:
                         # Already in sync (within slop). Handled.
-                        seen.add(name)
-                        handled_names.add(name)
+                        handled_pairs.add((name, h))
                         continue
                     # fallthrough — schedule a pull to refresh our expiry
                 else:
                     # Legacy peer that didn't emit ttl. Fall back to
                     # hash-only behavior (no refresh detection, but no
                     # false positives either).
-                    seen.add(name)
-                    handled_names.add(name)
+                    handled_pairs.add((name, h))
                     continue
-            seen.add(name)
-            to_pull.append(name)
+            to_pull.append((name, h))
 
-        pulled_names: set = set()
+        pulled_pairs: Set[Tuple[str, str]] = set()
         if to_pull:
-            pulled_names = self._pull_and_write(peer, to_pull)
-        handled_names |= pulled_names
+            pulled_pairs = self._pull_and_write(peer, to_pull)
+        handled_pairs |= pulled_pairs
 
         # Watermark advance.
         #
         # The hard safety property: never advance past a digest entry
         # that wasn't handled this tick (pulled, or already-present with
-        # matching hash + compatible TTL). Names that went into
+        # matching hash + compatible TTL). Pairs that went into
         # ``to_pull`` but weren't returned by ``_pull_and_write`` must
         # stay visible to the next digest: that includes entries beyond
-        # ``pull_batch_limit`` and those the peer declined or we rejected.
+        # ``pull_batch_limit`` and those the peer declined or we
+        # rejected.
         #
         # The original M2.4 design advanced past peer-rejection failures
         # to avoid getting stuck on a bad row. With the compound (ts,
-        # name) cursor we could do the same, but the validation gate
-        # above already filters the common "malicious poke" case, so
-        # it's safer to just hold the watermark at the last handled
-        # entry and let the next tick retry. A truly dead row will
-        # eventually expire and fall out of the digest entirely.
+        # name, value_hash) cursor the validation gate above already
+        # filters the common "malicious poke" case, so it's safer to
+        # hold the watermark at the last handled entry and let the next
+        # tick retry. A truly dead row will eventually expire and fall
+        # out of the digest entirely.
         handled_cursors: List[Cursor] = [
             (int(e["ts"]), e["name"], e["hash"])
             for e in valid_entries
-            if e["name"] in handled_names
+            if (e["name"], e["hash"]) in handled_pairs
         ]
         if handled_cursors:
             max_handled = max(handled_cursors)
@@ -668,8 +667,8 @@ class AntiEntropyWorker:
             max_handled = watermark
 
         # Peer's next_cursor is a pagination hint. We only trust it when:
-        #   - everything in the validated set was handled (so no entry is
-        #     being skipped), AND
+        #   - every validated (name, hash) pair was handled (so no entry
+        #     is being skipped), AND
         #   - it does not point STRICTLY PAST max_handled (so the peer
         #     isn't fabricating a future cursor to poke our watermark
         #     ahead of any real data we've verified).
@@ -679,7 +678,7 @@ class AntiEntropyWorker:
         new_watermark = max_handled
         if (
             peer_next_cursor is not None
-            and len(handled_names) == len(valid_entries)
+            and len(handled_pairs) == len(seen_pairs)
             and _cursor_ge(peer_next_cursor, watermark)
             and not _cursor_gt(peer_next_cursor, max_handled)
         ):
@@ -724,12 +723,15 @@ class AntiEntropyWorker:
             return None
         return (records, has_more, next_cursor)
 
-    def _pull_and_write(self, peer: SyncPeer, names: List[str]) -> set:
-        """Pull up to `pull_batch_limit` names from `peer`, verify+write
-        each, and return the set of names we successfully stored.
+    def _pull_and_write(
+        self, peer: SyncPeer, pairs: List[Tuple[str, str]]
+    ) -> Set[Tuple[str, str]]:
+        """Pull up to ``pull_batch_limit`` (name, hash) pairs from
+        ``peer``, verify+write each, and return the set of pairs we
+        successfully stored.
 
         The caller uses the returned set to advance the watermark: any
-        name present in the digest but absent from this set (because it
+        pair present in the digest but absent from this set (because it
         was deferred past the batch limit, rejected, or failed to write)
         must remain visible to the next digest request.
         """
@@ -738,11 +740,23 @@ class AntiEntropyWorker:
         # (their stored_ts hasn't changed, so they'll still show up in
         # the next digest window — as long as we don't advance the
         # watermark past them, see `_sync_with_peer`).
-        requested = names[: self._pull_limit]
-        requested_set = set(requested)
-        written: set = set()
+        requested = pairs[: self._pull_limit]
+        # Map name -> set of expected hashes the peer advertised. A peer
+        # may legitimately have multiple advertised hashes at one name
+        # (multi-value RRset); tracking the set lets a future hash-match
+        # verifier know which hash a given pulled value should match.
+        expected_hashes_by_name: Dict[str, Set[str]] = {}
+        for name, h in requested:
+            expected_hashes_by_name.setdefault(name, set()).add(h)
+        requested_names = [name for name, _ in requested]
+        written: Set[Tuple[str, str]] = set()
         url = f"{peer.http_endpoint.rstrip('/')}/v1/sync/pull"
-        payload = json.dumps({"names": requested}).encode("utf-8")
+        # Deduplicate names before the wire — the /pull endpoint does its
+        # own dedup but sending two copies of the same name on a
+        # multi-value RRset pull is wasted bandwidth.
+        payload = json.dumps({"names": list(dict.fromkeys(requested_names))}).encode(
+            "utf-8"
+        )
         status, body = self._http_post(url, self._token, payload, self._timeout)
         if status != 200:
             if status != 0:
@@ -776,7 +790,8 @@ class AntiEntropyWorker:
                 self.stats.records_rejected += 1
                 continue
             # Defense: peer must only return records for names we asked about.
-            if name not in requested_set:
+            expected = expected_hashes_by_name.get(name)
+            if expected is None:
                 log.warning(
                     "anti-entropy: peer %s returned unsolicited name %s",
                     peer.node_id,
@@ -796,12 +811,18 @@ class AntiEntropyWorker:
                 )
                 self.stats.records_rejected += 1
                 continue
+            # Compute the value's hash so the returned "written" set
+            # carries the (name, hash) pair that actually landed. The
+            # follow-up-3 commit adds a digest-hash-match gate HERE;
+            # for now we trust the peer to return one of the advertised
+            # hashes for a given name.
+            actual_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
             # Write via publish_txt_record, which is append-semantics: a
             # duplicate is a no-op TTL refresh, not an overwrite.
             try:
                 self._store.publish_txt_record(name, value, ttl=int(ttl))
                 self.stats.records_written += 1
-                written.add(name)
+                written.add((name, actual_hash))
             except Exception:
                 log.exception("anti-entropy: local publish failed for %s", name)
                 self.stats.errors += 1
