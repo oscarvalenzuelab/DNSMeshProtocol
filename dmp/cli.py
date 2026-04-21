@@ -479,7 +479,50 @@ def _make_cluster_reader_factory(
     return factory
 
 
-def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
+class _OfflineWriter(DNSRecordWriter):
+    """Placeholder writer used by local-only CLI commands in cluster mode.
+
+    `dmp identity show` and similar commands only read the local identity
+    state — no writer needed. But the legacy code path hands every client
+    a real `_HttpWriter`; when cluster mode is enabled we'd otherwise try
+    to fetch the cluster manifest at startup, which fails with exit 2 any
+    time DNS is unreachable (captive wi-fi, plane, DNS outage). That
+    breaks local-only commands that never intended to touch the network.
+
+    Using this placeholder keeps the local path working, and any
+    accidental network call fails loudly so a buggy command doesn't
+    silently swallow writes that should have hit DNS.
+    """
+
+    def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
+        raise RuntimeError(
+            "network unavailable: this command was built without cluster "
+            "bootstrap (local-only mode); publish_txt_record is not supported"
+        )
+
+    def delete_txt_record(self, name: str, value: Optional[str] = None) -> bool:
+        raise RuntimeError(
+            "network unavailable: this command was built without cluster "
+            "bootstrap (local-only mode); delete_txt_record is not supported"
+        )
+
+
+class _OfflineReader(DNSRecordReader):
+    """Placeholder reader mirror of `_OfflineWriter`. Raises on use."""
+
+    def query_txt_record(self, name: str):
+        raise RuntimeError(
+            "network unavailable: this command was built without cluster "
+            "bootstrap (local-only mode); query_txt_record is not supported"
+        )
+
+
+def _make_client(
+    config: CLIConfig,
+    passphrase: str,
+    *,
+    requires_network: bool = True,
+) -> DMPClient:
     """Build a DMPClient, routing through the cluster or legacy path.
 
     When cluster mode is enabled (both `cluster_base_domain` AND
@@ -491,6 +534,15 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
 
     When cluster mode is disabled, behavior is unchanged from the
     legacy single-endpoint path.
+
+    `requires_network=False` is an escape hatch for commands that only
+    need local state (e.g. `dmp identity show`, which just prints
+    username + derived keys). In that mode we skip the cluster manifest
+    fetch entirely and hand the client offline placeholder writer/reader
+    objects that raise on use. This keeps offline CLI use working (no
+    DNS required) without silencing real network failures for commands
+    that DO need the wire — those still pass `requires_network=True`
+    (the default) and still fail loudly on bootstrap failure.
     """
     cluster_client: Optional[ClusterClient] = None
     if _cluster_mode_enabled(config):
@@ -508,44 +560,58 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
                 "cluster_operator_spk must be 32 bytes (64 hex chars); got "
                 f"{len(operator_spk)} bytes",
             )
-        bootstrap_reader = _make_reader(config)
-        manifest = fetch_cluster_manifest(
-            config.cluster_base_domain,
-            operator_spk,
-            bootstrap_reader,
-        )
-        if manifest is None:
-            _die(
-                2,
-                f"cluster manifest fetch failed for {config.cluster_base_domain}. "
-                "Check that `cluster.<base>` TXT is published, signed by the "
-                "pinned operator key, and not expired.",
+        if not requires_network:
+            # Local-only mode: don't touch DNS. A subsequent network call
+            # on this client will raise via the offline placeholders.
+            writer: DNSRecordWriter = _OfflineWriter()
+            reader: DNSRecordReader = _OfflineReader()
+        else:
+            bootstrap_reader = _make_reader(config)
+            manifest = fetch_cluster_manifest(
+                config.cluster_base_domain,
+                operator_spk,
+                bootstrap_reader,
             )
-        refresh_interval: Optional[float] = (
-            float(config.cluster_refresh_interval)
-            if config.cluster_refresh_interval > 0
-            else None
-        )
-        cluster_client = ClusterClient(
-            manifest,
-            operator_spk=operator_spk,
-            base_domain=config.cluster_base_domain,
-            bootstrap_reader=bootstrap_reader,
-            writer_factory=_build_cluster_writer_factory(config),
-            reader_factory=_make_cluster_reader_factory(config, bootstrap_reader),
-            refresh_interval=refresh_interval,
-        )
-        writer: DNSRecordWriter = cluster_client.writer
-        reader: DNSRecordReader = cluster_client.reader
+            if manifest is None:
+                _die(
+                    2,
+                    f"cluster manifest fetch failed for {config.cluster_base_domain}. "
+                    "Check that `cluster.<base>` TXT is published, signed by the "
+                    "pinned operator key, and not expired.",
+                )
+            refresh_interval: Optional[float] = (
+                float(config.cluster_refresh_interval)
+                if config.cluster_refresh_interval > 0
+                else None
+            )
+            cluster_client = ClusterClient(
+                manifest,
+                operator_spk=operator_spk,
+                base_domain=config.cluster_base_domain,
+                bootstrap_reader=bootstrap_reader,
+                writer_factory=_build_cluster_writer_factory(config),
+                reader_factory=_make_cluster_reader_factory(config, bootstrap_reader),
+                refresh_interval=refresh_interval,
+            )
+            writer = cluster_client.writer
+            reader = cluster_client.reader
     else:
         if not config.endpoint:
-            _die(
-                1,
-                "no endpoint configured — run `dmp init` with --endpoint, or edit "
-                f"{_config_path()}",
-            )
-        writer = _HttpWriter(config.endpoint, config.http_token)
-        reader = _make_reader(config)
+            if not requires_network:
+                # Legacy mode with no endpoint: still usable for local
+                # commands. Hand back placeholders so `dmp identity show`
+                # works on a bare config that never got an --endpoint.
+                writer = _OfflineWriter()
+                reader = _OfflineReader()
+            else:
+                _die(
+                    1,
+                    "no endpoint configured — run `dmp init` with --endpoint, or edit "
+                    f"{_config_path()}",
+                )
+        else:
+            writer = _HttpWriter(config.endpoint, config.http_token)
+            reader = _make_reader(config)
     # Persist the replay cache next to the config so repeated `dmp recv` calls
     # across separate CLI processes don't re-deliver the same message.
     replay_path = str(_config_path().parent / "replay_cache.json")
@@ -657,9 +723,13 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_identity_show(args: argparse.Namespace) -> int:
+    # `identity show` only prints local-config state + keys derived from
+    # the passphrase; it never touches DNS. Skip the cluster manifest
+    # fetch so this command works offline (captive wi-fi, flight, DNS
+    # outage) even when cluster mode is pinned in config.
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
-    client = _make_client(cfg, passphrase)
+    client = _make_client(cfg, passphrase, requires_network=False)
     try:
         info = client.get_user_info()
         if args.json:

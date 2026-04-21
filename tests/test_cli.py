@@ -36,7 +36,14 @@ def shared_store(monkeypatch):
     """
     store = InMemoryDNSStore()
 
-    def fake_make_client(config, passphrase):
+    def fake_make_client(config, passphrase, *, requires_network=True):
+        # `requires_network` is accepted but ignored — the shared in-memory
+        # store stands in for both cluster and legacy network paths, so
+        # local-only commands and networked commands exercise the same
+        # fake. The real _make_client uses the flag to decide whether to
+        # call fetch_cluster_manifest; that branch is covered separately
+        # in TestLocalOnlyClusterBootstrap.
+        del requires_network
         from dmp.cli import _config_path
 
         replay_path = str(_config_path().parent / "replay_cache.json")
@@ -1199,3 +1206,180 @@ class TestNodeDnsReaderTruncation:
         monkeypatch.setattr(dns.query, "tcp", fake_tcp)
 
         assert reader.query_txt_record("example.com.") is None
+
+
+class TestLocalOnlyClusterBootstrap:
+    """Local-only CLI commands must not crash on cluster bootstrap failure.
+
+    `dmp identity show` prints only local-config state + keys derived
+    from the passphrase. In cluster mode, _make_client used to call
+    fetch_cluster_manifest unconditionally and die with exit 2 when DNS
+    was unreachable — breaking offline use. The fix routes local-only
+    commands through _make_client(..., requires_network=False) so they
+    skip the manifest fetch entirely.
+    """
+
+    def _pin_cluster_unreachable(self, monkeypatch):
+        """Make `fetch_cluster_manifest` behave as if DNS is offline."""
+        import dmp.cli as cli_mod
+
+        def failing_fetch(*args, **kwargs):
+            return None  # simulates "nothing verifying / DNS unreachable"
+
+        monkeypatch.setattr(cli_mod, "fetch_cluster_manifest", failing_fetch)
+
+    def test_identity_show_works_when_cluster_fetch_fails(
+        self, config_home, monkeypatch, capsys
+    ):
+        """`dmp identity show` must print local identity even when the
+        pinned cluster manifest is unreachable."""
+        from dmp.core.crypto import DMPCrypto
+
+        # Pin a cluster (both anchors set -> cluster mode on).
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op = DMPCrypto()
+        cli.main(
+            [
+                "cluster",
+                "pin",
+                op.get_signing_public_key_bytes().hex(),
+                "mesh.unreachable.example",
+            ]
+        )
+        capsys.readouterr()
+
+        # Simulate DNS outage — manifest fetch returns None.
+        self._pin_cluster_unreachable(monkeypatch)
+
+        monkeypatch.setenv("DMP_PASSPHRASE", "pw")
+        rc = cli.main(["identity", "show"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "username: alice" in out
+        assert "public_key:" in out
+
+    def test_identity_show_json_works_when_cluster_fetch_fails(
+        self, config_home, monkeypatch, capsys
+    ):
+        """JSON variant of the same: offline identity show still succeeds."""
+        import json as _json
+
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op = DMPCrypto()
+        cli.main(
+            [
+                "cluster",
+                "pin",
+                op.get_signing_public_key_bytes().hex(),
+                "mesh.unreachable.example",
+            ]
+        )
+        capsys.readouterr()
+
+        self._pin_cluster_unreachable(monkeypatch)
+
+        monkeypatch.setenv("DMP_PASSPHRASE", "pw")
+        rc = cli.main(["identity", "show", "--json"])
+        assert rc == 0
+        parsed = _json.loads(capsys.readouterr().out)
+        assert parsed["username"] == "alice"
+        assert len(parsed["public_key"]) == 64
+
+    def test_send_still_fails_loudly_when_cluster_fetch_fails(
+        self, config_home, monkeypatch, capsys
+    ):
+        """A networked command (`dmp send`) MUST still fail loudly with a
+        clear error + non-zero exit when bootstrap fails. Silencing that
+        would hide real breakage."""
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op = DMPCrypto()
+        cli.main(
+            [
+                "cluster",
+                "pin",
+                op.get_signing_public_key_bytes().hex(),
+                "mesh.unreachable.example",
+            ]
+        )
+        # Stash a contact so send gets past the unknown-contact check.
+        cli.main(["contacts", "add", "bob", "aa" * 32])
+        capsys.readouterr()
+
+        self._pin_cluster_unreachable(monkeypatch)
+
+        monkeypatch.setenv("DMP_PASSPHRASE", "pw")
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["send", "bob", "hi"])
+        # Exit 2 is the network/backend error code per cli.py docstring.
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "cluster manifest fetch failed" in err
+
+    def test_offline_writer_raises_on_publish(self):
+        """The offline placeholder writer must raise loudly on use, not
+        silently return success — otherwise a buggy command could think
+        it had published a record when in reality nothing went out."""
+        from dmp.cli import _OfflineWriter
+
+        w = _OfflineWriter()
+        with pytest.raises(RuntimeError, match="network unavailable"):
+            w.publish_txt_record("example.com.", "value")
+        with pytest.raises(RuntimeError, match="network unavailable"):
+            w.delete_txt_record("example.com.")
+
+    def test_offline_reader_raises_on_query(self):
+        """Same for the placeholder reader: raise, don't return None."""
+        from dmp.cli import _OfflineReader
+
+        r = _OfflineReader()
+        with pytest.raises(RuntimeError, match="network unavailable"):
+            r.query_txt_record("example.com.")
+
+    def test_make_client_skips_fetch_when_requires_network_false(
+        self, config_home, monkeypatch
+    ):
+        """Direct unit-level check: `requires_network=False` must not
+        invoke fetch_cluster_manifest at all, even when cluster mode is
+        pinned."""
+        import dmp.cli as cli_mod
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        op = DMPCrypto()
+        cli.main(
+            [
+                "cluster",
+                "pin",
+                op.get_signing_public_key_bytes().hex(),
+                "mesh.never.fetched.example",
+            ]
+        )
+
+        called = {"fetch_calls": 0}
+
+        def boom_fetch(*args, **kwargs):
+            called["fetch_calls"] += 1
+            raise AssertionError(
+                "fetch_cluster_manifest must NOT be called in local-only mode"
+            )
+
+        monkeypatch.setattr(cli_mod, "fetch_cluster_manifest", boom_fetch)
+
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        client = cli._make_client(cfg, "pw", requires_network=False)
+        try:
+            assert called["fetch_calls"] == 0
+            # Cluster handle is NOT created in local-only mode (we skipped
+            # the manifest → no ClusterClient to attach).
+            assert client._cluster_client is None
+            # Writer/reader are the offline placeholders — local ops like
+            # get_user_info() still work, but any accidental network call
+            # raises loudly.
+            assert isinstance(client.writer, cli_mod._OfflineWriter)
+            assert isinstance(client.reader, cli_mod._OfflineReader)
+        finally:
+            cli._close_client(client)
