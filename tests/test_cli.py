@@ -1072,12 +1072,26 @@ class TestClusterModeInMakeClient:
         try:
             # Cluster handle must be attached when cluster mode kicks in.
             assert client._cluster_client is not None
-            # Writer is a FanoutWriter and reader is a UnionReader.
+            # Writer is a FanoutWriter. Reader is a CompositeReader that
+            # wraps the cluster's UnionReader (cluster-local zone) + the
+            # bootstrap resolver (external zones) — a raw UnionReader
+            # would NXDOMAIN cross-domain identity fetches.
+            from dmp.network.composite_reader import CompositeReader
             from dmp.network.fanout_writer import FanoutWriter
             from dmp.network.union_reader import UnionReader
 
             assert isinstance(client.writer, FanoutWriter)
-            assert isinstance(client.reader, UnionReader)
+            assert isinstance(client.reader, CompositeReader)
+            # The composite's cluster_reader side is the UnionReader
+            # from the cluster client.
+            assert isinstance(
+                client.reader._cluster_reader,  # type: ignore[attr-defined]
+                UnionReader,
+            )
+            assert (
+                client.reader._cluster_base_domain  # type: ignore[attr-defined]
+                == "mesh.example.com"
+            )
             # Mailbox RRsets must live under the cluster's base domain,
             # not the legacy config.domain (default "mesh.local"). Using
             # the wrong domain here would silently target the wrong zone.
