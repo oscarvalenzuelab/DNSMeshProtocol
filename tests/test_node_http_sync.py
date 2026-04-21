@@ -15,6 +15,8 @@ from typing import List
 import pytest
 import requests
 
+from dmp.core.cluster import ClusterManifest, ClusterNode, cluster_rrset_name
+from dmp.core.crypto import DMPCrypto
 from dmp.network.memory import InMemoryDNSStore
 from dmp.server.anti_entropy import AntiEntropyWorker, SyncPeer
 from dmp.server.http_api import DMPHttpApi
@@ -306,6 +308,161 @@ class TestPull:
         assert len(recs) == 2
         values = sorted(r["value"] for r in recs)
         assert values == ["v1", "v2"]
+
+
+# ---- cluster-manifest gossip endpoint (M3.3) -----------------------------
+
+
+def _sign_cluster_manifest(
+    cluster_name: str = "mesh.example.com",
+    *,
+    seq: int = 1,
+    exp_in: int = 3600,
+    nodes=None,
+):
+    op = DMPCrypto()
+    manifest = ClusterManifest(
+        cluster_name=cluster_name,
+        operator_spk=op.get_signing_public_key_bytes(),
+        nodes=nodes
+        or [
+            ClusterNode(node_id="n1", http_endpoint="https://n1.example.com:8053"),
+            ClusterNode(node_id="n2", http_endpoint="https://n2.example.com:8053"),
+        ],
+        seq=seq,
+        exp=int(time.time()) + exp_in,
+    )
+    return manifest.sign(op), op, manifest
+
+
+@pytest.fixture
+def api_store_with_cluster(tmp_path):
+    store = SqliteMailboxStore(str(tmp_path / "n.db"))
+    api = DMPHttpApi(
+        store,
+        host="127.0.0.1",
+        port=_free_port(),
+        sync_peer_token="sync-token",
+        cluster_base_domain="mesh.example.com",
+    )
+    api.start()
+    try:
+        yield api, store
+    finally:
+        api.stop()
+        store.close()
+
+
+class TestClusterManifestEndpoint:
+    def test_requires_auth(self, api_store_with_cluster):
+        api, _ = api_store_with_cluster
+        r = requests.get(f"{_base(api)}/v1/sync/cluster-manifest", timeout=2)
+        assert r.status_code == 403
+
+    def test_rejects_wrong_token(self, api_store_with_cluster):
+        api, _ = api_store_with_cluster
+        r = requests.get(
+            f"{_base(api)}/v1/sync/cluster-manifest",
+            headers=_auth_hdr("nope"),
+            timeout=2,
+        )
+        assert r.status_code == 403
+
+    def test_204_when_no_manifest_installed(self, api_store_with_cluster):
+        api, _ = api_store_with_cluster
+        r = requests.get(
+            f"{_base(api)}/v1/sync/cluster-manifest",
+            headers=_auth_hdr("sync-token"),
+            timeout=2,
+        )
+        assert r.status_code == 204
+        # 204 is "no content"; no body expected.
+        assert r.content == b""
+
+    def test_204_when_base_domain_not_configured(self, tmp_path):
+        # cluster_base_domain=None → 204 regardless of store state.
+        store = SqliteMailboxStore(str(tmp_path / "n.db"))
+        api = DMPHttpApi(
+            store,
+            host="127.0.0.1",
+            port=_free_port(),
+            sync_peer_token="sync-token",
+        )
+        api.start()
+        try:
+            wire, _, _ = _sign_cluster_manifest()
+            store.publish_txt_record(
+                cluster_rrset_name("mesh.example.com"), wire, ttl=300
+            )
+            r = requests.get(
+                f"{_base(api)}/v1/sync/cluster-manifest",
+                headers=_auth_hdr("sync-token"),
+                timeout=2,
+            )
+            assert r.status_code == 204
+        finally:
+            api.stop()
+            store.close()
+
+    def test_returns_wire_when_installed(self, api_store_with_cluster):
+        api, store = api_store_with_cluster
+        wire, _, manifest = _sign_cluster_manifest()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire, ttl=300)
+        r = requests.get(
+            f"{_base(api)}/v1/sync/cluster-manifest",
+            headers=_auth_hdr("sync-token"),
+            timeout=2,
+        )
+        assert r.status_code == 200
+        doc = r.json()
+        assert doc["wire"] == wire
+        assert doc["seq"] == manifest.seq
+        assert doc["exp"] == manifest.exp
+        assert doc["cluster_name"] == "mesh.example.com"
+
+    def test_returns_highest_seq_when_multiple_co_resident(
+        self, api_store_with_cluster
+    ):
+        api, store = api_store_with_cluster
+        # Two manifests from two DIFFERENT operators under the same RRset
+        # (simulates operator rotation / co-resident rollout). Both parse
+        # structurally; we return the higher-seq one. Signature
+        # verification is the caller's job.
+        wire_low, _, _ = _sign_cluster_manifest(seq=3)
+        wire_high, _, _ = _sign_cluster_manifest(seq=7)
+        rrset = cluster_rrset_name("mesh.example.com")
+        store.publish_txt_record(rrset, wire_low, ttl=300)
+        store.publish_txt_record(rrset, wire_high, ttl=300)
+        r = requests.get(
+            f"{_base(api)}/v1/sync/cluster-manifest",
+            headers=_auth_hdr("sync-token"),
+            timeout=2,
+        )
+        assert r.status_code == 200
+        doc = r.json()
+        assert doc["wire"] == wire_high
+        assert doc["seq"] == 7
+
+    def test_204_when_no_sync_token_configured(self, tmp_path):
+        # sync_peer_token=None → endpoint 403s everyone.
+        store = SqliteMailboxStore(str(tmp_path / "n.db"))
+        api = DMPHttpApi(
+            store,
+            host="127.0.0.1",
+            port=_free_port(),
+            cluster_base_domain="mesh.example.com",
+        )
+        api.start()
+        try:
+            r = requests.get(
+                f"{_base(api)}/v1/sync/cluster-manifest",
+                headers=_auth_hdr("anything"),
+                timeout=2,
+            )
+            assert r.status_code == 403
+        finally:
+            api.stop()
+            store.close()
 
 
 # ---- two-node in-process integration ------------------------------------

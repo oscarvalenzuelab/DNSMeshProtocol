@@ -465,13 +465,35 @@ class AntiEntropyWorker:
         pull_batch_limit: int = PULL_MAX_NAMES,
         http_timeout: float = DEFAULT_HTTP_TIMEOUT,
         cluster_operator_spk: Optional[bytes] = None,
+        base_domain: Optional[str] = None,
+        self_node_id: Optional[str] = None,
+        self_http_endpoint: Optional[str] = None,
         http_get: Optional[HttpGet] = None,
         http_post: Optional[HttpPost] = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be > 0")
         self._store = store
-        self._peers: List[SyncPeer] = list(peers)
+        # ``base_domain`` is the cluster_name this node expects gossiped
+        # manifests to bind to. When both ``cluster_operator_spk`` and
+        # ``base_domain`` are set, each tick also fetches
+        # /v1/sync/cluster-manifest from the peer and installs any
+        # higher-seq verifying manifest locally. Without both, manifest
+        # gossip is disabled — trust-on-first-use for a new operator key
+        # would be a tooth in the chain of trust.
+        self._base_domain = base_domain
+        self._self_node_id = self_node_id
+        self._self_http_endpoint = (
+            # Normalize the same way replace_peers does — strip trailing
+            # slashes AND lowercase. Hostnames are case-insensitive, so
+            # a config like ``http://NODE-A:8053/`` must still match a
+            # manifest entry ``http://node-a:8053`` for self-exclusion
+            # to fire on the first gossip install.
+            self_http_endpoint.rstrip("/").lower()
+            if self_http_endpoint
+            else None
+        )
+        self._peers: List[SyncPeer] = self._filter_self(list(peers))
         self._token = sync_token
         self._interval = float(interval_seconds)
         self._digest_limit = max(1, min(int(digest_batch_limit), DIGEST_MAX_LIMIT))
@@ -496,6 +518,35 @@ class AntiEntropyWorker:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self.stats = SyncStats()
+        # Gossip bookkeeping. ``_installed_seq`` tracks the highest seq
+        # of any cluster manifest this worker has installed locally so
+        # we reject downgrades without re-reading the store on every
+        # tick. A fresh worker starts at -1 so seq=0 manifests can be
+        # installed on first tick (seq fits in uint64, but -1 is still a
+        # safe strict-less sentinel against any real seq).
+        self._installed_seq: int = -1
+
+    # ---- self-exclusion ----------------------------------------------------
+
+    def _filter_self(self, peers: List[SyncPeer]) -> List[SyncPeer]:
+        """Drop any peer entry that matches this node's identity.
+
+        Matches on ``self_node_id`` OR ``self_http_endpoint`` (normalized
+        by stripping trailing slashes), whichever is provided. This is
+        the non-negotiable "never sync with yourself" guard: a node
+        gossiping with itself is an infinite loop on first tick,
+        because /v1/sync/cluster-manifest would return the very
+        manifest we just installed, making the worker retry forever.
+        """
+        out: List[SyncPeer] = []
+        for p in peers:
+            if self._self_node_id and p.node_id == self._self_node_id:
+                continue
+            if self._self_http_endpoint:
+                if p.http_endpoint.rstrip("/").lower() == self._self_http_endpoint:
+                    continue
+            out.append(p)
+        return out
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -531,7 +582,17 @@ class AntiEntropyWorker:
                 self.stats.errors += 1
 
     def tick_once(self) -> None:
-        """Run one sync cycle against one peer. Public for tests."""
+        """Run one sync cycle against one peer. Public for tests.
+
+        The tick does two things per peer:
+
+        1. Digest/pull for data records (the existing M2.4 flow).
+        2. If manifest gossip is enabled (both ``cluster_operator_spk``
+           and ``base_domain`` were supplied), fetch
+           ``/v1/sync/cluster-manifest`` from the peer and install any
+           higher-seq verifying manifest — swapping the live peer set
+           to match.
+        """
         with self._lock:
             self.stats.ticks += 1
             if not self._peers:
@@ -539,6 +600,295 @@ class AntiEntropyWorker:
             peer = self._peers[self._rr_index % len(self._peers)]
             self._rr_index = (self._rr_index + 1) % len(self._peers)
         self._sync_with_peer(peer)
+        if self._gossip_enabled():
+            try:
+                self._try_gossip_manifest_from(peer)
+            except Exception:
+                # Gossip must never take down the data-sync tick. A
+                # gossip failure is a missed rollout, not a security
+                # problem: the pinned operator_spk remains unchanged,
+                # so a malformed response cannot install anything.
+                log.exception(
+                    "anti-entropy: gossip from %s raised — continuing", peer.node_id
+                )
+                self.stats.errors += 1
+
+    # ---- gossip ------------------------------------------------------------
+
+    def _gossip_enabled(self) -> bool:
+        """True when both the operator_spk anchor AND a target
+        base_domain are configured. Without either, we don't know what
+        to verify against or which cluster_name to bind the incoming
+        manifest to — gossip stays off rather than falling back to
+        trust-on-first-use."""
+        return self._cluster_operator_spk is not None and bool(self._base_domain)
+
+    def _try_gossip_manifest_from(self, peer: SyncPeer) -> None:
+        """Fetch peer's /v1/sync/cluster-manifest; install if verifying
+        AND seq > current. Never downgrades, never installs across a
+        different operator key, never installs across a different
+        cluster_name.
+
+        Failure modes (all log-and-skip):
+        - peer returns non-200 / 204 / unparseable JSON
+        - wire missing or not a string
+        - ``parse_and_verify`` returns None (bad sig, wrong operator,
+          expired, wrong cluster_name)
+        - seq <= currently installed (no-op)
+        """
+        assert self._base_domain is not None  # _gossip_enabled()
+        assert self._cluster_operator_spk is not None  # _gossip_enabled()
+
+        url = f"{peer.http_endpoint.rstrip('/')}/v1/sync/cluster-manifest"
+        status, body = self._http_get(url, self._token, self._timeout)
+        if status == 204:
+            # Peer has no manifest to share — normal during early
+            # cluster bootstrap.
+            return
+        if status != 200:
+            if status != 0:
+                log.debug(
+                    "anti-entropy: gossip from %s returned HTTP %d",
+                    peer.node_id,
+                    status,
+                )
+            return
+        try:
+            doc = json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            log.warning("anti-entropy: gossip %s returned non-JSON", peer.node_id)
+            return
+        if not isinstance(doc, dict):
+            return
+        wire = doc.get("wire")
+        if not isinstance(wire, str) or not wire:
+            return
+
+        manifest = ClusterManifest.parse_and_verify(
+            wire,
+            self._cluster_operator_spk,
+            expected_cluster_name=self._base_domain,
+        )
+        if manifest is None:
+            # Peer returned something — malformed, wrong key, wrong
+            # cluster_name, expired, or signature invalid. The pinned
+            # operator_spk is the only trust anchor; any verify miss
+            # is silent (no install, no watermark move).
+            log.warning(
+                "anti-entropy: gossip %s returned non-verifying manifest",
+                peer.node_id,
+            )
+            return
+
+        current = self._current_installed_seq()
+        if manifest.seq <= current:
+            # No-op: peer has the same or older view. The higher-seq
+            # manifest that lives locally was either set up by the
+            # operator on disk or installed by a previous gossip tick.
+            return
+
+        # Good: higher-seq verifying manifest. Install:
+        # 1) republish wire under cluster.<base> TXT (append-semantics
+        #    keeps the old wire visible during the TTL window, which
+        #    is fine — clients pick highest-seq that verifies).
+        # 2) swap the live peer set to the new node list, preserving
+        #    watermarks for retained peers.
+        self._install_gossiped_manifest(manifest, wire)
+
+    def _current_installed_seq(self) -> int:
+        """Return the highest seq currently visible to this worker.
+
+        Returns ``max(in-memory-cached seq, local-store max-verified
+        seq)``. Re-reading the store on every call is deliberate: the
+        operator rollout path pushes a new manifest to one node via
+        ``/v1/records/cluster.<base>`` (NOT through install_gossiped_
+        manifest), which means the worker's cache is blind to that
+        fresh value. Caching only would let a peer at seq == cache but
+        > disk sneak in a downgrade. Ground truth lives in the store.
+
+        The cache IS still useful: it captures in-process installs
+        whose wire hasn't been fully flushed / isn't yet visible to
+        query_txt_record via expiry semantics. We take the max of
+        both sources.
+        """
+        disk_best = -1
+        if self._base_domain and self._cluster_operator_spk is not None:
+            from dmp.core.cluster import cluster_rrset_name
+
+            try:
+                rrset = cluster_rrset_name(self._base_domain)
+            except ValueError:
+                rrset = None
+            if rrset is not None and hasattr(self._store, "query_txt_record"):
+                try:
+                    values = self._store.query_txt_record(rrset)
+                except Exception:
+                    values = None
+                for wire in values or []:
+                    if not isinstance(wire, str):
+                        continue
+                    m = ClusterManifest.parse_and_verify(
+                        wire,
+                        self._cluster_operator_spk,
+                        expected_cluster_name=self._base_domain,
+                    )
+                    if m is not None and m.seq > disk_best:
+                        disk_best = m.seq
+        return max(self._installed_seq, disk_best)
+
+    def _install_gossiped_manifest(
+        self, manifest: "ClusterManifest", wire: str
+    ) -> None:
+        """Store the wire + swap the peer list. Called only after
+        parse_and_verify succeeded and seq is strictly higher than any
+        manifest seen before."""
+        from dmp.core.cluster import cluster_rrset_name
+
+        try:
+            rrset = cluster_rrset_name(manifest.cluster_name)
+        except ValueError:
+            # Shouldn't happen after parse_and_verify, but guard anyway.
+            log.warning("anti-entropy: gossip install: invalid cluster_name")
+            return
+
+        # Republish into the local store. publish_txt_record is
+        # append-semantics: a duplicate is a no-op TTL refresh, not an
+        # overwrite. Old + new co-reside until the old TTL expires,
+        # matching the operator-rollout DNS pattern the client's
+        # highest-seq-wins fetch already handles.
+        try:
+            # TTL anchors to the manifest's own ``exp`` timestamp.
+            # A fixed 5-min TTL aged out gossiped manifests on nodes
+            # that learned the cluster ONLY via gossip — after 300s the
+            # record expired, /v1/sync/cluster-manifest returned 204,
+            # and downstream peers/clients could no longer discover the
+            # current manifest from this node. Tying the TTL to the
+            # manifest's expiry guarantees the TXT outlives its own
+            # validity window; a fresh install each time the worker
+            # learns a higher seq refreshes it.
+            import time as _time
+
+            now = int(_time.time())
+            # TTL tracks the manifest's own signed expiry — no cap. The
+            # manifest's parse_and_verify already rejects past-exp, so
+            # letting the TXT live the full validity window keeps the
+            # gossip-only node's /v1/sync/cluster-manifest responsive
+            # for the entire operator-chosen lifetime. Worst case a
+            # multi-day-valid manifest pins a record for several days;
+            # operator bumps seq to roll out a replacement.
+            exp_remaining = max(1, manifest.exp - now)
+            self._store.publish_txt_record(rrset, wire, ttl=exp_remaining)
+        except Exception:
+            log.exception(
+                "anti-entropy: gossip install: store publish for %s failed", rrset
+            )
+            return
+
+        # Swap peers. Retained peers keep their watermarks; new peers
+        # start at the sentinel; dropped peers have their state cleared.
+        new_peers: List[SyncPeer] = []
+        for node in manifest.nodes:
+            new_peers.append(
+                SyncPeer(node_id=node.node_id, http_endpoint=node.http_endpoint)
+            )
+        self.replace_peers(new_peers)
+
+        self._installed_seq = manifest.seq
+        log.info(
+            "anti-entropy: gossip installed manifest seq=%d from peers (%d nodes)",
+            manifest.seq,
+            len(manifest.nodes),
+        )
+
+    def replace_peers(self, peers: Iterable[SyncPeer]) -> None:
+        """Swap the worker's peer list at runtime.
+
+        Called by the gossip path when a higher-seq manifest lands,
+        but also safe to call from tests or operator tooling. Preserves
+        watermarks for peers retained across the swap. New peers start
+        at the ``(0, "", "")`` sentinel. Dropped peers have their
+        watermark entry removed.
+
+        Identity for retention is the PAIR (node_id, normalized
+        http_endpoint). Same-node_id-different-endpoint counts as
+        a genuinely new peer (endpoint rotation → fresh state).
+        Same-endpoint-different-node_id ALSO counts as retained:
+        this is the DMP_SYNC_PEERS → gossiped-manifest handoff path,
+        where peers were initially seeded with URL-derived synthetic
+        ids and then reappear under operator-defined ids. Without
+        that cross-key match the first gossip install would drop
+        every synthetic watermark and force a full rescan of records
+        we already validated.
+
+        Self-exclusion is re-applied so callers don't have to
+        pre-filter.
+        """
+        new_list = self._filter_self(list(peers))
+        # Deduplicate by node_id, preserving first-seen order.
+        seen: Set[str] = set()
+        deduped: List[SyncPeer] = []
+        for p in new_list:
+            if p.node_id in seen:
+                continue
+            seen.add(p.node_id)
+            deduped.append(p)
+
+        def _norm_endpoint(url: str) -> str:
+            # Same normalization _peer_id_from_url uses — strip trailing
+            # slashes, lowercase. Keeps url-synthetic and operator-pinned
+            # peers matchable by stable key.
+            return url.strip().rstrip("/").lower()
+
+        # Retention rule (narrow by design):
+        #   1. Same (node_id, endpoint) pair → preserve cursor (no change).
+        #   2. Endpoint unchanged, old node_id was SYNTHETIC (URL-derived
+        #      via _peer_id_from_url) and new id is operator-defined →
+        #      preserve cursor: this is the DMP_SYNC_PEERS-to-gossiped-
+        #      manifest handoff where the "node" was always the endpoint
+        #      and the synthetic id was our internal invention.
+        #   3. Any other rotation (endpoint change OR operator-id→
+        #      operator-id under same endpoint) → FRESH cursor. Both
+        #      indicate a real replacement; resuming mid-stream would
+        #      skip history the new peer hasn't replicated.
+        #
+        # _peer_id_from_url lives in dmp.server.node to avoid a circular
+        # import at module load; resolve lazily here.
+        def _is_synthetic_id(peer: SyncPeer) -> bool:
+            try:
+                from dmp.server.node import _peer_id_from_url
+            except Exception:
+                return False
+            return peer.node_id == _peer_id_from_url(peer.http_endpoint)
+
+        with self._lock:
+            old_peers_by_ep: Dict[str, SyncPeer] = {}
+            for old_peer in self._peers:
+                old_peers_by_ep[_norm_endpoint(old_peer.http_endpoint)] = old_peer
+
+            new_watermarks: Dict[str, Cursor] = {}
+            for p in deduped:
+                key_ep = _norm_endpoint(p.http_endpoint)
+                old_peer = old_peers_by_ep.get(key_ep)
+                old_cursor = (
+                    self._watermarks.get(old_peer.node_id) if old_peer else None
+                )
+                preserve = False
+                if old_peer is not None and old_cursor is not None:
+                    if old_peer.node_id == p.node_id:
+                        # Case 1: identical (id, endpoint).
+                        preserve = True
+                    elif _is_synthetic_id(old_peer):
+                        # Case 2: synthetic→operator handoff.
+                        preserve = True
+                    # Else: case 3 — operator-id change on same endpoint
+                    # means a real node replacement. Fresh cursor.
+                new_watermarks[p.node_id] = old_cursor if preserve else (0, "", "")
+            self._watermarks = new_watermarks
+            self._peers = deduped
+            if self._peers:
+                self._rr_index = self._rr_index % len(self._peers)
+            else:
+                self._rr_index = 0
 
     # ---- per-peer work -----------------------------------------------------
 
