@@ -146,9 +146,7 @@ class DMPNodeConfig:
             cluster_file=os.environ.get("DMP_CLUSTER_FILE", cls.cluster_file),
             node_id=os.environ.get("DMP_NODE_ID") or None,
             sync_peer_token=os.environ.get("DMP_SYNC_PEER_TOKEN") or None,
-            sync_interval=float(
-                os.environ.get("DMP_SYNC_INTERVAL", cls.sync_interval)
-            ),
+            sync_interval=float(os.environ.get("DMP_SYNC_INTERVAL", cls.sync_interval)),
             sync_cluster_operator_spk_hex=(
                 os.environ.get("DMP_SYNC_OPERATOR_SPK") or None
             ),

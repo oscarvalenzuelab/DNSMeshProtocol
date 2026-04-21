@@ -174,9 +174,7 @@ def _peers_from_wire(wire: str, self_node_id: Optional[str]) -> List[SyncPeer]:
     for node in manifest.nodes:
         if self_node_id and node.node_id == self_node_id:
             continue
-        peers.append(
-            SyncPeer(node_id=node.node_id, http_endpoint=node.http_endpoint)
-        )
+        peers.append(SyncPeer(node_id=node.node_id, http_endpoint=node.http_endpoint))
     return peers
 
 
@@ -558,9 +556,7 @@ class AntiEntropyWorker:
                 self._store.publish_txt_record(name, value, ttl=int(ttl))
                 self.stats.records_written += 1
             except Exception:
-                log.exception(
-                    "anti-entropy: local publish failed for %s", name
-                )
+                log.exception("anti-entropy: local publish failed for %s", name)
                 self.stats.errors += 1
 
     # ---- testing introspection --------------------------------------------
