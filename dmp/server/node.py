@@ -440,17 +440,32 @@ class DMPNode:
             return
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                wire = fh.read().strip()
+                raw = fh.read().strip()
         except OSError as e:
             log.warning("cluster manifest: cannot read %s: %s", path, e)
             return
-        # The same path may carry a JSON peer list (legacy
-        # DMP_CLUSTER_FILE shape) or a signed wire blob. Only the
-        # signed form gets published; JSON is ignored here.
+        # The same path can carry either the raw wire string OR the
+        # JSON envelope ``{"wire": "..."}`` used by
+        # ``load_peers_from_cluster_json``. Extract the wire from both
+        # shapes; genuine JSON peer-list files (no "wire" key) are
+        # silently ignored here.
         from dmp.core.cluster import RECORD_PREFIX as _CLUSTER_PREFIX
         from dmp.core.cluster import ClusterManifest, cluster_rrset_name
 
-        if not wire.startswith(_CLUSTER_PREFIX):
+        wire: Optional[str] = None
+        if raw.startswith(_CLUSTER_PREFIX):
+            wire = raw
+        elif raw.startswith("{"):
+            try:
+                import json as _json
+
+                doc = _json.loads(raw)
+            except Exception:
+                return
+            candidate = doc.get("wire") if isinstance(doc, dict) else None
+            if isinstance(candidate, str) and candidate.startswith(_CLUSTER_PREFIX):
+                wire = candidate
+        if wire is None:
             return
         # If the operator pinned an operator_spk for sync, use it for
         # verification before publishing. Otherwise publish opaquely
@@ -609,12 +624,35 @@ class DMPNode:
             return None
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                wire = fh.read().strip()
+                raw = fh.read().strip()
         except OSError:
             return None
         from dmp.core.cluster import RECORD_PREFIX as _CLUSTER_PREFIX
 
-        if not wire.startswith(_CLUSTER_PREFIX):
+        # cluster_file has two supported shapes:
+        #   1) the raw wire string ``v=dmp1;t=cluster;<base64>``
+        #   2) a JSON envelope ``{"wire": "v=dmp1;t=cluster;..."}`` —
+        #      this is the shape load_peers_from_cluster_json already
+        #      accepts for peer discovery. Without this branch, nodes
+        #      using the JSON form silently fall through to "no gossip"
+        #      because the raw-wire prefix check fails.
+        wire: str
+        if raw.startswith(_CLUSTER_PREFIX):
+            wire = raw
+        elif raw.startswith("{"):
+            try:
+                import json as _json
+
+                doc = _json.loads(raw)
+            except Exception:
+                return None
+            candidate = doc.get("wire") if isinstance(doc, dict) else None
+            if not isinstance(candidate, str) or not candidate.startswith(
+                _CLUSTER_PREFIX
+            ):
+                return None
+            wire = candidate
+        else:
             return None
         try:
             import base64 as _b64
