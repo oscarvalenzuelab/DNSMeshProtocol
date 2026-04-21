@@ -299,6 +299,17 @@ class DMPNode:
 
         self.store = SqliteMailboxStore(self.config.db_path)
 
+        # Publish the signed cluster manifest into the store on startup
+        # if one is mounted. Clients fan out / union-read against the
+        # cluster by first resolving `cluster.<base>` TXT — if the node
+        # never puts the wire into its own mailbox, there's nothing for
+        # DNS-based bootstrap to find. This runs even when DMP_SYNC_PEERS
+        # took precedence over the manifest for peer discovery, because
+        # the client-facing cluster TXT still needs to exist. Silently
+        # no-op if the file is missing / malformed — anti-entropy and
+        # the HTTP API are independent subsystems.
+        self._publish_cluster_manifest_from_file()
+
         # Expose record count as a lazy Prometheus gauge.
         REGISTRY.register_lazy_gauge(
             "dmp_records",
@@ -357,6 +368,96 @@ class DMPNode:
             self.config.db_path,
             len(self.anti_entropy.peers) if self.anti_entropy else 0,
         )
+
+    def _publish_cluster_manifest_from_file(self) -> None:
+        """If a signed cluster manifest is mounted at ``cluster_file``
+        AND it parses as a ClusterManifest wire blob, publish it under
+        ``cluster.<cluster_name>`` TXT in the local store so clients
+        fanning out / union-reading against this cluster can discover
+        the node list by DNS.
+
+        Silently no-ops when:
+        - no path is configured,
+        - the file doesn't exist,
+        - the file contains JSON (peer list) instead of a signed
+          manifest wire blob (detected by prefix),
+        - parsing / signature verification fails.
+
+        Malformed content must never block startup — the manifest is
+        orthogonal to everything else the node does.
+        """
+        path = self.config.cluster_file
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                wire = fh.read().strip()
+        except OSError as e:
+            log.warning("cluster manifest: cannot read %s: %s", path, e)
+            return
+        # The same path may carry a JSON peer list (legacy
+        # DMP_CLUSTER_FILE shape) or a signed wire blob. Only the
+        # signed form gets published; JSON is ignored here.
+        from dmp.core.cluster import RECORD_PREFIX as _CLUSTER_PREFIX
+        from dmp.core.cluster import ClusterManifest, cluster_rrset_name
+
+        if not wire.startswith(_CLUSTER_PREFIX):
+            return
+        # If the operator pinned an operator_spk for sync, use it for
+        # verification before publishing. Otherwise publish opaquely
+        # and rely on the client's own pin to reject if wrong.
+        operator_spk: Optional[bytes] = None
+        if self.config.sync_cluster_operator_spk_hex:
+            try:
+                operator_spk = bytes.fromhex(
+                    self.config.sync_cluster_operator_spk_hex.strip()
+                )
+                if len(operator_spk) != 32:
+                    operator_spk = None
+            except ValueError:
+                operator_spk = None
+        manifest = None
+        if operator_spk is not None:
+            manifest = ClusterManifest.parse_and_verify(wire, operator_spk)
+            if manifest is None:
+                log.warning(
+                    "cluster manifest at %s does not verify under the "
+                    "configured DMP_SYNC_OPERATOR_SPK; not publishing",
+                    path,
+                )
+                return
+        else:
+            # Best-effort parse without signature verification just so
+            # we can derive the cluster_name for the TXT owner.
+            try:
+                import base64
+                import struct
+
+                blob = base64.b64decode(wire[len(_CLUSTER_PREFIX) :], validate=True)
+                body = blob[:-64]
+                # Magic(7) + seq(8) + exp(8) + operator_spk(32) + name_len(1)
+                name_len = body[55]
+                cluster_name = body[56 : 56 + name_len].decode("utf-8").rstrip(".")
+            except Exception as e:
+                log.warning("cluster manifest at %s malformed: %s", path, e)
+                return
+
+            class _Bag:
+                pass
+
+            manifest = _Bag()
+            manifest.cluster_name = cluster_name
+
+        rrset = cluster_rrset_name(manifest.cluster_name)
+        ttl = min(300, self.config.max_ttl)
+        assert self.store is not None
+        if self.store.publish_txt_record(rrset, wire, ttl=ttl):
+            log.info(
+                "cluster manifest published: %s -> %s (%d bytes)",
+                rrset,
+                path,
+                len(wire.encode("utf-8")),
+            )
 
     def _make_anti_entropy_worker(self) -> Optional[AntiEntropyWorker]:
         # Two peer-discovery modes, checked in order:
