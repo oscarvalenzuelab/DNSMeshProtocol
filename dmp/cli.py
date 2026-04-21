@@ -983,24 +983,18 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         # zone signer cannot silently impersonate a legitimate cluster
         # (the cluster's own operator key is the gate there).
         #
-        # Walk entries in priority order — a backup cluster in the
-        # bootstrap record should serve the lookup if the primary is
-        # unreachable. Matches auto-pin's fallback behavior.
-        manifest = None
-        best = None
-        for entry in record.entries:
-            m = fetch_cluster_manifest(
-                entry.cluster_base_domain, entry.operator_spk, bootstrap_reader
-            )
-            if m is not None:
-                manifest = m
-                best = entry
-                break
+        # Walk entries in priority order and also probe the per-node
+        # factories — a malformed endpoint in a signed manifest must
+        # not crash ClusterClient construction below. Shared helper
+        # keeps this consistent with auto-pin and manual discover.
+        manifest, best = _pick_usable_bootstrap_entry(
+            record, cfg, bootstrap_reader
+        )
         if manifest is None or best is None:
             _die(
                 2,
-                f"--via-bootstrap: no cluster manifest reachable for any "
-                f"entry in the bootstrap record for {host} "
+                f"--via-bootstrap: no usable cluster manifest in the "
+                f"bootstrap record for {host} "
                 f"(tried {len(record.entries)} in priority order)",
             )
         # One-shot ClusterClient: no refresh thread. It lives only for
@@ -1701,6 +1695,42 @@ def cmd_bootstrap_pin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pick_usable_bootstrap_entry(
+    record,
+    cfg: CLIConfig,
+    bootstrap_reader: DNSRecordReader,
+):
+    """Walk `record.entries` in priority order, return (manifest, entry)
+    for the first entry whose cluster manifest fetches, verifies, AND
+    whose per-node factories can construct a writer+reader for every
+    node.
+
+    Returns (None, None) if no entry is usable. Used by bootstrap
+    discover / auto-pin / identity fetch --via-bootstrap so all three
+    code paths agree on the fallback semantics and don't diverge on
+    "manifest verifies but is unusable" cases.
+    """
+    for entry in record.entries:
+        m = fetch_cluster_manifest(
+            entry.cluster_base_domain, entry.operator_spk, bootstrap_reader
+        )
+        if m is None:
+            continue
+        writer_factory = _build_cluster_writer_factory(cfg)
+        reader_factory = _make_cluster_reader_factory(cfg, bootstrap_reader)
+        ok = True
+        for node in m.nodes:
+            try:
+                writer_factory(node)
+                reader_factory(node)
+            except Exception:
+                ok = False
+                break
+        if ok:
+            return m, entry
+    return None, None
+
+
 def _resolve_bootstrap_anchors(
     cfg: CLIConfig,
     *,
@@ -1876,19 +1906,34 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
             "Check the TXT is published, signed by the pinned signer, "
             "not expired, and binds to this user_domain.",
         )
-    best = record.best_entry()
-
     if not args.auto_pin:
         # Diagnostic mode: show the operator what the pinning would
         # look like so they can approve/deny with full visibility.
+        # Walk the same fallback ladder --auto-pin uses so the guidance
+        # points at a cluster that actually works, not just the
+        # highest-priority entry that may be down. If nothing usable,
+        # fall back to best_entry() for visibility with a clear warning.
+        _usable_manifest, chosen = _pick_usable_bootstrap_entry(
+            record, cfg, bootstrap_reader
+        )
+        shown = chosen if chosen is not None else record.best_entry()
         print(f"address:     {user}@{host}")
         print(f"user_domain: {host}  (seq={record.seq}, exp={record.exp})")
-        print(f"best entry:  priority={best.priority}")
-        print(f"  cluster_base_domain: {best.cluster_base_domain}")
-        print(f"  operator_spk:        {best.operator_spk.hex()}")
+        if chosen is None:
+            print(
+                "WARNING: no entry in this record has a reachable + "
+                "factory-buildable cluster manifest right now. Showing "
+                "the highest-priority entry for visibility only — "
+                "pinning it would immediately break cluster commands."
+            )
+        print(f"shown entry: priority={shown.priority}")
+        print(f"  cluster_base_domain: {shown.cluster_base_domain}")
+        print(f"  operator_spk:        {shown.operator_spk.hex()}")
         print()
         print("to pin this cluster manually, run:")
-        print(f"  dmp cluster pin {best.operator_spk.hex()} {best.cluster_base_domain}")
+        print(
+            f"  dmp cluster pin {shown.operator_spk.hex()} {shown.cluster_base_domain}"
+        )
         print("  dmp cluster fetch  # verify manifest")
         print("  dmp cluster enable # activate cluster mode")
         print()
@@ -1909,36 +1954,14 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     # manifest is unreachable (node down, not yet published, etc.) we
     # fall through to the next verified entry. A bootstrap record
     # carrying a backup cluster is useless if clients don't try it.
-    manifest = None
-    chosen = None
-    for entry in record.entries:
-        m = fetch_cluster_manifest(
-            entry.cluster_base_domain, entry.operator_spk, bootstrap_reader
-        )
-        if m is None:
-            continue
-        # Dry-run the per-node factories against the fetched manifest
-        # before accepting it. A malformed http_endpoint / dns_endpoint
-        # slips past ClusterManifest validation but would crash the
-        # next networked command — the "all-or-nothing" contract means
-        # we must prove the config is usable before persisting it.
-        # Same pattern cluster-atomic-refresh uses on refresh_now.
-        writer_factory = _build_cluster_writer_factory(cfg)
-        reader_factory = _make_cluster_reader_factory(cfg, bootstrap_reader)
-        factory_ok = True
-        for node in m.nodes:
-            try:
-                writer_factory(node)
-                reader_factory(node)
-            except Exception:
-                factory_ok = False
-                break
-        if not factory_ok:
-            # This entry's manifest is unusable. Try the next one.
-            continue
-        manifest = m
-        chosen = entry
-        break
+    # Walk entries in priority order. Accept only an entry whose
+    # cluster manifest verifies AND whose per-node factories can
+    # actually build writer/reader instances — dry-run matches the
+    # "all-or-nothing" contract. Shared helper keeps this consistent
+    # with --via-bootstrap and manual discover output.
+    manifest, chosen = _pick_usable_bootstrap_entry(
+        record, cfg, bootstrap_reader
+    )
     if manifest is None or chosen is None:
         _die(
             2,
