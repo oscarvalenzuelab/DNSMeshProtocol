@@ -240,9 +240,7 @@ class FakePeerHTTP:
 
             wire = self.cluster_manifest_wire
             try:
-                blob = _b64.b64decode(
-                    wire[len("v=dmp1;t=cluster;") :], validate=True
-                )
+                blob = _b64.b64decode(wire[len("v=dmp1;t=cluster;") :], validate=True)
                 body_bytes = blob[:-64]
                 seq = int.from_bytes(body_bytes[7:15], "big")
                 exp = int.from_bytes(body_bytes[15:23], "big")
@@ -1380,9 +1378,7 @@ class TestGossipManifest:
         local = InMemoryDNSStore()
         # Note: the self endpoint has a trailing slash, the peer entry
         # does not. Normalization must make them match.
-        peer_self = SyncPeer(
-            node_id="twin-a", http_endpoint="http://self.example:8053"
-        )
+        peer_self = SyncPeer(node_id="twin-a", http_endpoint="http://self.example:8053")
         peer_other = SyncPeer(
             node_id="other", http_endpoint="http://other.example:8053"
         )
@@ -1429,9 +1425,7 @@ class TestGossipManifest:
         local = InMemoryDNSStore()
         op = DMPCrypto()
         wire, _ = _make_cluster(op, seq=5)
-        local.publish_txt_record(
-            cluster_rrset_name("mesh.example.com"), wire, ttl=300
-        )
+        local.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire, ttl=300)
 
         peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=wire)
         peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
