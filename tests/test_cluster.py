@@ -505,6 +505,37 @@ class TestClusterManifestSecurity:
         # Trailing dot stripped so it compares equal to our sign-side form.
         assert parsed.cluster_name == "mesh.example.com"
 
+    def test_externally_produced_64byte_name_with_trailing_dot_parses(self):
+        """Externally produced manifest at the 64-byte normalized-length
+        boundary with canonical FQDN trailing dot (65 bytes on the wire)
+        must parse — sign()'s cap is on the normalized form, parse must
+        match so we interoperate with other implementations.
+        """
+        operator = _make_operator()
+        opk = operator.get_signing_public_key_bytes()
+        # Build a 63-byte label-content name + 1 trailing dot = 64 wire bytes
+        # ... wait that's not 64 normalized. Go to 63 + dot to land at
+        # 64 wire for the trailing-dot boundary. For the 64+dot=65 case:
+        core = "a" * 55 + ".bcd.efg"  # 55 + 1 + 3 + 1 + 3 = 63 bytes
+        name_str = core + "a"  # 64 bytes of label content
+        assert len(name_str) == 64
+        wire_name = name_str + "."  # 65 bytes on wire
+        assert len(wire_name.encode()) == 65
+        body = (
+            b"DMPCL01"
+            + (1).to_bytes(8, "big")
+            + (int(time.time()) + 3600).to_bytes(8, "big")
+            + opk
+            + len(wire_name).to_bytes(1, "big")
+            + wire_name.encode("utf-8")
+            + (0).to_bytes(1, "big")
+        )
+        sig = operator.sign_data(body)
+        raw_wire = RECORD_PREFIX + base64.b64encode(body + sig).decode("ascii")
+        parsed = ClusterManifest.parse_and_verify(raw_wire, opk)
+        assert parsed is not None
+        assert parsed.cluster_name == name_str
+
 
 # ---- expiry ---------------------------------------------------------------
 
@@ -873,6 +904,21 @@ class TestClusterRrsetName:
         # a caller typo and publishing to the wrong RRset. We now refuse.
         with pytest.raises(ValueError, match="empty label"):
             cluster_rrset_name("mesh.example.com..")
+
+    def test_invalid_names_rejected(self):
+        # cluster_rrset_name must apply the same DNS-name rules the rest
+        # of the module enforces — otherwise a direct caller can publish
+        # or query an invalid owner name that no other code path would
+        # accept.
+        for bad in (
+            "",
+            ".mesh.example.com",
+            "mesh..example.com",
+            "under_score.example.com",
+            "café.example.com",
+        ):
+            with pytest.raises(ValueError):
+                cluster_rrset_name(bad)
 
 
 # ---- cluster_name DNS-name validation -------------------------------------
