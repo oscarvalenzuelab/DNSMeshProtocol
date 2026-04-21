@@ -3,6 +3,7 @@
 from dmp.network.base import DNSRecordWriter, DNSRecordReader, DNSRecordStore
 from dmp.network.memory import InMemoryDNSStore
 from dmp.network.resolver_pool import ResolverPool, WELL_KNOWN_RESOLVERS
+from dmp.network.union_reader import UnionReader
 
 __all__ = [
     "DNSRecordWriter",
@@ -10,5 +11,6 @@ __all__ = [
     "DNSRecordStore",
     "InMemoryDNSStore",
     "ResolverPool",
+    "UnionReader",
     "WELL_KNOWN_RESOLVERS",
 ]
