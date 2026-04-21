@@ -155,18 +155,15 @@ class CloudflarePublisher(DNSRecordWriter):
         try:
             ttl = max(60, ttl)  # Cloudflare minimum TTL
             existing = self._find_record(name, "TXT")
-            # Cloudflare's v4 API accepts a ``content`` string that is
-            # served as-is. For values > 255 bytes we need to pass the
-            # multi-string "chunk1" "chunk2" form (space-separated
-            # quoted chunks) so Cloudflare emits a valid multi-string
-            # TXT RDATA on the wire. Values <= 255 bytes keep the prior
-            # raw-string behavior to avoid needlessly changing
-            # existing records.
-            chunks = _split_txt_value(value)
-            if len(chunks) == 1:
-                content = value
-            else:
-                content = " ".join(f'"{c}"' for c in chunks)
+            # Cloudflare's v4 API stores ``content`` as a literal string
+            # and handles DNS wire-format string splitting internally,
+            # up to their ~2048-character content cap. Passing a
+            # quoted-chunk form like `"a" "b"` would be stored with
+            # the literal quotes and break resolution. Pass raw.
+            # Values that exceed Cloudflare's cap will get an API error
+            # response (surfaced via `response.json().get("success", False)`)
+            # rather than silent corruption.
+            content = value
             payload = {
                 "type": "TXT",
                 "name": name,
