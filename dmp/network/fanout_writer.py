@@ -61,6 +61,7 @@ operator, or for the wrong cluster, is the caller's responsibility.
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -167,7 +168,9 @@ class FanoutWriter(DNSRecordWriter):
         self._timeout = float(timeout)
         self._lock = threading.Lock()
         # Current manifest (always the most recently installed one).
-        self._manifest: ClusterManifest = manifest
+        # Stored as a deepcopy so caller-side mutation of the passed
+        # ClusterManifest can't corrupt our monotonicity check.
+        self._manifest: ClusterManifest = copy.deepcopy(manifest)
         # Per-node state, keyed by node_id. Insertion order is the
         # manifest's node order, which makes snapshot() deterministic.
         self._nodes: Dict[str, _NodeState] = {}
@@ -327,6 +330,11 @@ class FanoutWriter(DNSRecordWriter):
         if manifest.is_expired():
             return False
         with self._lock:
+            if self._closed:
+                # A close()-in-flight must block further installs;
+                # otherwise we allocate writers / a new executor that
+                # close() already committed to not draining.
+                return False
             if manifest.seq <= self._manifest.seq:
                 return False
 
@@ -432,7 +440,11 @@ class FanoutWriter(DNSRecordWriter):
                 self._retired_executors.append(self._executor)
                 self._executor = new_executor
 
-            self._manifest = manifest
+            # Snapshot the manifest so a caller that reuses and
+            # mutates the dataclass after install (e.g. bumping seq
+            # on the next refresh) can't corrupt the installed state
+            # we compare future refreshes against.
+            self._manifest = copy.deepcopy(manifest)
             self._nodes = new_states
         return True
 
