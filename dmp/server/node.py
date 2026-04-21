@@ -530,17 +530,19 @@ class DMPNode:
             manifest.exp = manifest_exp
 
         rrset = cluster_rrset_name(manifest.cluster_name)
-        # TTL anchors to the manifest's own signed expiry so the TXT
-        # stays serveable for the entire validity window — a 5-minute
-        # cap would make a file-seeded node go 204 after startup and
-        # break DNS-based discovery for peers starting later. max_ttl
-        # clamps egregious values; we never extend past the manifest's
-        # own self-declared lifetime.
+        # TTL tracks the manifest's own signed expiry, NOT max_ttl. The
+        # generic max_ttl cap exists to bound untrusted publishes via
+        # the public HTTP API; the cluster manifest is operator-signed
+        # and parse_and_verify already rejects past-exp records, so
+        # clamping here just reintroduces early expiry — a manifest
+        # valid for multiple days would still vanish from the local
+        # store after max_ttl (default 86400s), breaking
+        # /v1/sync/cluster-manifest for late-joining peers. Trust the
+        # signed exp.
         import time as _time
 
         now = int(_time.time())
-        exp_remaining = max(1, int(manifest.exp) - now)
-        ttl = min(exp_remaining, self.config.max_ttl)
+        ttl = max(1, int(manifest.exp) - now)
         assert self.store is not None
         if self.store.publish_txt_record(rrset, wire, ttl=ttl):
             log.info(
