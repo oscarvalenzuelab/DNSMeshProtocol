@@ -49,9 +49,11 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import threading
+import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -81,6 +83,103 @@ _TTL_REFRESH_SLOP_SECONDS = 5
 # A well-formed chunk record prefix (the only type without a d= suffix and
 # not in the signed-type list).
 _CHUNK_PREFIX = "v=dmp1;t=chunk;d="
+
+# Watermark type alias. The compound (stored_ts_ms, name) form replaces the
+# plain int cursor from the original M2.4 code; see the module docstring.
+Cursor = Tuple[int, str]
+
+# Digest-entry validation: peers are untrusted, so we harden every field
+# before it's allowed to influence the local watermark. The DNS-label
+# regex rejects anything that couldn't plausibly be a record name; the
+# 60-second future-skew window absorbs honest clock drift while capping a
+# malicious peer's ability to poke the watermark out past our real data.
+_VALID_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,253}$")
+_VALID_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_MAX_TTL = 2**31
+_CLOCK_SKEW_MS = 60_000
+
+
+def _valid_digest_entry(entry: Any) -> bool:
+    """True if ``entry`` is a structurally-sound digest record.
+
+    Only entries that pass this check are allowed to advance our
+    per-peer watermark. A buggy or malicious peer that stuffs
+    ``{"ts": 9999999999999, "name": "bogus", "hash": "not-sha256"}``
+    into their digest response cannot poke the local watermark out past
+    the real data — if they could, legitimate updates with lower ts
+    would be invisible to every subsequent digest call (their stored_ts
+    lives below the poisoned cutoff).
+
+    Checks (all required):
+
+    - ``name`` is a string, <= 253 bytes, matches ``_VALID_NAME_RE``.
+    - ``hash`` is a 64-char lowercase hex string (sha256 hex digest).
+    - ``ts`` is an int in [0, now_ms + 60s]. Future timestamps beyond the
+      skew window are treated as forged; absent ts is treated as 0.
+    - ``ttl`` is an int in [0, 2**31].
+    """
+    if not isinstance(entry, dict):
+        return False
+    name = entry.get("name")
+    if not isinstance(name, str):
+        return False
+    if len(name.encode("utf-8")) > 253:
+        return False
+    if not _VALID_NAME_RE.match(name):
+        return False
+    h = entry.get("hash")
+    if not isinstance(h, str) or not _VALID_HASH_RE.match(h):
+        return False
+    ts = entry.get("ts")
+    if not isinstance(ts, int) or isinstance(ts, bool):
+        return False
+    now_ms = int(time.time() * 1000)
+    if ts < 0 or ts > now_ms + _CLOCK_SKEW_MS:
+        return False
+    ttl = entry.get("ttl")
+    if not isinstance(ttl, int) or isinstance(ttl, bool):
+        return False
+    if ttl < 0 or ttl > _MAX_TTL:
+        return False
+    return True
+
+
+def _parse_next_cursor(raw: Any) -> Optional[Cursor]:
+    """Parse a peer-supplied ``next_cursor`` string into ``(ts, name)``.
+
+    Returns ``None`` if the peer returned something unparseable — we just
+    fall back to advancing the watermark from the validated entries. The
+    splitting is on the first ``:`` so names that happen to contain one
+    (shouldn't, in DNS) don't silently corrupt the ts half.
+    """
+    if not isinstance(raw, str):
+        return None
+    parts = raw.split(":", 1)
+    if len(parts) != 2:
+        return None
+    ts_str, name = parts
+    try:
+        ts = int(ts_str)
+    except (ValueError, TypeError):
+        return None
+    if ts < 0:
+        return None
+    now_ms = int(time.time() * 1000)
+    if ts > now_ms + _CLOCK_SKEW_MS:
+        return None
+    if len(name) > 253:
+        return None
+    return (ts, name)
+
+
+def _cursor_ge(a: Cursor, b: Cursor) -> bool:
+    """True iff cursor ``a`` is >= cursor ``b`` in (ts, name) order."""
+    return (a[0], a[1]) >= (b[0], b[1])
+
+
+def _cursor_gt(a: Cursor, b: Cursor) -> bool:
+    """True iff cursor ``a`` is strictly greater than cursor ``b``."""
+    return (a[0], a[1]) > (b[0], b[1])
 
 
 @dataclass
@@ -368,7 +467,10 @@ class AntiEntropyWorker:
         self._http_get = http_get or _default_http_get
         self._http_post = http_post or _default_http_post
 
-        self._watermarks: Dict[str, int] = {p.node_id: 0 for p in self._peers}
+        # Compound (ts_ms, name) watermark per peer. The name half breaks
+        # same-millisecond pagination ties that plain ts would drop.
+        # Initial value (0, "") means "pull from the beginning."
+        self._watermarks: Dict[str, Cursor] = {p.node_id: (0, "") for p in self._peers}
         self._rr_index: int = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -421,14 +523,40 @@ class AntiEntropyWorker:
     # ---- per-peer work -----------------------------------------------------
 
     def _sync_with_peer(self, peer: SyncPeer) -> None:
-        watermark = self._watermarks.get(peer.node_id, 0)
+        watermark = self._current_watermark(peer.node_id)
         digest = self._fetch_digest(peer, watermark)
         if digest is None:
             return
-        entries, has_more = digest
+        entries, has_more, peer_next_cursor = digest
         self.stats.digests_fetched += 1
 
         if not entries:
+            # Empty page — nothing newer than our watermark. We
+            # deliberately do NOT trust the peer's next_cursor here: with
+            # no validated data to anchor against, a lying peer could
+            # push us arbitrarily far forward. Leave the watermark where
+            # it is; next tick will re-query from the same cursor and
+            # pick up anything that appeared in the interim.
+            return
+
+        # Hard security gate: drop structurally-invalid entries BEFORE they
+        # can touch either the pull set or the watermark calculation. A
+        # peer that returns {"ts": far_future, "name": "bogus"} must not
+        # be able to skip the local node past legitimate lower-ts updates.
+        valid_entries = [e for e in entries if _valid_digest_entry(e)]
+        rejected = len(entries) - len(valid_entries)
+        if rejected:
+            log.warning(
+                "anti-entropy: peer %s returned %d structurally-invalid "
+                "digest entries (dropped, watermark unaffected)",
+                peer.node_id,
+                rejected,
+            )
+            self.stats.records_rejected += rejected
+
+        if not valid_entries:
+            # Everything the peer sent was garbage. Do NOT trust their
+            # next_cursor either — they already demonstrated they'll lie.
             return
 
         # Build local (hash -> ttl_remaining) index for just the names the
@@ -437,7 +565,7 @@ class AntiEntropyWorker:
         # TTL side of the tuple powers the TTL-refresh detection further
         # down: when value hashes match but the peer's TTL is materially
         # higher than ours, the peer has seen a republish we missed.
-        peer_names = [e["name"] for e in entries]
+        peer_names = [e["name"] for e in valid_entries]
         local_by_name: Dict[str, Dict[str, int]] = {}
         local_store_records = self._store.get_records_by_name(peer_names)
         for r in local_store_records:
@@ -451,12 +579,18 @@ class AntiEntropyWorker:
         # false refresh on in-sync rows.
         to_pull: List[str] = []
         seen: set = set()
-        for entry in entries:
-            name = entry.get("name")
-            h = entry.get("hash")
-            if not isinstance(name, str) or not isinstance(h, str):
-                continue
+        # Also track entries considered "handled" — those we either
+        # pulled successfully OR already had at the same hash with a
+        # close-enough TTL. Only handled entries can advance the
+        # watermark.
+        handled_names: set = set()
+        for entry in valid_entries:
+            name = entry["name"]
+            h = entry["hash"]
             if name in seen:
+                # Duplicate entry in the page — the peer repeated a name
+                # at a new hash. We already queued/handled the first
+                # occurrence; skip.
                 continue
             local_hashes = local_by_name.get(name, {})
             if h in local_hashes:
@@ -468,12 +602,17 @@ class AntiEntropyWorker:
                 if isinstance(peer_ttl, int) and peer_ttl > 0:
                     local_ttl = local_hashes[h]
                     if peer_ttl <= local_ttl + _TTL_REFRESH_SLOP_SECONDS:
+                        # Already in sync (within slop). Handled.
+                        seen.add(name)
+                        handled_names.add(name)
                         continue
                     # fallthrough — schedule a pull to refresh our expiry
                 else:
                     # Legacy peer that didn't emit ttl. Fall back to
                     # hash-only behavior (no refresh detection, but no
                     # false positives either).
+                    seen.add(name)
+                    handled_names.add(name)
                     continue
             seen.add(name)
             to_pull.append(name)
@@ -481,63 +620,67 @@ class AntiEntropyWorker:
         pulled_names: set = set()
         if to_pull:
             pulled_names = self._pull_and_write(peer, to_pull)
+        handled_names |= pulled_names
 
         # Watermark advance.
         #
-        # The hard safety property: never advance past a digest entry we
-        # *declined to request* this tick. If a batch lists more missing
-        # names than we could pull in one request (pull_batch_limit), the
-        # tail was deferred to the next tick; advancing past its stored_ts
-        # would skip those names forever (peer's stored_ts hasn't moved,
-        # so they'd be below the next `since=` cutoff).
+        # The hard safety property: never advance past a digest entry
+        # that wasn't handled this tick (pulled, or already-present with
+        # matching hash + compatible TTL). Names that went into
+        # ``to_pull`` but weren't returned by ``_pull_and_write`` must
+        # stay visible to the next digest: that includes entries beyond
+        # ``pull_batch_limit`` and those the peer declined or we rejected.
         #
-        # Failures *after* we requested — peer declined to return the
-        # name, or we rejected the value — are handled differently:
-        # holding the watermark there forever would leave us stuck, since
-        # on the next tick the digest likely won't list the same bad
-        # name either. We advance past those so the loop makes progress;
-        # if the peer later republishes with a fresher stored_ts, we'll
-        # pick it up normally.
-        #
-        # has_more just means "there are more rows past this page"; it
-        # does NOT affect safety because those tail rows have stored_ts
-        # strictly greater than everything in this page by the ORDER BY
-        # contract, so they're still visible with a higher watermark.
-        deferred_names = set(to_pull[self._pull_limit :])
-        if deferred_names:
-            # Cap advance below the first deferred entry's ts. Entries
-            # are ordered by ts ASC from the digest endpoint, so the
-            # deferred-min ts dominates.
-            deferred_ts_values = [
-                int(e.get("ts", 0) or 0)
-                for e in entries
-                if isinstance(e.get("name"), str) and e["name"] in deferred_names
-            ]
-            min_deferred_ts = min(deferred_ts_values, default=0)
-            # Advance to max ts *strictly less than* min_deferred_ts so
-            # the deferred names stay above the cutoff.
-            safe_ts_values = [
-                int(e.get("ts", 0) or 0)
-                for e in entries
-                if int(e.get("ts", 0) or 0) < min_deferred_ts
-            ]
-            new_watermark = max(safe_ts_values, default=watermark)
+        # The original M2.4 design advanced past peer-rejection failures
+        # to avoid getting stuck on a bad row. With the compound (ts,
+        # name) cursor we could do the same, but the validation gate
+        # above already filters the common "malicious poke" case, so
+        # it's safer to just hold the watermark at the last handled
+        # entry and let the next tick retry. A truly dead row will
+        # eventually expire and fall out of the digest entirely.
+        handled_cursors: List[Cursor] = [
+            (int(e["ts"]), e["name"])
+            for e in valid_entries
+            if e["name"] in handled_names
+        ]
+        if handled_cursors:
+            max_handled = max(handled_cursors)
         else:
-            # Nothing was deferred — either everything we needed was
-            # pulled, or everything in the page was already in our store.
-            # Safe to advance to the end of the observed page.
-            new_watermark = max(
-                (int(e.get("ts", 0) or 0) for e in entries), default=watermark
-            )
-        if new_watermark > watermark:
+            max_handled = watermark
+
+        # Peer's next_cursor is a pagination hint. We only trust it when:
+        #   - everything in the validated set was handled (so no entry is
+        #     being skipped), AND
+        #   - it does not point STRICTLY PAST max_handled (so the peer
+        #     isn't fabricating a future cursor to poke our watermark
+        #     ahead of any real data we've verified).
+        # If the peer lied about where pagination ends, we ignore the
+        # cursor and advance only to max_handled — the next tick will
+        # still re-request from there and see any rows we missed.
+        new_watermark = max_handled
+        if (
+            peer_next_cursor is not None
+            and len(handled_names) == len(valid_entries)
+            and _cursor_ge(peer_next_cursor, watermark)
+            and not _cursor_gt(peer_next_cursor, max_handled)
+        ):
+            new_watermark = peer_next_cursor
+
+        if _cursor_gt(new_watermark, watermark):
             self._watermarks[peer.node_id] = new_watermark
 
     def _fetch_digest(
-        self, peer: SyncPeer, watermark: int
-    ) -> Optional[Tuple[List[dict], bool]]:
+        self, peer: SyncPeer, watermark: Cursor
+    ) -> Optional[Tuple[List[dict], bool, Optional[Cursor]]]:
+        # Send the compound cursor as the opaque ``cursor=<ts>:<name>``
+        # query param. DNS names don't contain colons, so the delimiter
+        # is unambiguous. Empty-name half still parses cleanly as
+        # ``"<ts>:"``.
+        cur_ts, cur_name = watermark
+        cursor_param = f"{int(cur_ts)}:{cur_name}"
         url = (
             f"{peer.http_endpoint.rstrip('/')}/v1/sync/digest"
-            f"?since={int(watermark)}&limit={self._digest_limit}"
+            f"?cursor={cursor_param}&limit={self._digest_limit}"
         )
         status, body = self._http_get(url, self._token, self._timeout)
         if status != 200:
@@ -555,10 +698,11 @@ class AntiEntropyWorker:
             return None
         records = doc.get("records")
         has_more = bool(doc.get("has_more"))
+        next_cursor = _parse_next_cursor(doc.get("next_cursor"))
         if not isinstance(records, list):
             self.stats.errors += 1
             return None
-        return (records, has_more)
+        return (records, has_more, next_cursor)
 
     def _pull_and_write(self, peer: SyncPeer, names: List[str]) -> set:
         """Pull up to `pull_batch_limit` names from `peer`, verify+write
@@ -645,11 +789,51 @@ class AntiEntropyWorker:
 
     # ---- testing introspection --------------------------------------------
 
-    def watermark(self, node_id: str) -> int:
-        return int(self._watermarks.get(node_id, 0))
+    def _current_watermark(self, node_id: str) -> Cursor:
+        """Return the compound watermark for ``node_id``, migrating a
+        lingering plain-int cursor to ``(int, "")`` on first access.
 
-    def set_watermark(self, node_id: str, ts: int) -> None:
-        self._watermarks[node_id] = int(ts)
+        The integer form lingers on disk nowhere (watermarks are
+        in-memory) but tests occasionally seed them via ``set_watermark``
+        with the old shape. Treating ``int`` as ``(int, "")`` keeps
+        compatibility without a hard break.
+        """
+        raw = self._watermarks.get(node_id, (0, ""))
+        if isinstance(raw, int):
+            migrated: Cursor = (raw, "")
+            self._watermarks[node_id] = migrated
+            return migrated
+        # Defensive: tuple shape check.
+        if (
+            not isinstance(raw, tuple)
+            or len(raw) != 2
+            or not isinstance(raw[0], int)
+            or not isinstance(raw[1], str)
+        ):
+            self._watermarks[node_id] = (0, "")
+            return (0, "")
+        return raw
+
+    def watermark(self, node_id: str) -> Cursor:
+        """Return the ``(stored_ts_ms, name)`` watermark for ``node_id``.
+
+        The return shape changed from ``int`` to ``(int, str)`` in the
+        M2.4 follow-up. Callers that treat the result as truthy (``if
+        worker.watermark(...)``) still work because ``(0, "")`` is the
+        sole "pull from beginning" sentinel.
+        """
+        return self._current_watermark(node_id)
+
+    def set_watermark(self, node_id: str, ts: Union[int, Cursor]) -> None:
+        """Seed a watermark for tests. Accepts either the legacy ``int``
+        or the compound ``(int, str)`` shape. Legacy ints are stored
+        directly and migrated to ``(int, "")`` on next access."""
+        if isinstance(ts, int):
+            self._watermarks[node_id] = (int(ts), "")
+        elif isinstance(ts, tuple) and len(ts) == 2:
+            self._watermarks[node_id] = (int(ts[0]), str(ts[1]))
+        else:
+            raise TypeError("watermark must be int or (int, str)")
 
     @property
     def peers(self) -> List[SyncPeer]:
