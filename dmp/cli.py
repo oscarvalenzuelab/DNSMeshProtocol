@@ -1965,9 +1965,9 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     # Inspecting a recipient's cluster is still possible without
     # --auto-pin (diagnostic mode) or via --via-bootstrap on
     # identity fetch.
-    if not cfg.bootstrap_user_domain or _norm_dns_name(
-        host
-    ) != _norm_dns_name(cfg.bootstrap_user_domain):
+    if not cfg.bootstrap_user_domain or _norm_dns_name(host) != _norm_dns_name(
+        cfg.bootstrap_user_domain
+    ):
         _die(
             1,
             f"--auto-pin refuses to rehome config onto {host!r}: it is "
