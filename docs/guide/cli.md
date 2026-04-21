@@ -55,6 +55,16 @@ identity even if you remember the passphrase.
   needed to pick up node-set changes).
 - `cluster_node_token`: optional bearer token for the per-node HTTP
   publish writers. Falls back to `http_token` when empty.
+- `bootstrap_user_domain` + `bootstrap_signer_spk`: anchors for
+  bootstrap discovery (M3.2-wire). Pinning these with
+  `dmp bootstrap pin <user_domain> <signer_spk_hex>` lets the client
+  translate `alice@<user_domain>` addresses into concrete cluster
+  anchors via a signed TXT record at `_dmp.<user_domain>`. See
+  [Bootstrap discovery](#bootstrap-discovery). This is a **separate
+  trust domain** from `cluster_*`: the zone operator signing the
+  bootstrap record and the cluster operator signing the cluster
+  manifest are distinct keys, and the client verifies each
+  independently during discovery.
 
 ## Subcommands
 
@@ -106,7 +116,7 @@ resolvers (all `:53`, or all default) are unaffected.
 | `dmp identity show [--json]` | Print this identity's public keys |
 | `dmp identity publish [--ttl N]` | Publish the signed identity record to DNS |
 | `dmp identity refresh-prekeys [--count N] [--ttl S]` | Generate and publish a one-time prekey pool |
-| `dmp identity fetch <user> [--domain D] [--add] [--accept-fingerprint F] [--json]` | Resolve someone else's identity |
+| `dmp identity fetch <user> [--domain D] [--add] [--accept-fingerprint F] [--via-bootstrap] [--json]` | Resolve someone else's identity |
 
 `dmp identity fetch` accepts either a plain `<user>` (hash-based lookup
 under the shared mesh domain — TOFU) or a zone-anchored
@@ -116,6 +126,14 @@ ownership).
 When two valid identity records coexist at the same name, `--add` is
 refused and fingerprints are printed on stderr. Re-run with
 `--accept-fingerprint <16-hex>` after verifying out of band.
+
+`--via-bootstrap` (M3.2-wire): when the address is in `<user>@<host>`
+form and a bootstrap signer is pinned for `<host>` via
+`dmp bootstrap pin`, the command discovers the cluster serving that
+host on-the-fly and routes the identity query through a one-shot
+cluster client. No config is written — this is a lookup convenience.
+For a permanent cluster pin, use `dmp bootstrap discover --auto-pin`
+instead.
 
 ### `dmp contacts`
 
@@ -334,6 +352,16 @@ This deliberate one-time migration step avoids the "upgrade
 bricks every command if the manifest isn't reachable right now"
 failure mode the field was introduced to fix.
 
+#### Migration note: bootstrap fields are additive
+
+The M3.2-wire `bootstrap_user_domain` / `bootstrap_signer_spk`
+fields are purely additive. An existing cluster-only config (both
+`cluster_*` anchors pinned, `cluster_enabled=True`) is unchanged by
+the upgrade — it continues to use the pinned cluster path. The
+bootstrap-discovery commands (`dmp bootstrap pin / fetch / discover`)
+are opt-in; until you pin a bootstrap signer, the CLI behavior is
+identical to pre-M3.2.
+
 #### Cluster mode
 
 When the two anchors above are set, publishes go to `ceil(N/2)`
@@ -345,6 +373,109 @@ unauthenticated). The per-node reader is a UDP DNS reader pointed at
 `node.dns_endpoint`; nodes whose manifest entries omit
 `dns_endpoint` fall back to the configured bootstrap reader (the
 same resolver pool used to fetch the manifest).
+
+### `dmp bootstrap`
+
+Bootstrap discovery (M3.2-wire). A bootstrap record is a signed TXT
+record at `_dmp.<user_domain>` that points the user domain at one or
+more clusters. It is the analogue of an SMTP MX record: given an
+address like `alice@example.com`, a client queries DNS once, verifies
+the record under the **zone operator**'s pinned pubkey, and learns
+which cluster's `cluster.<base>` TXT to fetch next. No prior
+knowledge of the cluster's base domain is needed — only the zone
+operator's Ed25519 key, obtained out-of-band.
+
+| Subcommand | Purpose |
+|---|---|
+| `dmp bootstrap pin <user_domain> <signer_spk_hex>` | Store the zone operator's trust anchor in config |
+| `dmp bootstrap fetch [--user-domain X] [--signer-spk hex]` | One-shot fetch + verify; print the entry summary |
+| `dmp bootstrap discover <user@host> [--signer-spk hex] [--auto-pin]` | End-to-end discovery; print `cluster pin` guidance or auto-commit |
+
+#### Trust model
+
+The discovery flow crosses **two independent trust boundaries**.
+`bootstrap_signer_spk` authorizes the zone operator to say "domain X
+is served by cluster Y" but gives them no authority over cluster Y
+itself. The cluster's own `operator_spk` (carried inside the
+bootstrap entry and verified against the cluster manifest) gates
+anything published there. Compromising one does not imply
+compromising the other — a stolen zone-operator key can redirect
+users to a different cluster but cannot forge records inside any
+legitimate one, and a stolen cluster-operator key can tamper with
+mailbox data on that cluster but cannot rewrite which cluster a user
+domain points at.
+
+`dmp bootstrap discover --auto-pin` makes this two-hop verification
+visible: it first verifies the bootstrap record against the pinned
+`bootstrap_signer_spk`, THEN verifies the cluster manifest at the
+returned anchor against the entry's `operator_spk`. Only after
+**both** succeed does it write anything to config. A failure at
+either step exits 2 and leaves the config untouched — a half-written
+config (bootstrap pinned but no cluster) is worse than none.
+
+#### `pin`
+
+```
+dmp bootstrap pin example.com 3c6a...
+pinned bootstrap signer for example.com
+next:
+  1. `dmp bootstrap fetch` to verify the record at _dmp.example.com resolves
+  2. `dmp bootstrap discover <user>@example.com` to see which cluster(s) the domain points at
+```
+
+Pin writes `bootstrap_user_domain` + `bootstrap_signer_spk` to
+config. Does **not** fetch — pinning an operator whose record isn't
+yet published is safe (the command never touches DNS, so it never
+wedges). The same decoupling `dmp cluster pin` uses.
+
+#### `fetch`
+
+```
+dmp bootstrap fetch
+user_domain: example.com
+seq:         3
+expires:     1816000000
+entries (sorted by priority):
+  priority=10  cluster=mesh.example.com  operator_spk=7f3b2a89b4e5c6d1...
+  priority=20  cluster=backup.example.com  operator_spk=2c1e9a3f8d0b74a5...
+```
+
+One-shot diagnostic: resolves `_dmp.<user_domain>` TXT, returns the
+highest-seq record that verifies and binds to the expected user
+domain, and prints entries sorted by priority (lowest first, SMTP
+MX semantics). CLI flags override pinned config for pre-pin
+verification.
+
+Exit codes: 1 for a missing pin or bad hex; 2 for DNS unreachable
+or no verifying record.
+
+#### `discover`
+
+```
+dmp bootstrap discover alice@example.com
+address:     alice@example.com
+user_domain: example.com  (seq=3, exp=1816000000)
+best entry:  priority=10
+  cluster_base_domain: mesh.example.com
+  operator_spk:        7f3b2a89b4e5c6d1...
+
+to pin this cluster manually, run:
+  dmp cluster pin 7f3b2a89b4e5c6d1... mesh.example.com
+  dmp cluster fetch  # verify manifest
+  dmp cluster enable # activate cluster mode
+
+or re-run with --auto-pin to do all of the above atomically.
+```
+
+Without `--auto-pin`, discover is a diagnostic that shows the
+operator exactly what an end-to-end pin would do — no state is
+written, trust decisions stay explicit.
+
+With `--auto-pin`, discover performs the full two-hop verification
+(bootstrap → cluster manifest), then writes both the bootstrap and
+cluster anchors and sets `cluster_enabled=True` in a single atomic
+step. If either verification fails, the command exits 2 and leaves
+the config untouched.
 
 ### `dmp node`
 
