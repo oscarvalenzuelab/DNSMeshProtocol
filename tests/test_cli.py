@@ -2227,7 +2227,7 @@ class TestBootstrapCommand:
             cli.main(["bootstrap", "discover", "alice@example.com", "--auto-pin"])
         assert exc.value.code == 2
         err = capsys.readouterr().err
-        assert "no cluster manifest reachable" in err
+        assert "no usable cluster manifest" in err
 
         # Config must not have been mutated. Before discover ran, only
         # bootstrap_* was set via pin; cluster_* remained empty.

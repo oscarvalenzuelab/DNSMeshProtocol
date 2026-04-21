@@ -1915,18 +1915,39 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
         m = fetch_cluster_manifest(
             entry.cluster_base_domain, entry.operator_spk, bootstrap_reader
         )
-        if m is not None:
-            manifest = m
-            chosen = entry
-            break
+        if m is None:
+            continue
+        # Dry-run the per-node factories against the fetched manifest
+        # before accepting it. A malformed http_endpoint / dns_endpoint
+        # slips past ClusterManifest validation but would crash the
+        # next networked command — the "all-or-nothing" contract means
+        # we must prove the config is usable before persisting it.
+        # Same pattern cluster-atomic-refresh uses on refresh_now.
+        writer_factory = _build_cluster_writer_factory(cfg)
+        reader_factory = _make_cluster_reader_factory(cfg, bootstrap_reader)
+        factory_ok = True
+        for node in m.nodes:
+            try:
+                writer_factory(node)
+                reader_factory(node)
+            except Exception:
+                factory_ok = False
+                break
+        if not factory_ok:
+            # This entry's manifest is unusable. Try the next one.
+            continue
+        manifest = m
+        chosen = entry
+        break
     if manifest is None or chosen is None:
         _die(
             2,
-            f"no cluster manifest reachable for any entry in the bootstrap "
-            f"record (tried {len(record.entries)} in priority order). "
+            f"no usable cluster manifest in the bootstrap record for {host} "
+            f"(tried {len(record.entries)} in priority order). "
             "Either no preferred cluster is published yet, a signer key "
-            "rotation is mid-flight, or all entries are expired. "
-            "No config written.",
+            "rotation is mid-flight, all entries are expired, or every "
+            "reachable manifest carries endpoints the local factories "
+            "can't build. No config written.",
         )
 
     # Both records verified: commit both to config atomically.
@@ -1935,16 +1956,19 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     # anchors and set cluster_enabled=True so the next `dmp send` /
     # `dmp recv` routes through the federation path.
     #
-    # Clear cluster_node_token: it was scoped to the previous cluster
-    # operator and sending it to the newly pinned cluster would leak
-    # a credential to a different trust domain (and likely fail auth
-    # anyway). The operator can repopulate via `dmp config set` or
-    # editing the config file if the new cluster requires a token.
+    # Clear cluster_node_token AND http_token: both were scoped to the
+    # previous operator. _build_cluster_writer_factory falls back from
+    # cluster_node_token to http_token, so clearing only the former
+    # would still send the legacy token to the newly discovered cluster
+    # — a cross-trust-domain credential leak. The operator can
+    # repopulate either via `dmp config set` or by editing the config
+    # file if the new cluster requires auth.
     cfg.bootstrap_user_domain = host.rstrip(".")
     cfg.bootstrap_signer_spk = signer_hex.lower()
     cfg.cluster_base_domain = chosen.cluster_base_domain
     cfg.cluster_operator_spk = chosen.operator_spk.hex()
     cfg.cluster_node_token = ""
+    cfg.http_token = None
     cfg.cluster_enabled = True
     cfg.save(path)
 
