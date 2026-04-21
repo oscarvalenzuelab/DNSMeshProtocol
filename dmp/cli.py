@@ -987,9 +987,7 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         # factories — a malformed endpoint in a signed manifest must
         # not crash ClusterClient construction below. Shared helper
         # keeps this consistent with auto-pin and manual discover.
-        manifest, best = _pick_usable_bootstrap_entry(
-            record, cfg, bootstrap_reader
-        )
+        manifest, best = _pick_usable_bootstrap_entry(record, cfg, bootstrap_reader)
         if manifest is None or best is None:
             _die(
                 2,
@@ -1959,9 +1957,7 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     # actually build writer/reader instances — dry-run matches the
     # "all-or-nothing" contract. Shared helper keeps this consistent
     # with --via-bootstrap and manual discover output.
-    manifest, chosen = _pick_usable_bootstrap_entry(
-        record, cfg, bootstrap_reader
-    )
+    manifest, chosen = _pick_usable_bootstrap_entry(record, cfg, bootstrap_reader)
     if manifest is None or chosen is None:
         _die(
             2,
