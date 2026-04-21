@@ -40,6 +40,7 @@ def _build_manifest(
     *,
     cluster_name: str,
     exp_delta_seconds: int,
+    seq: int,
 ) -> ClusterManifest:
     """Three nodes addressed by their compose container names.
 
@@ -60,9 +61,45 @@ def _build_manifest(
         cluster_name=cluster_name,
         operator_spk=operator.get_signing_public_key_bytes(),
         nodes=nodes,
-        seq=1,
+        seq=seq,
         exp=int(time.time()) + exp_delta_seconds,
     )
+
+
+def _read_existing_seq(manifest_out: Path) -> int:
+    """Best-effort: if a manifest already exists at this path, peek at
+    its seq and return ``seq + 1``. Returns 1 if no prior manifest.
+
+    Fanout/Union readers reject manifests whose seq isn't strictly
+    greater than the currently pinned one, so a re-run that stamps
+    seq=1 again makes rotated endpoints / extended expiry invisible
+    to every already-bootstrapped client.
+    """
+    if not manifest_out.exists():
+        return 1
+    try:
+        wire = manifest_out.read_text()
+        # Peek without full signature verification — we're bumping our
+        # own prior output. parse_and_verify needs the operator key
+        # which we haven't generated yet at this point; a lighter
+        # parse_body path would work but isn't public. Fall back to
+        # pattern scrape.
+        import base64
+        import struct
+
+        PREFIX = "v=dmp1;t=cluster;"
+        if not wire.startswith(PREFIX):
+            return 1
+        blob = base64.b64decode(wire[len(PREFIX) :], validate=True)
+        # Body layout: MAGIC(7) + seq(8 BE) + ...
+        body = blob[:-64]  # strip signature
+        if len(body) < 15 or not body.startswith(b"DMPCL01"):
+            return 1
+        prior_seq = struct.unpack(">Q", body[7:15])[0]
+        return prior_seq + 1
+    except Exception:
+        # Malformed prior manifest — caller can override via --seq.
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -93,6 +130,17 @@ def main(argv: list[str] | None = None) -> int:
         default=365,
         help="manifest expiry horizon in days (default: 365)",
     )
+    parser.add_argument(
+        "--seq",
+        type=int,
+        default=None,
+        help=(
+            "manifest sequence number (default: autoincrement from the "
+            "existing --manifest-out if present, else 1). Clients reject "
+            "a regenerated manifest whose seq isn't strictly greater "
+            "than the currently pinned one, so rotation requires bump."
+        ),
+    )
     args = parser.parse_args(argv)
 
     print("=" * 72)
@@ -108,13 +156,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     print("=" * 72)
 
+    seq = args.seq if args.seq is not None else _read_existing_seq(args.manifest_out)
     operator = DMPCrypto()
     manifest = _build_manifest(
         operator,
         cluster_name=args.cluster_name,
         exp_delta_seconds=args.exp_days * 86400,
+        seq=seq,
     )
     wire = manifest.sign(operator)
+    print(f"manifest seq: {seq}")
 
     args.manifest_out.parent.mkdir(parents=True, exist_ok=True)
     args.manifest_out.write_text(wire)
