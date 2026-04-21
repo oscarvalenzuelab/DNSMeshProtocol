@@ -5,10 +5,13 @@ the authoritative-write / recursive-read split with a single dict, so
 writes are instantly visible to reads.
 """
 
+import hashlib
+import time
 from threading import RLock
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from dmp.network.base import DNSRecordStore
+from dmp.storage.sqlite_store import StoredRecord
 
 
 class InMemoryDNSStore(DNSRecordStore):
@@ -16,8 +19,13 @@ class InMemoryDNSStore(DNSRecordStore):
 
     def __init__(self) -> None:
         self._lock = RLock()
-        # name -> list[str] (TXT records can hold multiple strings per RRset)
-        self._records: Dict[str, List[str]] = {}
+        # name -> list[(value, expires_at_seconds, stored_ts_ms)]. We carry
+        # the same metadata SqliteMailboxStore does so the anti-entropy
+        # sync worker can run in unit tests against this store. Note the
+        # mixed resolutions: expires_at stays in seconds (it's compared
+        # against time.time() as a cutoff); stored_ts is milliseconds so
+        # that same-second bursts paginate cleanly.
+        self._records: Dict[str, List[Tuple[str, int, int]]] = {}
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
         """Append to the RRset at `name`. Duplicates are collapsed.
@@ -27,10 +35,18 @@ class InMemoryDNSStore(DNSRecordStore):
         so an attacker who reaches the publish endpoint can add records but
         cannot evict legitimate ones. Identical re-publishes are idempotent.
         """
+        now_s = int(time.time())
+        now_ms = int(time.time() * 1000)
+        expires = now_s + int(ttl)
         with self._lock:
-            values = self._records.setdefault(name, [])
-            if value not in values:
-                values.append(value)
+            entries = self._records.setdefault(name, [])
+            for i, (v, _exp, _ts) in enumerate(entries):
+                if v == value:
+                    # Refresh TTL + stored_ts (ms), same as the sqlite
+                    # store's INSERT OR REPLACE.
+                    entries[i] = (v, expires, now_ms)
+                    return True
+            entries.append((value, expires, now_ms))
         return True
 
     def delete_txt_record(self, name: str, value: Optional[str] = None) -> bool:
@@ -40,15 +56,21 @@ class InMemoryDNSStore(DNSRecordStore):
             if value is None:
                 del self._records[name]
                 return True
-            self._records[name] = [v for v in self._records[name] if v != value]
+            self._records[name] = [
+                (v, exp, ts) for (v, exp, ts) in self._records[name] if v != value
+            ]
             if not self._records[name]:
                 del self._records[name]
             return True
 
     def query_txt_record(self, name: str) -> Optional[List[str]]:
+        now = int(time.time())
         with self._lock:
-            records = self._records.get(name)
-            return list(records) if records else None
+            entries = self._records.get(name)
+            if not entries:
+                return None
+            live = [v for (v, exp, _ts) in entries if exp > now]
+        return live if live else None
 
     # Testing helpers (not part of DNSRecordStore contract)
 
@@ -59,3 +81,100 @@ class InMemoryDNSStore(DNSRecordStore):
     def clear(self) -> None:
         with self._lock:
             self._records.clear()
+
+    # ---- anti-entropy support (parity with SqliteMailboxStore) -----------
+
+    def iter_records_since(
+        self,
+        since_ts: int = 0,
+        *,
+        limit: Optional[int] = None,
+        cursor: Optional[Tuple[int, ...]] = None,
+    ) -> List[StoredRecord]:
+        """Same semantics as ``SqliteMailboxStore.iter_records_since``.
+
+        Either ``cursor=(ts, name, value_hash)`` (compound, M2.4-followup-2),
+        ``cursor=(ts, name)`` (legacy two-tuple, treated as
+        ``(ts, name, "")``), or ``since_ts=<ms>`` (legacy; equivalent to
+        ``cursor=(since_ts, "", "")``) may be passed — not both.
+
+        Ordering is ``(stored_ts, name, value_hash)`` ASC so a
+        multi-value RRset burst paginates correctly across ``limit``
+        boundaries.
+        """
+        if cursor is not None and since_ts:
+            raise ValueError("pass cursor OR since_ts, not both")
+        if cursor is None:
+            cursor = (int(since_ts), "", "")
+        elif len(cursor) == 2:
+            cursor = (int(cursor[0]), str(cursor[1]), "")
+        cur_ts = int(cursor[0])
+        cur_name = str(cursor[1])
+        cur_hash = str(cursor[2]) if len(cursor) >= 3 else ""
+        now = int(time.time())
+        rows: List[StoredRecord] = []
+        with self._lock:
+            for name, entries in self._records.items():
+                for value, exp, ts in entries:
+                    if exp <= now:
+                        continue
+                    vhash = hashlib.sha256(value.encode("utf-8")).hexdigest()
+                    # (ts, name, value_hash) > (cur_ts, cur_name, cur_hash)
+                    # in lex order — match the SQL predicate exactly.
+                    if ts > cur_ts:
+                        pass
+                    elif ts == cur_ts and name > cur_name:
+                        pass
+                    elif ts == cur_ts and name == cur_name and vhash > cur_hash:
+                        pass
+                    else:
+                        continue
+                    rows.append(
+                        StoredRecord(
+                            name=name,
+                            value=value,
+                            ttl_remaining=max(0, exp - now),
+                            stored_ts=ts,
+                        )
+                    )
+        rows.sort(
+            key=lambda r: (
+                r.stored_ts,
+                r.name,
+                hashlib.sha256(r.value.encode("utf-8")).hexdigest(),
+            )
+        )
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
+    def get_records_by_name(self, names: Iterable[str]) -> List[StoredRecord]:
+        unique = list(dict.fromkeys(names))
+        if not unique:
+            return []
+        now = int(time.time())
+        out: List[StoredRecord] = []
+        with self._lock:
+            for name in unique:
+                entries = self._records.get(name)
+                if not entries:
+                    continue
+                for value, exp, ts in entries:
+                    if exp <= now:
+                        continue
+                    out.append(
+                        StoredRecord(
+                            name=name,
+                            value=value,
+                            ttl_remaining=max(0, exp - now),
+                            stored_ts=ts,
+                        )
+                    )
+        out.sort(
+            key=lambda r: (
+                r.stored_ts,
+                r.name,
+                hashlib.sha256(r.value.encode("utf-8")).hexdigest(),
+            )
+        )
+        return out

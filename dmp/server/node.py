@@ -29,6 +29,13 @@ Environment variables (all optional, sensible defaults for dev):
     DMP_LOG_LEVEL          python logging level              default: INFO
     DMP_LOG_FORMAT         "text" (default) or "json"        default: text
 
+    DMP_CLUSTER_FILE       on-disk cluster.json (peer list)  default: /var/lib/dmp/cluster.json
+    DMP_NODE_ID            this node's id in the cluster     default: none (skip self-filter)
+    DMP_SYNC_PEER_TOKEN    shared token for /v1/sync/*       default: none (endpoints 403)
+    DMP_SYNC_INTERVAL      seconds between sync ticks        default: 10
+    DMP_SYNC_OPERATOR_SPK  hex ed25519 operator pubkey for
+                           cluster-record re-verify         default: none
+
 Port 53 is privileged on Linux. In a container, publish with
 `-p 53:5353/udp` or run with CAP_NET_BIND_SERVICE.
 """
@@ -42,6 +49,7 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
+from dmp.server.anti_entropy import AntiEntropyWorker, load_peers_from_cluster_json
 from dmp.server.cleanup import CleanupWorker
 from dmp.server.dns_server import DMPDnsServer
 from dmp.server.http_api import (
@@ -89,6 +97,20 @@ class DMPNodeConfig:
     log_level: str = "INFO"
     log_format: str = "text"  # "text" or "json"
 
+    # M2.4 anti-entropy. See dmp.server.anti_entropy for the full design.
+    # Empty cluster_file or a missing file silently disables the worker —
+    # a solo node has nothing to sync with.
+    cluster_file: str = "/var/lib/dmp/cluster.json"
+    node_id: Optional[str] = None
+    sync_peer_token: Optional[str] = None
+    sync_interval: float = 10.0
+    # Hex-encoded Ed25519 operator public key used to re-verify signed
+    # cluster-manifest records pulled from peers. Optional — without it
+    # cluster records are accepted after a structural parse, which is
+    # fine for most operators (the node's own operator deployed the
+    # cluster.json anyway).
+    sync_cluster_operator_spk_hex: Optional[str] = None
+
     @classmethod
     def from_env(cls) -> "DMPNodeConfig":
         return cls(
@@ -121,6 +143,13 @@ class DMPNodeConfig:
             ),
             log_level=os.environ.get("DMP_LOG_LEVEL", cls.log_level),
             log_format=os.environ.get("DMP_LOG_FORMAT", cls.log_format),
+            cluster_file=os.environ.get("DMP_CLUSTER_FILE", cls.cluster_file),
+            node_id=os.environ.get("DMP_NODE_ID") or None,
+            sync_peer_token=os.environ.get("DMP_SYNC_PEER_TOKEN") or None,
+            sync_interval=float(os.environ.get("DMP_SYNC_INTERVAL", cls.sync_interval)),
+            sync_cluster_operator_spk_hex=(
+                os.environ.get("DMP_SYNC_OPERATOR_SPK") or None
+            ),
         )
 
 
@@ -133,6 +162,7 @@ class DMPNode:
         self.dns: Optional[DMPDnsServer] = None
         self.http: Optional[DMPHttpApi] = None
         self.cleanup: Optional[CleanupWorker] = None
+        self.anti_entropy: Optional[AntiEntropyWorker] = None
         self._stopped = threading.Event()
 
     @classmethod
@@ -177,26 +207,78 @@ class DMPNode:
                 rate_per_second=self.config.http_rate,
                 burst=self.config.http_burst,
             ),
+            sync_peer_token=self.config.sync_peer_token,
         )
         self.cleanup = CleanupWorker(
             self.store.cleanup_expired,
             interval_seconds=self.config.cleanup_interval,
         )
 
+        # Anti-entropy (M2.4). Only wire if a cluster file is reachable
+        # and we have at least one peer after filtering self out. A
+        # missing file is the standard "solo node" case and must not
+        # prevent startup.
+        self.anti_entropy = self._make_anti_entropy_worker()
+
         self.dns.start()
         self.http.start()
         self.cleanup.start()
+        if self.anti_entropy is not None:
+            self.anti_entropy.start()
         log.info(
-            "DMP node up: dns=%s:%d/udp http=%s:%d db=%s",
+            "DMP node up: dns=%s:%d/udp http=%s:%d db=%s peers=%d",
             self.config.dns_host,
             self.dns.port,
             self.config.http_host,
             self.http.port,
             self.config.db_path,
+            len(self.anti_entropy.peers) if self.anti_entropy else 0,
+        )
+
+    def _make_anti_entropy_worker(self) -> Optional[AntiEntropyWorker]:
+        path = self.config.cluster_file
+        if not path or not os.path.isfile(path):
+            return None
+        peers = load_peers_from_cluster_json(path, self_node_id=self.config.node_id)
+        if not peers:
+            return None
+        if not self.config.sync_peer_token:
+            # A token is required for the sync endpoints to return
+            # anything; without one every outbound sync would bounce 403.
+            # Log loudly so the operator notices the misconfig.
+            log.warning(
+                "anti-entropy: %d peer(s) in %s but no sync_peer_token "
+                "configured — worker not started",
+                len(peers),
+                path,
+            )
+            return None
+        operator_spk = None
+        if self.config.sync_cluster_operator_spk_hex:
+            try:
+                operator_spk = bytes.fromhex(
+                    self.config.sync_cluster_operator_spk_hex.strip()
+                )
+                if len(operator_spk) != 32:
+                    raise ValueError("operator_spk must be 32 bytes")
+            except ValueError as e:
+                log.warning("anti-entropy: invalid operator_spk hex: %s", e)
+                operator_spk = None
+        return AntiEntropyWorker(
+            store=self.store,
+            peers=peers,
+            sync_token=self.config.sync_peer_token,
+            interval_seconds=self.config.sync_interval,
+            cluster_operator_spk=operator_spk,
         )
 
     def stop(self) -> None:
         log.info("DMP node shutting down")
+        # Stop the sync worker before the HTTP server goes: in-flight sync
+        # POSTs against a dying peer are harmless (they just fail the tick),
+        # but we want clean teardown ordering for tests and logs.
+        if self.anti_entropy:
+            self.anti_entropy.stop()
         if self.cleanup:
             self.cleanup.stop()
         if self.http:
