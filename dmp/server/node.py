@@ -68,7 +68,7 @@ import os
 import signal
 import threading
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from dmp.server.anti_entropy import (
     AntiEntropyWorker,
@@ -704,11 +704,21 @@ class DMPNode:
             return None
         from dmp.core.cluster import ClusterManifest
 
-        best_seq = -1
-        best_name: Optional[str] = None
+        # A valid manifest for cluster X lives at ``cluster.X`` and
+        # embeds ``cluster_name=X``. Use that alignment to filter: a
+        # manifest whose embedded cluster_name doesn't match the owner
+        # it was stored under isn't a candidate (defense against stray
+        # publishes). Then if MORE THAN ONE distinct aligned cluster is
+        # present and signed by the same key (e.g. operator reuses the
+        # key across dev/prod environments), recovery is fundamentally
+        # ambiguous — we'd have no principled way to pick one over the
+        # other, so refuse and require the operator to disambiguate
+        # via DMP_CLUSTER_BASE_DOMAIN.
+        aligned_by_cluster: Dict[str, int] = {}  # cluster_name -> highest seq
         for name in names:
             if not name.startswith("cluster."):
                 continue
+            owner_cluster = name[len("cluster.") :]  # the X in cluster.X
             try:
                 values = self.store.query_txt_record(name)
             except Exception:
@@ -716,11 +726,29 @@ class DMPNode:
             for wire in values or []:
                 if not isinstance(wire, str):
                     continue
-                m = ClusterManifest.parse_and_verify(wire, operator_spk)
-                if m is not None and m.seq > best_seq:
-                    best_seq = m.seq
-                    best_name = m.cluster_name
-        return best_name
+                m = ClusterManifest.parse_and_verify(
+                    wire,
+                    operator_spk,
+                    expected_cluster_name=owner_cluster,
+                )
+                if m is None:
+                    continue
+                prior = aligned_by_cluster.get(m.cluster_name, -1)
+                if m.seq > prior:
+                    aligned_by_cluster[m.cluster_name] = m.seq
+        if len(aligned_by_cluster) == 0:
+            return None
+        if len(aligned_by_cluster) > 1:
+            log.warning(
+                "anti-entropy: local store carries verified manifests for "
+                "%d distinct clusters (%s); cannot auto-recover "
+                "cluster_base_domain. Set DMP_CLUSTER_BASE_DOMAIN "
+                "explicitly.",
+                len(aligned_by_cluster),
+                ", ".join(sorted(aligned_by_cluster.keys())),
+            )
+            return None
+        return next(iter(aligned_by_cluster.keys()))
 
     def _derive_cluster_base_domain(self) -> Optional[str]:
         """Extract ``cluster_name`` from the on-disk cluster file when
