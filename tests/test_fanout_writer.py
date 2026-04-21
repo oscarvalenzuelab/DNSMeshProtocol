@@ -925,6 +925,86 @@ class TestUserMaxWorkersRespectedOnResize:
             fw.close()
 
 
+class TestEndpointChangeIsolation:
+    def test_inflight_future_on_old_writer_does_not_mutate_new_state(self) -> None:
+        """An endpoint change must give in-flight futures their original
+        writer. If install_manifest mutated `_NodeState.writer` in place,
+        a future submitted against the old writer would (a) potentially
+        route its call to the new writer on late execution, and (b)
+        record its late success/failure against the new endpoint's
+        health counters. Creating a fresh _NodeState isolates both.
+        """
+        op = DMPCrypto()
+        # Slow old writer; when it finally runs, it will record a
+        # SUCCESS. The old _NodeState should absorb that — the new
+        # _NodeState (different endpoint, fresh writer) must not see
+        # its counters touched by the old writer's late result.
+        slow_old = FakeWriter(latency_ms=200)
+        new_writer = FakeWriter()
+        call_log: list = []
+
+        def factory(node: ClusterNode):
+            # First call → slow_old; second call (endpoint change) → new_writer.
+            call_log.append(node.http_endpoint)
+            if node.http_endpoint == "https://n0.example.com:8053":
+                return slow_old
+            return new_writer
+
+        m1 = _manifest(1, seq=1, operator=op)
+        fw = FanoutWriter(m1, factory, timeout=2.0)
+        # Fire a publish; quorum=1 so the vacuous-success-after-one
+        # never happens — one node means wait for it. Kick off in a
+        # thread so we can install_manifest while it's in flight.
+        import threading
+
+        result: dict = {}
+
+        def do_publish():
+            result["ok"] = fw.publish_txt_record("x.mesh.test", "v=dmp1", ttl=60)
+
+        t = threading.Thread(target=do_publish, daemon=True)
+        t.start()
+        # Give the executor a moment to dispatch.
+        time.sleep(0.02)
+        # Now rotate the endpoint. Old writer is in flight; new
+        # _NodeState created for the new endpoint.
+        m2 = ClusterManifest(
+            cluster_name=m1.cluster_name,
+            operator_spk=m1.operator_spk,
+            nodes=[
+                ClusterNode(
+                    node_id=m1.nodes[0].node_id,
+                    http_endpoint="https://n0-rotated.example.com:8053",
+                ),
+            ],
+            seq=2,
+            exp=m1.exp,
+        )
+        assert fw.install_manifest(m2) is True
+        # Old writer's call should still complete on slow_old (its
+        # original binding), not on new_writer.
+        t.join(timeout=2.0)
+        assert result["ok"] is True
+        # Factory must have been called exactly twice: once for the
+        # initial node, once for the rotated node.
+        assert len(call_log) == 2
+        # The late old-writer success must not have landed on the new
+        # state's counters: the new _NodeState inherited the old's
+        # counters at refresh time and should not have been updated
+        # further, because the late future still holds a reference to
+        # the ORIGINAL _NodeState.
+        snap = fw.snapshot()
+        # Exactly one entry in the active pool (the rotated node).
+        assert len(snap) == 1
+        new_entry = snap[0]
+        assert new_entry["http_endpoint"] == "https://n0-rotated.example.com:8053"
+        # No publish has been issued on new_writer yet.
+        assert new_writer.publish_calls == []
+        # slow_old did see the publish, as expected.
+        assert len(slow_old.publish_calls) == 1
+        fw.close()
+
+
 class TestCloseDrainsBeforeClosingWriters:
     def test_close_waits_for_inflight_before_closing_retired_writers(self) -> None:
         """close() must wait for in-flight fan-out futures to finish
