@@ -1816,3 +1816,571 @@ class TestLocalOnlyClusterBootstrap:
             assert isinstance(client.reader, cli_mod._OfflineReader)
         finally:
             cli._close_client(client)
+
+
+class TestBootstrapCommand:
+    """`dmp bootstrap pin` / `dmp bootstrap fetch` / `dmp bootstrap discover`.
+
+    M3.2-wire: bootstrap discovery translates `user@host` addresses
+    into concrete cluster anchors without prior `cluster pin` config.
+    Tests cover pin validation, fetch summary printing, unreachable
+    DNS, end-to-end discover → auto-pin with two-hop verification,
+    and `identity fetch --via-bootstrap`.
+    """
+
+    # ----------------------------------------------------------- helpers
+
+    def _patch_reader(self, monkeypatch, store):
+        """Force `_make_reader` to return a reader backed by `store`."""
+
+        class _StoreReader:
+            def query_txt_record(self, name):
+                return store.query_txt_record(name)
+
+        monkeypatch.setattr(cli, "_make_reader", lambda cfg: _StoreReader())
+
+    def _publish_bootstrap(self, store, *, user_domain, signer, entries, seq=1):
+        """Publish a signed BootstrapRecord into the given store."""
+        import time as _time
+
+        from dmp.core.bootstrap import BootstrapRecord, bootstrap_rrset_name
+
+        record = BootstrapRecord(
+            user_domain=user_domain,
+            signer_spk=signer.get_signing_public_key_bytes(),
+            entries=list(entries),
+            seq=seq,
+            exp=int(_time.time()) + 3600,
+        )
+        store.publish_txt_record(bootstrap_rrset_name(user_domain), record.sign(signer))
+        return record
+
+    def _publish_cluster_manifest(
+        self, store, *, cluster_name, operator, n_nodes=2, seq=1
+    ):
+        """Publish a signed ClusterManifest at cluster.<cluster_name>."""
+        import time as _time
+
+        from dmp.core.cluster import ClusterManifest, ClusterNode, cluster_rrset_name
+
+        nodes = [
+            ClusterNode(
+                node_id=f"n{i:02d}",
+                http_endpoint=f"https://n{i}.{cluster_name}:8053",
+                dns_endpoint=f"203.0.113.{i}:53",
+            )
+            for i in range(1, n_nodes + 1)
+        ]
+        manifest = ClusterManifest(
+            cluster_name=cluster_name,
+            operator_spk=operator.get_signing_public_key_bytes(),
+            nodes=nodes,
+            seq=seq,
+            exp=int(_time.time()) + 3600,
+        )
+        store.publish_txt_record(
+            cluster_rrset_name(cluster_name), manifest.sign(operator)
+        )
+        return manifest
+
+    # ----------------------------------------------------------- bootstrap pin
+
+    def test_bootstrap_pin_writes_config(self, config_home):
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+        hex_spk = signer.get_signing_public_key_bytes().hex()
+        rc = cli.main(["bootstrap", "pin", "example.com", hex_spk])
+        assert rc == 0
+        cfg = yaml.safe_load((config_home / "config.yaml").read_text())
+        assert cfg["bootstrap_user_domain"] == "example.com"
+        assert cfg["bootstrap_signer_spk"] == hex_spk
+
+    def test_bootstrap_pin_does_not_fetch(self, config_home, monkeypatch):
+        """`bootstrap pin` must not call fetch_bootstrap_record — pinning
+        an operator whose record is not yet published should be safe."""
+        import dmp.cli as cli_mod
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+
+        def boom_fetch(*args, **kwargs):  # pragma: no cover
+            raise AssertionError("fetch_bootstrap_record must NOT be called by pin")
+
+        monkeypatch.setattr(cli_mod, "fetch_bootstrap_record", boom_fetch)
+        rc = cli.main(
+            [
+                "bootstrap",
+                "pin",
+                "example.com",
+                signer.get_signing_public_key_bytes().hex(),
+            ]
+        )
+        assert rc == 0
+
+    def test_bootstrap_pin_rejects_malformed_user_domain(self, config_home):
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+        hex_spk = signer.get_signing_public_key_bytes().hex()
+        # Leading dot — _validate_dns_name rejects.
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap", "pin", ".example.com", hex_spk])
+        assert exc.value.code == 1
+
+    def test_bootstrap_pin_rejects_bad_hex(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap", "pin", "example.com", "not-hex"])
+        assert exc.value.code == 1
+
+    def test_bootstrap_pin_rejects_wrong_length(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        # 16-byte hex (too short for Ed25519).
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap", "pin", "example.com", "aa" * 16])
+        assert exc.value.code == 1
+
+    # ----------------------------------------------------------- bootstrap fetch
+
+    def test_bootstrap_fetch_prints_summary(self, config_home, monkeypatch, capsys):
+        from dmp.core.bootstrap import BootstrapEntry
+        from dmp.core.crypto import DMPCrypto
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+        hex_spk = signer.get_signing_public_key_bytes().hex()
+        cli.main(["bootstrap", "pin", "example.com", hex_spk])
+        capsys.readouterr()
+
+        store = InMemoryDNSStore()
+        cluster_op = DMPCrypto()
+        self._publish_bootstrap(
+            store,
+            user_domain="example.com",
+            signer=signer,
+            entries=[
+                BootstrapEntry(
+                    priority=10,
+                    cluster_base_domain="mesh.example.com",
+                    operator_spk=cluster_op.get_signing_public_key_bytes(),
+                ),
+                BootstrapEntry(
+                    priority=20,
+                    cluster_base_domain="backup.example.com",
+                    operator_spk=cluster_op.get_signing_public_key_bytes(),
+                ),
+            ],
+            seq=3,
+        )
+        self._patch_reader(monkeypatch, store)
+
+        rc = cli.main(["bootstrap", "fetch"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "user_domain: example.com" in out
+        assert "seq:         3" in out
+        assert "priority=10" in out
+        assert "mesh.example.com" in out
+        assert "priority=20" in out
+        assert "backup.example.com" in out
+
+    def test_bootstrap_fetch_without_pin_errors(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap", "fetch"])
+        assert exc.value.code == 1
+
+    def test_bootstrap_fetch_nothing_published_exits_2(self, config_home, monkeypatch):
+        from dmp.core.crypto import DMPCrypto
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+        cli.main(
+            [
+                "bootstrap",
+                "pin",
+                "example.com",
+                signer.get_signing_public_key_bytes().hex(),
+            ]
+        )
+
+        store = InMemoryDNSStore()  # nothing published
+        self._patch_reader(monkeypatch, store)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap", "fetch"])
+        assert exc.value.code == 2
+
+    def test_bootstrap_fetch_unreachable_dns_exits_2(self, config_home, monkeypatch):
+        """Reader that raises on query → treated as unreachable → exit 2."""
+        from dmp.core.crypto import DMPCrypto
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+        cli.main(
+            [
+                "bootstrap",
+                "pin",
+                "example.com",
+                signer.get_signing_public_key_bytes().hex(),
+            ]
+        )
+
+        class _FailingReader:
+            def query_txt_record(self, name):
+                raise RuntimeError("dns unreachable")
+
+        monkeypatch.setattr(cli, "_make_reader", lambda cfg: _FailingReader())
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap", "fetch"])
+        assert exc.value.code == 2
+
+    def test_bootstrap_fetch_with_cli_override(self, config_home, monkeypatch, capsys):
+        """CLI args override any pinned anchors — useful for pre-pin
+        verification. No pin in config here at all."""
+        from dmp.core.bootstrap import BootstrapEntry
+        from dmp.core.crypto import DMPCrypto
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+        hex_spk = signer.get_signing_public_key_bytes().hex()
+        store = InMemoryDNSStore()
+        cluster_op = DMPCrypto()
+        self._publish_bootstrap(
+            store,
+            user_domain="example.com",
+            signer=signer,
+            entries=[
+                BootstrapEntry(
+                    priority=10,
+                    cluster_base_domain="mesh.example.com",
+                    operator_spk=cluster_op.get_signing_public_key_bytes(),
+                )
+            ],
+        )
+        self._patch_reader(monkeypatch, store)
+
+        rc = cli.main(
+            [
+                "bootstrap",
+                "fetch",
+                "--user-domain",
+                "example.com",
+                "--signer-spk",
+                hex_spk,
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "user_domain: example.com" in out
+
+    # ----------------------------------------------------------- bootstrap discover
+
+    def test_bootstrap_discover_prints_guidance(self, config_home, monkeypatch, capsys):
+        """Without --auto-pin, discover is a pure diagnostic that prints
+        what a manual `dmp cluster pin` would do; no config is written."""
+        from dmp.core.bootstrap import BootstrapEntry
+        from dmp.core.crypto import DMPCrypto
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+        hex_spk = signer.get_signing_public_key_bytes().hex()
+        cli.main(["bootstrap", "pin", "example.com", hex_spk])
+        capsys.readouterr()
+
+        store = InMemoryDNSStore()
+        cluster_op = DMPCrypto()
+        self._publish_bootstrap(
+            store,
+            user_domain="example.com",
+            signer=signer,
+            entries=[
+                BootstrapEntry(
+                    priority=10,
+                    cluster_base_domain="mesh.example.com",
+                    operator_spk=cluster_op.get_signing_public_key_bytes(),
+                )
+            ],
+        )
+        self._patch_reader(monkeypatch, store)
+
+        rc = cli.main(["bootstrap", "discover", "alice@example.com"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "alice@example.com" in out
+        assert "mesh.example.com" in out
+        assert "dmp cluster pin" in out
+        assert "dmp cluster enable" in out
+        assert "--auto-pin" in out
+
+        # No config mutation: cluster_* fields remain empty.
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_base_domain == ""
+        assert cfg.cluster_operator_spk == ""
+        assert cfg.cluster_enabled is False
+
+    def test_bootstrap_discover_requires_pinned_host_or_signer(
+        self, config_home, capsys
+    ):
+        """discover without a pin for the host AND without --signer-spk
+        must exit 1 with a clear error."""
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap", "discover", "alice@example.com"])
+        assert exc.value.code == 1
+
+    def test_bootstrap_discover_auto_pin_writes_both_configs(
+        self, config_home, monkeypatch, capsys
+    ):
+        """--auto-pin verifies bootstrap AND cluster manifest, then writes
+        bootstrap + cluster anchors and sets cluster_enabled=True."""
+        from dmp.core.bootstrap import BootstrapEntry
+        from dmp.core.crypto import DMPCrypto
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+        hex_spk = signer.get_signing_public_key_bytes().hex()
+        cli.main(["bootstrap", "pin", "example.com", hex_spk])
+        capsys.readouterr()
+
+        store = InMemoryDNSStore()
+        cluster_op = DMPCrypto()
+        cluster_op_hex = cluster_op.get_signing_public_key_bytes().hex()
+        self._publish_bootstrap(
+            store,
+            user_domain="example.com",
+            signer=signer,
+            entries=[
+                BootstrapEntry(
+                    priority=10,
+                    cluster_base_domain="mesh.example.com",
+                    operator_spk=cluster_op.get_signing_public_key_bytes(),
+                )
+            ],
+        )
+        # The cluster manifest MUST also verify — auto-pin's two-hop
+        # trust chain rejects if either step fails.
+        self._publish_cluster_manifest(
+            store, cluster_name="mesh.example.com", operator=cluster_op, n_nodes=2
+        )
+        self._patch_reader(monkeypatch, store)
+
+        rc = cli.main(["bootstrap", "discover", "alice@example.com", "--auto-pin"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "cluster:" in out
+        assert "mesh.example.com" in out
+        assert "cluster_enabled       = True" in out
+
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.bootstrap_user_domain == "example.com"
+        assert cfg.bootstrap_signer_spk == hex_spk
+        assert cfg.cluster_base_domain == "mesh.example.com"
+        assert cfg.cluster_operator_spk == cluster_op_hex
+        assert cfg.cluster_enabled is True
+
+    def test_bootstrap_discover_auto_pin_aborts_on_manifest_failure(
+        self, config_home, monkeypatch, capsys
+    ):
+        """If the bootstrap record verifies but the cluster manifest does
+        NOT (not published, wrong key, etc.), --auto-pin must leave
+        config untouched. Half-written state is worse than none."""
+        from dmp.core.bootstrap import BootstrapEntry
+        from dmp.core.crypto import DMPCrypto
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        signer = DMPCrypto()
+        hex_spk = signer.get_signing_public_key_bytes().hex()
+        cli.main(["bootstrap", "pin", "example.com", hex_spk])
+        capsys.readouterr()
+
+        store = InMemoryDNSStore()
+        cluster_op = DMPCrypto()
+        self._publish_bootstrap(
+            store,
+            user_domain="example.com",
+            signer=signer,
+            entries=[
+                BootstrapEntry(
+                    priority=10,
+                    cluster_base_domain="mesh.example.com",
+                    operator_spk=cluster_op.get_signing_public_key_bytes(),
+                )
+            ],
+        )
+        # Deliberately DO NOT publish the cluster manifest — auto-pin
+        # must abort at the second verification hop.
+        self._patch_reader(monkeypatch, store)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap", "discover", "alice@example.com", "--auto-pin"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "no usable cluster manifest" in err
+
+        # Config must not have been mutated. Before discover ran, only
+        # bootstrap_* was set via pin; cluster_* remained empty.
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_base_domain == ""
+        assert cfg.cluster_operator_spk == ""
+        assert cfg.cluster_enabled is False
+        # bootstrap anchor was pinned up-front; it's untouched too.
+        assert cfg.bootstrap_user_domain == "example.com"
+        assert cfg.bootstrap_signer_spk == hex_spk
+
+    def test_bootstrap_discover_rejects_bad_address(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap", "discover", "no-at-sign"])
+        assert exc.value.code == 1
+
+    # ----------------------------------------------------------- config persistence
+
+    def test_config_defaults_include_bootstrap_fields(self, config_home):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cfg = yaml.safe_load((config_home / "config.yaml").read_text())
+        assert cfg.get("bootstrap_user_domain", "") == ""
+        assert cfg.get("bootstrap_signer_spk", "") == ""
+
+    def test_load_tolerates_absent_bootstrap_fields(self, config_home):
+        """An older config without bootstrap_* keys loads cleanly as empty."""
+        cfg_path = config_home / "config.yaml"
+        config_home.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(
+            yaml.safe_dump(
+                {
+                    "username": "alice",
+                    "domain": "mesh.local",
+                    "endpoint": "http://x",
+                    "kdf_salt": "aa" * 32,
+                }
+            )
+        )
+        loaded = cli.CLIConfig.load(cfg_path)
+        assert loaded.bootstrap_user_domain == ""
+        assert loaded.bootstrap_signer_spk == ""
+
+    # ----------------------------------------------------------- identity fetch --via-bootstrap
+
+    def test_identity_fetch_via_bootstrap_routes_through_discovered_cluster(
+        self, config_home, monkeypatch, capsys
+    ):
+        """`identity fetch alice@example.com --via-bootstrap` discovers
+        the cluster for `example.com` on the fly (no pinned cluster),
+        then queries the identity record via the discovered cluster.
+        Does NOT persist any cluster config — pure lookup convenience."""
+        import hashlib
+        import time as _time
+
+        from dmp.core.bootstrap import BootstrapEntry
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.identity import (
+            IdentityRecord,
+            zone_anchored_identity_name,
+        )
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "bob", "--endpoint", "http://x"])
+        signer = DMPCrypto()  # zone operator for example.com
+        cluster_op = DMPCrypto()  # cluster operator
+        cli.main(
+            [
+                "bootstrap",
+                "pin",
+                "example.com",
+                signer.get_signing_public_key_bytes().hex(),
+            ]
+        )
+        capsys.readouterr()
+
+        store = InMemoryDNSStore()
+        # 1. Bootstrap record pointing at mesh.example.com cluster.
+        self._publish_bootstrap(
+            store,
+            user_domain="example.com",
+            signer=signer,
+            entries=[
+                BootstrapEntry(
+                    priority=10,
+                    cluster_base_domain="mesh.example.com",
+                    operator_spk=cluster_op.get_signing_public_key_bytes(),
+                )
+            ],
+        )
+        # 2. Cluster manifest at cluster.mesh.example.com. Use
+        #    dns_endpoint=None on every node so _make_cluster_reader_factory
+        #    falls back to the shared bootstrap_reader (the patched store)
+        #    — that simulates a real deployment where the cluster nodes
+        #    are authoritative for the user's zone and the union reader
+        #    queries them for dmp.example.com directly.
+        import time as _time2
+        from dmp.core.cluster import (
+            ClusterManifest as _CM,
+            ClusterNode as _CN,
+            cluster_rrset_name as _crn,
+        )
+
+        nodes = [
+            _CN(
+                node_id=f"n{i:02d}",
+                http_endpoint=f"https://n{i}.mesh.example.com:8053",
+                dns_endpoint=None,  # falls back to bootstrap_reader in the factory
+            )
+            for i in range(1, 3)
+        ]
+        cluster_manifest = _CM(
+            cluster_name="mesh.example.com",
+            operator_spk=cluster_op.get_signing_public_key_bytes(),
+            nodes=nodes,
+            seq=1,
+            exp=int(_time2.time()) + 3600,
+        )
+        store.publish_txt_record(
+            _crn("mesh.example.com"), cluster_manifest.sign(cluster_op)
+        )
+        # 3. Alice's identity record published under the cluster zone
+        #    (zone-anchored: dmp.example.com TXT). The bootstrap-
+        #    discovered flow queries dmp.<host> where host = example.com.
+        alice_crypto = DMPCrypto()
+        identity = IdentityRecord(
+            username="alice",
+            x25519_pk=alice_crypto.get_public_key_bytes(),
+            ed25519_spk=alice_crypto.get_signing_public_key_bytes(),
+            ts=int(_time.time()),
+        )
+        identity_wire = identity.sign(alice_crypto)
+        store.publish_txt_record(
+            zone_anchored_identity_name("example.com"), identity_wire
+        )
+
+        self._patch_reader(monkeypatch, store)
+
+        rc = cli.main(
+            ["identity", "fetch", "alice@example.com", "--via-bootstrap", "--json"]
+        )
+        assert rc == 0
+
+        import json as _json
+
+        out = capsys.readouterr().out
+        parsed = _json.loads(out)
+        assert parsed["username"] == "alice"
+        assert parsed["public_key"] == alice_crypto.get_public_key_bytes().hex()
+
+        # Via-bootstrap is a pure lookup — must NOT have written
+        # cluster anchors to config.
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_base_domain == ""
+        assert cfg.cluster_operator_spk == ""
+        assert cfg.cluster_enabled is False

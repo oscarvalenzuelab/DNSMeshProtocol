@@ -32,8 +32,10 @@ from typing import Dict, List, Optional, Tuple
 
 import yaml
 
+from dmp.client.bootstrap_discovery import fetch_bootstrap_record
 from dmp.client.client import DMPClient
 from dmp.client.cluster_bootstrap import ClusterClient, fetch_cluster_manifest
+from dmp.core.bootstrap import bootstrap_rrset_name
 from dmp.core.cluster import ClusterNode
 from dmp.network.base import DNSRecordReader, DNSRecordWriter
 from dmp.network.composite_reader import CompositeReader
@@ -101,6 +103,21 @@ class CLIConfig:
     # Back-compat: older configs load as False even when both anchors
     # are pinned — upgrading requires a one-time `dmp cluster enable`.
     cluster_enabled: bool = False
+    # Bootstrap-discovery anchors (M3.2-wire). When pinned via
+    # `dmp bootstrap pin <user_domain> <signer_spk_hex>`, subsequent
+    # `dmp bootstrap fetch / discover` and `dmp identity fetch
+    # alice@<host> --via-bootstrap` commands translate a user domain
+    # into the cluster handling its mailboxes. This is a SEPARATE
+    # trust domain from `cluster_*`: the zone operator signing
+    # `_dmp.<user_domain>` TXT is not (necessarily) the same party
+    # as the cluster operator signing the cluster manifest.
+    # Compromising one does not imply compromising the other; the
+    # bootstrap discover → cluster pin flow verifies both hops before
+    # writing any config. Empty on a fresh init; back-compat for
+    # older configs loads as empty. No auto-activation — the user
+    # must explicitly `bootstrap pin` or pass anchors per-call.
+    bootstrap_user_domain: str = ""  # e.g. "example.com"
+    bootstrap_signer_spk: str = ""  # hex Ed25519 pubkey of the zone operator
     # Each contact is {"pub": <x25519 hex>, "spk": <ed25519 hex or "">}.
     # `spk` may be empty for contacts added before Ed25519 pinning landed
     # (and for the `contacts add` shortcut that doesn't require a signing
@@ -151,6 +168,11 @@ class CLIConfig:
             # on upgrade. Default to False; the operator must run
             # `dmp cluster enable` once to cut over.
             cluster_enabled=bool(data.get("cluster_enabled", False)),
+            # Bootstrap-discovery anchors (M3.2-wire). Load as empty on
+            # pre-M3.2 configs; no auto-activation. Persisted alongside
+            # the cluster_* block for consistency.
+            bootstrap_user_domain=data.get("bootstrap_user_domain", "") or "",
+            bootstrap_signer_spk=data.get("bootstrap_signer_spk", "") or "",
             contacts=contacts,
         )
 
@@ -894,6 +916,13 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
       - `alice`                    — legacy / TOFU; queries
         `id-{sha256(alice)[:16]}.<domain>` where <domain> is either
         `--domain` or the config's mesh domain.
+
+    `--via-bootstrap` (M3.2-wire): when the address has `user@host`
+    form, discover the cluster that serves `host` on-the-fly via a
+    pinned `bootstrap_signer_spk`, route the identity query through a
+    one-shot `ClusterClient` pointed at the discovered cluster, then
+    tear it down. No config is written — this is a lookup convenience
+    for cross-domain addresses, not a cluster-mode cutover.
     """
     import hashlib
     from dmp.core.identity import (
@@ -913,7 +942,82 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
     # recursive DNS catches up.
     bootstrap_reader = _make_reader(cfg)
     cluster_handle: Optional[ClusterClient] = None
-    if _cluster_mode_enabled(cfg):
+
+    # ---- --via-bootstrap: one-shot discovery then cluster-routed fetch.
+    if getattr(args, "via_bootstrap", False):
+        parsed_addr = parse_address(args.username)
+        if parsed_addr is None:
+            _die(
+                1,
+                f"--via-bootstrap requires an address in user@host form; "
+                f"got {args.username!r}",
+            )
+        _, host = parsed_addr
+        # parse_address only asserts `user@host` shape; host can still be
+        # a malformed DNS name like ".example.com" or "bad_host" that
+        # would raise ValueError out of bootstrap_rrset_name below.
+        # Validate here so bad input surfaces as a clean CLI exit.
+        from dmp.core.cluster import _validate_dns_name as _validate_host_dns
+
+        try:
+            _validate_host_dns(host)
+        except ValueError as exc:
+            _die(1, f"--via-bootstrap: invalid host in address: {exc}")
+        if cfg.bootstrap_user_domain.casefold() != host.casefold():
+            _die(
+                1,
+                f"--via-bootstrap: no bootstrap signer pinned for {host!r}; "
+                f"run `dmp bootstrap pin {host} <signer_spk_hex>` first",
+            )
+        signer_spk = _decode_signer_spk(
+            cfg.bootstrap_signer_spk, field_name="bootstrap_signer_spk"
+        )
+        record = fetch_bootstrap_record(host, signer_spk, bootstrap_reader)
+        if record is None:
+            _die(
+                2,
+                f"--via-bootstrap: no verifying bootstrap record at _dmp.{host}",
+            )
+        # Second trust hop: the cluster manifest must verify under the
+        # operator_spk carried by each bootstrap entry. Compromising the
+        # zone signer cannot silently impersonate a legitimate cluster
+        # (the cluster's own operator key is the gate there).
+        #
+        # Walk entries in priority order and also probe the per-node
+        # factories — a malformed endpoint in a signed manifest must
+        # not crash ClusterClient construction below. Shared helper
+        # keeps this consistent with auto-pin and manual discover.
+        manifest, best = _pick_usable_bootstrap_entry(record, cfg, bootstrap_reader)
+        if manifest is None or best is None:
+            _die(
+                2,
+                f"--via-bootstrap: no usable cluster manifest in the "
+                f"bootstrap record for {host} "
+                f"(tried {len(record.entries)} in priority order)",
+            )
+        # One-shot ClusterClient: no refresh thread. It lives only for
+        # the duration of this identity fetch and is closed in the
+        # `finally` block below, so this command never persists any
+        # cluster state or leaves background work behind.
+        cluster_handle = ClusterClient(
+            manifest,
+            operator_spk=best.operator_spk,
+            base_domain=best.cluster_base_domain,
+            bootstrap_reader=bootstrap_reader,
+            writer_factory=_build_cluster_writer_factory(cfg),
+            reader_factory=_make_cluster_reader_factory(cfg, bootstrap_reader),
+            refresh_interval=None,
+        )
+        # Route the identity lookup DIRECTLY through the union reader.
+        # The identity record for `alice@host` lives at `dmp.<host>`,
+        # which is NOT under the cluster's `cluster_base_domain`
+        # (e.g. mesh.example.com). A CompositeReader would therefore
+        # route it to the external resolver, defeating the whole point
+        # of --via-bootstrap. We trust the cluster's nodes to be
+        # authoritative (or delegated) for the user's zone — that's
+        # the deployment contract a bootstrap record implies.
+        reader = cluster_handle.reader
+    elif _cluster_mode_enabled(cfg):
         try:
             op_spk = bytes.fromhex(cfg.cluster_operator_spk)
         except ValueError:
@@ -1530,6 +1634,428 @@ def cmd_cluster_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _decode_signer_spk(hex_value: str, *, field_name: str = "signer_spk") -> bytes:
+    """Decode + validate a 32-byte Ed25519 pubkey from hex.
+
+    Centralizes the check so every bootstrap subcommand reports the
+    same errors and exit code. Returns the raw bytes; calls `_die(1)`
+    on malformed hex or wrong length.
+    """
+    try:
+        raw = bytes.fromhex(hex_value)
+    except ValueError:
+        _die(1, f"{field_name} must be 64 hex chars (32 bytes Ed25519)")
+    if len(raw) != 32:
+        _die(1, f"{field_name} must be 32 bytes; got {len(raw)}")
+    return raw
+
+
+def cmd_bootstrap_pin(args: argparse.Namespace) -> int:
+    """Pin a bootstrap trust anchor (zone operator) for a user domain.
+
+    Writes `bootstrap_user_domain` + `bootstrap_signer_spk` to config.
+    Does NOT fetch — pinning is cheap and reversible, while a failing
+    fetch during pin would wedge every subsequent command on DNS
+    availability. Mirrors the `dmp cluster pin` ergonomics.
+
+    Validation:
+    - `user_domain` goes through `bootstrap_rrset_name` which runs the
+      shared DNS-name validator (empty, leading dot, oversized label,
+      non-ASCII all raise). Pinning a malformed name would fail later
+      inside `fetch_bootstrap_record` with a less helpful traceback.
+    - `signer_spk_hex` must be 64 hex chars decoding to 32 bytes.
+    """
+    path = _config_path()
+    if not path.exists():
+        _die(1, f"no config at {path} — run `dmp init <username>` first")
+    cfg = CLIConfig.load(path)
+    # Validate the user domain the same way bootstrap_rrset_name will
+    # — reject malformed names here so the error surfaces at pin time,
+    # not deep inside a later fetch.
+    try:
+        bootstrap_rrset_name(args.user_domain)
+    except ValueError as exc:
+        _die(1, f"invalid user_domain: {exc}")
+    _decode_signer_spk(args.signer_spk_hex, field_name="signer_spk")
+    cfg.bootstrap_user_domain = args.user_domain.rstrip(".")
+    cfg.bootstrap_signer_spk = args.signer_spk_hex.lower()
+    cfg.save(path)
+    print(f"pinned bootstrap signer for {cfg.bootstrap_user_domain}")
+    print("next:")
+    print(
+        f"  1. `dmp bootstrap fetch` to verify the record at "
+        f"_dmp.{cfg.bootstrap_user_domain} resolves"
+    )
+    print(
+        f"  2. `dmp bootstrap discover <user>@{cfg.bootstrap_user_domain}` "
+        "to see which cluster(s) the domain points at"
+    )
+    return 0
+
+
+def _norm_dns_name(name: str) -> str:
+    """Canonicalize a DNS owner name for comparison: strip a single
+    trailing dot and casefold. DNS names are case-insensitive, and
+    ``example.com.`` / ``example.com`` denote the same zone."""
+    return name.rstrip(".").casefold()
+
+
+def _pick_usable_bootstrap_entry(
+    record,
+    cfg: CLIConfig,
+    bootstrap_reader: DNSRecordReader,
+):
+    """Walk `record.entries` in priority order, return (manifest, entry)
+    for the first entry whose cluster manifest fetches, verifies, AND
+    whose per-node factories can construct a writer+reader for every
+    node.
+
+    Returns (None, None) if no entry is usable. Used by bootstrap
+    discover / auto-pin / identity fetch --via-bootstrap so all three
+    code paths agree on the fallback semantics and don't diverge on
+    "manifest verifies but is unusable" cases.
+
+    Note: a manifest where every node has ``dns_endpoint=None`` IS
+    considered usable. ``_make_cluster_reader_factory`` falls back to
+    the shared bootstrap reader for such nodes, which means
+    ``--via-bootstrap`` reads for ``dmp.<host>`` land on whatever
+    resolver the bootstrap layer is configured with (typically the
+    public DNS system). That is a legitimate deployment shape — the
+    cluster may publish via ``nsupdate`` to a public zone and have no
+    per-node DNS ingress — but it does mean cluster-routed reads in
+    that case are only as fresh as public DNS propagation. Operators
+    who want guaranteed cluster-local reads should publish manifests
+    where at least one node has a ``dns_endpoint``.
+    """
+    for entry in record.entries:
+        m = fetch_cluster_manifest(
+            entry.cluster_base_domain, entry.operator_spk, bootstrap_reader
+        )
+        if m is None:
+            continue
+        writer_factory = _build_cluster_writer_factory(cfg)
+        reader_factory = _make_cluster_reader_factory(cfg, bootstrap_reader)
+        ok = True
+        for node in m.nodes:
+            try:
+                writer_factory(node)
+                reader_factory(node)
+            except Exception:
+                ok = False
+                break
+        if ok:
+            return m, entry
+    return None, None
+
+
+def _resolve_bootstrap_anchors(
+    cfg: CLIConfig,
+    *,
+    cli_user_domain: Optional[str],
+    cli_signer_spk: Optional[str],
+) -> Tuple[str, bytes]:
+    """Pick `(user_domain, signer_spk_bytes)` from CLI args or config.
+
+    CLI args take precedence over pinned config — so an operator can
+    verify a fresh anchor one-shot before committing to pin. Either
+    BOTH must be supplied together, or both can be left off (fall
+    back to pinned config). Mixing a CLI user_domain with a config
+    signer_spk for a different user_domain would be a silent trust
+    error; we refuse it.
+    """
+    user_domain = cli_user_domain or cfg.bootstrap_user_domain
+    signer_hex = cli_signer_spk or cfg.bootstrap_signer_spk
+    if not user_domain or not signer_hex:
+        _die(
+            1,
+            "no bootstrap anchors available — pass --user-domain + "
+            "--signer-spk, or pin with `dmp bootstrap pin <user_domain> "
+            "<signer_spk_hex>` first",
+        )
+    # If CLI supplied only one side, complain rather than silently
+    # mixing with the pinned value for the other side.
+    if cli_user_domain and not cli_signer_spk and not cfg.bootstrap_signer_spk:
+        _die(1, "--user-domain given but no --signer-spk and no pinned anchor")
+    if cli_signer_spk and not cli_user_domain and not cfg.bootstrap_user_domain:
+        _die(1, "--signer-spk given but no --user-domain and no pinned anchor")
+    # DNS names are case-insensitive and a trailing dot is canonical —
+    # normalize both sides before rejecting the mismatch so users can
+    # pass `--user-domain EXAMPLE.com` or `--user-domain example.com.`
+    # against a config pinned to `example.com` without being forced to
+    # redundantly re-pass --signer-spk.
+    if (
+        cli_user_domain
+        and cfg.bootstrap_user_domain
+        and _norm_dns_name(cli_user_domain) != _norm_dns_name(cfg.bootstrap_user_domain)
+        and not cli_signer_spk
+    ):
+        # User supplied a CLI domain that differs from the pinned one
+        # but didn't override the signer — the pinned signer trusts a
+        # different zone and would never verify records here.
+        _die(
+            1,
+            "--user-domain differs from pinned bootstrap_user_domain; "
+            "pass --signer-spk to override the trust anchor too",
+        )
+    signer_spk = _decode_signer_spk(signer_hex, field_name="signer_spk")
+    # Validate the user_domain as a DNS name before handing it off to
+    # any downstream code that assumes it's publishable (bootstrap_rrset_name
+    # will raise ValueError with a traceback otherwise on malformed
+    # input like ".example.com" or "bad_host").
+    from dmp.core.cluster import _validate_dns_name as _validate_bootstrap_dns
+
+    try:
+        _validate_bootstrap_dns(user_domain)
+    except ValueError as exc:
+        _die(1, f"invalid bootstrap user_domain: {exc}")
+    return user_domain, signer_spk
+
+
+def cmd_bootstrap_fetch(args: argparse.Namespace) -> int:
+    """One-shot: fetch + verify the bootstrap record, print a summary.
+
+    Resolves `_dmp.<user_domain>` TXT, picks the highest-seq record
+    that verifies under the signer_spk anchor, and prints entries
+    sorted by priority. This is a diagnostic — no state is written.
+
+    Anchor resolution:
+    - If `--user-domain` or `--signer-spk` is supplied, it overrides
+      the pinned config value (useful for verifying a candidate
+      anchor before pinning it).
+    - Otherwise both come from `bootstrap_user_domain` +
+      `bootstrap_signer_spk` in config.
+    """
+    path = _config_path()
+    if not path.exists():
+        _die(1, f"no config at {path} — run `dmp init <username>` first")
+    cfg = CLIConfig.load(path)
+    user_domain, signer_spk = _resolve_bootstrap_anchors(
+        cfg,
+        cli_user_domain=args.user_domain,
+        cli_signer_spk=args.signer_spk,
+    )
+    bootstrap_reader = _make_reader(cfg)
+    record = fetch_bootstrap_record(user_domain, signer_spk, bootstrap_reader)
+    if record is None:
+        _die(
+            2,
+            f"no verifying bootstrap record at _dmp.{user_domain}. "
+            "Check that the TXT is published, signed by the pinned "
+            "signer key, not expired, and binds to this user_domain.",
+        )
+    print(f"user_domain: {record.user_domain}")
+    print(f"seq:         {record.seq}")
+    print(f"expires:     {record.exp}")
+    print("entries (sorted by priority):")
+    for entry in record.entries:
+        spk_short = entry.operator_spk.hex()[:16] + "..."
+        print(
+            f"  priority={entry.priority}  "
+            f"cluster={entry.cluster_base_domain}  "
+            f"operator_spk={spk_short}"
+        )
+    return 0
+
+
+def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
+    """End-to-end discovery for an external address.
+
+    Given `alice@example.com`:
+    1. Parse into `(user, host)`.
+    2. Resolve bootstrap anchors: require pin for `host` (via
+       `bootstrap pin`) OR explicit `--signer-spk`.
+    3. Fetch + verify the bootstrap record for `host`.
+    4. Pick `best_entry()` (lowest priority — SMTP MX semantics).
+    5. Without `--auto-pin`: print the `dmp cluster pin` /
+       `dmp cluster enable` steps the operator would run. Do NOT
+       write anything to config — this is a diagnostic that bridges
+       discovery to cluster handoff so the operator approves.
+    6. With `--auto-pin`: ALSO fetch + verify the cluster manifest
+       at the returned anchor against the entry's `operator_spk`,
+       THEN write BOTH bootstrap and cluster config + set
+       `cluster_enabled=True`. If either verification step fails,
+       exit 2 and leave config untouched — a half-written config
+       (bootstrap pinned but cluster not) is worse than nothing.
+    """
+    from dmp.core.identity import parse_address
+
+    path = _config_path()
+    if not path.exists():
+        _die(1, f"no config at {path} — run `dmp init <username>` first")
+    cfg = CLIConfig.load(path)
+
+    parsed = parse_address(args.address)
+    if parsed is None:
+        _die(1, f"could not parse address {args.address!r}; expected user@host")
+    user, host = parsed
+
+    # Trust anchor resolution: CLI --signer-spk wins; otherwise the
+    # pinned config must have bootstrap_user_domain matching the host.
+    signer_hex: Optional[str] = args.signer_spk
+    if not signer_hex:
+        if cfg.bootstrap_user_domain.casefold() != host.casefold():
+            _die(
+                1,
+                f"no bootstrap signer pinned for {host!r} — run "
+                f"`dmp bootstrap pin {host} <signer_spk_hex>` first, or "
+                "pass --signer-spk <hex> on this call",
+            )
+        signer_hex = cfg.bootstrap_signer_spk
+        if not signer_hex:
+            _die(
+                1,
+                f"no bootstrap signer pinned for {host!r} — run "
+                f"`dmp bootstrap pin {host} <signer_spk_hex>` first",
+            )
+    signer_spk = _decode_signer_spk(signer_hex, field_name="signer_spk")
+
+    # parse_address only asserts user@host shape; host can still be a
+    # malformed DNS name. Validate before fetch so bad input is a clean
+    # CLI exit instead of a traceback out of bootstrap_rrset_name.
+    from dmp.core.cluster import _validate_dns_name as _validate_discover_host
+
+    try:
+        _validate_discover_host(host)
+    except ValueError as exc:
+        _die(1, f"invalid host in address: {exc}")
+
+    bootstrap_reader = _make_reader(cfg)
+    record = fetch_bootstrap_record(host, signer_spk, bootstrap_reader)
+    if record is None:
+        _die(
+            2,
+            f"no verifying bootstrap record at _dmp.{host}. "
+            "Check the TXT is published, signed by the pinned signer, "
+            "not expired, and binds to this user_domain.",
+        )
+    if not args.auto_pin:
+        # Diagnostic mode: show the operator what the pinning would
+        # look like so they can approve/deny with full visibility.
+        # Walk the same fallback ladder --auto-pin uses so the guidance
+        # points at a cluster that actually works, not just the
+        # highest-priority entry that may be down. If nothing usable,
+        # fall back to best_entry() for visibility with a clear warning.
+        _usable_manifest, chosen = _pick_usable_bootstrap_entry(
+            record, cfg, bootstrap_reader
+        )
+        shown = chosen if chosen is not None else record.best_entry()
+        print(f"address:     {user}@{host}")
+        print(f"user_domain: {host}  (seq={record.seq}, exp={record.exp})")
+        if chosen is None:
+            print(
+                "WARNING: no entry in this record has a reachable + "
+                "factory-buildable cluster manifest right now. Showing "
+                "the highest-priority entry for visibility only — "
+                "pinning it would immediately break cluster commands."
+            )
+        print(f"shown entry: priority={shown.priority}")
+        print(f"  cluster_base_domain: {shown.cluster_base_domain}")
+        print(f"  operator_spk:        {shown.operator_spk.hex()}")
+        print()
+        print("to pin this cluster manually, run:")
+        print(
+            f"  dmp cluster pin {shown.operator_spk.hex()} {shown.cluster_base_domain}"
+        )
+        print("  dmp cluster fetch  # verify manifest")
+        print("  dmp cluster enable # activate cluster mode")
+        print()
+        print("or re-run with --auto-pin to do all of the above atomically.")
+        return 0
+
+    # --auto-pin mutates the caller's own global cluster_* config and
+    # flips cluster_enabled=True, which rehomes every subsequent
+    # `dmp send` / `dmp recv` / `identity publish` onto the discovered
+    # cluster. Running it against ANY address (e.g. to look at a
+    # recipient alice@example.com) would rehome the operator's local
+    # mailbox state to someone else's cluster — a silent hijack.
+    #
+    # Guard: require the discovered host to match bootstrap_user_domain
+    # pinned in config. That makes auto-pin an explicit two-step flow:
+    #   1. `dmp bootstrap pin <my-domain> <my-signer-spk>`  — acknowledge
+    #      trust anchor for the zone you actually live on
+    #   2. `dmp bootstrap discover me@my-domain --auto-pin`
+    # Inspecting a recipient's cluster is still possible without
+    # --auto-pin (diagnostic mode) or via --via-bootstrap on
+    # identity fetch.
+    if not cfg.bootstrap_user_domain or _norm_dns_name(host) != _norm_dns_name(
+        cfg.bootstrap_user_domain
+    ):
+        _die(
+            1,
+            f"--auto-pin refuses to rehome config onto {host!r}: it is "
+            f"not the bootstrap_user_domain pinned in config "
+            f"({cfg.bootstrap_user_domain!r}). Pin your own home domain "
+            f"first with `dmp bootstrap pin {host} <signer_spk_hex>`, "
+            f"then re-run --auto-pin. For one-off discovery of a "
+            f"recipient's cluster, omit --auto-pin (diagnostic mode) "
+            f"or use `dmp identity fetch alice@host --via-bootstrap`.",
+        )
+
+    # Verify the cluster manifest at the returned anchor BEFORE writing
+    # any config. Two-hop trust chain:
+    # 1. bootstrap record verified against pinned bootstrap_signer_spk
+    #    (above, via fetch_bootstrap_record).
+    # 2. cluster manifest verified against the entry's operator_spk
+    #    (below, via fetch_cluster_manifest).
+    # Only after BOTH succeed do we persist. A half-written config
+    # (bootstrap pinned but no cluster) is worse than none at all —
+    # `dmp send` would wedge on cluster-mode enabled with no manifest.
+    #
+    # Walk entries in priority order. Accept only an entry whose
+    # cluster manifest verifies AND whose per-node factories can
+    # actually build writer/reader instances — dry-run matches the
+    # "all-or-nothing" contract. Shared helper keeps this consistent
+    # with --via-bootstrap and manual discover output.
+    manifest, chosen = _pick_usable_bootstrap_entry(record, cfg, bootstrap_reader)
+    if manifest is None or chosen is None:
+        _die(
+            2,
+            f"no usable cluster manifest in the bootstrap record for {host} "
+            f"(tried {len(record.entries)} in priority order). "
+            "Either no preferred cluster is published yet, a signer key "
+            "rotation is mid-flight, all entries are expired, or every "
+            "reachable manifest carries endpoints the local factories "
+            "can't build. No config written.",
+        )
+
+    # Both records verified: commit both to config atomically.
+    # Pin the bootstrap anchor on the caller's behalf so future
+    # discover/fetch calls don't need --signer-spk. Pin the cluster
+    # anchors and set cluster_enabled=True so the next `dmp send` /
+    # `dmp recv` routes through the federation path.
+    #
+    # Clear cluster_node_token AND http_token: both were scoped to the
+    # previous operator. _build_cluster_writer_factory falls back from
+    # cluster_node_token to http_token, so clearing only the former
+    # would still send the legacy token to the newly discovered cluster
+    # — a cross-trust-domain credential leak. The operator can
+    # repopulate either via `dmp config set` or by editing the config
+    # file if the new cluster requires auth.
+    cfg.bootstrap_user_domain = host.rstrip(".")
+    cfg.bootstrap_signer_spk = signer_hex.lower()
+    cfg.cluster_base_domain = chosen.cluster_base_domain
+    cfg.cluster_operator_spk = chosen.operator_spk.hex()
+    cfg.cluster_node_token = ""
+    cfg.http_token = None
+    cfg.cluster_enabled = True
+    cfg.save(path)
+
+    print(f"address:     {user}@{host}")
+    print(f"user_domain: {host}  (seq={record.seq})")
+    print(
+        f"cluster:     {manifest.cluster_name}  "
+        f"(seq={manifest.seq}, nodes={len(manifest.nodes)})"
+    )
+    print()
+    print("wrote config:")
+    print(f"  bootstrap_user_domain = {cfg.bootstrap_user_domain}")
+    print(f"  bootstrap_signer_spk  = {cfg.bootstrap_signer_spk}")
+    print(f"  cluster_base_domain   = {cfg.cluster_base_domain}")
+    print(f"  cluster_operator_spk  = {cfg.cluster_operator_spk}")
+    print(f"  cluster_enabled       = True")
+    return 0
+
+
 def cmd_node(args: argparse.Namespace) -> int:
     """Convenience: launch a dmp-node in the foreground."""
     from dmp.server.node import DMPNode, DMPNodeConfig
@@ -1641,6 +2167,15 @@ def build_parser() -> argparse.ArgumentParser:
         "this 16-hex fingerprint to disambiguate (verify out-of-band first)",
     )
     p_id_fetch.add_argument("--json", action="store_true")
+    p_id_fetch.add_argument(
+        "--via-bootstrap",
+        dest="via_bootstrap",
+        action="store_true",
+        help="discover the cluster serving the address's right-hand host "
+        "via the pinned bootstrap signer, then route the lookup through "
+        "a one-shot ClusterClient. Requires `dmp bootstrap pin <host> "
+        "<signer_spk_hex>` first. No config is written.",
+    )
     p_id_fetch.set_defaults(func=cmd_identity_fetch)
 
     # contacts
@@ -1742,6 +2277,63 @@ def build_parser() -> argparse.ArgumentParser:
         "(flips cluster_enabled=False)",
     )
     p_cl_disable.set_defaults(func=cmd_cluster_disable)
+
+    # bootstrap (M3.2-wire: user-domain → cluster discovery)
+    p_bs = sub.add_parser(
+        "bootstrap",
+        help="manage bootstrap-discovery trust anchors (M3.2-wire)",
+    )
+    sub_bs = p_bs.add_subparsers(dest="sub", required=True)
+    p_bs_pin = sub_bs.add_parser(
+        "pin",
+        help="store the zone operator's Ed25519 pubkey + user_domain in config",
+    )
+    p_bs_pin.add_argument(
+        "user_domain",
+        help="user domain to pin a trust anchor for (e.g. example.com)",
+    )
+    p_bs_pin.add_argument(
+        "signer_spk_hex",
+        help="32-byte Ed25519 public key of the zone operator, hex-encoded",
+    )
+    p_bs_pin.set_defaults(func=cmd_bootstrap_pin)
+    p_bs_fetch = sub_bs.add_parser(
+        "fetch",
+        help="one-shot fetch + verify the bootstrap record; print summary",
+    )
+    p_bs_fetch.add_argument(
+        "--user-domain",
+        default=None,
+        help="override pinned user_domain for this fetch",
+    )
+    p_bs_fetch.add_argument(
+        "--signer-spk",
+        default=None,
+        help="override pinned signer_spk (hex) for this fetch",
+    )
+    p_bs_fetch.set_defaults(func=cmd_bootstrap_fetch)
+    p_bs_discover = sub_bs.add_parser(
+        "discover",
+        help="resolve user@host → cluster anchors; with --auto-pin, commit",
+    )
+    p_bs_discover.add_argument(
+        "address",
+        help="external address in user@host form (e.g. alice@example.com)",
+    )
+    p_bs_discover.add_argument(
+        "--signer-spk",
+        default=None,
+        help="bootstrap signer_spk (hex) for this host; required when the "
+        "host has not been pinned via `dmp bootstrap pin`",
+    )
+    p_bs_discover.add_argument(
+        "--auto-pin",
+        action="store_true",
+        help="after verifying the bootstrap record AND the cluster manifest "
+        "at the returned anchor, write both to config and enable cluster "
+        "mode. All-or-nothing: on any failure the config is left untouched.",
+    )
+    p_bs_discover.set_defaults(func=cmd_bootstrap_discover)
 
     # node (convenience launcher)
     p_n = sub.add_parser("node", help="run a dmp node in the foreground")
