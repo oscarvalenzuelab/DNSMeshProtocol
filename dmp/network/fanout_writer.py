@@ -494,27 +494,33 @@ class FanoutWriter(DNSRecordWriter):
         futures are left running in the executor; their completion will
         still update per-node health through :meth:`_run_on_node`.
         """
-        # Snapshot the state set under the lock; we hand the executor a
-        # fixed list so a concurrent install_manifest doesn't race with
-        # an in-flight fan-out. The state objects themselves outlive
-        # the snapshot as long as they remain referenced by the
-        # captured futures, so health updates on slow nodes still
-        # land correctly even if the node is removed mid-flight.
+        # Snapshot state AND submit under the lock. Holding through
+        # submit prevents a race where close() sees _closed=False, we
+        # drop the lock, then close() shuts down the executor before
+        # our executor.submit() — which would raise RuntimeError into
+        # the caller instead of returning a clean False. Submit is
+        # non-blocking so the lock-hold window is bounded by N
+        # executor queue operations, not by writer latency.
         with self._lock:
             if self._closed:
                 raise RuntimeError("FanoutWriter is closed")
             states = list(self._nodes.values())
             quorum = _ceil_half(len(states))
-
-        # Vacuous success: nothing to fan out to, quorum zero.
-        if not states:
-            return True
+            if not states:
+                # Vacuous success: nothing to fan out to.
+                return True
+            try:
+                futures: List[Future] = [
+                    self._executor.submit(self._run_on_node, s, op) for s in states
+                ]
+            except RuntimeError:
+                # Executor was shut down between our _closed check and
+                # submit (can happen if close() doesn't take the lock
+                # on the shutdown path; defense in depth). Surface as
+                # a failed write rather than a traceback.
+                return False
 
         deadline = time.monotonic() + self._timeout
-
-        futures: List[Future] = [
-            self._executor.submit(self._run_on_node, s, op) for s in states
-        ]
 
         successes = 0
         try:
@@ -535,10 +541,25 @@ class FanoutWriter(DNSRecordWriter):
                     # unhandled error either — treat it as a failure.
                     pass
                 if successes >= quorum:
+                    # Quorum met early. Cancel any futures that haven't
+                    # started yet so they release their queue slots;
+                    # futures that are already running can't be
+                    # cancelled (cancel() returns False) but any of
+                    # them that we can free prevents gradual pool
+                    # exhaustion from abandoned-write stragglers on
+                    # backends without their own request timeouts.
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
                     return True
         except TimeoutError:
-            # Deadline exceeded before quorum; remaining futures stay
-            # running and will update health on completion.
+            # Deadline exceeded before quorum; cancel pending futures
+            # so their queue slots don't accumulate across calls. Any
+            # currently-running ones will finish in their own time and
+            # update health through _run_on_node.
+            for f in futures:
+                if not f.done():
+                    f.cancel()
             return False
 
         return successes >= quorum
