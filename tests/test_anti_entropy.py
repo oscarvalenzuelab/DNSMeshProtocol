@@ -197,6 +197,12 @@ class FakePeerHTTP:
     Carries its own InMemoryDNSStore and implements just enough of the
     sync protocol to exercise the worker. The worker talks to it via the
     injected http_get / http_post callables on AntiEntropyWorker.
+
+    ``cluster_manifest_wire`` controls the /v1/sync/cluster-manifest
+    response (M3.3 gossip). Default None → 204 "no content"; setting a
+    string returns it verbatim in a 200. ``cluster_manifest_raw_body``
+    overrides the entire response body (used to test malformed /
+    garbage payloads).
     """
 
     def __init__(
@@ -206,18 +212,55 @@ class FakePeerHTTP:
         *,
         lie_extra: bool = False,
         forge_manifest: Optional[str] = None,
+        cluster_manifest_wire: Optional[str] = None,
+        cluster_manifest_raw_body: Optional[bytes] = None,
     ):
         self.peer_id = peer_id
         self.token = token
         self.store = InMemoryDNSStore()
         self.lie_extra = lie_extra
         self.forge_manifest = forge_manifest
+        self.cluster_manifest_wire = cluster_manifest_wire
+        self.cluster_manifest_raw_body = cluster_manifest_raw_body
         self.digest_calls = 0
         self.pull_calls = 0
+        self.cluster_manifest_calls = 0
 
     def get(self, url: str, token: Optional[str], timeout: float) -> Tuple[int, bytes]:
         if token != self.token:
             return (403, b'{"error":"forbidden"}')
+        if "/v1/sync/cluster-manifest" in url:
+            self.cluster_manifest_calls += 1
+            if self.cluster_manifest_raw_body is not None:
+                return (200, self.cluster_manifest_raw_body)
+            if self.cluster_manifest_wire is None:
+                return (204, b"")
+            # Shape the body the same way the real endpoint does.
+            import base64 as _b64
+
+            wire = self.cluster_manifest_wire
+            try:
+                blob = _b64.b64decode(
+                    wire[len("v=dmp1;t=cluster;") :], validate=True
+                )
+                body_bytes = blob[:-64]
+                seq = int.from_bytes(body_bytes[7:15], "big")
+                exp = int.from_bytes(body_bytes[15:23], "big")
+                name_len = body_bytes[55]
+                cluster_name = (
+                    body_bytes[56 : 56 + name_len].decode("utf-8").rstrip(".")
+                )
+            except Exception:
+                seq = 0
+                exp = 0
+                cluster_name = ""
+            doc = {
+                "wire": wire,
+                "seq": seq,
+                "exp": exp,
+                "cluster_name": cluster_name,
+            }
+            return (200, json.dumps(doc).encode("utf-8"))
         if "/v1/sync/digest" in url:
             self.digest_calls += 1
             # Parse ?cursor=&limit= (primary) or legacy ?since=&limit=.
@@ -966,3 +1009,459 @@ class TestWorkerTick:
             f"watermark {wm} advanced past a pair we never actually "
             f"wrote — next tick will never retry that (name, hash)"
         )
+
+
+# ---- M3.3 manifest gossip ------------------------------------------------
+
+
+def _make_cluster(
+    op: DMPCrypto,
+    *,
+    seq: int,
+    cluster_name: str = "mesh.example.com",
+    nodes: Optional[List[ClusterNode]] = None,
+    exp_in: int = 3600,
+) -> Tuple[str, ClusterManifest]:
+    manifest = ClusterManifest(
+        cluster_name=cluster_name,
+        operator_spk=op.get_signing_public_key_bytes(),
+        nodes=nodes
+        or [
+            ClusterNode(node_id="node-a", http_endpoint="http://n-a.example:8053"),
+            ClusterNode(node_id="node-b", http_endpoint="http://n-b.example:8053"),
+            ClusterNode(node_id="node-c", http_endpoint="http://n-c.example:8053"),
+        ],
+        seq=seq,
+        exp=int(time.time()) + exp_in,
+    )
+    return manifest.sign(op), manifest
+
+
+def _make_gossip_worker(
+    local_store: InMemoryDNSStore,
+    peers: List[Tuple[SyncPeer, FakePeerHTTP]],
+    *,
+    operator_spk: Optional[bytes] = None,
+    base_domain: Optional[str] = "mesh.example.com",
+    token: str = "peer-token",
+    **kwargs,
+) -> AntiEntropyWorker:
+    by_endpoint: Dict[str, FakePeerHTTP] = {p.http_endpoint: fake for p, fake in peers}
+
+    def http_get(url, tok, timeout):
+        for ep, fake in by_endpoint.items():
+            if url.startswith(ep):
+                return fake.get(url, tok, timeout)
+        return (0, b"")
+
+    def http_post(url, tok, body, timeout):
+        for ep, fake in by_endpoint.items():
+            if url.startswith(ep):
+                return fake.post(url, tok, body, timeout)
+        return (0, b"")
+
+    return AntiEntropyWorker(
+        store=local_store,
+        peers=[p for p, _ in peers],
+        sync_token=token,
+        interval_seconds=kwargs.pop("interval_seconds", 1.0),
+        cluster_operator_spk=operator_spk,
+        base_domain=base_domain,
+        http_get=http_get,
+        http_post=http_post,
+        **kwargs,
+    )
+
+
+class TestGossipManifest:
+    """Manifest gossip — M3.3 node-to-node rollout."""
+
+    def test_gossip_installs_higher_seq_manifest(self):
+        """Peer serves seq=5; local has seq=3; install and republish."""
+        from dmp.core.cluster import cluster_rrset_name
+
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+
+        # Seed local with seq=3 manifest.
+        wire_local, _ = _make_cluster(op, seq=3)
+        rrset = cluster_rrset_name("mesh.example.com")
+        local.publish_txt_record(rrset, wire_local, ttl=300)
+
+        # Peer holds seq=5 manifest to gossip.
+        wire_peer, _ = _make_cluster(op, seq=5)
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=wire_peer)
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=op.get_signing_public_key_bytes(),
+        )
+
+        worker.tick_once()
+
+        # Local must now serve BOTH the old (append-semantics kept it)
+        # and the new wire. Highest-seq is the peer's.
+        values = local.query_txt_record(rrset) or []
+        assert wire_peer in values
+
+    def test_gossip_rejects_lower_seq_manifest(self):
+        """Peer at seq=2; local at seq=5 — no-op."""
+        from dmp.core.cluster import cluster_rrset_name
+
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+        wire_local, _ = _make_cluster(op, seq=5)
+        rrset = cluster_rrset_name("mesh.example.com")
+        local.publish_txt_record(rrset, wire_local, ttl=300)
+
+        wire_peer, _ = _make_cluster(op, seq=2)
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=wire_peer)
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=op.get_signing_public_key_bytes(),
+        )
+
+        worker.tick_once()
+
+        values = local.query_txt_record(rrset) or []
+        # Peer's older wire must NOT have been installed.
+        assert wire_peer not in values
+        assert wire_local in values
+
+    def test_gossip_rejects_unsigned_wire(self):
+        """Peer returns garbage — no install."""
+        from dmp.core.cluster import cluster_rrset_name
+
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+
+        # Raw body returns total junk where the wire field is garbage.
+        garbage_body = json.dumps(
+            {
+                "wire": "not-a-wire-record",
+                "seq": 99,
+                "exp": int(time.time()) + 3600,
+                "cluster_name": "mesh.example.com",
+            }
+        ).encode("utf-8")
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_raw_body=garbage_body)
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=op.get_signing_public_key_bytes(),
+        )
+
+        worker.tick_once()
+
+        rrset = cluster_rrset_name("mesh.example.com")
+        assert local.query_txt_record(rrset) in (None, [])
+        # The peer must not have poked the worker's installed seq.
+        assert worker.peers == [peer]
+
+    def test_gossip_rejects_wrong_operator_key(self):
+        """Manifest signed by DIFFERENT key — rejected."""
+        from dmp.core.cluster import cluster_rrset_name
+
+        local = InMemoryDNSStore()
+        pinned = DMPCrypto()  # worker pins this key
+        other = DMPCrypto()  # peer serves a manifest signed by THIS key
+
+        wire_peer, _ = _make_cluster(other, seq=99)
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=wire_peer)
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=pinned.get_signing_public_key_bytes(),
+        )
+
+        worker.tick_once()
+
+        rrset = cluster_rrset_name("mesh.example.com")
+        # The wrong-key manifest was NOT installed.
+        assert wire_peer not in (local.query_txt_record(rrset) or [])
+
+    def test_gossip_rejects_expired_manifest(self):
+        """Manifest past its expiry — rejected even if seq is high."""
+        from dmp.core.cluster import cluster_rrset_name
+
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+
+        # Expiry 10s in the past.
+        wire_peer, _ = _make_cluster(op, seq=99, exp_in=-10)
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=wire_peer)
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=op.get_signing_public_key_bytes(),
+        )
+
+        worker.tick_once()
+
+        rrset = cluster_rrset_name("mesh.example.com")
+        assert wire_peer not in (local.query_txt_record(rrset) or [])
+
+    def test_gossip_rejects_wrong_cluster_name(self):
+        """Manifest bound to a DIFFERENT cluster_name — rejected."""
+        from dmp.core.cluster import cluster_rrset_name
+
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+
+        # Peer serves a manifest for cluster "other.example.com" when
+        # the worker is pinned to "mesh.example.com".
+        wire_peer, _ = _make_cluster(op, seq=99, cluster_name="other.example.com")
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=wire_peer)
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=op.get_signing_public_key_bytes(),
+        )
+
+        worker.tick_once()
+
+        rrset = cluster_rrset_name("mesh.example.com")
+        assert wire_peer not in (local.query_txt_record(rrset) or [])
+
+    def test_gossip_updates_peer_list_on_manifest_change(self):
+        """New manifest adds node-d; worker's peer list grows."""
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+
+        # Seed local with 3-node manifest at seq=1.
+        wire_local, _ = _make_cluster(op, seq=1)
+        from dmp.core.cluster import cluster_rrset_name
+
+        local.publish_txt_record(
+            cluster_rrset_name("mesh.example.com"), wire_local, ttl=300
+        )
+
+        # Peer's newer manifest has 4 nodes.
+        new_nodes = [
+            ClusterNode(node_id="node-a", http_endpoint="http://n-a.example:8053"),
+            ClusterNode(node_id="node-b", http_endpoint="http://n-b.example:8053"),
+            ClusterNode(node_id="node-c", http_endpoint="http://n-c.example:8053"),
+            ClusterNode(node_id="node-d", http_endpoint="http://n-d.example:8053"),
+        ]
+        wire_peer, _ = _make_cluster(op, seq=2, nodes=new_nodes)
+        # Worker's initial peer is "peer-b" at a different URL; peer
+        # faking the response is the one it talks to.
+        peer_a = SyncPeer(node_id="node-b", http_endpoint="http://n-b.example:8053")
+        peer_fake_a = FakePeerHTTP("node-b", cluster_manifest_wire=wire_peer)
+
+        worker = _make_gossip_worker(
+            local,
+            [(peer_a, peer_fake_a)],
+            operator_spk=op.get_signing_public_key_bytes(),
+            self_node_id="node-a",  # this node is node-a
+        )
+        # Worker starts with one peer (node-b).
+        assert [p.node_id for p in worker.peers] == ["node-b"]
+
+        worker.tick_once()
+
+        # After gossip: node-a (self) excluded, node-b/c/d present.
+        ids = {p.node_id for p in worker.peers}
+        assert "node-a" not in ids  # self filtered
+        assert ids == {"node-b", "node-c", "node-d"}
+
+    def test_gossip_removes_peer_on_manifest_change(self):
+        """New manifest drops node-c; worker's peer list shrinks."""
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+
+        # Seed local with 3-node manifest.
+        wire_local, _ = _make_cluster(op, seq=1)
+        from dmp.core.cluster import cluster_rrset_name
+
+        local.publish_txt_record(
+            cluster_rrset_name("mesh.example.com"), wire_local, ttl=300
+        )
+
+        # New manifest has only node-a and node-b (node-c removed).
+        new_nodes = [
+            ClusterNode(node_id="node-a", http_endpoint="http://n-a.example:8053"),
+            ClusterNode(node_id="node-b", http_endpoint="http://n-b.example:8053"),
+        ]
+        wire_peer, _ = _make_cluster(op, seq=2, nodes=new_nodes)
+        peer_b = SyncPeer(node_id="node-b", http_endpoint="http://n-b.example:8053")
+        peer_c = SyncPeer(node_id="node-c", http_endpoint="http://n-c.example:8053")
+        peer_fake_b = FakePeerHTTP("node-b", cluster_manifest_wire=wire_peer)
+        peer_fake_c = FakePeerHTTP("node-c", cluster_manifest_wire=wire_peer)
+
+        worker = _make_gossip_worker(
+            local,
+            [(peer_b, peer_fake_b), (peer_c, peer_fake_c)],
+            operator_spk=op.get_signing_public_key_bytes(),
+            self_node_id="node-a",
+        )
+        # Seed a watermark for node-c so we can assert it's cleared.
+        worker.set_watermark("node-c", (999, "some.name", "a" * 64))
+        assert worker.watermark("node-c") == (999, "some.name", "a" * 64)
+
+        # First tick talks to node-b (round-robin index 0) and installs
+        # the new manifest — which drops node-c.
+        worker.tick_once()
+
+        ids = {p.node_id for p in worker.peers}
+        assert "node-c" not in ids
+        assert ids == {"node-b"}
+
+        # Watermark for node-c was cleared by the peer swap.
+        assert worker.watermark("node-c") == (0, "", "")
+
+    def test_gossip_disabled_without_operator_spk(self):
+        """Worker without an operator_spk never fetches /cluster-manifest."""
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+        wire_peer, _ = _make_cluster(op, seq=5)
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=wire_peer)
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=None,  # explicitly disabled
+        )
+
+        worker.tick_once()
+        worker.tick_once()
+
+        # The gossip endpoint was never called.
+        assert peer_fake.cluster_manifest_calls == 0
+
+    def test_gossip_disabled_without_base_domain(self):
+        """Worker with operator_spk but no base_domain cannot verify
+        cluster_name binding; gossip stays off."""
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+        wire_peer, _ = _make_cluster(op, seq=5)
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=wire_peer)
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=op.get_signing_public_key_bytes(),
+            base_domain=None,
+        )
+
+        worker.tick_once()
+        assert peer_fake.cluster_manifest_calls == 0
+
+    def test_self_exclusion_by_node_id(self):
+        """A peer entry with node_id matching self_node_id is dropped
+        on construction."""
+        local = InMemoryDNSStore()
+        peer_self = SyncPeer(node_id="me", http_endpoint="http://self.example:8053")
+        peer_other = SyncPeer(
+            node_id="other", http_endpoint="http://other.example:8053"
+        )
+        worker = AntiEntropyWorker(
+            store=local,
+            peers=[peer_self, peer_other],
+            sync_token="tok",
+            interval_seconds=1.0,
+            self_node_id="me",
+        )
+        assert [p.node_id for p in worker.peers] == ["other"]
+
+    def test_self_exclusion_by_http_endpoint(self):
+        """A peer entry with http_endpoint matching self_http_endpoint is
+        dropped — a future manifest-generator writing self into the list
+        cannot wedge the worker on a self-sync loop."""
+        local = InMemoryDNSStore()
+        # Note: the self endpoint has a trailing slash, the peer entry
+        # does not. Normalization must make them match.
+        peer_self = SyncPeer(
+            node_id="twin-a", http_endpoint="http://self.example:8053"
+        )
+        peer_other = SyncPeer(
+            node_id="other", http_endpoint="http://other.example:8053"
+        )
+        worker = AntiEntropyWorker(
+            store=local,
+            peers=[peer_self, peer_other],
+            sync_token="tok",
+            interval_seconds=1.0,
+            self_http_endpoint="http://self.example:8053/",
+        )
+        assert [p.node_id for p in worker.peers] == ["other"]
+
+    def test_replace_peers_preserves_watermarks_for_retained(self):
+        """replace_peers keeps watermarks for peers still in the new set."""
+        local = InMemoryDNSStore()
+        p_a = SyncPeer(node_id="a", http_endpoint="http://a.example:8053")
+        p_b = SyncPeer(node_id="b", http_endpoint="http://b.example:8053")
+        worker = AntiEntropyWorker(
+            store=local,
+            peers=[p_a, p_b],
+            sync_token="tok",
+            interval_seconds=1.0,
+        )
+        worker.set_watermark("a", (1000, "alice", "f" * 64))
+        worker.set_watermark("b", (2000, "bob", "e" * 64))
+
+        # Swap: keep a, drop b, add c.
+        p_c = SyncPeer(node_id="c", http_endpoint="http://c.example:8053")
+        worker.replace_peers([p_a, p_c])
+
+        ids = {p.node_id for p in worker.peers}
+        assert ids == {"a", "c"}
+        # a's watermark preserved.
+        assert worker.watermark("a") == (1000, "alice", "f" * 64)
+        # b's watermark dropped.
+        assert worker.watermark("b") == (0, "", "")
+        # c is fresh.
+        assert worker.watermark("c") == (0, "", "")
+
+    def test_gossip_no_op_when_peer_has_same_seq(self):
+        """Peer and local both at seq=5 — no install, no peer swap."""
+        from dmp.core.cluster import cluster_rrset_name
+
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+        wire, _ = _make_cluster(op, seq=5)
+        local.publish_txt_record(
+            cluster_rrset_name("mesh.example.com"), wire, ttl=300
+        )
+
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=wire)
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=op.get_signing_public_key_bytes(),
+        )
+
+        # Initial peer list is just the one synthetic peer; if gossip
+        # installed a "same-seq" manifest the list would mutate.
+        before = [p.node_id for p in worker.peers]
+        worker.tick_once()
+        after = [p.node_id for p in worker.peers]
+        assert before == after
+
+    def test_gossip_peer_returns_204(self):
+        """Peer has no manifest to share — gossip returns silently."""
+        local = InMemoryDNSStore()
+        op = DMPCrypto()
+
+        peer_fake = FakePeerHTTP("n2", cluster_manifest_wire=None)  # 204
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        worker = _make_gossip_worker(
+            local,
+            [(peer, peer_fake)],
+            operator_spk=op.get_signing_public_key_bytes(),
+        )
+
+        worker.tick_once()
+        assert peer_fake.cluster_manifest_calls == 1
+        # No peer-set changes.
+        assert [p.node_id for p in worker.peers] == ["n2"]
