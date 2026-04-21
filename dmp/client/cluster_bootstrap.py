@@ -268,32 +268,26 @@ class ClusterClient:
         # the same factory. Since we've just shown the factory doesn't
         # raise on any node in this manifest, those internal builds are
         # guaranteed not to trip a factory exception.
-        probes = []
-        try:
-            for node in new_manifest.nodes:
-                try:
-                    probes.append(self._writer_factory(node))
-                    probes.append(self._reader_factory(node))
-                except Exception as exc:
-                    log.warning(
-                        "cluster manifest refresh aborted: factory "
-                        "probe failed for node %r: %s",
-                        node.node_id,
-                        exc,
-                    )
-                    return False
-        finally:
-            # Close any probe instances we built — they're otherwise
-            # unreferenced. Tolerate the close method being absent or
-            # raising: this is best-effort cleanup, not part of the
-            # atomicity contract.
-            for probe in probes:
-                close = getattr(probe, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:  # pragma: no cover - best-effort
-                        pass
+        # We deliberately DO NOT call close() on probe instances. Factories
+        # are allowed to return shared/singleton objects — `_make_cluster_reader_factory`
+        # hands back the live bootstrap reader for nodes without a
+        # `dns_endpoint`, and tests commonly use pre-built shared writers.
+        # Closing a probe could tear down a live instance the installed
+        # ClusterClient is actively using. The probe objects are cheap
+        # Python references; dropping them at function exit lets the GC
+        # reclaim any throwaway instances without risking shared ones.
+        for node in new_manifest.nodes:
+            try:
+                self._writer_factory(node)
+                self._reader_factory(node)
+            except Exception as exc:
+                log.warning(
+                    "cluster manifest refresh aborted: factory "
+                    "probe failed for node %r: %s",
+                    node.node_id,
+                    exc,
+                )
+                return False
         # Dry-run passed: both install_manifest calls will succeed at
         # the factory layer. Any remaining False return is a
         # monotonicity/expiry rejection, which both sides apply

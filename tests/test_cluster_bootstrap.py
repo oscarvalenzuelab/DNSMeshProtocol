@@ -712,10 +712,14 @@ class TestClusterClient:
         finally:
             cc.close()
 
-    def test_refresh_now_dry_run_closes_probes(self):
-        """If the probe instances have a close() method, the dry-run
-        cleans them up so we don't leak sockets / executors for every
-        refresh tick."""
+    def test_refresh_now_does_not_close_probe_outputs(self):
+        """Factories are allowed to return shared/singleton instances
+        (e.g. _make_cluster_reader_factory hands back the live bootstrap
+        reader for nodes without a dns_endpoint). If refresh_now closed
+        probe outputs blindly, a successful refresh would tear down a
+        live shared instance the installed ClusterClient still uses.
+        Verify the probe pass never calls close() on factory outputs.
+        """
         op = DMPCrypto()
         manifest_v1 = _build_manifest(op, seq=1)
         store = InMemoryDNSStore()
@@ -725,30 +729,29 @@ class TestClusterClient:
             manifest_v2.sign(op),
         )
 
-        closed_writers: List["_CloseableWriter"] = []
-        closed_readers: List["_CloseableReader"] = []
+        # One shared writer + reader handed back for every node. If the
+        # probe pass calls close() on either, the counter trips.
+        shared_writer_closes = 0
+        shared_reader_closes = 0
 
-        class _CloseableWriter(_FakeWriter):
-            def __init__(self) -> None:
-                self.closed = False
-
+        class _SharedWriter(_FakeWriter):
             def close(self) -> None:
-                self.closed = True
-                closed_writers.append(self)
+                nonlocal shared_writer_closes
+                shared_writer_closes += 1
 
-        class _CloseableReader(_FakeReader):
-            def __init__(self) -> None:
-                self.closed = False
-
+        class _SharedReader(_FakeReader):
             def close(self) -> None:
-                self.closed = True
-                closed_readers.append(self)
+                nonlocal shared_reader_closes
+                shared_reader_closes += 1
+
+        shared_writer = _SharedWriter()
+        shared_reader = _SharedReader()
 
         def writer_factory(node: ClusterNode) -> DNSRecordWriter:
-            return _CloseableWriter()
+            return shared_writer
 
         def reader_factory(node: ClusterNode) -> DNSRecordReader:
-            return _CloseableReader()
+            return shared_reader
 
         cc = ClusterClient(
             manifest_v1,
@@ -759,22 +762,11 @@ class TestClusterClient:
             reader_factory=reader_factory,
         )
         try:
-            # Snapshot pre-refresh close counts: the initial
-            # FanoutWriter + UnionReader construction builds its own
-            # instances via these factories, and some of those may
-            # (depending on implementation) live out the lifetime of
-            # the ClusterClient — so we care only about NEW closes
-            # caused by the dry-run probe pass in refresh_now.
-            pre_w_closed = sum(1 for w in closed_writers if w.closed)
-            pre_r_closed = sum(1 for r in closed_readers if r.closed)
-
             assert cc.refresh_now() is True
-
-            # 3 nodes in the new manifest → 3 probe-writer closes and
-            # 3 probe-reader closes from the dry-run pass alone.
-            post_w_closed = sum(1 for w in closed_writers if w.closed)
-            post_r_closed = sum(1 for r in closed_readers if r.closed)
-            assert post_w_closed - pre_w_closed >= 3
-            assert post_r_closed - pre_r_closed >= 3
+            # The probe pass must NOT close shared factory outputs —
+            # doing so would kill the live reader/writer the installed
+            # ClusterClient is holding. Zero closes from refresh_now.
+            assert shared_writer_closes == 0
+            assert shared_reader_closes == 0
         finally:
             cc.close()
