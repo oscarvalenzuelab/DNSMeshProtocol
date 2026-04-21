@@ -142,6 +142,9 @@ class TestDigest:
             # ts is ms-resolution since M2.4-followup; a fresh row must
             # have well more than 10^12 (year 2001 in ms) on any clock.
             assert isinstance(e["ts"], int) and e["ts"] > 1_000_000_000_000
+            # ttl shipped alongside hash so clients can detect
+            # TTL-only refreshes.
+            assert isinstance(e["ttl"], int) and e["ttl"] > 0
 
     def test_filters_by_since(self, api_store_with_sync):
         api, store = api_store_with_sync

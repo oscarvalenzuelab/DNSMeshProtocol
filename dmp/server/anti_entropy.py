@@ -72,6 +72,12 @@ DIGEST_DEFAULT_LIMIT = 1000
 DIGEST_MAX_LIMIT = 10_000
 PULL_MAX_NAMES = 256
 
+# TTL-refresh diff slop. Two nodes in sync will have `ttl_remaining` that
+# differs by at most one RTT + clock skew; use a few seconds of slop so
+# every digest tick doesn't flag every row as "TTL drifted". A real
+# refresh (caller re-publishes with a fresh TTL) produces deltas >> this.
+_TTL_REFRESH_SLOP_SECONDS = 5
+
 # A well-formed chunk record prefix (the only type without a d= suffix and
 # not in the signed-type list).
 _CHUNK_PREFIX = "v=dmp1;t=chunk;d="
@@ -425,16 +431,24 @@ class AntiEntropyWorker:
         if not entries:
             return
 
-        # Build local hash index for just the names the peer lists. We only
-        # need to hash the values at those names, not the whole store, so
-        # this is cheap even with a big store.
+        # Build local (hash -> ttl_remaining) index for just the names the
+        # peer lists. We only need to hash the values at those names, not
+        # the whole store, so this is cheap even with a big store. The
+        # TTL side of the tuple powers the TTL-refresh detection further
+        # down: when value hashes match but the peer's TTL is materially
+        # higher than ours, the peer has seen a republish we missed.
         peer_names = [e["name"] for e in entries]
-        local_by_name: Dict[str, set] = {}
+        local_by_name: Dict[str, Dict[str, int]] = {}
         local_store_records = self._store.get_records_by_name(peer_names)
         for r in local_store_records:
-            local_by_name.setdefault(r.name, set()).add(r.record_hash)
+            local_by_name.setdefault(r.name, {})[r.record_hash] = int(r.ttl_remaining)
 
-        # Names to pull: those with a (name, hash) the peer has and we don't.
+        # Names to pull: those where the peer has a (name, hash) we don't,
+        # OR the peer has the same (name, hash) but a materially fresher
+        # TTL than us. The TTL_REFRESH_SLOP handles the unavoidable drift
+        # between when the peer hashed its row and when we measured ours
+        # (RTT + clock skew); without slop every digest would report a
+        # false refresh on in-sync rows.
         to_pull: List[str] = []
         seen: set = set()
         for entry in entries:
@@ -442,15 +456,31 @@ class AntiEntropyWorker:
             h = entry.get("hash")
             if not isinstance(name, str) or not isinstance(h, str):
                 continue
-            if h in local_by_name.get(name, set()):
-                continue
             if name in seen:
                 continue
+            local_hashes = local_by_name.get(name, {})
+            if h in local_hashes:
+                # Same value hash — check for a TTL-only refresh. The peer's
+                # digest carries ttl as of when it built the response; if
+                # the peer says the row has materially more life left than
+                # ours does, they've seen a refresh we missed.
+                peer_ttl = entry.get("ttl")
+                if isinstance(peer_ttl, int) and peer_ttl > 0:
+                    local_ttl = local_hashes[h]
+                    if peer_ttl <= local_ttl + _TTL_REFRESH_SLOP_SECONDS:
+                        continue
+                    # fallthrough — schedule a pull to refresh our expiry
+                else:
+                    # Legacy peer that didn't emit ttl. Fall back to
+                    # hash-only behavior (no refresh detection, but no
+                    # false positives either).
+                    continue
             seen.add(name)
             to_pull.append(name)
 
+        pulled_names: set = set()
         if to_pull:
-            self._pull_and_write(peer, to_pull)
+            pulled_names = self._pull_and_write(peer, to_pull)
 
         # Watermark advance.
         #
@@ -530,13 +560,23 @@ class AntiEntropyWorker:
             return None
         return (records, has_more)
 
-    def _pull_and_write(self, peer: SyncPeer, names: List[str]) -> None:
+    def _pull_and_write(self, peer: SyncPeer, names: List[str]) -> set:
+        """Pull up to `pull_batch_limit` names from `peer`, verify+write
+        each, and return the set of names we successfully stored.
+
+        The caller uses the returned set to advance the watermark: any
+        name present in the digest but absent from this set (because it
+        was deferred past the batch limit, rejected, or failed to write)
+        must remain visible to the next digest request.
+        """
         # Cap the request to the pull limit; if the peer's digest named
         # more than that, we'll catch the remainder on the next tick
         # (their stored_ts hasn't changed, so they'll still show up in
-        # the next digest window).
+        # the next digest window — as long as we don't advance the
+        # watermark past them, see `_sync_with_peer`).
         requested = names[: self._pull_limit]
         requested_set = set(requested)
+        written: set = set()
         url = f"{peer.http_endpoint.rstrip('/')}/v1/sync/pull"
         payload = json.dumps({"names": requested}).encode("utf-8")
         status, body = self._http_post(url, self._token, payload, self._timeout)
@@ -546,16 +586,16 @@ class AntiEntropyWorker:
                     "anti-entropy: pull %s returned HTTP %d", peer.node_id, status
                 )
             self.stats.errors += 1
-            return
+            return written
         try:
             doc = json.loads(body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self.stats.errors += 1
-            return
+            return written
         records = doc.get("records")
         if not isinstance(records, list):
             self.stats.errors += 1
-            return
+            return written
 
         for rec in records:
             if not isinstance(rec, dict):
@@ -597,9 +637,11 @@ class AntiEntropyWorker:
             try:
                 self._store.publish_txt_record(name, value, ttl=int(ttl))
                 self.stats.records_written += 1
+                written.add(name)
             except Exception:
                 log.exception("anti-entropy: local publish failed for %s", name)
                 self.stats.errors += 1
+        return written
 
     # ---- testing introspection --------------------------------------------
 
