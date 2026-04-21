@@ -376,6 +376,21 @@ class DMPNode:
         gossip_base = (
             self.config.cluster_base_domain or self._derive_cluster_base_domain()
         )
+        # Parse operator_spk once so the HTTP endpoint can filter
+        # unverified wires from the cluster RRset before picking the
+        # highest-seq candidate. Falls back to structural-only selection
+        # when not set (back-compat path; gossip is disabled in that
+        # mode anyway).
+        http_operator_spk: Optional[bytes] = None
+        if self.config.sync_cluster_operator_spk_hex:
+            try:
+                raw = bytes.fromhex(
+                    self.config.sync_cluster_operator_spk_hex.strip()
+                )
+                if len(raw) == 32:
+                    http_operator_spk = raw
+            except ValueError:
+                http_operator_spk = None
         self.http = DMPHttpApi(
             self.store,
             host=self.config.http_host,
@@ -391,6 +406,7 @@ class DMPNode:
             ),
             sync_peer_token=self.config.sync_peer_token,
             cluster_base_domain=gossip_base,
+            sync_cluster_operator_spk=http_operator_spk,
         )
         self.cleanup = CleanupWorker(
             self.store.cleanup_expired,
@@ -612,12 +628,24 @@ class DMPNode:
         )
 
     def _derive_cluster_base_domain(self) -> Optional[str]:
-        """Best-effort extraction of the cluster_name from the on-disk
-        cluster file, when ``DMP_CLUSTER_BASE_DOMAIN`` is unset. Reads
-        ONLY the structural header — signature verification already
-        happened in ``_publish_cluster_manifest_from_file``. Returns
-        None on missing file / malformed content (gossip then stays
-        off).
+        """Extract ``cluster_name`` from the on-disk cluster file when
+        ``DMP_CLUSTER_BASE_DOMAIN`` is unset.
+
+        Security: when ``DMP_SYNC_OPERATOR_SPK`` is pinned, the file's
+        wire must VERIFY under that key before we trust its
+        cluster_name. Without this check, a stale or wrong-zone
+        cluster_file on disk could set ``expected_cluster_name`` for
+        the gossip layer — the node would then accept gossiped
+        manifests for the wrong cluster name, even though
+        ``_publish_cluster_manifest_from_file`` already refused to
+        publish that same file.
+
+        Falls back to structural parse only when no operator_spk is
+        configured (gossip is disabled in that mode anyway, so the
+        base_domain is informational).
+
+        Returns None on missing file, malformed content, or signature
+        rejection — gossip then stays off.
         """
         path = self.config.cluster_file
         if not path or not os.path.isfile(path):
@@ -627,6 +655,7 @@ class DMPNode:
                 raw = fh.read().strip()
         except OSError:
             return None
+        from dmp.core.cluster import ClusterManifest
         from dmp.core.cluster import RECORD_PREFIX as _CLUSTER_PREFIX
 
         # cluster_file has two supported shapes:
@@ -654,6 +683,32 @@ class DMPNode:
             wire = candidate
         else:
             return None
+
+        # If the operator key is pinned, require the file to verify
+        # under it before we trust the embedded cluster_name. This
+        # prevents a stale / wrong-zone cluster_file from steering the
+        # gossip layer into the wrong cluster.
+        if self.config.sync_cluster_operator_spk_hex:
+            try:
+                operator_spk = bytes.fromhex(
+                    self.config.sync_cluster_operator_spk_hex.strip()
+                )
+            except ValueError:
+                return None
+            if len(operator_spk) != 32:
+                return None
+            parsed = ClusterManifest.parse_and_verify(wire, operator_spk)
+            if parsed is None:
+                log.warning(
+                    "anti-entropy: cluster_file %s does not verify under "
+                    "DMP_SYNC_OPERATOR_SPK; refusing to derive base_domain "
+                    "from it. Set DMP_CLUSTER_BASE_DOMAIN explicitly or "
+                    "replace the file.",
+                    path,
+                )
+                return None
+            return parsed.cluster_name
+
         try:
             import base64 as _b64
 
