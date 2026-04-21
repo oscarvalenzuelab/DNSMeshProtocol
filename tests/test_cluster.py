@@ -463,6 +463,48 @@ class TestClusterManifestSecurity:
         )
         assert parsed is not None
 
+    def test_expected_cluster_name_bind_is_case_insensitive(self):
+        # DNS owner names are case-insensitive — `Mesh.Example.COM`
+        # and `mesh.example.com` denote the same owner. The bind
+        # check must casefold both sides to avoid false mismatches
+        # from operators who configure in a different case than the
+        # signed record.
+        operator = _make_operator()
+        mf = _make_manifest(operator, cluster_name="Mesh.Example.COM")
+        wire = mf.sign(operator)
+        parsed = ClusterManifest.parse_and_verify(
+            wire,
+            operator.get_signing_public_key_bytes(),
+            expected_cluster_name="mesh.example.com",
+        )
+        assert parsed is not None
+
+    def test_externally_produced_trailing_dot_normalized_on_parse(self):
+        """A correctly-signed manifest from another implementation that
+        preserves the canonical FQDN trailing dot in the wire must
+        parse to a cluster_name without the dot — matching our own
+        serialized form — so downstream equality/binding logic works.
+        """
+        operator = _make_operator()
+        opk = operator.get_signing_public_key_bytes()
+        # Hand-build a body with 'mesh.example.com.' in the wire.
+        name = b"mesh.example.com."
+        body = (
+            b"DMPCL01"
+            + (1).to_bytes(8, "big")
+            + (int(time.time()) + 3600).to_bytes(8, "big")
+            + opk
+            + len(name).to_bytes(1, "big")
+            + name
+            + (0).to_bytes(1, "big")
+        )
+        sig = operator.sign_data(body)
+        wire = RECORD_PREFIX + base64.b64encode(body + sig).decode("ascii")
+        parsed = ClusterManifest.parse_and_verify(wire, opk)
+        assert parsed is not None
+        # Trailing dot stripped so it compares equal to our sign-side form.
+        assert parsed.cluster_name == "mesh.example.com"
+
 
 # ---- expiry ---------------------------------------------------------------
 
