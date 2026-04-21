@@ -29,12 +29,17 @@ Design summary
   ``seq`` and the new manifest is not already expired. Node state is
   preserved across refresh for retained ``node_id``s — **including**
   when only the endpoint changes (the writer is rebuilt but health
-  counters are kept). New nodes get fresh state. Removed nodes' writer
-  instances are closed (if they expose a ``close()`` method) and their
-  state is dropped. Old writers from endpoint-change swaps are parked
-  in a retention list and closed at :meth:`close` time, since
-  in-flight fan-outs may still be dispatching to them after a
-  quorum-return.
+  counters are kept). New nodes get fresh state. Removed nodes' and
+  endpoint-swapped nodes' writers are parked in a retention list and
+  closed at :meth:`close` time: ``_fanout`` returns on quorum and lets
+  slow-path futures keep running, so calling ``.close()`` on a
+  removed writer mid-flight would race the still-running call. The
+  retention list grows with (cluster_size * refresh_frequency) across
+  the lifetime of the instance — acceptable for production clusters
+  that refresh manifests on the order of minutes/hours, not seconds.
+  If you run a pathological workload that refreshes manifests in a
+  tight loop, ref-count the writers or destroy/recreate the
+  FanoutWriter periodically.
 * **Executor growth.** The executor is sized from the initial manifest
   and grown when :meth:`install_manifest` installs a manifest with more
   nodes than the current executor can run in parallel. Old executors
@@ -290,8 +295,11 @@ class FanoutWriter(DNSRecordWriter):
           (not closed) so in-flight fan-outs that already dispatched to
           it don't race with a ``close()``.
         * New ``node_id``s get a fresh ``_NodeState`` and a new writer.
-        * Removed ``node_id``s have their writers closed (if they
-          expose a ``close()`` method) and their state dropped.
+        * Removed ``node_id``s have their writers **retained** (not
+          closed) for the same race-avoidance reason as endpoint
+          swaps: quorum-return leaves slow-path futures running
+          against those writers; closing them mid-flight would crash
+          the background call. They're drained in :meth:`close`.
         * If the new manifest has more nodes than the current executor
           can run in parallel, the executor is replaced with a larger
           one. The old executor is retired (shutdown deferred to
@@ -339,18 +347,18 @@ class FanoutWriter(DNSRecordWriter):
                 # keepalive pool, auth token, etc.).
                 new_states[node.node_id] = existing
 
-            # Nodes that disappeared: close their writer if possible,
-            # then drop them. Suppress any exceptions; a buggy close()
-            # on a removed writer must not prevent the refresh.
+            # Nodes that disappeared: retain their writers; close
+            # them at FanoutWriter.close() time. Rationale: _fanout
+            # returns on quorum and lets slow-path futures keep
+            # running. A quorum-return that left a call dispatched to
+            # the about-to-be-removed node would race a
+            # close()-in-refresh, crashing the background call or
+            # corrupting writer state. Retention list growth is
+            # bounded by cluster size * refresh frequency; manifest
+            # refreshes are infrequent in practice.
             removed_ids = set(old_states.keys()) - set(new_states.keys())
             for rid in removed_ids:
-                writer = old_states[rid].writer
-                closer = getattr(writer, "close", None)
-                if callable(closer):
-                    try:
-                        closer()
-                    except Exception:
-                        pass
+                self._retired_writers.append(old_states[rid].writer)
 
             # Executor resize: grow the pool if the new manifest has
             # more nodes than the current pool can run in parallel.
