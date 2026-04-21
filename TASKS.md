@@ -1,11 +1,7 @@
 # Current sprint
 
-**Sprint status:** M1 — resolver resilience — **CLOSED + POLISHED**
-(2026-04-20). All four M1 tasks merged, plus the M1.5 per-host-port
-follow-up and the M1-retro-codex findings cleanup. 317 tests passing.
-
-Next sprint: opening **M2 — federation** (client fan-out across
-multiple node operators).
+**Sprint status:** M2 — federation — **active**. M2.1 foundation
+merged (2026-04-20); M2.2 (write fan-out) is the next unblocked task.
 
 See `ROADMAP.md` for the long-horizon view. This file is the active
 work queue.
@@ -20,76 +16,55 @@ work queue.
 
 ## Active
 
-### M2.1 — Node cluster manifest (signed node list record)
+### M2.2 — Client write fan-out across cluster nodes
 
 | Field | Value |
 |---|---|
-| **ID** | `M2.1` |
+| **ID** | `M2.2` |
 | **Status** | `pending` |
 | **Owner** | — |
-| **Depends on** | — |
-| **Blocks** | `M2.2`, `M2.3` |
+| **Depends on** | `M2.1` (done) |
+| **Blocks** | end-to-end federation |
 | **Estimated effort** | 2-3 days |
-| **Touch zones** | `dmp/core/cluster.py` (new), `dmp/core/identity.py` (possibly — reuse signed-record patterns), `tests/test_cluster.py` (new), `docs/protocol/cluster.md` (new or add to existing) |
+| **Touch zones** | `dmp/network/fanout_writer.py` (new), `dmp/client/client.py`, `tests/test_fanout_writer.py` (new), possibly `docs/protocol/cluster.md` for semantics |
 
-**Goal:** define a signed, DNS-publishable record type listing the set
-of DMP nodes that make up a cluster. A client points at one
-bootstrap name, reads this manifest, and gets the full node set.
+**Goal:** a `DNSRecordWriter` implementation that fans each publish across the nodes listed in a `ClusterManifest` and returns success iff at least `r_w = ceil(N/2)` nodes ack. Failed nodes are tracked for health reporting but don't block the caller.
 
 **Acceptance criteria:**
 
-- [ ] New `ClusterManifest` dataclass with binary wire format.
-      Must fit in one 255-byte DNS TXT string OR split across multiple
-      TXT strings within one RRset (document the choice).
-- [ ] Ed25519-signed by a cluster-operator key. Signature verified on
-      parse (reject tampered or wrong-signer records).
-- [ ] Carries: cluster name, node list (host + HTTP endpoint + optional
-      DNS endpoint, one entry per node), sequence number, expiry.
-- [ ] `parse_and_verify(wire, operator_pubkey)` returns
-      `(ClusterManifest, metadata)` or `None`.
-- [ ] Round-trip unit tests: sign → wire → parse → verify; tamper
-      rejection; wrong-signer rejection; malformed input returns None.
-- [ ] Docs page under `docs/protocol/` describing the record format
-      alongside `manifest.md`, `identity.md`, `prekey.md`.
+- [ ] `FanoutWriter(cluster_manifest, writer_factory)` wraps a list of per-node writers. `writer_factory(http_endpoint) -> DNSRecordWriter`.
+- [ ] `publish_txt_record` fans out concurrently; returns True if ≥ `r_w` succeed within a per-call timeout.
+- [ ] `delete_txt_record` same semantics.
+- [ ] Tracks per-node failure counts + last error; exposes via `snapshot()`.
+- [ ] Refresh on manifest update: when the caller pushes a new `ClusterManifest` (higher seq), rebuilds the per-node writers.
+- [ ] Respects `expected_cluster_name` binding on manifest install.
+- [ ] Tests: all-succeed, partial-fail-above-quorum, partial-fail-below-quorum, all-fail, timeout, manifest refresh.
+
+### M2.3 — Read union across cluster nodes with dedup
+
+| Field | Value |
+|---|---|
+| **ID** | `M2.3` |
+| **Status** | `pending` |
+| **Owner** | — |
+| **Depends on** | `M2.1` (done) |
+| **Blocks** | end-to-end federation |
+| **Estimated effort** | 2 days |
+| **Touch zones** | `dmp/network/union_reader.py` (new), `dmp/client/client.py`, `tests/test_union_reader.py` (new) |
+
+**Goal:** a `DNSRecordReader` that queries every node in a cluster and unions the TXT answers, dedup'd by full string value. Complements the M2.2 write-quorum model.
 
 ## Backlog (promoted to active as bandwidth allows)
 
-- **M2.2** — Client write-fan-out to N nodes with `r_w / 2` success rule.
-  Depends on M2.1. Touch zones: `dmp/client/client.py`, new
-  `dmp/network/fanout_writer.py`, tests.
-- **M2.3** — Read-union across configured node set + dedupe.
-  Depends on M2.1. Touch zones: new `dmp/network/union_reader.py`,
-  `dmp/client/client.py`, tests.
-- **M3.1** — Bootstrap-domain record type (SRV-like discovery for
-  cluster entry point).
+- **M1.retro-codex-final** — Final retro Codex review of M1.1, M1.2, M1.3, M1.4, M1.5 commits now that OpenAI API is stable. Most findings already landed via M1.5 polish, but a final pass is cheap insurance.
+- **M3.1** — Bootstrap-domain record type (SRV-like discovery for cluster entry point).
 - **M4.1** — Formal protocol spec document (expand `docs/protocol/`).
 
 ## Done
 
-- **M1.1** — `ResolverPool` with per-host health tracking, oracle-based
-  demotion, and cooldown-as-preference fallback — commits `7cb8d7f`
-  through `12376a4` (6 Codex review rounds, final clean pass).
-- **M1.2** — CLI `--dns-resolvers` multi-resolver pool wiring +
-  `_make_reader` factory + IP-literal parser (`host`, `ip:port`,
-  `[ipv6]:port`) + config persistence + back-compat with single-host
-  `--dns-host` — commit `3096eb0`. 12 new test cases. Retroactive
-  Codex review clean after the `8ab60e7` scalar-dns_resolvers fix
-  landed with M1.5.
-- **M1.3** — `ResolverPool.discover()` classmethod + `WELL_KNOWN_RESOLVERS`
-  + `dmp resolvers discover [--save]` + `dmp resolvers list` CLI —
-  commit `d39cb56`. 18 new test cases. Retroactive Codex review clean
-  after `6267686` (reject NoAnswer during discover) and `f9d3dfa`
-  (resolvers list handles missing config) landed with M1.5.
-- **M1.4** — Integration test: resolver failover under partial block.
-  Real-UDP stubs (good `DMPDnsServer` + handcrafted NXDOMAIN server),
-  8 tests — commits `29c5c44` (impl) + `6108c66` (atomic port-bind
-  fix from Codex P2). Final Codex review: clean.
-- **M1.5** — Per-host ports in `ResolverPool` (accepts
-  `[(ip, port), ...]` or bare IPs). Dropped the "first explicit port
-  wins" workaround in `_make_reader`. Dropped the test-only
-  `_PerHostPortResolverPool` subclass from `test_resolver_failover`.
-  `_HostState` + `snapshot()` now carry per-host port; new
-  `healthy_upstreams()` returns `(ip, port)` tuples — commits
-  `9bfab67`, `5fe2425`, `4ebcb9f`, plus the four retro/follow-up
-  fixes `50ba3d7`, `8ab60e7`, `6267686`, `f9d3dfa`. 317 tests passing.
-  Final Codex review: clean.
+- **M1.1** — `ResolverPool` with per-host health tracking, oracle-based demotion, cooldown-as-preference fallback — commits `7cb8d7f..12376a4`.
+- **M1.2** — CLI `--dns-resolvers` + `_make_reader` factory + IP-literal parser + config persistence — commit `3096eb0`.
+- **M1.3** — `ResolverPool.discover()` + `WELL_KNOWN_RESOLVERS` + `dmp resolvers discover [--save]` + `dmp resolvers list` CLI — commit `d39cb56`.
+- **M1.4** — Integration test: resolver failover under partial block (8 tests) — commits `29c5c44`, `6108c66`.
+- **M1.5** — Per-host ports in `ResolverPool` + retro-Codex cleanup on M1.2/M1.3 — commits `9bfab67..f9d3dfa` (base) plus `50ba3d7`, `8ab60e7`, `6267686`, `f9d3dfa` (follow-ups).
+- **M2.1** — Cluster manifest record type: signed node-list TXT record, wire format, parse_and_verify with binding to expected cluster name, cluster_rrset_name, multi-string TXT support across publishers — commits `548c5b7..b3bc8be` (14 commits, 10 Codex review rounds, final clean pass). 75 tests added; 405 total passing. Core deliverables: ClusterManifest, ClusterNode, DNS-name validation, duplicate node_id rejection, symmetric wire-cap enforcement, multi-string TXT publishing, case-insensitive + trailing-dot-normalized name binding.
