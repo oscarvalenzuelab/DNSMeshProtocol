@@ -6,9 +6,9 @@ critical path for tagging `v0.2.0-beta` and then a `v1.0` that earns the
 word "decentralized" in the tagline.
 
 **Status (2026-04-21):** `v0.1.0-alpha`, pre-external-audit. M1, M2
-(full, incl. node-side anti-entropy + compose cluster), M3.1/M3.2-wire,
-and M4.1 are shipped. Node-to-node gossip (M3.3) and the external
-cryptographic audit (M4.2–M4.4) are the remaining gates to
+(full, incl. node-side anti-entropy + compose cluster), M3 (full, incl.
+bootstrap discovery + cluster manifest gossip), and M4.1 are shipped.
+The external cryptographic audit (M4.2–M4.4) is the remaining gate to
 `v0.2.0-beta`. See the per-milestone status below.
 
 Atomic tasks for the current sprint live in [`TASKS.md`](TASKS.md);
@@ -86,14 +86,19 @@ cluster operator) verifies before any config is written.
       fallback — commits `cd2f383..5c33cd5`, plus `81f1dd7`.
 - [x] **M3.2-wire** `dmp bootstrap pin/fetch/discover [--auto-pin]` +
       `identity fetch --via-bootstrap` — commits `20a83fe..d21c305`.
-- [ ] **M3.3** *(NOT SHIPPED)* Node-to-node gossip: nodes periodically
-      exchange peer lists so a warmed-up node knows about newcomers
-      within minutes. Currently the node set is static — operators
-      update the signed cluster manifest manually.
+- [x] **M3.3** Node-to-node gossip of the signed cluster manifest.
+      Operator pushes a seq++ manifest to ONE node (disk, HTTP POST, or
+      curl); every other node picks it up within 1-2 sync ticks via
+      `GET /v1/sync/cluster-manifest` against peers, verifies under the
+      pinned operator Ed25519 key with expected_cluster_name binding,
+      swaps the live anti-entropy peer set to match (preserving cursors
+      across the synthetic→operator id handoff), and republishes at
+      `cluster.<base>` TXT. 22 new tests, 7 Codex review rounds —
+      merged as `7ffad67`.
 
 **Exit criteria for M3 *complete*:** a fresh client with only
 `--bootstrap <one-name>` can onboard AND the node set can evolve
-without manual manifest republishing per change.
+without manual manifest republishing per change. **MET.**
 
 ### M4 — Formal spec + external audit — SHIPPED M4.1; M4.2–M4.4 BLOCKING BETA
 
@@ -151,11 +156,8 @@ These appear in the design-intent docs but are unlikely to ship as-spec:
 
 The shortest remaining path:
 
-1. **M3.3** — node-to-node gossip for peer discovery. Optional if
-   operators are OK managing the peer set manually via cluster
-   manifest + env files.
-2. **M4.2 → M4.4** — engage an auditor, fix findings, publish report.
-3. **M5.1** — PyPI release.
+1. **M4.2 → M4.4** — engage an auditor, fix findings, publish report.
+2. **M5.1** — PyPI release.
 
-Item 1 is days of focused work; item 2 is calendar time bounded by
-the auditor's schedule. Item 3 is a day once items 1–2 are done.
+Item 1 is calendar time bounded by the auditor's schedule. Item 2
+is a day once item 1 is done.
