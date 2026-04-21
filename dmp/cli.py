@@ -105,11 +105,12 @@ class CLIConfig:
     cluster_enabled: bool = False
     # Bootstrap-discovery anchors (M3.2-wire). When pinned via
     # `dmp bootstrap pin <user_domain> <signer_spk_hex>`, subsequent
-    # `dmp bootstrap fetch / discover` commands translate a user
-    # domain into the cluster handling its mailboxes. This is a
-    # SEPARATE trust domain from `cluster_*`: the zone operator
-    # signing `_dmp.<user_domain>` TXT is not (necessarily) the same
-    # party as the cluster operator signing the cluster manifest.
+    # `dmp bootstrap fetch / discover` and `dmp identity fetch
+    # alice@<host> --via-bootstrap` commands translate a user domain
+    # into the cluster handling its mailboxes. This is a SEPARATE
+    # trust domain from `cluster_*`: the zone operator signing
+    # `_dmp.<user_domain>` TXT is not (necessarily) the same party
+    # as the cluster operator signing the cluster manifest.
     # Compromising one does not imply compromising the other; the
     # bootstrap discover → cluster pin flow verifies both hops before
     # writing any config. Empty on a fresh init; back-compat for
@@ -915,6 +916,13 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
       - `alice`                    — legacy / TOFU; queries
         `id-{sha256(alice)[:16]}.<domain>` where <domain> is either
         `--domain` or the config's mesh domain.
+
+    `--via-bootstrap` (M3.2-wire): when the address has `user@host`
+    form, discover the cluster that serves `host` on-the-fly via a
+    pinned `bootstrap_signer_spk`, route the identity query through a
+    one-shot `ClusterClient` pointed at the discovered cluster, then
+    tear it down. No config is written — this is a lookup convenience
+    for cross-domain addresses, not a cluster-mode cutover.
     """
     import hashlib
     from dmp.core.identity import (
@@ -934,7 +942,65 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
     # recursive DNS catches up.
     bootstrap_reader = _make_reader(cfg)
     cluster_handle: Optional[ClusterClient] = None
-    if _cluster_mode_enabled(cfg):
+
+    # ---- --via-bootstrap: one-shot discovery then cluster-routed fetch.
+    if getattr(args, "via_bootstrap", False):
+        parsed_addr = parse_address(args.username)
+        if parsed_addr is None:
+            _die(
+                1,
+                f"--via-bootstrap requires an address in user@host form; "
+                f"got {args.username!r}",
+            )
+        _, host = parsed_addr
+        if cfg.bootstrap_user_domain.casefold() != host.casefold():
+            _die(
+                1,
+                f"--via-bootstrap: no bootstrap signer pinned for {host!r}; "
+                f"run `dmp bootstrap pin {host} <signer_spk_hex>` first",
+            )
+        signer_spk = _decode_signer_spk(
+            cfg.bootstrap_signer_spk, field_name="bootstrap_signer_spk"
+        )
+        record = fetch_bootstrap_record(host, signer_spk, bootstrap_reader)
+        if record is None:
+            _die(
+                2,
+                f"--via-bootstrap: no verifying bootstrap record at _dmp.{host}",
+            )
+        best = record.best_entry()
+        # Second trust hop: the cluster manifest must verify under the
+        # operator_spk carried by the bootstrap entry. Compromising the
+        # zone signer cannot silently impersonate a legitimate cluster
+        # (the cluster's own operator key is the gate there).
+        manifest = fetch_cluster_manifest(
+            best.cluster_base_domain, best.operator_spk, bootstrap_reader
+        )
+        if manifest is None:
+            _die(
+                2,
+                f"--via-bootstrap: cluster manifest fetch failed for "
+                f"{best.cluster_base_domain}",
+            )
+        # One-shot ClusterClient: no refresh thread. It lives only for
+        # the duration of this identity fetch and is closed in the
+        # `finally` block below, so this command never persists any
+        # cluster state or leaves background work behind.
+        cluster_handle = ClusterClient(
+            manifest,
+            operator_spk=best.operator_spk,
+            base_domain=best.cluster_base_domain,
+            bootstrap_reader=bootstrap_reader,
+            writer_factory=_build_cluster_writer_factory(cfg),
+            reader_factory=_make_cluster_reader_factory(cfg, bootstrap_reader),
+            refresh_interval=None,
+        )
+        reader = CompositeReader(
+            cluster_reader=cluster_handle.reader,
+            external_reader=bootstrap_reader,
+            cluster_base_domain=best.cluster_base_domain,
+        )
+    elif _cluster_mode_enabled(cfg):
         try:
             op_spk = bytes.fromhex(cfg.cluster_operator_spk)
         except ValueError:
@@ -1945,6 +2011,15 @@ def build_parser() -> argparse.ArgumentParser:
         "this 16-hex fingerprint to disambiguate (verify out-of-band first)",
     )
     p_id_fetch.add_argument("--json", action="store_true")
+    p_id_fetch.add_argument(
+        "--via-bootstrap",
+        dest="via_bootstrap",
+        action="store_true",
+        help="discover the cluster serving the address's right-hand host "
+        "via the pinned bootstrap signer, then route the lookup through "
+        "a one-shot ClusterClient. Requires `dmp bootstrap pin <host> "
+        "<signer_spk_hex>` first. No config is written.",
+    )
     p_id_fetch.set_defaults(func=cmd_identity_fetch)
 
     # contacts
