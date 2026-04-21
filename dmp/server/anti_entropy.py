@@ -484,7 +484,14 @@ class AntiEntropyWorker:
         self._base_domain = base_domain
         self._self_node_id = self_node_id
         self._self_http_endpoint = (
-            self_http_endpoint.rstrip("/") if self_http_endpoint else None
+            # Normalize the same way replace_peers does — strip trailing
+            # slashes AND lowercase. Hostnames are case-insensitive, so
+            # a config like ``http://NODE-A:8053/`` must still match a
+            # manifest entry ``http://node-a:8053`` for self-exclusion
+            # to fire on the first gossip install.
+            self_http_endpoint.rstrip("/").lower()
+            if self_http_endpoint
+            else None
         )
         self._peers: List[SyncPeer] = self._filter_self(list(peers))
         self._token = sync_token
@@ -536,7 +543,7 @@ class AntiEntropyWorker:
             if self._self_node_id and p.node_id == self._self_node_id:
                 continue
             if self._self_http_endpoint:
-                if p.http_endpoint.rstrip("/") == self._self_http_endpoint:
+                if p.http_endpoint.rstrip("/").lower() == self._self_http_endpoint:
                     continue
             out.append(p)
         return out

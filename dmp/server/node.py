@@ -374,7 +374,9 @@ class DMPNode:
         # cluster_name so existing deployments pick the endpoint up
         # without a config change.
         gossip_base = (
-            self.config.cluster_base_domain or self._derive_cluster_base_domain()
+            self.config.cluster_base_domain
+            or self._derive_cluster_base_domain()
+            or self._derive_cluster_base_domain_from_store()
         )
         # Parse operator_spk once so the HTTP endpoint can filter
         # unverified wires from the cluster RRset before picking the
@@ -639,6 +641,61 @@ class DMPNode:
             self_node_id=self.config.node_id,
             self_http_endpoint=self.config.sync_self_endpoint,
         )
+
+    def _derive_cluster_base_domain_from_store(self) -> Optional[str]:
+        """Recover ``cluster_base_domain`` from a previously-gossiped
+        manifest persisted in the local sqlite store.
+
+        A gossip-only node (bootstrapped via ``DMP_SYNC_PEERS`` +
+        ``DMP_SYNC_OPERATOR_SPK``, no cluster_file, no
+        ``DMP_CLUSTER_BASE_DOMAIN``) used to come back from a restart
+        with manifest gossip DISABLED: neither env nor file provided a
+        base_domain, so ``_make_anti_entropy_worker`` couldn't wire the
+        gossip path even though a valid manifest was already sitting in
+        the local store. This method scans the store for any
+        ``cluster.*`` TXT value that verifies under the pinned
+        operator_spk and returns the cluster_name from the highest-seq
+        match.
+
+        Requires ``DMP_SYNC_OPERATOR_SPK`` to be set — without a trust
+        anchor we won't pull a base_domain out of unverified store
+        contents.
+        """
+        if not self.config.sync_cluster_operator_spk_hex:
+            return None
+        try:
+            operator_spk = bytes.fromhex(
+                self.config.sync_cluster_operator_spk_hex.strip()
+            )
+            if len(operator_spk) != 32:
+                return None
+        except ValueError:
+            return None
+        if self.store is None or not hasattr(self.store, "list_names"):
+            return None
+        try:
+            names = self.store.list_names()
+        except Exception:
+            return None
+        from dmp.core.cluster import ClusterManifest
+
+        best_seq = -1
+        best_name: Optional[str] = None
+        for name in names:
+            if not name.startswith("cluster."):
+                continue
+            try:
+                values = self.store.query_txt_record(name)
+            except Exception:
+                continue
+            for wire in values or []:
+                if not isinstance(wire, str):
+                    continue
+                m = ClusterManifest.parse_and_verify(wire, operator_spk)
+                if m is not None and m.seq > best_seq:
+                    best_seq = m.seq
+                    best_name = m.cluster_name
+        return best_name
 
     def _derive_cluster_base_domain(self) -> Optional[str]:
         """Extract ``cluster_name`` from the on-disk cluster file when
