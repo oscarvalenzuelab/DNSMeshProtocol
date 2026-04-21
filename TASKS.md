@@ -1,12 +1,16 @@
 # Current sprint
 
-**Sprint status:** M2 — federation — **CLOSED + WIRED** (2026-04-20).
-All three M2 tasks (cluster manifest, fan-out writer, union reader)
-plus M2.wire (client integration) merged. 547 tests passing on main.
-Users can now pin a cluster operator key + base domain and operate
-transparently against a multi-node cluster. Next sprint TBD from the
-ROADMAP backlog — M3.1 (bootstrap discovery), M4.1 (protocol spec),
-or M2.wire-polish are the candidates.
+**Sprint status:** M2 — federation — **CLOSED + WIRED + POLISHED**
+(2026-04-20). M2.1/M2.2/M2.3 foundation + M2.wire integration + all
+three audit follow-ups (M2.wire-polish, cluster-composite-reader,
+cluster-atomic-refresh) merged. 582 tests passing on main.
+
+Users now have a hardened cluster-mode flow: pin anchors, verify via
+`cluster fetch`, explicitly cut over with `cluster enable`, reads
+split cleanly between cluster-local and external DNS, and manifest
+refresh is atomic across fan-out writer and union reader. Next
+sprint TBD from ROADMAP backlog — M3.1 (bootstrap discovery) or
+M4.1 (protocol spec) are the candidates.
 
 See `ROADMAP.md` for the long-horizon view. This file is the active
 work queue.
@@ -27,13 +31,7 @@ _No tasks currently active. Promote from Backlog to open the next sprint._
 
 ### Ready to start (unblocked, small)
 
-- **M2.wire-polish** — Decouple `dmp cluster pin` from cluster-mode activation. Today pinning a key+domain immediately flips `_cluster_mode_enabled`, so every networked command stops using the legacy endpoint and hard-fails if the cluster manifest isn't already published. Migration flow wants: pin anchors, verify via `cluster fetch`, then `cluster enable` to cut over. Add a `cluster_enabled: bool` flag to `CLIConfig` (default: auto-set to True on successful `cluster pin` + fetch, False on pin-only), and a `dmp cluster enable` / `dmp cluster disable` command pair. Effort: ~0.5 day. Touch zones: `dmp/cli.py`, `tests/test_cli.py`.
 - **M1.retro-codex-final** — Final retro Codex review of M1.1, M1.2, M1.3, M1.4, M1.5 commits. Most findings already landed via M1.5 polish; cheap insurance.
-
-### Findings from the 2026-04-20 comprehensive Codex audit (not yet addressed)
-
-- **cluster-composite-reader** — [P1] `DMPClient` in cluster mode uses the union reader for ALL reads, including cross-domain lookups (e.g. `alice@other-domain.com` identity / prekey records). Authoritative cluster nodes NXDOMAIN for names outside their own zone, so cross-domain contacts break. Fix: build a `CompositeReader` that routes cluster-local names (under `cluster_base_domain`) through the union reader and external names through the bootstrap resolver. Effort: ~0.5 day. Touch zones: new `dmp/network/composite_reader.py`, `dmp/cli.py` wiring, tests.
-- **cluster-atomic-refresh** — [P2] `ClusterClient.refresh_now` swaps reader then writer. If `writer_factory` raises (e.g. malformed `http_endpoint` in a newly published manifest), the reader has already advanced while the writer stayed on the old seq. Writes go to old node set, reads to new — freshly published records can disappear during a rollout window. Fix: pre-construct both pools against the new manifest (catching factory errors) BEFORE calling `install_manifest` on either side, then swap atomically. Effort: ~0.5 day. Touch zones: `dmp/client/cluster_bootstrap.py`.
 
 ### Milestones
 
@@ -55,3 +53,6 @@ _No tasks currently active. Promote from Backlog to open the next sprint._
 - **M2.2** — Quorum write fan-out: `FanoutWriter` fans publish/delete across cluster nodes, returns True iff ≥ `ceil(N/2)` ack within timeout. Health tracking, manifest refresh with seq monotonicity + expiry + closed checks, fresh `_NodeState` on endpoint change (http OR dns), retired-writer retention list drained on `close()` after `shutdown(wait=True)`, user `max_workers` preserved across growth, submit-under-lock to avoid close/submit race, deepcopy of installed manifest, cancel pending futures on timeout/quorum — commits `9c71332..b55c93b` (7 commits, 5 Codex review rounds). 53 tests.
 - **M2.3** — Read union across cluster nodes: `UnionReader` queries every node concurrently, unions dedup'd TXT answers with first-completed-first ordering. Same manifest-refresh semantics as M2.2. None is healthy; only exceptions/timeouts count as failures. Expired/closed/seq-stale rejection on install. Deepcopy; drain-before-close; max_workers honored; pending futures cancelled on timeout — commits `7a0340e..f5e3776`, merged as `3e50b39`. 44 tests.
 - **M2.wire** — Cluster-mode client integration: new `dmp.client.cluster_bootstrap` with `fetch_cluster_manifest` + `ClusterClient` (background refresh thread). CLI gains `cluster pin`, `cluster fetch [--save]`, `cluster status` commands. `_make_client` switches to cluster mode when both anchors pinned; effective domain (mailbox/identity/prekey RRsets) uses `cluster_base_domain` consistently. `_NodeDnsReader` with UDP→TCP retry on TC flag. Local-only commands (`identity show`) skip the bootstrap fetch so offline usage still works. `fetch_cluster_manifest` picks the highest-seq verifying manifest to handle operator rollout with multiple co-resident records — commits `94964d9..31eba4e` (8 commits, 7 Codex review rounds), merged as `cbacf82`. 45 new tests (20 bootstrap + 3 e2e + 22 cli cluster).
+- **M2.wire-polish** — Decoupled `dmp cluster pin` from cluster-mode activation. New `cluster_enabled: bool` flag (default False, back-compat for existing configs requires explicit `cluster enable`). New `dmp cluster enable` / `dmp cluster disable` commands; enable runs a live manifest fetch before flipping. `dmp cluster fetch` / `status` work regardless of enable state as pre-enable diagnostics — commits `775c22b..3879663`, merged as `012552a`. 11 new tests.
+- **cluster-composite-reader** — `CompositeReader` routes cluster-local names (suffix match on `cluster_base_domain`) to the union reader and external names to the bootstrap resolver. Fixes cross-domain identity/prekey lookups in cluster mode. Label-boundary-safe suffix match (casefold + trailing-dot normalized). Wired into both `_make_client` and `cmd_identity_fetch` — commits `ef5dee4..a47a78c`, merged as `6060bbf`. 20 new tests.
+- **cluster-atomic-refresh** — `ClusterClient.refresh_now` pre-runs both factories across every node in the new manifest before touching either `install_manifest`. If any factory raises, neither side advances; no more split-brain between reader and writer on malformed endpoints. Probe outputs are not closed (factories may return shared instances) — commits `bd2fb03..32a2553`, merged as `3ee9d6a`. 4 new tests.
