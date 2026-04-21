@@ -9,6 +9,12 @@ ENV PIP_NO_CACHE_DIR=1 \
 
 WORKDIR /build
 
+# zfec has a C extension; install a minimal build toolchain for the
+# builder stage only. The runtime stage stays slim.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
 # Copy only what pip needs so dependency layers cache cleanly.
 COPY setup.py requirements.txt README.md ./
 COPY dmp ./dmp
@@ -20,7 +26,9 @@ RUN pip install --prefix=/install --no-deps . \
         dnspython \
         reedsolo \
         pyyaml \
-        requests
+        requests \
+        argon2-cffi \
+        zfec
 
 # ---- runtime stage ------------------------------------------------------
 FROM python:3.11-slim AS runtime
