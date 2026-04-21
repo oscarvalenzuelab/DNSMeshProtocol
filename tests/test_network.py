@@ -153,6 +153,21 @@ class TestSplitTxtValue:
         chunks = _split_txt_value(value, chunk_bytes=3)
         assert chunks == ["abc", "def", "ghi", "j"]
 
+    def test_short_non_ascii_accepted_single_chunk(self):
+        # Under the cap, non-ASCII passes through unchanged — it's only
+        # the split path that requires ASCII safety.
+        value = "café"
+        assert _split_txt_value(value) == [value]
+
+    def test_long_non_ascii_rejected(self):
+        # A naive byte split could land mid-codepoint and break UTF-8
+        # decoding downstream; rather than silently corrupt the record
+        # or emit provider-specific failures, we reject explicitly so
+        # the caller can base64-encode first.
+        value = "ñ" * 200  # 400 utf-8 bytes, every byte non-ASCII
+        with pytest.raises(ValueError, match="ASCII-safe"):
+            _split_txt_value(value)
+
 
 class TestDNSUpdatePublisherMultiString:
     """RFC 2136 UPDATE path must hand dnspython multi-string RDATA for

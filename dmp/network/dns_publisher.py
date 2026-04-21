@@ -45,17 +45,25 @@ def _split_txt_value(value: str, chunk_bytes: int = _TXT_CHUNK_BYTES) -> List[st
     list; longer values are split on byte boundaries.
 
     The DMP wire format (``v=dmp1;...`` prefix + base64 body) is
-    all-ASCII, so splitting on byte boundaries and then UTF-8 decoding
-    each chunk is safe — a multi-byte UTF-8 sequence would never
-    straddle a 255-byte boundary in ASCII-only text. We still decode
-    with ``errors="strict"`` so a future non-ASCII wire format would
-    blow up loudly here rather than silently corrupt the record.
+    all-ASCII, so splitting on byte boundaries is safe for any value
+    this project publishes today. For non-ASCII values that exceed one
+    chunk, a naive byte split can land mid-codepoint and break UTF-8
+    decoding — rather than silently corrupt the record or emit
+    provider-specific failures, we reject such inputs explicitly so
+    the caller can decide (typically: base64-encode first, or use a
+    binary publisher path).
     """
     raw = value.encode("utf-8")
     if len(raw) <= chunk_bytes:
         return [value]
+    if not value.isascii():
+        raise ValueError(
+            "multi-string TXT splitting requires ASCII-safe input; "
+            f"values exceeding {chunk_bytes} bytes must be ASCII "
+            "(base64-encode non-ASCII payloads first)"
+        )
     return [
-        raw[i : i + chunk_bytes].decode("utf-8", errors="strict")
+        raw[i : i + chunk_bytes].decode("ascii")
         for i in range(0, len(raw), chunk_bytes)
     ]
 
