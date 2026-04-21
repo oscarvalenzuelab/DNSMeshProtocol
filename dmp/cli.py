@@ -33,6 +33,8 @@ from typing import Dict, List, Optional, Tuple
 import yaml
 
 from dmp.client.client import DMPClient
+from dmp.client.cluster_bootstrap import ClusterClient, fetch_cluster_manifest
+from dmp.core.cluster import ClusterNode
 from dmp.network.base import DNSRecordReader, DNSRecordWriter
 from dmp.network.resolver_pool import ResolverPool, WELL_KNOWN_RESOLVERS
 
@@ -72,6 +74,24 @@ class CLIConfig:
     # shape. Leaving this empty falls back to the hash-based name under
     # the shared mesh `domain` (squat-prone, TOFU only).
     identity_domain: str = ""
+    # Cluster-mode configuration (M2.wire). When both
+    # `cluster_base_domain` AND `cluster_operator_spk` are set,
+    # `_make_client` boots the federation path: fetch the signed cluster
+    # manifest from `cluster.<base>` TXT, verify under the pinned
+    # operator key, build FanoutWriter + UnionReader from the node list,
+    # and inject both into the DMPClient. Leaving either empty falls
+    # back to the legacy single-endpoint mode. See docs/guide/cli.md.
+    cluster_base_domain: str = ""
+    cluster_operator_spk: str = ""  # hex-encoded Ed25519 public key
+    # Background manifest refresh cadence in seconds (0 or negative
+    # disables the refresh thread). Default 3600 matches a
+    # once-per-hour rollover cadence for operator-side node-set changes.
+    cluster_refresh_interval: int = 3600
+    # Optional bearer token used when a per-node HTTP writer talks to
+    # a cluster node's publish API. Separate from `http_token` because
+    # operators may want distinct creds for the cluster-federation path.
+    # When empty, falls back to `http_token` if set; otherwise no auth.
+    cluster_node_token: str = ""
     # Each contact is {"pub": <x25519 hex>, "spk": <ed25519 hex or "">}.
     # `spk` may be empty for contacts added before Ed25519 pinning landed
     # (and for the `contacts add` shortcut that doesn't require a signing
@@ -113,6 +133,10 @@ class CLIConfig:
             passphrase_file=data.get("passphrase_file"),
             kdf_salt=data.get("kdf_salt", ""),
             identity_domain=data.get("identity_domain", ""),
+            cluster_base_domain=data.get("cluster_base_domain", "") or "",
+            cluster_operator_spk=data.get("cluster_operator_spk", "") or "",
+            cluster_refresh_interval=int(data.get("cluster_refresh_interval", 3600)),
+            cluster_node_token=data.get("cluster_node_token", "") or "",
             contacts=contacts,
         )
 
@@ -314,15 +338,198 @@ def _make_reader(config: CLIConfig) -> DNSRecordReader:
     return _DnsReader(config.dns_host, config.dns_port)
 
 
+def _cluster_mode_enabled(config: CLIConfig) -> bool:
+    """A config is in cluster mode when both anchors are pinned.
+
+    Two fields gate cluster mode: the base domain we fetch `cluster.<X>`
+    TXT from, and the operator public key we trust signatures against.
+    Either one missing means we fall back to the single-endpoint legacy
+    path.
+    """
+    return bool(config.cluster_base_domain and config.cluster_operator_spk)
+
+
+def _build_cluster_writer_factory(config: CLIConfig):
+    """Return a writer_factory(ClusterNode) -> `_HttpWriter`.
+
+    Each cluster node has an `http_endpoint`; we hand that to
+    `_HttpWriter`. For auth, prefer `cluster_node_token` (cluster-specific
+    token), else fall back to the generic `http_token`, else no auth.
+    """
+    token = config.cluster_node_token or config.http_token or None
+
+    def factory(node: ClusterNode) -> DNSRecordWriter:
+        return _HttpWriter(node.http_endpoint, token)
+
+    return factory
+
+
+class _NodeDnsReader(DNSRecordReader):
+    """UDP DNS reader bound to one cluster node's `dns_endpoint`.
+
+    Parses `host`, `host:port`, or `[ipv6]:port` forms. When no port is
+    given, defaults to 53. Uses `dns.query.udp` directly so the reader
+    has a single deterministic destination — we do NOT fall back to
+    the system resolver on failure (that would hide an unreachable
+    cluster node from the union).
+    """
+
+    def __init__(self, dns_endpoint: str, *, timeout: float = 3.0) -> None:
+        host, port = _parse_host_port(dns_endpoint, default_port=53)
+        self._host = host
+        self._port = port
+        self._timeout = float(timeout)
+
+    def query_txt_record(self, name: str):
+        import dns.exception
+        import dns.message
+        import dns.query
+        import dns.rcode
+        import dns.rdatatype
+
+        try:
+            request = dns.message.make_query(name, dns.rdatatype.TXT)
+            response = dns.query.udp(
+                request,
+                self._host,
+                port=self._port,
+                timeout=self._timeout,
+            )
+        except Exception:
+            # Any transport-level error (socket, timeout, malformed
+            # packet) coalesces to "not seen" for this node. The
+            # UnionReader counts this as a per-node failure and keeps
+            # going with the other nodes.
+            return None
+        if response.rcode() != dns.rcode.NOERROR:
+            return None
+        values: List[str] = []
+        for rrset in response.answer:
+            for rdata in rrset:
+                values.append(b"".join(rdata.strings).decode("utf-8"))
+        return values or None
+
+
+def _parse_host_port(entry: str, *, default_port: int) -> Tuple[str, int]:
+    """Parse `host`, `host:port`, or `[ipv6]:port`.
+
+    Returns `(host, port)`. Hostnames are accepted here (unlike the
+    resolver pool which is IP-only) because a cluster manifest may
+    legitimately publish a hostname for a node's DNS endpoint; the
+    operator controls those addresses.
+    """
+    entry = entry.strip()
+    if not entry:
+        raise ValueError("dns_endpoint is empty")
+    if entry.startswith("["):
+        close = entry.find("]")
+        if close == -1:
+            raise ValueError(f"dns_endpoint {entry!r}: unmatched '['")
+        host = entry[1:close]
+        rest = entry[close + 1 :]
+        if not rest:
+            return host, default_port
+        if not rest.startswith(":"):
+            raise ValueError(f"dns_endpoint {entry!r}: expected ':port' after ']'")
+        return host, _parse_port(rest[1:], entry)
+    # IPv4 or hostname. IPv6 without brackets is ambiguous — either the
+    # whole thing is an address, or the trailing `:port` is a port.
+    # We disambiguate by counting colons: exactly one colon => host:port.
+    if entry.count(":") == 1:
+        host, _, port_str = entry.partition(":")
+        return host, _parse_port(port_str, entry)
+    return entry, default_port
+
+
+def _make_cluster_reader_factory(
+    config: CLIConfig,
+    bootstrap_reader: DNSRecordReader,
+):
+    """Return a reader_factory(ClusterNode) -> DNSRecordReader.
+
+    Node has `dns_endpoint`: build a `_NodeDnsReader` pointed at that
+    host:port. Node has no `dns_endpoint`: fall back to the bootstrap
+    reader (the same resolver pool used to fetch the cluster manifest).
+    The fallback keeps the read-side union non-empty for nodes that
+    only run HTTP ingress — they still contribute via the public DNS
+    plane (which should carry their records on propagation).
+    """
+
+    def factory(node: ClusterNode) -> DNSRecordReader:
+        if node.dns_endpoint:
+            return _NodeDnsReader(node.dns_endpoint)
+        return bootstrap_reader
+
+    return factory
+
+
 def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
-    if not config.endpoint:
-        _die(
-            1,
-            "no endpoint configured — run `dmp init` with --endpoint, or edit "
-            f"{_config_path()}",
+    """Build a DMPClient, routing through the cluster or legacy path.
+
+    When cluster mode is enabled (both `cluster_base_domain` AND
+    `cluster_operator_spk` populated), the returned client uses the
+    FanoutWriter + UnionReader produced by a `ClusterClient`. The
+    `ClusterClient` is attached to the returned DMPClient via a
+    `_cluster_client` attribute so the CLI wrapper can close it on exit
+    (see `_close_client`).
+
+    When cluster mode is disabled, behavior is unchanged from the
+    legacy single-endpoint path.
+    """
+    cluster_client: Optional[ClusterClient] = None
+    if _cluster_mode_enabled(config):
+        try:
+            operator_spk = bytes.fromhex(config.cluster_operator_spk)
+        except ValueError:
+            _die(
+                1,
+                "cluster_operator_spk is not valid hex; run "
+                "`dmp cluster pin <hex> <base_domain>` to fix",
+            )
+        if len(operator_spk) != 32:
+            _die(
+                1,
+                "cluster_operator_spk must be 32 bytes (64 hex chars); got "
+                f"{len(operator_spk)} bytes",
+            )
+        bootstrap_reader = _make_reader(config)
+        manifest = fetch_cluster_manifest(
+            config.cluster_base_domain,
+            operator_spk,
+            bootstrap_reader,
         )
-    writer = _HttpWriter(config.endpoint, config.http_token)
-    reader = _make_reader(config)
+        if manifest is None:
+            _die(
+                2,
+                f"cluster manifest fetch failed for {config.cluster_base_domain}. "
+                "Check that `cluster.<base>` TXT is published, signed by the "
+                "pinned operator key, and not expired.",
+            )
+        refresh_interval: Optional[float] = (
+            float(config.cluster_refresh_interval)
+            if config.cluster_refresh_interval > 0
+            else None
+        )
+        cluster_client = ClusterClient(
+            manifest,
+            operator_spk=operator_spk,
+            base_domain=config.cluster_base_domain,
+            bootstrap_reader=bootstrap_reader,
+            writer_factory=_build_cluster_writer_factory(config),
+            reader_factory=_make_cluster_reader_factory(config, bootstrap_reader),
+            refresh_interval=refresh_interval,
+        )
+        writer: DNSRecordWriter = cluster_client.writer
+        reader: DNSRecordReader = cluster_client.reader
+    else:
+        if not config.endpoint:
+            _die(
+                1,
+                "no endpoint configured — run `dmp init` with --endpoint, or edit "
+                f"{_config_path()}",
+            )
+        writer = _HttpWriter(config.endpoint, config.http_token)
+        reader = _make_reader(config)
     # Persist the replay cache next to the config so repeated `dmp recv` calls
     # across separate CLI processes don't re-deliver the same message.
     replay_path = str(_config_path().parent / "replay_cache.json")
@@ -342,6 +549,11 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
         kdf_salt=kdf_salt,
         prekey_store_path=prekey_path,
     )
+    # Attach the cluster handle (if any) so the CLI can close it at
+    # exit. Setting an attribute on DMPClient after construction is
+    # intentionally unintrusive — we do not modify DMPClient itself,
+    # per the M2.wire hard-rules constraint.
+    client._cluster_client = cluster_client  # type: ignore[attr-defined]
     for name, entry in config.contacts.items():
         client.add_contact(
             name,
@@ -350,6 +562,21 @@ def _make_client(config: CLIConfig, passphrase: str) -> DMPClient:
             signing_key_hex=entry.get("spk", ""),
         )
     return client
+
+
+def _close_client(client: DMPClient) -> None:
+    """Release the cluster-client handle if one is attached.
+
+    Called at CLI exit to stop the refresh thread and drain the
+    FanoutWriter / UnionReader cleanly. Safe to call on legacy clients
+    (the attribute is set to None in that case).
+    """
+    cluster_client: Optional[ClusterClient] = getattr(client, "_cluster_client", None)
+    if cluster_client is not None:
+        try:
+            cluster_client.close()
+        except Exception:
+            pass
 
 
 # ----------------------------- commands --------------------------------------
@@ -417,19 +644,22 @@ def cmd_identity_show(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
-    info = client.get_user_info()
-    if args.json:
-        print(json.dumps(info, indent=2))
-    else:
-        for key in (
-            "username",
-            "domain",
-            "public_key",
-            "signing_public_key",
-            "user_id",
-        ):
-            print(f"{key}: {info[key]}")
-    return 0
+    try:
+        info = client.get_user_info()
+        if args.json:
+            print(json.dumps(info, indent=2))
+        else:
+            for key in (
+                "username",
+                "domain",
+                "public_key",
+                "signing_public_key",
+                "user_id",
+            ):
+                print(f"{key}: {info[key]}")
+        return 0
+    finally:
+        _close_client(client)
 
 
 def cmd_identity_publish(args: argparse.Namespace) -> int:
@@ -443,24 +673,28 @@ def cmd_identity_publish(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
-    record = make_record(client.crypto, cfg.username)
-    wire = record.sign(client.crypto)
+    try:
+        record = make_record(client.crypto, cfg.username)
+        wire = record.sign(client.crypto)
 
-    if cfg.identity_domain:
-        # Zone-anchored: user controls <identity_domain>. Squat resistance
-        # comes from the DNS zone's access control, not from a hash.
-        name = zone_anchored_identity_name(cfg.identity_domain)
-        resolve_hint = f"dmp identity fetch {cfg.username}@{cfg.identity_domain}"
-    else:
-        name = identity_domain(cfg.username, cfg.domain)
-        resolve_hint = f"dmp identity fetch {cfg.username}"
+        if cfg.identity_domain:
+            # Zone-anchored: user controls <identity_domain>. Squat
+            # resistance comes from the DNS zone's access control, not
+            # from a hash.
+            name = zone_anchored_identity_name(cfg.identity_domain)
+            resolve_hint = f"dmp identity fetch {cfg.username}@{cfg.identity_domain}"
+        else:
+            name = identity_domain(cfg.username, cfg.domain)
+            resolve_hint = f"dmp identity fetch {cfg.username}"
 
-    ok = client.writer.publish_txt_record(name, wire, ttl=args.ttl)
-    if not ok:
-        _die(2, "publish failed — see node logs")
-    print(f"published identity to {name}")
-    print(f"  others can resolve you with: {resolve_hint}")
-    return 0
+        ok = client.writer.publish_txt_record(name, wire, ttl=args.ttl)
+        if not ok:
+            _die(2, "publish failed — see node logs")
+        print(f"published identity to {name}")
+        print(f"  others can resolve you with: {resolve_hint}")
+        return 0
+    finally:
+        _close_client(client)
 
 
 def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
@@ -477,16 +711,18 @@ def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
-
-    published = client.refresh_prekeys(count=args.count, ttl_seconds=args.ttl)
-    name = prekey_rrset_name(cfg.username, cfg.domain)
-    print(f"published {published}/{args.count} prekeys to {name}")
-    print(f"  local live prekey count: {client.prekey_store.count_live()}")
-    if published < args.count:
-        print(
-            "  (note: some publishes were rejected — check node rate limits and caps)"
-        )
-    return 0
+    try:
+        published = client.refresh_prekeys(count=args.count, ttl_seconds=args.ttl)
+        name = prekey_rrset_name(cfg.username, cfg.domain)
+        print(f"published {published}/{args.count} prekeys to {name}")
+        print(f"  local live prekey count: {client.prekey_store.count_live()}")
+        if published < args.count:
+            print(
+                "  (note: some publishes were rejected — check node rate limits and caps)"
+            )
+        return 0
+    finally:
+        _close_client(client)
 
 
 def cmd_identity_fetch(args: argparse.Namespace) -> int:
@@ -683,47 +919,55 @@ def cmd_send(args: argparse.Namespace) -> int:
         )
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
-    ok = client.send_message(args.recipient, args.message)
-    if not ok:
-        _die(2, f"send failed (see node logs for details)")
-    print(f"sent → {args.recipient}")
-    return 0
+    try:
+        ok = client.send_message(args.recipient, args.message)
+        if not ok:
+            _die(2, f"send failed (see node logs for details)")
+        print(f"sent → {args.recipient}")
+        return 0
+    finally:
+        _close_client(client)
 
 
 def cmd_recv(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
-    inbox = client.receive_messages()
-    if not inbox:
-        print("(no new messages)")
+    try:
+        inbox = client.receive_messages()
+        if not inbox:
+            print("(no new messages)")
+            return 0
+
+        # Reverse-lookup sender_signing_pk against known contacts when
+        # possible. This requires the contact to match on the derived
+        # Ed25519 pubkey, which is itself derived from their X25519
+        # pubkey — cross-reference locally.
+        from dmp.core.crypto import DMPCrypto
+
+        known = {}
+        for name, pubkey_hex in cfg.contacts.items():
+            try:
+                contact_crypto = DMPCrypto.from_private_bytes(bytes.fromhex(pubkey_hex))
+            except Exception:
+                continue
+            # We can't actually derive the contact's signing key from
+            # just their public key (the ED25519 seed is derived from
+            # the X25519 *private* bytes). So we can't reverse-lookup
+            # names here — just show the hex.
+            known[name] = pubkey_hex
+
+        for msg in inbox:
+            print(f"from {msg.sender_signing_pk.hex()[:16]}...")
+            print(f"  ts={msg.timestamp}")
+            try:
+                print(f"  {msg.plaintext.decode('utf-8')}")
+            except UnicodeDecodeError:
+                print(f"  (binary, {len(msg.plaintext)} bytes)")
+            print()
         return 0
-
-    # Reverse-lookup sender_signing_pk against known contacts when possible.
-    # This requires the contact to match on the derived Ed25519 pubkey, which
-    # is itself derived from their X25519 pubkey — cross-reference locally.
-    from dmp.core.crypto import DMPCrypto
-
-    known = {}
-    for name, pubkey_hex in cfg.contacts.items():
-        try:
-            contact_crypto = DMPCrypto.from_private_bytes(bytes.fromhex(pubkey_hex))
-        except Exception:
-            continue
-        # We can't actually derive the contact's signing key from just their
-        # public key (the ED25519 seed is derived from the X25519 *private*
-        # bytes). So we can't reverse-lookup names here — just show the hex.
-        known[name] = pubkey_hex
-
-    for msg in inbox:
-        print(f"from {msg.sender_signing_pk.hex()[:16]}...")
-        print(f"  ts={msg.timestamp}")
-        try:
-            print(f"  {msg.plaintext.decode('utf-8')}")
-        except UnicodeDecodeError:
-            print(f"  (binary, {len(msg.plaintext)} bytes)")
-        print()
-    return 0
+    finally:
+        _close_client(client)
 
 
 def cmd_resolvers_discover(args: argparse.Namespace) -> int:
@@ -790,6 +1034,168 @@ def cmd_resolvers_list(args: argparse.Namespace) -> int:
         return 0
     for host in cfg.dns_resolvers:
         print(host)
+    return 0
+
+
+def cmd_cluster_pin(args: argparse.Namespace) -> int:
+    """Pin a cluster operator key + base domain in config.
+
+    Writes to config; does NOT fetch. Run `dmp cluster fetch` after to
+    sanity-check that the manifest is published + verifiable.
+    """
+    path = _config_path()
+    if not path.exists():
+        _die(1, f"no config at {path} — run `dmp init <username>` first")
+    cfg = CLIConfig.load(path)
+    try:
+        raw = bytes.fromhex(args.operator_spk)
+    except ValueError:
+        _die(1, "operator_spk must be 64 hex chars (32 bytes Ed25519)")
+    if len(raw) != 32:
+        _die(1, f"operator_spk must be 32 bytes; got {len(raw)}")
+    cfg.cluster_operator_spk = args.operator_spk.lower()
+    cfg.cluster_base_domain = args.base_domain
+    cfg.save(path)
+    print(f"pinned cluster operator key and base domain {args.base_domain}")
+    print(
+        "next: `dmp cluster fetch` to confirm the manifest is "
+        "published and verifiable"
+    )
+    return 0
+
+
+def cmd_cluster_fetch(args: argparse.Namespace) -> int:
+    """One-shot: fetch + verify the cluster manifest, print a summary.
+
+    Does not install anything. Useful before enabling cluster mode to
+    confirm the manifest is published, correctly signed, not expired,
+    and addresses the expected cluster name.
+
+    `--save` dumps the raw wire to `cluster_manifest.wire` in the config
+    dir. Future offline-bootstrap work may consume that cache on
+    startup when DNS is unavailable.
+    """
+    cfg = CLIConfig.load(_config_path())
+    if not _cluster_mode_enabled(cfg):
+        _die(
+            1,
+            "cluster not configured — run `dmp cluster pin <operator_spk_hex> "
+            "<base_domain>` first",
+        )
+    try:
+        operator_spk = bytes.fromhex(cfg.cluster_operator_spk)
+    except ValueError:
+        _die(1, "cluster_operator_spk in config is not valid hex")
+    if len(operator_spk) != 32:
+        _die(1, "cluster_operator_spk must be 32 bytes (64 hex chars)")
+
+    bootstrap_reader = _make_reader(cfg)
+    manifest = fetch_cluster_manifest(
+        cfg.cluster_base_domain, operator_spk, bootstrap_reader
+    )
+    if manifest is None:
+        _die(
+            2,
+            f"no verifying cluster manifest at cluster.{cfg.cluster_base_domain}",
+        )
+    print(f"cluster: {manifest.cluster_name}")
+    print(f"  seq:   {manifest.seq}")
+    print(f"  exp:   {manifest.exp}")
+    print(f"  nodes: {len(manifest.nodes)}")
+    for node in manifest.nodes:
+        dns = node.dns_endpoint or "(via bootstrap reader)"
+        print(f"    {node.node_id}  http={node.http_endpoint}  dns={dns}")
+
+    if args.save:
+        # Re-sign is not available from just the parsed manifest (we
+        # don't have the operator private key here). Persist the raw
+        # wire string off the *first* matching TXT record so an offline
+        # bootstrap has something to load. We re-fetch the rrset rather
+        # than round-tripping through sign() to keep the original
+        # signed blob byte-identical.
+        from dmp.core.cluster import cluster_rrset_name
+
+        rrset = cluster_rrset_name(cfg.cluster_base_domain)
+        raw_records = bootstrap_reader.query_txt_record(rrset)
+        if raw_records:
+            wire_path = _config_path().parent / "cluster_manifest.wire"
+            # Pick the first record that parses + verifies with the
+            # same constraints as fetch_cluster_manifest, to ensure we
+            # cache the same manifest the runtime would use.
+            from dmp.core.cluster import ClusterManifest
+
+            for wire in raw_records:
+                if (
+                    ClusterManifest.parse_and_verify(
+                        wire,
+                        operator_spk,
+                        expected_cluster_name=cfg.cluster_base_domain,
+                    )
+                    is not None
+                ):
+                    wire_path.parent.mkdir(parents=True, exist_ok=True)
+                    wire_path.write_text(wire)
+                    print(f"saved signed manifest wire to {wire_path}")
+                    break
+    return 0
+
+
+def cmd_cluster_status(args: argparse.Namespace) -> int:
+    """Build the cluster client and print health snapshots.
+
+    Unlike `dmp cluster fetch`, this actually spins up the full
+    ClusterClient (including per-node writers/readers) so the
+    fanout/union health snapshots have data to report. We shut it
+    down immediately after printing — no background refresh thread
+    is left running.
+    """
+    cfg = CLIConfig.load(_config_path())
+    if not _cluster_mode_enabled(cfg):
+        _die(
+            1,
+            "cluster not configured — run `dmp cluster pin <operator_spk_hex> "
+            "<base_domain>` first",
+        )
+    try:
+        operator_spk = bytes.fromhex(cfg.cluster_operator_spk)
+    except ValueError:
+        _die(1, "cluster_operator_spk in config is not valid hex")
+    if len(operator_spk) != 32:
+        _die(1, "cluster_operator_spk must be 32 bytes (64 hex chars)")
+
+    bootstrap_reader = _make_reader(cfg)
+    manifest = fetch_cluster_manifest(
+        cfg.cluster_base_domain, operator_spk, bootstrap_reader
+    )
+    if manifest is None:
+        _die(2, f"no verifying cluster manifest at cluster.{cfg.cluster_base_domain}")
+
+    cc = ClusterClient(
+        manifest,
+        operator_spk=operator_spk,
+        base_domain=cfg.cluster_base_domain,
+        bootstrap_reader=bootstrap_reader,
+        writer_factory=_build_cluster_writer_factory(cfg),
+        reader_factory=_make_cluster_reader_factory(cfg, bootstrap_reader),
+        refresh_interval=None,  # no background refresh for a one-shot status
+    )
+    try:
+        m = cc.manifest
+        print(f"cluster: {m.cluster_name} (seq={m.seq}, exp={m.exp})")
+        print("fan-out writer snapshot:")
+        for row in cc.writer.snapshot():  # type: ignore[attr-defined]
+            print(
+                f"  {row['node_id']}  http={row['http_endpoint']}  "
+                f"fails={row['consecutive_failures']}  err={row['last_error']}"
+            )
+        print("union reader snapshot:")
+        for row in cc.reader.snapshot():  # type: ignore[attr-defined]
+            print(
+                f"  {row['node_id']}  http={row['http_endpoint']}  "
+                f"fails={row['consecutive_failures']}  err={row['last_error']}"
+            )
+    finally:
+        cc.close()
     return 0
 
 
@@ -956,6 +1362,43 @@ def build_parser() -> argparse.ArgumentParser:
         "list", help="print the currently configured dns_resolvers"
     )
     p_rv_list.set_defaults(func=cmd_resolvers_list)
+
+    # cluster (federation mode: fetch-verify manifest, build Fanout/Union)
+    p_cl = sub.add_parser(
+        "cluster",
+        help="manage cluster-mode federation (M2.wire)",
+    )
+    sub_cl = p_cl.add_subparsers(dest="sub", required=True)
+    p_cl_pin = sub_cl.add_parser(
+        "pin",
+        help="store operator Ed25519 pubkey + cluster base domain in config",
+    )
+    p_cl_pin.add_argument(
+        "operator_spk",
+        help="32-byte Ed25519 public key of the cluster operator, hex",
+    )
+    p_cl_pin.add_argument(
+        "base_domain",
+        help="cluster base domain (e.g. mesh.example.com); manifest RRset "
+        "lives at cluster.<base_domain>",
+    )
+    p_cl_pin.set_defaults(func=cmd_cluster_pin)
+    p_cl_fetch = sub_cl.add_parser(
+        "fetch",
+        help="one-shot fetch + verify the cluster manifest; print summary",
+    )
+    p_cl_fetch.add_argument(
+        "--save",
+        action="store_true",
+        help="cache the signed manifest wire to `cluster_manifest.wire` "
+        "in the config dir for future offline bootstrap",
+    )
+    p_cl_fetch.set_defaults(func=cmd_cluster_fetch)
+    p_cl_status = sub_cl.add_parser(
+        "status",
+        help="build the cluster client and print fanout/union health",
+    )
+    p_cl_status.set_defaults(func=cmd_cluster_status)
 
     # node (convenience launcher)
     p_n = sub.add_parser("node", help="run a dmp node in the foreground")
