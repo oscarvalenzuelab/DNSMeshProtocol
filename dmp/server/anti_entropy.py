@@ -799,6 +799,32 @@ class AntiEntropyWorker:
                 )
                 self.stats.records_rejected += 1
                 continue
+            # Hash-match check: the pulled value's sha256 MUST match one
+            # of the hashes the digest advertised for this name. A peer
+            # that advertised H1 and returns a value hashing to H2 is
+            # lying — accepting would both write the wrong data AND
+            # advance the watermark past H1 (the new write's stored_ts
+            # would bump forward), so H1 would never be retried. Reject
+            # instead; the pair stays unhandled and the next digest
+            # tick will re-ask.
+            #
+            # Order of gates (all must pass):
+            #   1. Hash-match vs digest (this check).
+            #   2. Structural / signature verify (below).
+            #   3. Write to store.
+            #   4. Mark (name, hash) handled by adding to `written`.
+            actual_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            if actual_hash not in expected:
+                log.warning(
+                    "anti-entropy: peer %s returned value for %s whose "
+                    "hash %s is not among advertised hashes %s",
+                    peer.node_id,
+                    name,
+                    actual_hash,
+                    sorted(expected),
+                )
+                self.stats.records_rejected += 1
+                continue
             self.stats.records_pulled += 1
             # Re-verify signed record types. If verification fails, drop.
             if not verify_record(
@@ -811,12 +837,6 @@ class AntiEntropyWorker:
                 )
                 self.stats.records_rejected += 1
                 continue
-            # Compute the value's hash so the returned "written" set
-            # carries the (name, hash) pair that actually landed. The
-            # follow-up-3 commit adds a digest-hash-match gate HERE;
-            # for now we trust the peer to return one of the advertised
-            # hashes for a given name.
-            actual_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
             # Write via publish_txt_record, which is append-semantics: a
             # duplicate is a no-op TTL refresh, not an overwrite.
             try:
