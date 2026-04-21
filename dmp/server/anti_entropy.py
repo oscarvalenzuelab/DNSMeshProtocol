@@ -762,12 +762,15 @@ class AntiEntropyWorker:
             import time as _time
 
             now = int(_time.time())
+            # TTL tracks the manifest's own signed expiry — no cap. The
+            # manifest's parse_and_verify already rejects past-exp, so
+            # letting the TXT live the full validity window keeps the
+            # gossip-only node's /v1/sync/cluster-manifest responsive
+            # for the entire operator-chosen lifetime. Worst case a
+            # multi-day-valid manifest pins a record for several days;
+            # operator bumps seq to roll out a replacement.
             exp_remaining = max(1, manifest.exp - now)
-            # Cap at 24h so a long-horizon operator manifest doesn't
-            # pin a defunct wire in the store past a reasonable refresh
-            # cadence.
-            ttl = min(exp_remaining, 86400)
-            self._store.publish_txt_record(rrset, wire, ttl=ttl)
+            self._store.publish_txt_record(rrset, wire, ttl=exp_remaining)
         except Exception:
             log.exception(
                 "anti-entropy: gossip install: store publish for %s failed", rrset

@@ -506,7 +506,8 @@ class DMPNode:
                 return
         else:
             # Best-effort parse without signature verification just so
-            # we can derive the cluster_name for the TXT owner.
+            # we can derive the cluster_name for the TXT owner AND the
+            # exp for a sensible TTL.
             try:
                 import base64
                 import struct
@@ -514,6 +515,7 @@ class DMPNode:
                 blob = base64.b64decode(wire[len(_CLUSTER_PREFIX) :], validate=True)
                 body = blob[:-64]
                 # Magic(7) + seq(8) + exp(8) + operator_spk(32) + name_len(1)
+                manifest_exp = int.from_bytes(body[15:23], "big")
                 name_len = body[55]
                 cluster_name = body[56 : 56 + name_len].decode("utf-8").rstrip(".")
             except Exception as e:
@@ -525,9 +527,20 @@ class DMPNode:
 
             manifest = _Bag()
             manifest.cluster_name = cluster_name
+            manifest.exp = manifest_exp
 
         rrset = cluster_rrset_name(manifest.cluster_name)
-        ttl = min(300, self.config.max_ttl)
+        # TTL anchors to the manifest's own signed expiry so the TXT
+        # stays serveable for the entire validity window — a 5-minute
+        # cap would make a file-seeded node go 204 after startup and
+        # break DNS-based discovery for peers starting later. max_ttl
+        # clamps egregious values; we never extend past the manifest's
+        # own self-declared lifetime.
+        import time as _time
+
+        now = int(_time.time())
+        exp_remaining = max(1, int(manifest.exp) - now)
+        ttl = min(exp_remaining, self.config.max_ttl)
         assert self.store is not None
         if self.store.publish_txt_record(rrset, wire, ttl=ttl):
             log.info(
