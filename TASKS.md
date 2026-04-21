@@ -30,6 +30,11 @@ _No tasks currently active. Promote from Backlog to open the next sprint._
 - **M2.wire-polish** — Decouple `dmp cluster pin` from cluster-mode activation. Today pinning a key+domain immediately flips `_cluster_mode_enabled`, so every networked command stops using the legacy endpoint and hard-fails if the cluster manifest isn't already published. Migration flow wants: pin anchors, verify via `cluster fetch`, then `cluster enable` to cut over. Add a `cluster_enabled: bool` flag to `CLIConfig` (default: auto-set to True on successful `cluster pin` + fetch, False on pin-only), and a `dmp cluster enable` / `dmp cluster disable` command pair. Effort: ~0.5 day. Touch zones: `dmp/cli.py`, `tests/test_cli.py`.
 - **M1.retro-codex-final** — Final retro Codex review of M1.1, M1.2, M1.3, M1.4, M1.5 commits. Most findings already landed via M1.5 polish; cheap insurance.
 
+### Findings from the 2026-04-20 comprehensive Codex audit (not yet addressed)
+
+- **cluster-composite-reader** — [P1] `DMPClient` in cluster mode uses the union reader for ALL reads, including cross-domain lookups (e.g. `alice@other-domain.com` identity / prekey records). Authoritative cluster nodes NXDOMAIN for names outside their own zone, so cross-domain contacts break. Fix: build a `CompositeReader` that routes cluster-local names (under `cluster_base_domain`) through the union reader and external names through the bootstrap resolver. Effort: ~0.5 day. Touch zones: new `dmp/network/composite_reader.py`, `dmp/cli.py` wiring, tests.
+- **cluster-atomic-refresh** — [P2] `ClusterClient.refresh_now` swaps reader then writer. If `writer_factory` raises (e.g. malformed `http_endpoint` in a newly published manifest), the reader has already advanced while the writer stayed on the old seq. Writes go to old node set, reads to new — freshly published records can disappear during a rollout window. Fix: pre-construct both pools against the new manifest (catching factory errors) BEFORE calling `install_manifest` on either side, then swap atomically. Effort: ~0.5 day. Touch zones: `dmp/client/cluster_bootstrap.py`.
+
 ### Milestones
 
 - **M3.1** — Bootstrap-domain record type (SRV-like discovery so clients find the cluster manifest name given just a user's email/address domain).
