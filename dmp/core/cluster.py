@@ -397,6 +397,12 @@ class ClusterManifest:
         # owner name; reject here rather than handing downstream code
         # an unusable record.
         _validate_dns_name(cluster_name)
+        # Normalize: strip single trailing dot so externally produced
+        # manifests that preserve the canonical FQDN form compare equal
+        # to our own (which sign() serializes without the dot). DNS
+        # treats the two as identical, so we canonicalize on storage.
+        if cluster_name.endswith("."):
+            cluster_name = cluster_name[:-1]
         off += name_len
 
         if off + 1 > len(body):
@@ -542,17 +548,17 @@ class ClusterManifest:
             return None
 
         # 8. If the caller specified the expected cluster name, bind the
-        # parsed manifest to it. Normalize a single trailing dot on both
-        # sides so canonical FQDN and bare-label forms compare equal —
-        # but preserve any leading/interior weirdness so we catch
-        # typos like "mesh.example.com..".
+        # parsed manifest to it. DNS owner names are case-insensitive,
+        # so we casefold both sides; we also normalize a single trailing
+        # dot. Preserve any leading/interior weirdness so typos like
+        # "mesh.example.com.." still fail loudly.
         if expected_cluster_name is not None:
             expected_norm = (
                 expected_cluster_name[:-1]
                 if expected_cluster_name.endswith(".")
                 else expected_cluster_name
             )
-            if manifest.cluster_name != expected_norm:
+            if manifest.cluster_name.casefold() != expected_norm.casefold():
                 return None
 
         return manifest
