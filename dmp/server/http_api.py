@@ -289,14 +289,20 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         """GET /v1/sync/digest?cursor=<opaque>&limit=<int>
 
         Preferred entry point for the M2.4-followup worker. ``cursor`` is
-        an opaque ``"<ts>:<name>"`` string the server previously emitted
-        as ``next_cursor`` in a digest response — carrying both halves of
-        the compound ``(stored_ts, name)`` watermark makes pagination
-        correct even when > ``limit`` records land in the same millisecond.
+        an opaque ``"<ts>:<name>:<value_hash>"`` string the server
+        previously emitted as ``next_cursor`` in a digest response —
+        carrying all three halves of the compound
+        ``(stored_ts, name, value_hash)`` watermark makes pagination
+        correct even when > ``limit`` values land at the same
+        ``(stored_ts, name)`` (a multi-value RRset burst: e.g. 5 prekey
+        TXT entries under ``prekeys.id-xxx``).
 
         Legacy ``?since=<ts>`` is still accepted (the original M2.4 shape);
-        it is equivalent to ``cursor="<ts>:"`` and logs a one-line warning
-        so operators can see when a stale peer is still calling it.
+        it is equivalent to ``cursor="<ts>::"`` and logs a one-line warning
+        so operators can see when a stale peer is still calling it. The
+        ``"<ts>:<name>"`` (two-field) cursor shape emitted by the
+        followup-1 worker is also still accepted — treated as
+        ``"<ts>:<name>:"`` — so mid-upgrade peers aren't broken.
 
         Returns compact hash-per-record entries the peer can diff against.
         ``next_cursor`` is always emitted — terminal pages carry the
@@ -324,7 +330,10 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             raw = params["cursor"][0]
             parsed = _parse_digest_cursor(raw)
             if parsed is None:
-                self._send_json(400, {"error": "cursor must be '<ts>:<name>'"})
+                self._send_json(
+                    400,
+                    {"error": "cursor must be '<ts>:<name>:<value_hash>'"},
+                )
                 return 400
             cursor_tuple = parsed
         elif "since" in params:
@@ -343,9 +352,9 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
                 "peer should upgrade to cursor=<opaque>",
                 self.address_string(),
             )
-            cursor_tuple = (since, "")
+            cursor_tuple = (since, "", "")
         else:
-            cursor_tuple = (0, "")
+            cursor_tuple = (0, "", "")
 
         try:
             limit = int(params.get("limit", [_SYNC_DIGEST_DEFAULT_LIMIT])[0])
@@ -386,15 +395,17 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
                 }
             )
 
-        # next_cursor: the (ts, name) of the last row emitted, encoded as
-        # "<ts>:<name>". Emitted even on the terminal page so the worker
-        # persists it as its watermark. If the store was empty, echo the
-        # caller's input cursor back — there is nowhere newer to advance.
+        # next_cursor: the (ts, name, value_hash) of the last row emitted,
+        # encoded as "<ts>:<name>:<value_hash>". Emitted even on the
+        # terminal page so the worker persists it as its watermark. If
+        # the store was empty, echo the caller's input cursor back —
+        # there is nowhere newer to advance.
         if entries:
             last = entries[-1]
-            next_cursor = f"{int(last['ts'])}:{last['name']}"
+            next_cursor = f"{int(last['ts'])}:{last['name']}:{last['hash']}"
         else:
-            next_cursor = f"{int(cursor_tuple[0])}:{cursor_tuple[1]}"
+            cur_hash = cursor_tuple[2] if len(cursor_tuple) >= 3 else ""
+            next_cursor = f"{int(cursor_tuple[0])}:{cursor_tuple[1]}:{cur_hash}"
 
         self._send_json(
             200,
@@ -491,20 +502,34 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
 
 
 def _parse_digest_cursor(raw: str) -> Optional[tuple]:
-    """Parse an opaque digest cursor ``"<ts>:<name>"`` into ``(int, str)``.
+    """Parse an opaque digest cursor into ``(int, str, str)``.
+
+    Accepted shapes (in order of preference):
+
+    - ``"<ts>:<name>:<value_hash>"`` — the followup-2 shape. value_hash
+      is 64 hex chars (sha256 of the row's TXT value).
+    - ``"<ts>:<name>"`` — the followup-1 shape, treated as
+      ``"<ts>:<name>:"`` (empty hash sorts below any real digest, so
+      the next page starts at the first value_hash for that name).
 
     Returns ``None`` on malformed input so callers can 400. The ``:``
     delimiter is safe because DNS names never contain colons (labels are
-    ``[a-zA-Z0-9-]`` separated by ``.``). We split on the *first* colon
-    only; a future slot/mailbox label scheme that somehow introduced a
-    ``:`` in the second half wouldn't silently corrupt the ts.
+    ``[a-zA-Z0-9-]`` separated by ``.``) and value_hash is lowercase hex.
+    We split on the first two colons only (``maxsplit=2``) so a stray
+    ``:`` can't silently corrupt the ts field; any further colons would
+    end up inside the value_hash check, which then rejects it as
+    non-hex.
     """
     if not isinstance(raw, str):
         return None
-    parts = raw.split(":", 1)
-    if len(parts) != 2:
+    parts = raw.split(":", 2)
+    if len(parts) == 2:
+        ts_str, name = parts
+        value_hash = ""
+    elif len(parts) == 3:
+        ts_str, name, value_hash = parts
+    else:
         return None
-    ts_str, name = parts
     try:
         ts = int(ts_str)
     except (ValueError, TypeError):
@@ -515,7 +540,16 @@ def _parse_digest_cursor(raw: str) -> Optional[tuple]:
     # used by legacy since-only callers.
     if len(name) > 253:
         return None
-    return (ts, name)
+    # value_hash is either empty (start-of-name sentinel) or a 64-char
+    # lowercase hex digest. Anything else is garbage.
+    if value_hash and not _VALUE_HASH_RE.match(value_hash):
+        return None
+    return (ts, name, value_hash)
+
+
+# Cached regex for the hash half of the cursor. Module-level so every
+# digest request doesn't recompile it.
+_VALUE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _consteq(a: str, b: str) -> bool:

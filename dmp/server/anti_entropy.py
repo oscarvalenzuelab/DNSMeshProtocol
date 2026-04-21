@@ -84,9 +84,11 @@ _TTL_REFRESH_SLOP_SECONDS = 5
 # not in the signed-type list).
 _CHUNK_PREFIX = "v=dmp1;t=chunk;d="
 
-# Watermark type alias. The compound (stored_ts_ms, name) form replaces the
-# plain int cursor from the original M2.4 code; see the module docstring.
-Cursor = Tuple[int, str]
+# Watermark type alias. The compound (stored_ts_ms, name, value_hash) form
+# replaces the plain int cursor from the original M2.4 code; the value_hash
+# tiebreaker was added in followup-2 so > ``pull_batch_limit`` values at the
+# same (ts, name) — a multi-value RRset burst — paginate correctly.
+Cursor = Tuple[int, str, str]
 
 # Digest-entry validation: peers are untrusted, so we harden every field
 # before it's allowed to influence the local watermark. The DNS-label
@@ -145,19 +147,28 @@ def _valid_digest_entry(entry: Any) -> bool:
 
 
 def _parse_next_cursor(raw: Any) -> Optional[Cursor]:
-    """Parse a peer-supplied ``next_cursor`` string into ``(ts, name)``.
+    """Parse a peer-supplied ``next_cursor`` into ``(ts, name, value_hash)``.
 
-    Returns ``None`` if the peer returned something unparseable — we just
-    fall back to advancing the watermark from the validated entries. The
-    splitting is on the first ``:`` so names that happen to contain one
-    (shouldn't, in DNS) don't silently corrupt the ts half.
+    Accepts either the followup-2 ``"<ts>:<name>:<value_hash>"`` wire
+    form or the legacy followup-1 ``"<ts>:<name>"`` form (the latter is
+    promoted to ``(ts, name, "")``). Returns ``None`` if the peer
+    returned something unparseable — we just fall back to advancing the
+    watermark from the validated entries.
+
+    We split on the first two ``:``s (``maxsplit=2``) so a malformed
+    suffix cannot silently corrupt the ts half; any further ``:`` ends
+    up inside the value_hash check, which rejects non-hex content.
     """
     if not isinstance(raw, str):
         return None
-    parts = raw.split(":", 1)
-    if len(parts) != 2:
+    parts = raw.split(":", 2)
+    if len(parts) == 2:
+        ts_str, name = parts
+        value_hash = ""
+    elif len(parts) == 3:
+        ts_str, name, value_hash = parts
+    else:
         return None
-    ts_str, name = parts
     try:
         ts = int(ts_str)
     except (ValueError, TypeError):
@@ -169,17 +180,21 @@ def _parse_next_cursor(raw: Any) -> Optional[Cursor]:
         return None
     if len(name) > 253:
         return None
-    return (ts, name)
+    # value_hash must be empty or a 64-char lowercase hex digest.
+    if value_hash and not _VALID_HASH_RE.match(value_hash):
+        return None
+    return (ts, name, value_hash)
 
 
 def _cursor_ge(a: Cursor, b: Cursor) -> bool:
-    """True iff cursor ``a`` is >= cursor ``b`` in (ts, name) order."""
-    return (a[0], a[1]) >= (b[0], b[1])
+    """True iff cursor ``a`` is >= cursor ``b`` in
+    (ts, name, value_hash) order."""
+    return tuple(a) >= tuple(b)
 
 
 def _cursor_gt(a: Cursor, b: Cursor) -> bool:
     """True iff cursor ``a`` is strictly greater than cursor ``b``."""
-    return (a[0], a[1]) > (b[0], b[1])
+    return tuple(a) > tuple(b)
 
 
 @dataclass
@@ -467,10 +482,14 @@ class AntiEntropyWorker:
         self._http_get = http_get or _default_http_get
         self._http_post = http_post or _default_http_post
 
-        # Compound (ts_ms, name) watermark per peer. The name half breaks
-        # same-millisecond pagination ties that plain ts would drop.
-        # Initial value (0, "") means "pull from the beginning."
-        self._watermarks: Dict[str, Cursor] = {p.node_id: (0, "") for p in self._peers}
+        # Compound (ts_ms, name, value_hash) watermark per peer. The
+        # name + value_hash halves break same-millisecond / same-name
+        # pagination ties that plain ts would drop (a multi-value RRset
+        # at one ts would lose values to the tie-break). Initial value
+        # (0, "", "") means "pull from the beginning."
+        self._watermarks: Dict[str, Cursor] = {
+            p.node_id: (0, "", "") for p in self._peers
+        }
         self._rr_index: int = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -639,7 +658,7 @@ class AntiEntropyWorker:
         # entry and let the next tick retry. A truly dead row will
         # eventually expire and fall out of the digest entirely.
         handled_cursors: List[Cursor] = [
-            (int(e["ts"]), e["name"])
+            (int(e["ts"]), e["name"], e["hash"])
             for e in valid_entries
             if e["name"] in handled_names
         ]
@@ -672,12 +691,13 @@ class AntiEntropyWorker:
     def _fetch_digest(
         self, peer: SyncPeer, watermark: Cursor
     ) -> Optional[Tuple[List[dict], bool, Optional[Cursor]]]:
-        # Send the compound cursor as the opaque ``cursor=<ts>:<name>``
-        # query param. DNS names don't contain colons, so the delimiter
-        # is unambiguous. Empty-name half still parses cleanly as
-        # ``"<ts>:"``.
-        cur_ts, cur_name = watermark
-        cursor_param = f"{int(cur_ts)}:{cur_name}"
+        # Send the compound cursor as the opaque
+        # ``cursor=<ts>:<name>:<value_hash>`` query param. DNS names
+        # don't contain colons and value_hash is lowercase hex, so the
+        # delimiter is unambiguous. Empty halves (e.g. the ``(0, "", "")``
+        # sentinel) still parse cleanly as ``"0::"``.
+        cur_ts, cur_name, cur_hash = watermark
+        cursor_param = f"{int(cur_ts)}:{cur_name}:{cur_hash}"
         url = (
             f"{peer.http_endpoint.rstrip('/')}/v1/sync/digest"
             f"?cursor={cursor_param}&limit={self._digest_limit}"
@@ -790,50 +810,69 @@ class AntiEntropyWorker:
     # ---- testing introspection --------------------------------------------
 
     def _current_watermark(self, node_id: str) -> Cursor:
-        """Return the compound watermark for ``node_id``, migrating a
-        lingering plain-int cursor to ``(int, "")`` on first access.
+        """Return the compound watermark for ``node_id``, migrating any
+        legacy shape on first access.
 
         The integer form lingers on disk nowhere (watermarks are
         in-memory) but tests occasionally seed them via ``set_watermark``
-        with the old shape. Treating ``int`` as ``(int, "")`` keeps
-        compatibility without a hard break.
+        with the old shape. We coerce:
+
+        - ``int`` → ``(int, "", "")``
+        - ``(int, str)`` → ``(int, str, "")``
+        - ``(int, str, str)`` → returned as-is
+
+        Anything else is reset to ``(0, "", "")``.
         """
-        raw = self._watermarks.get(node_id, (0, ""))
+        raw = self._watermarks.get(node_id, (0, "", ""))
         if isinstance(raw, int):
-            migrated: Cursor = (raw, "")
+            migrated: Cursor = (raw, "", "")
             self._watermarks[node_id] = migrated
             return migrated
-        # Defensive: tuple shape check.
+        if isinstance(raw, tuple) and len(raw) == 2:
+            migrated2: Cursor = (int(raw[0]), str(raw[1]), "")
+            self._watermarks[node_id] = migrated2
+            return migrated2
+        # Defensive: three-tuple shape check.
         if (
             not isinstance(raw, tuple)
-            or len(raw) != 2
+            or len(raw) != 3
             or not isinstance(raw[0], int)
             or not isinstance(raw[1], str)
+            or not isinstance(raw[2], str)
         ):
-            self._watermarks[node_id] = (0, "")
-            return (0, "")
+            self._watermarks[node_id] = (0, "", "")
+            return (0, "", "")
         return raw
 
     def watermark(self, node_id: str) -> Cursor:
-        """Return the ``(stored_ts_ms, name)`` watermark for ``node_id``.
+        """Return the ``(stored_ts_ms, name, value_hash)`` watermark for
+        ``node_id``.
 
-        The return shape changed from ``int`` to ``(int, str)`` in the
-        M2.4 follow-up. Callers that treat the result as truthy (``if
-        worker.watermark(...)``) still work because ``(0, "")`` is the
-        sole "pull from beginning" sentinel.
+        The return shape evolved ``int`` → ``(int, str)`` in M2.4
+        follow-up, then ``(int, str)`` → ``(int, str, str)`` in
+        follow-up-2. Callers that treat the result as truthy (``if
+        worker.watermark(...)``) still work because ``(0, "", "")`` is
+        the sole "pull from beginning" sentinel.
         """
         return self._current_watermark(node_id)
 
-    def set_watermark(self, node_id: str, ts: Union[int, Cursor]) -> None:
-        """Seed a watermark for tests. Accepts either the legacy ``int``
-        or the compound ``(int, str)`` shape. Legacy ints are stored
-        directly and migrated to ``(int, "")`` on next access."""
+    def set_watermark(self, node_id: str, ts: Union[int, Tuple]) -> None:
+        """Seed a watermark for tests. Accepts the legacy ``int``, the
+        followup-1 ``(int, str)`` shape, or the followup-2
+        ``(int, str, str)`` shape. Legacy values are normalized on the
+        way in."""
         if isinstance(ts, int):
-            self._watermarks[node_id] = (int(ts), "")
+            self._watermarks[node_id] = (int(ts), "", "")
         elif isinstance(ts, tuple) and len(ts) == 2:
-            self._watermarks[node_id] = (int(ts[0]), str(ts[1]))
+            self._watermarks[node_id] = (int(ts[0]), str(ts[1]), "")
+        elif isinstance(ts, tuple) and len(ts) == 3:
+            self._watermarks[node_id] = (
+                int(ts[0]),
+                str(ts[1]),
+                str(ts[2]),
+            )
         else:
-            raise TypeError("watermark must be int or (int, str)")
+            raise TypeError("watermark must be int, (int, str), or (int, str, str)")
 
     @property
     def peers(self) -> List[SyncPeer]:

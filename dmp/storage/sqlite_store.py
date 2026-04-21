@@ -40,12 +40,25 @@ CREATE TABLE IF NOT EXISTS records (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     stored_ts  INTEGER NOT NULL DEFAULT 0,
+    value_hash TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (name, value)
 );
 CREATE INDEX IF NOT EXISTS idx_records_name      ON records(name);
 CREATE INDEX IF NOT EXISTS idx_records_expires   ON records(expires_at);
 CREATE INDEX IF NOT EXISTS idx_records_stored_ts ON records(stored_ts);
+CREATE INDEX IF NOT EXISTS idx_records_page      ON records(stored_ts, name, value_hash);
 """
+
+
+def _hash_value(value: str) -> str:
+    """SHA-256 hex digest of a TXT value. Stable across nodes.
+
+    Centralized so the sqlite store, in-memory store, and digest
+    endpoint all agree on the encoding (UTF-8) and hex casing
+    (lowercase). Any deviation between them desynchronizes the
+    cursor-based pagination.
+    """
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -66,7 +79,7 @@ class StoredRecord:
     @property
     def record_hash(self) -> str:
         """SHA-256 hex digest of the TXT value. Stable across nodes."""
-        return hashlib.sha256(self.value.encode("utf-8")).hexdigest()
+        return _hash_value(self.value)
 
 
 class SqliteMailboxStore(DNSRecordStore):
@@ -92,7 +105,7 @@ class SqliteMailboxStore(DNSRecordStore):
     def _migrate(self) -> None:
         """Best-effort schema migrations.
 
-        Two evolutions land here:
+        Three evolutions land here:
 
         - `stored_ts` was added in M2.4 for the anti-entropy sync
           worker. Older DBs created before M2.4 don't have the column;
@@ -103,6 +116,11 @@ class SqliteMailboxStore(DNSRecordStore):
           M2.4-seconds code carry small values (< ~10^12). We detect
           that and multiply in place so same-second pagination stays
           correct going forward. Fresh DBs skip this branch entirely.
+        - M2.4-followup-2: `value_hash` was added so the digest cursor
+          can paginate correctly across > ``limit`` values at the same
+          (stored_ts, name) — a multi-value RRset burst. Older DBs get
+          the column added and backfilled from the live ``value``; the
+          companion compound index keeps paginated reads fast.
         """
         with self._lock:
             cols = {
@@ -136,12 +154,39 @@ class SqliteMailboxStore(DNSRecordStore):
                 (_MS_THRESHOLD,),
             )
 
+            if "value_hash" not in cols:
+                # Pre-M2.4-followup-2 DB. Add the column (DEFAULT '' so the
+                # ALTER succeeds on existing rows), backfill from value.
+                # The backfill is cheap — SHA-256 of short TXT strings —
+                # and runs once per DB reopen.
+                self._conn.execute(
+                    "ALTER TABLE records ADD COLUMN value_hash TEXT NOT NULL "
+                    "DEFAULT ''"
+                )
+                # Backfill row by row so the digest we compute is byte-
+                # identical to what _hash_value produces on live writes.
+                # One sqlite scalar function would be faster but pulls in
+                # more surface area; this runs once per cold start.
+                rows = self._conn.execute(
+                    "SELECT rowid, value FROM records WHERE value_hash = ''"
+                ).fetchall()
+                for rowid, value in rows:
+                    self._conn.execute(
+                        "UPDATE records SET value_hash = ? WHERE rowid = ?",
+                        (_hash_value(value), rowid),
+                    )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_records_page "
+                    "ON records(stored_ts, name, value_hash)"
+                )
+
     # ---- DNSRecordStore contract ------------------------------------------
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
         now_s = int(time.time())
         now_ms = int(time.time() * 1000)
         expires = now_s + int(ttl)
+        vhash = _hash_value(value)
         with self._lock:
             # Append semantics. DNS natively supports multiple TXT records at
             # one name (an RRset); the prior "replace all" behavior let an
@@ -153,12 +198,16 @@ class SqliteMailboxStore(DNSRecordStore):
             # set. `stored_ts` records the millisecond at which this *node*
             # accepted the write; sync peers use it as their cursor and the
             # ms resolution keeps pagination correct even when many writes
-            # land inside the same second.
+            # land inside the same second. `value_hash` is stored so the
+            # digest-pagination cursor can break ties at the same
+            # (stored_ts, name) — a multi-value RRset burst — without
+            # recomputing SHA-256 per row during paginated reads.
             self._conn.execute(
                 "INSERT OR REPLACE INTO records "
-                "(name, value, ttl, created_at, expires_at, stored_ts) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (name, value, int(ttl), now_s, expires, now_ms),
+                "(name, value, ttl, created_at, expires_at, stored_ts, "
+                "value_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name, value, int(ttl), now_s, expires, now_ms, vhash),
             )
         return True
 
@@ -225,25 +274,36 @@ class SqliteMailboxStore(DNSRecordStore):
         since_ts: int = 0,
         *,
         limit: Optional[int] = None,
-        cursor: Optional[Tuple[int, str]] = None,
+        cursor: Optional[Tuple[int, str, str]] = None,
     ) -> List[StoredRecord]:
         """Return non-expired records strictly past the given cursor,
-        oldest first, ordered by (stored_ts ASC, name ASC, value ASC).
+        oldest first, ordered by (stored_ts ASC, name ASC, value_hash ASC).
 
         Used by the anti-entropy digest endpoint. There are two entry
         shapes for historical reasons:
 
-        - ``cursor=(ts, name)`` — the compound cursor added in the M2.4
-          follow-up. Returns rows where ``stored_ts > ts`` OR
-          (``stored_ts == ts`` AND ``name > name``). This is the only
-          pagination shape that remains correct when > ``limit`` rows
-          land in the same millisecond: a plain ``stored_ts > cursor_ts``
-          either skips the tail (advance past the ms) or replays the
-          same page forever (keep the old ms).
+        - ``cursor=(ts, name, value_hash)`` — the compound cursor added
+          in the M2.4 follow-up (third element added in follow-up-2).
+          Returns rows where ``stored_ts > ts`` OR
+          (``stored_ts == ts`` AND ``name > name``) OR
+          (``stored_ts == ts`` AND ``name == name`` AND
+          ``value_hash > value_hash``). The value_hash tiebreaker is
+          the only pagination shape that remains correct when > ``limit``
+          values land at the same (stored_ts, name) — a multi-value
+          RRset burst (e.g. 5 prekey TXT entries at the same name
+          published in one second): a (ts, name)-only cursor either
+          skips the tail (advance past the name) or replays the same
+          page forever (keep the old name).
         - ``since_ts=<ms>`` — the legacy shape. Degenerates to
-          ``cursor=(since_ts, "")``; since every real name is strictly
-          greater than the empty string, the name comparison collapses
-          and we recover the original ``stored_ts > since_ts`` behavior.
+          ``cursor=(since_ts, "", "")``; since every real name is
+          strictly greater than the empty string, the trailing
+          comparisons collapse and we recover the original
+          ``stored_ts > since_ts`` behavior.
+
+        A two-element ``cursor=(ts, name)`` is also accepted and treated
+        as ``(ts, name, "")`` for compatibility with legacy in-process
+        callers that were already on the compound cursor but hadn't
+        picked up the value_hash tiebreaker yet.
 
         Passing both raises ``ValueError`` so callers don't accidentally
         double-dip.
@@ -255,23 +315,42 @@ class SqliteMailboxStore(DNSRecordStore):
         if cursor is not None and since_ts:
             raise ValueError("pass cursor OR since_ts, not both")
         if cursor is None:
-            cursor = (int(since_ts), "")
-        cur_ts, cur_name = int(cursor[0]), str(cursor[1])
+            cursor = (int(since_ts), "", "")
+        elif len(cursor) == 2:
+            # Back-compat: (ts, name) → (ts, name, ""). Value_hash="" is
+            # strictly less than any real 64-char hex digest, so this
+            # reproduces the pre-followup-2 start-of-name semantics.
+            cursor = (int(cursor[0]), str(cursor[1]), "")
+        cur_ts = int(cursor[0])
+        cur_name = str(cursor[1])
+        cur_hash = str(cursor[2]) if len(cursor) >= 3 else ""
         now = int(time.time())
         with self._lock:
             sql = (
-                "SELECT name, value, expires_at, stored_ts FROM records "
-                "WHERE (stored_ts > ? OR (stored_ts = ? AND name > ?)) "
+                "SELECT name, value, expires_at, stored_ts, value_hash "
+                "FROM records "
+                "WHERE (stored_ts > ? "
+                "       OR (stored_ts = ? AND name > ?) "
+                "       OR (stored_ts = ? AND name = ? "
+                "           AND value_hash > ?)) "
                 "AND expires_at > ? "
-                "ORDER BY stored_ts ASC, name ASC, value ASC"
+                "ORDER BY stored_ts ASC, name ASC, value_hash ASC"
             )
-            params: Tuple = (cur_ts, cur_ts, cur_name, now)
+            params: Tuple = (
+                cur_ts,
+                cur_ts,
+                cur_name,
+                cur_ts,
+                cur_name,
+                cur_hash,
+                now,
+            )
             if limit is not None:
                 sql += " LIMIT ?"
                 params = params + (int(limit),)
             rows = self._conn.execute(sql, params).fetchall()
         out: List[StoredRecord] = []
-        for name, value, expires_at, stored_ts in rows:
+        for name, value, expires_at, stored_ts, _vhash in rows:
             ttl_remaining = max(0, int(expires_at) - now)
             out.append(
                 StoredRecord(
@@ -308,9 +387,10 @@ class SqliteMailboxStore(DNSRecordStore):
                 batch = unique[i : i + 256]
                 placeholders = ",".join("?" * len(batch))
                 sql = (
-                    f"SELECT name, value, expires_at, stored_ts FROM records "
+                    f"SELECT name, value, expires_at, stored_ts "
+                    f"FROM records "
                     f"WHERE name IN ({placeholders}) AND expires_at > ? "
-                    f"ORDER BY stored_ts ASC, name ASC, value ASC"
+                    f"ORDER BY stored_ts ASC, name ASC, value_hash ASC"
                 )
                 rows = self._conn.execute(sql, (*batch, now)).fetchall()
                 for name, value, expires_at, stored_ts in rows:

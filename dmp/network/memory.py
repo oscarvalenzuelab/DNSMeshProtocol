@@ -5,6 +5,7 @@ the authoritative-write / recursive-read split with a single dict, so
 writes are instantly visible to reads.
 """
 
+import hashlib
 import time
 from threading import RLock
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -88,19 +89,28 @@ class InMemoryDNSStore(DNSRecordStore):
         since_ts: int = 0,
         *,
         limit: Optional[int] = None,
-        cursor: Optional[Tuple[int, str]] = None,
+        cursor: Optional[Tuple[int, ...]] = None,
     ) -> List[StoredRecord]:
         """Same semantics as ``SqliteMailboxStore.iter_records_since``.
 
-        Either ``cursor=(ts, name)`` (compound, M2.4-followup) or
-        ``since_ts=<ms>`` (legacy; equivalent to ``cursor=(since_ts, "")``)
-        may be passed — not both.
+        Either ``cursor=(ts, name, value_hash)`` (compound, M2.4-followup-2),
+        ``cursor=(ts, name)`` (legacy two-tuple, treated as
+        ``(ts, name, "")``), or ``since_ts=<ms>`` (legacy; equivalent to
+        ``cursor=(since_ts, "", "")``) may be passed — not both.
+
+        Ordering is ``(stored_ts, name, value_hash)`` ASC so a
+        multi-value RRset burst paginates correctly across ``limit``
+        boundaries.
         """
         if cursor is not None and since_ts:
             raise ValueError("pass cursor OR since_ts, not both")
         if cursor is None:
-            cursor = (int(since_ts), "")
-        cur_ts, cur_name = int(cursor[0]), str(cursor[1])
+            cursor = (int(since_ts), "", "")
+        elif len(cursor) == 2:
+            cursor = (int(cursor[0]), str(cursor[1]), "")
+        cur_ts = int(cursor[0])
+        cur_name = str(cursor[1])
+        cur_hash = str(cursor[2]) if len(cursor) >= 3 else ""
         now = int(time.time())
         rows: List[StoredRecord] = []
         with self._lock:
@@ -108,18 +118,32 @@ class InMemoryDNSStore(DNSRecordStore):
                 for value, exp, ts in entries:
                     if exp <= now:
                         continue
-                    # (ts, name) > (cur_ts, cur_name) in lexicographic
-                    # order — match the SQL predicate exactly.
-                    if ts > cur_ts or (ts == cur_ts and name > cur_name):
-                        rows.append(
-                            StoredRecord(
-                                name=name,
-                                value=value,
-                                ttl_remaining=max(0, exp - now),
-                                stored_ts=ts,
-                            )
+                    vhash = hashlib.sha256(value.encode("utf-8")).hexdigest()
+                    # (ts, name, value_hash) > (cur_ts, cur_name, cur_hash)
+                    # in lex order — match the SQL predicate exactly.
+                    if ts > cur_ts:
+                        pass
+                    elif ts == cur_ts and name > cur_name:
+                        pass
+                    elif ts == cur_ts and name == cur_name and vhash > cur_hash:
+                        pass
+                    else:
+                        continue
+                    rows.append(
+                        StoredRecord(
+                            name=name,
+                            value=value,
+                            ttl_remaining=max(0, exp - now),
+                            stored_ts=ts,
                         )
-        rows.sort(key=lambda r: (r.stored_ts, r.name, r.value))
+                    )
+        rows.sort(
+            key=lambda r: (
+                r.stored_ts,
+                r.name,
+                hashlib.sha256(r.value.encode("utf-8")).hexdigest(),
+            )
+        )
         if limit is not None:
             rows = rows[:limit]
         return rows
@@ -146,5 +170,11 @@ class InMemoryDNSStore(DNSRecordStore):
                             stored_ts=ts,
                         )
                     )
-        out.sort(key=lambda r: (r.stored_ts, r.name, r.value))
+        out.sort(
+            key=lambda r: (
+                r.stored_ts,
+                r.name,
+                hashlib.sha256(r.value.encode("utf-8")).hexdigest(),
+            )
+        )
         return out
