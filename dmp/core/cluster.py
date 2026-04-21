@@ -70,6 +70,66 @@ MAX_DNS_ENDPOINT_LEN = 64
 MAX_CLUSTER_NAME_LEN = 64
 MAX_NODE_COUNT = 32  # protocol ceiling; sign() still enforces MAX_WIRE_LEN
 
+# Per-label DNS cap. Labels in a DNS name max out at 63 octets (RFC 1035).
+# The wire format accepts a 64-byte cluster_name but the *content* of that
+# cluster_name must itself be a publishable DNS name — see
+# `_validate_dns_name` below.
+MAX_DNS_LABEL_LEN = 63
+
+
+def _validate_dns_name(name: str) -> None:
+    """Validate that `name` is a publishable DNS name.
+
+    The cluster_name ends up as part of a TXT RRset owner name (via
+    `cluster_rrset_name`), so it must satisfy the host/DNS-name rules
+    that the publishing path actually supports. The MAX_CLUSTER_NAME_LEN
+    byte cap is the outer bound; this function layers the stricter
+    hostname rules on top.
+
+    Rules enforced:
+    - Non-empty string after stripping a single trailing `.` (canonical
+      FQDN form is accepted; `cluster_rrset_name` already normalizes).
+    - ASCII only (no IDN; the publishing path does not A-label encode).
+    - Each label 1..63 chars, letters/digits/`-` only, and must not
+      start or end with `-` (RFC 1123-style host labels).
+    - No empty labels (rejects `""`, `".a"`, `"a..b"`, etc.).
+
+    Raises ValueError on any violation.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("cluster_name must be a non-empty string")
+    # Accept a single trailing dot (canonical FQDN form); strip for checks.
+    # Leading dots and embedded empty labels are rejected below.
+    normalized = name[:-1] if name.endswith(".") else name
+    if not normalized:
+        raise ValueError("cluster_name must have at least one label")
+    # ASCII-only: no IDN support in the publishing path.
+    try:
+        normalized.encode("ascii")
+    except UnicodeEncodeError as e:
+        raise ValueError("cluster_name must be ASCII (no IDN support)") from e
+    labels = normalized.split(".")
+    for label in labels:
+        if not label:
+            raise ValueError(
+                "cluster_name has empty label (leading/double dot not allowed)"
+            )
+        if len(label) > MAX_DNS_LABEL_LEN:
+            raise ValueError(
+                f"cluster_name label {label!r} exceeds {MAX_DNS_LABEL_LEN} chars"
+            )
+        if label.startswith("-") or label.endswith("-"):
+            raise ValueError(
+                f"cluster_name label {label!r} cannot start or end with '-'"
+            )
+        for ch in label:
+            if not (ch.isascii() and (ch.isalnum() or ch == "-")):
+                raise ValueError(
+                    f"cluster_name label {label!r} contains invalid character "
+                    f"{ch!r} (letters/digits/'-' only)"
+                )
+
+
 # Absolute wire-length cap, enforced at sign() time. 1200 bytes is a
 # comfortable ~4 TXT strings worth of base64'd payload. Records exceeding
 # this are rejected rather than silently truncated; operators who
@@ -230,6 +290,11 @@ class ClusterManifest:
             raise ValueError(
                 f"cluster_name too long (max {MAX_CLUSTER_NAME_LEN} utf-8 bytes)"
             )
+        # cluster_name is published as `cluster.<cluster_name>` TXT; the
+        # inner name must itself be a valid DNS name. The byte cap above
+        # is the outer bound; _validate_dns_name layers on the per-label
+        # hostname rules.
+        _validate_dns_name(self.cluster_name)
         if (
             not isinstance(self.operator_spk, (bytes, bytearray))
             or len(self.operator_spk) != _OPERATOR_SPK_LEN

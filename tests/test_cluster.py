@@ -596,3 +596,123 @@ class TestClusterRrsetName:
 
     def test_trailing_dot_stripped(self):
         assert cluster_rrset_name("mesh.example.com.") == "cluster.mesh.example.com"
+
+
+# ---- cluster_name DNS-name validation -------------------------------------
+
+
+class TestClusterManifestNameValidation:
+    """cluster_name is fed into cluster_rrset_name() and published as a
+    DNS TXT owner name, so it must itself be a valid DNS name — the
+    64-byte UTF-8 cap alone is not sufficient (labels > 63 chars, `_`,
+    non-ASCII, empty/dot-edge names all signed/verified but could not
+    be published).
+
+    Covers valid cases (including canonical trailing-dot FQDN form) and
+    each failure mode enumerated in the Codex P2 finding.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "mesh.example.com",
+            "a.b",
+            "x.y.z.w",
+            "node-1.mesh.example.com",  # hyphens mid-label allowed
+            "mesh.example.com.",  # canonical FQDN form (trailing dot)
+            "A.B.C",  # uppercase allowed
+            "a1.b2.c3",  # digits allowed
+        ],
+    )
+    def test_valid_names_accepted(self, name):
+        operator = _make_operator()
+        mf = _make_manifest(operator, cluster_name=name)
+        wire = mf.sign(operator)
+        parsed = ClusterManifest.parse_and_verify(
+            wire, operator.get_signing_public_key_bytes()
+        )
+        assert parsed is not None
+        assert parsed.cluster_name == name
+
+    def test_trailing_dot_roundtrips_and_rrset_strips_it(self):
+        # Canonical FQDN form is accepted on sign/parse; cluster_rrset_name
+        # normalizes by stripping the trailing dot so callers don't end up
+        # with `cluster.mesh.example.com.` vs `cluster.mesh.example.com`.
+        operator = _make_operator()
+        mf = _make_manifest(operator, cluster_name="mesh.example.com.")
+        wire = mf.sign(operator)
+        parsed = ClusterManifest.parse_and_verify(
+            wire, operator.get_signing_public_key_bytes()
+        )
+        assert parsed is not None
+        assert cluster_rrset_name(parsed.cluster_name) == "cluster.mesh.example.com"
+
+    @pytest.mark.parametrize(
+        "bad_name,reason_substr",
+        [
+            ("", "non-empty"),  # empty
+            ("a" * 64, "63 chars"),  # single 64-char label > DNS label cap
+            ("under_score.example.com", "invalid character"),  # underscore
+            ("café.example.com", "ASCII"),  # non-ASCII (no IDN)
+            ("mesh..example.com", "empty label"),  # double dot
+            (".mesh.example.com", "empty label"),  # leading dot
+            ("-bad.example.com", "start or end with '-'"),  # leading hyphen
+            ("bad-.example.com", "start or end with '-'"),  # trailing hyphen
+            ("mesh.example.com/", "invalid character"),  # slash
+            ("mesh example.com", "invalid character"),  # space
+        ],
+    )
+    def test_invalid_names_rejected(self, bad_name, reason_substr):
+        operator = _make_operator()
+        mf = ClusterManifest(
+            cluster_name=bad_name,
+            operator_spk=operator.get_signing_public_key_bytes(),
+            nodes=[_make_node(1)],
+            seq=1,
+            exp=int(time.time()) + 600,
+        )
+        with pytest.raises(ValueError, match=reason_substr):
+            mf.sign(operator)
+
+    def test_label_at_boundary_63_chars_accepted(self):
+        # A 63-char label is the max allowed. Combined with ".xy" this fits
+        # under MAX_CLUSTER_NAME_LEN (64 utf-8 bytes would cap the *whole*
+        # name, but a single 63-char label + ".x" = 65 bytes and exceeds
+        # the byte cap). Use a name that fits both: 63 chars + ".a" = 65,
+        # still over; so use 61 + ".ab" = 64.
+        name = ("a" * 61) + ".ab"
+        assert len(name.encode("utf-8")) <= MAX_CLUSTER_NAME_LEN
+        operator = _make_operator()
+        mf = _make_manifest(operator, cluster_name=name)
+        wire = mf.sign(operator)
+        parsed = ClusterManifest.parse_and_verify(
+            wire, operator.get_signing_public_key_bytes()
+        )
+        assert parsed is not None
+
+    def test_node_endpoints_not_subject_to_dns_rules(self):
+        # http_endpoint / dns_endpoint are free-form URLs / ip:port, NOT
+        # DNS owner names. They must remain unconstrained beyond the
+        # existing length + utf-8 checks — especially: `_`, ports, paths,
+        # colons, slashes must all be accepted.
+        operator = _make_operator()
+        # A URL with path + port + query-like chars; a dns_endpoint
+        # with an underscore-bearing hostname (unusual but legal in
+        # "free-form endpoint" space) would not be a DNS name anyway.
+        nodes = [
+            ClusterNode(
+                node_id="n1",
+                http_endpoint="https://host_with_under.example.com:8053/path?x=1",
+                dns_endpoint="203.0.113.10:53",
+            ),
+        ]
+        mf = _make_manifest(operator, nodes=nodes)
+        wire = mf.sign(operator)
+        parsed = ClusterManifest.parse_and_verify(
+            wire, operator.get_signing_public_key_bytes()
+        )
+        assert parsed is not None
+        assert (
+            parsed.nodes[0].http_endpoint
+            == "https://host_with_under.example.com:8053/path?x=1"
+        )

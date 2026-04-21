@@ -41,7 +41,15 @@ cluster.<cluster_name>   IN TXT  "v=dmp1;t=cluster;<b64(body || sig)>"
 
 - `<cluster_name>` — the display/log name of the cluster, e.g.
   `mesh.example.com`. Matches the `cluster_name` field inside the
-  signed body.
+  signed body. Because the publishing path uses it as part of a DNS
+  owner name, `cluster_name` must itself be a valid DNS name:
+  - ASCII only (no IDN; the publishing path does not A-label encode).
+  - Each label 1..63 chars, letters/digits/`-` only, must not start
+    or end with `-`.
+  - No empty labels (leading dot and double dots are rejected).
+  - Whole name ≤ 64 UTF-8 bytes (the wire-format cap).
+  - A single trailing `.` (canonical FQDN form) is accepted and
+    normalized away by `cluster_rrset_name`.
 - The `cluster_rrset_name("mesh.example.com")` helper returns
   `cluster.mesh.example.com`. This is kept as a function so we can
   evolve the convention (e.g. to `_dmp-cluster.<name>` SRV-style)
