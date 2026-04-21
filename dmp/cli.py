@@ -382,6 +382,7 @@ class _NodeDnsReader(DNSRecordReader):
 
     def query_txt_record(self, name: str):
         import dns.exception
+        import dns.flags
         import dns.message
         import dns.query
         import dns.rcode
@@ -401,6 +402,21 @@ class _NodeDnsReader(DNSRecordReader):
             # UnionReader counts this as a per-node failure and keeps
             # going with the other nodes.
             return None
+        # Real DMP RRsets (prekey sets, multi-chunk slot manifests) can
+        # exceed the UDP 512-byte ceiling. When that happens the node
+        # sets the TC (truncated) bit and the answer section is useless;
+        # we MUST retry over TCP to see the full rrset. Reuse the same
+        # request so the question section + id matches.
+        if response.flags & dns.flags.TC:
+            try:
+                response = dns.query.tcp(
+                    request,
+                    self._host,
+                    port=self._port,
+                    timeout=self._timeout,
+                )
+            except Exception:
+                return None
         if response.rcode() != dns.rcode.NOERROR:
             return None
         values: List[str] = []

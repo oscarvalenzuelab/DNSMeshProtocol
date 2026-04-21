@@ -1086,3 +1086,116 @@ class TestClusterModeInMakeClient:
             assert client._cluster_client is None
         finally:
             cli._close_client(client)
+
+
+class TestNodeDnsReaderTruncation:
+    """`_NodeDnsReader` retries over TCP when the UDP response is truncated.
+
+    DMP RRsets that carry prekey pools or multi-chunk slot manifests can
+    easily exceed the 512-byte UDP DNS limit. Nodes return the TC
+    (truncated) flag with an empty answer; a client that trusts UDP
+    alone silently drops these rrsets and the union reader sees no data.
+    The reader must detect TC and retry over TCP.
+    """
+
+    def _build_truncated_udp_response(self, request):
+        """Return a response with TC set and an empty answer section."""
+        import dns.flags
+        import dns.message
+
+        response = dns.message.make_response(request)
+        response.flags |= dns.flags.TC
+        return response
+
+    def _build_tcp_answer_response(self, request, name, values):
+        """Return a full (non-truncated) TXT response carrying `values`."""
+        import dns.message
+        import dns.rdataclass
+        import dns.rdatatype
+        import dns.rrset
+
+        response = dns.message.make_response(request)
+        rrset = dns.rrset.from_text_list(
+            name,
+            300,
+            dns.rdataclass.IN,
+            dns.rdatatype.TXT,
+            [f'"{v}"' for v in values],
+        )
+        response.answer.append(rrset)
+        return response
+
+    def test_udp_truncation_triggers_tcp_retry(self, monkeypatch):
+        """UDP returns TC with empty answer → TCP retry is issued, its
+        answer is returned."""
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", timeout=1.0)
+        captured = {"udp_calls": 0, "tcp_calls": 0, "tcp_request": None}
+
+        def fake_udp(request, host, port, timeout):
+            captured["udp_calls"] += 1
+            return self._build_truncated_udp_response(request)
+
+        def fake_tcp(request, host, port, timeout):
+            captured["tcp_calls"] += 1
+            captured["tcp_request"] = request
+            return self._build_tcp_answer_response(
+                request, "example.com.", ["hello-big-rrset"]
+            )
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        monkeypatch.setattr(dns.query, "tcp", fake_tcp)
+
+        result = reader.query_txt_record("example.com.")
+        assert captured["udp_calls"] == 1
+        assert captured["tcp_calls"] == 1
+        assert result == ["hello-big-rrset"]
+
+    def test_no_tcp_retry_when_udp_not_truncated(self, monkeypatch):
+        """Non-truncated UDP response → TCP must NOT be called."""
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", timeout=1.0)
+        captured = {"udp_calls": 0, "tcp_calls": 0}
+
+        def fake_udp(request, host, port, timeout):
+            captured["udp_calls"] += 1
+            return self._build_tcp_answer_response(
+                request, "example.com.", ["small-rrset"]
+            )
+
+        def fake_tcp(request, host, port, timeout):  # pragma: no cover
+            captured["tcp_calls"] += 1
+            raise AssertionError("TCP should not be called for a non-truncated reply")
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        monkeypatch.setattr(dns.query, "tcp", fake_tcp)
+
+        result = reader.query_txt_record("example.com.")
+        assert captured["udp_calls"] == 1
+        assert captured["tcp_calls"] == 0
+        assert result == ["small-rrset"]
+
+    def test_tcp_retry_failure_returns_none(self, monkeypatch):
+        """UDP truncated + TCP blows up → None (per-node failure, not a crash)."""
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", timeout=1.0)
+
+        def fake_udp(request, host, port, timeout):
+            return self._build_truncated_udp_response(request)
+
+        def fake_tcp(request, host, port, timeout):
+            raise OSError("tcp connect refused")
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        monkeypatch.setattr(dns.query, "tcp", fake_tcp)
+
+        assert reader.query_txt_record("example.com.") is None
