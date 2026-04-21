@@ -913,6 +913,7 @@ class TestClusterManifestNameValidation:
             ("bad-.example.com", "start or end with '-'"),  # trailing hyphen
             ("mesh.example.com/", "invalid character"),  # slash
             ("mesh example.com", "invalid character"),  # space
+            ("mesh.example.com..", "empty label"),  # doubled trailing dot
         ],
     )
     def test_invalid_names_rejected(self, bad_name, reason_substr):
