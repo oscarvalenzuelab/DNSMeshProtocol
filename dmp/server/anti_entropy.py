@@ -750,9 +750,24 @@ class AntiEntropyWorker:
         # matching the operator-rollout DNS pattern the client's
         # highest-seq-wins fetch already handles.
         try:
-            # Use a modest TTL (5 min) so stale manifest wires age out
-            # instead of lingering forever after rollout.
-            self._store.publish_txt_record(rrset, wire, ttl=300)
+            # TTL anchors to the manifest's own ``exp`` timestamp.
+            # A fixed 5-min TTL aged out gossiped manifests on nodes
+            # that learned the cluster ONLY via gossip — after 300s the
+            # record expired, /v1/sync/cluster-manifest returned 204,
+            # and downstream peers/clients could no longer discover the
+            # current manifest from this node. Tying the TTL to the
+            # manifest's expiry guarantees the TXT outlives its own
+            # validity window; a fresh install each time the worker
+            # learns a higher seq refreshes it.
+            import time as _time
+
+            now = int(_time.time())
+            exp_remaining = max(1, manifest.exp - now)
+            # Cap at 24h so a long-horizon operator manifest doesn't
+            # pin a defunct wire in the store past a reasonable refresh
+            # cadence.
+            ttl = min(exp_remaining, 86400)
+            self._store.publish_txt_record(rrset, wire, ttl=ttl)
         except Exception:
             log.exception(
                 "anti-entropy: gossip install: store publish for %s failed", rrset
@@ -815,26 +830,24 @@ class AntiEntropyWorker:
             return url.strip().rstrip("/").lower()
 
         with self._lock:
+            # Identity for retention is the normalized endpoint, NOT
+            # node_id. Same-endpoint-any-id preserves the cursor (covers
+            # both "same node, same id" and the synthetic-to-operator
+            # id rotation). Endpoint change — even under an identical
+            # node_id — means a genuinely new host/port and must get
+            # a fresh cursor: resuming from the middle of the digest
+            # stream would skip historical records the new endpoint
+            # hasn't replicated yet.
             old_by_endpoint: Dict[str, Cursor] = {}
-            for old_pid, old_peer in zip(self._watermarks.keys(), self._peers):
-                if old_peer.node_id != old_pid:
-                    # defensive: keep the pairing explicit via _peers
-                    continue
-                old_by_endpoint[_norm_endpoint(old_peer.http_endpoint)] = (
-                    self._watermarks[old_pid]
-                )
+            for old_peer in self._peers:
+                cur = self._watermarks.get(old_peer.node_id)
+                if cur is not None:
+                    old_by_endpoint[_norm_endpoint(old_peer.http_endpoint)] = cur
 
             new_watermarks: Dict[str, Cursor] = {}
             for p in deduped:
                 key_ep = _norm_endpoint(p.http_endpoint)
-                if p.node_id in self._watermarks:
-                    # Exact node_id match — preserve cursor.
-                    new_watermarks[p.node_id] = self._watermarks[p.node_id]
-                elif key_ep in old_by_endpoint:
-                    # Node_id changed but endpoint is the same physical
-                    # peer (e.g. DMP_SYNC_PEERS synthetic id →
-                    # operator-defined id from the gossiped manifest).
-                    # Carry the cursor forward under the new id.
+                if key_ep in old_by_endpoint:
                     new_watermarks[p.node_id] = old_by_endpoint[key_ep]
                 else:
                     new_watermarks[p.node_id] = (0, "", "")
