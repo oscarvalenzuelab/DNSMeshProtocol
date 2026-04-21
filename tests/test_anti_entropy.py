@@ -475,3 +475,39 @@ class TestWorkerTick:
         worker.start()
         worker.stop()
         worker.stop()  # must not raise
+
+    def test_watermark_does_not_skip_unpulled_names_past_limit(self):
+        """Regression: many same-ms records with >pull_limit missing.
+
+        Pre-fix, the watermark advanced to max(digest.ts) even though we
+        only pulled the first `pull_batch_limit` names, dropping the rest
+        forever. Now it must cap strictly below the first deferred ts so
+        subsequent ticks can catch up.
+        """
+        local = InMemoryDNSStore()
+        peer_fake = FakePeerHTTP("n2")
+        # Populate the peer with more rows than a single pull request
+        # can carry. The ms-resolution stored_ts means pagination also
+        # can't rely on second-granularity cursor safety.
+        total = 300
+        for i in range(total):
+            peer_fake.store.publish_txt_record(f"r{i:04d}.mesh.test", f"v{i}", ttl=300)
+
+        peer = SyncPeer(node_id="n2", http_endpoint="http://n2.example")
+        # Use a small pull_batch_limit to force the deferred path.
+        worker = _make_worker(
+            local,
+            [(peer, peer_fake)],
+            pull_batch_limit=64,
+            digest_batch_limit=total + 10,
+        )
+
+        # Bounded retries to account for the digest limit + pagination.
+        for _ in range(10):
+            worker.tick_once()
+            if len(local.list_names()) >= total:
+                break
+
+        # All rows should have landed.
+        for i in range(total):
+            assert local.query_txt_record(f"r{i:04d}.mesh.test") == [f"v{i}"]
