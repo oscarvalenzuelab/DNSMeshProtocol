@@ -1165,6 +1165,16 @@ def cmd_cluster_pin(args: argparse.Namespace) -> int:
         _die(1, "operator_spk must be 64 hex chars (32 bytes Ed25519)")
     if len(raw) != 32:
         _die(1, f"operator_spk must be 32 bytes; got {len(raw)}")
+    # Validate the base domain the same way cluster_rrset_name will:
+    # reject anything that can't be a DNS owner name. Otherwise the
+    # pin succeeds but the next cluster-backed command raises
+    # ValueError out of main() instead of a normal CLI error.
+    from dmp.core.cluster import _validate_dns_name as _validate_cluster_dns
+
+    try:
+        _validate_cluster_dns(args.base_domain)
+    except ValueError as exc:
+        _die(1, f"invalid base_domain: {exc}")
     cfg.cluster_operator_spk = args.operator_spk.lower()
     cfg.cluster_base_domain = args.base_domain
     cfg.save(path)
