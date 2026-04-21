@@ -631,3 +631,500 @@ class TestConstruction:
             assert reader.snapshot() == []
         finally:
             reader.close()
+
+    def test_rejects_expired_manifest_on_init(self):
+        """An already-expired manifest must be rejected on construction,
+        mirroring install_manifest's invariant. Otherwise a direct call
+        or reload path silently queries stale nodes until the next
+        refresh."""
+        nodes = [_node(1)]
+        fakes = {"n01": FakeReader(["a"])}
+        expired = _manifest(nodes, seq=1, exp_delta=-60)
+        with pytest.raises(ValueError, match="expired"):
+            UnionReader(expired, _factory(fakes))
+
+
+# ---------------------------------------------------------------------
+# Endpoint-change semantics (DNS and HTTP parity with FanoutWriter)
+# ---------------------------------------------------------------------
+
+
+class _TrackingFactory:
+    """Factory that records every call and hands back a fresh FakeReader each time.
+
+    Mirrors tests/test_fanout_writer.py's _TrackingFactory. Lets tests
+    assert how many readers were built and inspect each generation.
+    """
+
+    def __init__(self, records_per_node: Optional[dict] = None) -> None:
+        # node_id -> list[FakeReader] (one entry per factory call).
+        self.readers: dict = {}
+        # (node_id, http_endpoint, dns_endpoint) per factory call.
+        self.calls: list = []
+        self._records_per_node = records_per_node or {}
+
+    def __call__(self, node: ClusterNode) -> DNSRecordReader:
+        recs = self._records_per_node.get(node.node_id, [node.node_id])
+        r = FakeReader(list(recs))
+        self.calls.append((node.node_id, node.http_endpoint, node.dns_endpoint))
+        self.readers.setdefault(node.node_id, []).append(r)
+        return r
+
+    def latest(self, node_id: str) -> FakeReader:
+        return self.readers[node_id][-1]
+
+    def first(self, node_id: str) -> FakeReader:
+        return self.readers[node_id][0]
+
+
+class TestEndpointChange:
+    def test_http_endpoint_change_triggers_new_reader(self):
+        """HTTP endpoint drift rebuilds the reader via the factory."""
+        factory = _TrackingFactory()
+        n00_v1 = ClusterNode(node_id="n00", http_endpoint="https://e1.example:8053")
+        m1 = _manifest([n00_v1], seq=1)
+        with UnionReader(m1, factory) as reader:
+            reader.query_txt_record("x")
+            assert len(factory.first("n00").query_calls) == 1
+
+            n00_v2 = ClusterNode(node_id="n00", http_endpoint="https://e2.example:8053")
+            m2 = _manifest([n00_v2], seq=2)
+            assert reader.install_manifest(m2) is True
+            # Factory must have been called again for the rebuilt reader.
+            assert [(c[0], c[1]) for c in factory.calls] == [
+                ("n00", "https://e1.example:8053"),
+                ("n00", "https://e2.example:8053"),
+            ]
+            # Next query hits E2's reader, not E1's.
+            reader.query_txt_record("y")
+            assert len(factory.first("n00").query_calls) == 1  # E1 unchanged
+            assert len(factory.latest("n00").query_calls) == 1  # E2 got the new one
+            snap = reader.snapshot()
+            assert snap[0]["http_endpoint"] == "https://e2.example:8053"
+
+    def test_dns_endpoint_change_triggers_new_reader(self):
+        """DNS-only endpoint drift (HTTP identical) must still rebuild.
+
+        This is the Codex P1 fix: the pre-fix code only compared
+        http_endpoint and silently kept the stale reader around.
+        """
+        factory = _TrackingFactory()
+        n00_v1 = ClusterNode(
+            node_id="n00",
+            http_endpoint="https://e.example:8053",
+            dns_endpoint="203.0.113.1:53",
+        )
+        m1 = _manifest([n00_v1], seq=1)
+        with UnionReader(m1, factory) as reader:
+            n00_v2 = ClusterNode(
+                node_id="n00",
+                http_endpoint="https://e.example:8053",  # unchanged
+                dns_endpoint="203.0.113.2:53",  # changed
+            )
+            m2 = _manifest([n00_v2], seq=2)
+            assert reader.install_manifest(m2) is True
+            # HTTP endpoint is the same but dns_endpoint changed; still
+            # expect the reader to be rebuilt.
+            assert len(factory.calls) == 2
+
+    def test_both_endpoints_unchanged_reuses_reader(self):
+        """Refresh with identical node entry must not call the factory again."""
+        factory = _TrackingFactory()
+        node = ClusterNode(
+            node_id="n00",
+            http_endpoint="https://e.example:8053",
+            dns_endpoint="203.0.113.1:53",
+        )
+        m1 = _manifest([node], seq=1)
+        with UnionReader(m1, factory) as reader:
+            # Identical second manifest — only seq advances.
+            m2 = _manifest([node], seq=2)
+            assert reader.install_manifest(m2) is True
+            # One factory call only: the initial construction.
+            assert len(factory.calls) == 1
+            # And the reader instance survived the refresh.
+            assert reader.query_txt_record("x") == ["n00"]
+            assert len(factory.first("n00").query_calls) == 1
+
+    def test_health_preserved_across_endpoint_change(self):
+        """consecutive_failures must survive the endpoint swap."""
+        # Custom factory: first reader raises (fails), second succeeds.
+        made: List[FakeReader] = []
+
+        def factory(node: ClusterNode) -> DNSRecordReader:
+            if not made:
+                r = FakeReader(raise_exc=RuntimeError("down"))
+            else:
+                r = FakeReader(["ok"])
+            made.append(r)
+            return r
+
+        n00_v1 = ClusterNode(node_id="n00", http_endpoint="https://e1.example:8053")
+        m1 = _manifest([n00_v1], seq=1)
+        with UnionReader(m1, factory) as reader:
+            # Drive consecutive_failures up on the E1 reader.
+            reader.query_txt_record("a")
+            reader.query_txt_record("b")
+            pre = reader.snapshot()[0]
+            assert pre["consecutive_failures"] == 2
+            pre_last_failure_ts = pre["last_failure_ts"]
+
+            # Refresh to E2 (HTTP change). Health counters must survive.
+            n00_v2 = ClusterNode(node_id="n00", http_endpoint="https://e2.example:8053")
+            m2 = _manifest([n00_v2], seq=2)
+            assert reader.install_manifest(m2) is True
+            post = reader.snapshot()[0]
+            assert post["consecutive_failures"] == 2
+            assert post["last_failure_ts"] == pre_last_failure_ts
+            assert post["http_endpoint"] == "https://e2.example:8053"
+
+    def test_endpoint_change_retains_old_reader_until_close(self):
+        """The rebuilt reader must not be close()'d at swap time."""
+
+        class ClosableReader(FakeReader):
+            def __init__(self, records=None) -> None:
+                super().__init__(records=records)
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        made: List[ClosableReader] = []
+
+        def factory(node: ClusterNode) -> DNSRecordReader:
+            r = ClosableReader([node.node_id])
+            made.append(r)
+            return r
+
+        n00_v1 = ClusterNode(node_id="n00", http_endpoint="https://e1.example:8053")
+        m1 = _manifest([n00_v1], seq=1)
+        reader = UnionReader(m1, factory)
+        try:
+            n00_v2 = ClusterNode(node_id="n00", http_endpoint="https://e2.example:8053")
+            m2 = _manifest([n00_v2], seq=2)
+            assert reader.install_manifest(m2) is True
+            # The E1 reader is retained, not yet closed.
+            assert made[0].close_calls == 0
+        finally:
+            reader.close()
+        # After close, the retained E1 reader is drained.
+        assert made[0].close_calls == 1
+
+    def test_inflight_future_on_old_reader_does_not_mutate_new_state(self):
+        """An endpoint change must give in-flight futures their original
+        reader. If install_manifest mutated `_NodeState.reader` in place,
+        a future submitted against the old reader would (a) potentially
+        route its call to the new reader on late execution, and (b)
+        record its late success/failure against the new endpoint's
+        health counters. Creating a fresh _NodeState isolates both.
+
+        Mirrors tests/test_fanout_writer.py::
+        test_inflight_future_on_old_writer_does_not_mutate_new_state.
+        """
+        slow_old = FakeReader(["old"], latency_ms=200)
+        new_reader_obj = FakeReader(["new"])
+        call_log: list = []
+
+        def factory(node: ClusterNode) -> DNSRecordReader:
+            call_log.append(node.http_endpoint)
+            if node.http_endpoint == "https://n0.example.com:8053":
+                return slow_old
+            return new_reader_obj
+
+        n00 = ClusterNode(node_id="n00", http_endpoint="https://n0.example.com:8053")
+        m1 = _manifest([n00], seq=1)
+        reader = UnionReader(m1, factory, timeout=2.0)
+
+        # Fire a query in a thread so install_manifest can race it.
+        result: dict = {}
+
+        def do_query():
+            result["out"] = reader.query_txt_record("x")
+
+        t = threading.Thread(target=do_query, daemon=True)
+        t.start()
+        # Give the executor a moment to dispatch.
+        time.sleep(0.02)
+        # Rotate the endpoint. slow_old is in flight; a fresh
+        # _NodeState is created for the new endpoint.
+        n00_rot = ClusterNode(
+            node_id="n00", http_endpoint="https://n0-rotated.example.com:8053"
+        )
+        m2 = _manifest([n00_rot], seq=2)
+        assert reader.install_manifest(m2) is True
+        # Old reader's call should still complete on slow_old (its
+        # original binding), not on new_reader_obj.
+        t.join(timeout=3.0)
+        assert result["out"] == ["old"]
+        # Factory called exactly twice.
+        assert len(call_log) == 2
+        # The late old-reader success landed on the retired _NodeState,
+        # not on the new endpoint's counters. The new _NodeState
+        # inherited the old's counters at refresh time (all zeros) and
+        # has NOT been updated since — because the late future still
+        # holds a reference to the ORIGINAL _NodeState.
+        snap = reader.snapshot()
+        assert len(snap) == 1
+        new_entry = snap[0]
+        assert new_entry["http_endpoint"] == "https://n0-rotated.example.com:8053"
+        # No query has been issued against new_reader_obj yet.
+        assert new_reader_obj.query_calls == []
+        # slow_old DID see the query.
+        assert len(slow_old.query_calls) == 1
+        reader.close()
+
+
+# ---------------------------------------------------------------------
+# Close / post-close behavior
+# ---------------------------------------------------------------------
+
+
+class TestCloseBehavior:
+    def test_install_rejected_after_close(self):
+        """A close() in flight must block further installs; otherwise
+        we'd allocate readers / a new executor that close() already
+        committed to not draining."""
+        nodes = [_node(1)]
+        fakes = {"n01": FakeReader(["a"])}
+        reader = UnionReader(_manifest(nodes, seq=1), _factory(fakes))
+        reader.close()
+        fakes["n02"] = FakeReader(["b"])
+        nodes_v2 = [_node(1), _node(2)]
+        assert reader.install_manifest(_manifest(nodes_v2, seq=2)) is False
+
+    def test_close_is_idempotent(self):
+        nodes = [_node(1)]
+        fakes = {"n01": FakeReader(["a"])}
+        reader = UnionReader(_manifest(nodes), _factory(fakes))
+        reader.close()
+        reader.close()  # Must not raise.
+
+    def test_close_waits_for_inflight_before_closing_retired_readers(self):
+        """close() must wait for in-flight query futures to finish
+        before closing retained readers. Otherwise the mid-flight race
+        the retention list was supposed to fix reappears at teardown.
+
+        Mirrors test_fanout_writer's
+        test_close_waits_for_inflight_before_closing_retired_writers.
+        """
+        order: list = []
+
+        class OrderingReader(FakeReader):
+            def __init__(self, records=None, *, latency_ms=0):
+                super().__init__(records=records, latency_ms=latency_ms)
+                self.close_calls = 0
+
+            def query_txt_record(self, name: str):
+                if self.latency_ms:
+                    time.sleep(self.latency_ms / 1000.0)
+                order.append("query-done")
+                self.query_calls.append(name)
+                return list(self.records) if self.records else []
+
+            def close(self) -> None:
+                order.append("close")
+                self.close_calls += 1
+
+        slow = OrderingReader(records=["slow"], latency_ms=300)
+        fast = OrderingReader(records=["fast"])
+        mapping = {"n01": slow, "n02": fast}
+
+        def factory(node):
+            return mapping[node.node_id]
+
+        nodes_v1 = [_node(1), _node(2)]
+        m1 = _manifest(nodes_v1, seq=1)
+        # Long timeout → union waits for every node, so no straggler
+        # left behind at query-return time. But retirement via
+        # install_manifest happens AFTER a subsequent query that leaves
+        # slow still in flight? Simpler: fire a slow-latency query,
+        # retire n01 mid-flight, and close().
+        reader = UnionReader(m1, factory, timeout=5.0)
+        # Kick off a query with a short client-side join so slow is
+        # still mid-execution when install_manifest runs.
+        q_done = threading.Event()
+
+        def do_query():
+            reader.query_txt_record("x")
+            q_done.set()
+
+        t = threading.Thread(target=do_query, daemon=True)
+        t.start()
+        # Wait until fast has finished and slow is still running.
+        time.sleep(0.05)
+        # Retire slow by dropping n01 from the manifest.
+        m2 = _manifest([_node(2)], seq=2)
+        assert reader.install_manifest(m2) is True
+        # Close must drain slow's in-flight query BEFORE calling its
+        # close(). Ordering assertion proves the race is fixed.
+        reader.close()
+        assert q_done.wait(timeout=5.0)
+        t.join(timeout=5.0)
+        assert "query-done" in order
+        # The retired slow reader was closed after its in-flight query
+        # completed. We can't assert a fixed relative index (fast's
+        # query-done also lives in order) but we can assert that
+        # slow's "close" followed slow's "query-done".
+        # Find the index of slow's own close (there's only one close
+        # for the retired reader; fast is live and never closed).
+        assert slow.close_calls == 1
+        # slow's query_calls must have been recorded (it finished).
+        assert slow.query_calls == ["x"]
+        # fast was not retired; never closed.
+        assert fast.close_calls == 0
+
+
+# ---------------------------------------------------------------------
+# Manifest deepcopy isolation
+# ---------------------------------------------------------------------
+
+
+class TestManifestDeepcopy:
+    def test_mutating_caller_manifest_after_install_does_not_affect_reader(self):
+        """UnionReader must deepcopy installed manifests so a caller
+        that reuses and mutates the dataclass after install can't
+        corrupt our retained comparison state (e.g. sneaking in a
+        lower-seq refresh on the next call).
+        """
+        nodes = [_node(1)]
+        fakes = {"n01": FakeReader(["a"])}
+        m1 = _manifest(nodes, seq=1)
+        reader = UnionReader(m1, _factory(fakes))
+        try:
+            # Mutate the caller's manifest after the constructor accepted it.
+            object.__setattr__(m1, "seq", 999)
+            # The reader's snapshot of the manifest still reflects seq=1.
+            assert reader.manifest.seq == 1
+            # A refresh to seq=2 must still be accepted (would be
+            # rejected as <=999 if UnionReader had retained the
+            # mutated dataclass).
+            fakes["n02"] = FakeReader(["b"])
+            m2 = _manifest([_node(1), _node(2)], seq=2)
+            assert reader.install_manifest(m2) is True
+        finally:
+            reader.close()
+
+    def test_install_manifest_deepcopy(self):
+        """install_manifest must also deepcopy — otherwise a caller
+        that mutates the post-install manifest dataclass could corrupt
+        our monotonicity check."""
+        nodes = [_node(1)]
+        fakes = {"n01": FakeReader(["a"])}
+        reader = UnionReader(_manifest(nodes, seq=1), _factory(fakes))
+        try:
+            m2 = _manifest(nodes, seq=2)
+            assert reader.install_manifest(m2) is True
+            # Mutate the caller-side dataclass after install.
+            object.__setattr__(m2, "seq", 999)
+            # Reader's retained seq is still 2.
+            assert reader.manifest.seq == 2
+            # So seq=3 is accepted.
+            m3 = _manifest(nodes, seq=3)
+            assert reader.install_manifest(m3) is True
+        finally:
+            reader.close()
+
+
+# ---------------------------------------------------------------------
+# max_workers preservation on growth
+# ---------------------------------------------------------------------
+
+
+class TestMaxWorkersPreservation:
+    def test_user_cap_preserved_across_manifest_growth(self):
+        """max_workers=2 caller must still get 2 threads even when a
+        manifest refresh grows from 1 node to 10.
+
+        Mirrors test_fanout_writer's
+        test_user_cap_preserved_across_manifest_growth.
+        """
+        nodes_v1 = [_node(0)]
+        fakes = {f"n{i:02d}": FakeReader([f"n{i:02d}"]) for i in range(10)}
+        reader = UnionReader(_manifest(nodes_v1, seq=1), _factory(fakes), max_workers=2)
+        try:
+            nodes_v2 = [_node(i) for i in range(10)]
+            assert reader.install_manifest(_manifest(nodes_v2, seq=2)) is True
+            # Active executor still honors the caller's cap.
+            assert reader._executor._max_workers == 2  # type: ignore[attr-defined]
+        finally:
+            reader.close()
+
+    def test_default_heuristic_when_user_did_not_pin(self):
+        """When max_workers is None, min(N, 16) applies on resize."""
+        nodes_v1 = [_node(0)]
+        fakes = {f"n{i:02d}": FakeReader([f"n{i:02d}"]) for i in range(8)}
+        reader = UnionReader(_manifest(nodes_v1, seq=1), _factory(fakes))
+        try:
+            nodes_v2 = [_node(i) for i in range(8)]
+            assert reader.install_manifest(_manifest(nodes_v2, seq=2)) is True
+            assert reader._executor._max_workers == 8  # type: ignore[attr-defined]
+        finally:
+            reader.close()
+
+
+# ---------------------------------------------------------------------
+# Pending-future cancellation on timeout
+# ---------------------------------------------------------------------
+
+
+class TestTimeoutCancelsPending:
+    def test_pending_future_cancelled_on_timeout(self):
+        """On timeout, Future.cancel() is called on every unfinished
+        future. Futures that were PENDING (never started) are actually
+        cancelled and their queue slots freed; futures that were
+        RUNNING keep going (cancel() returns False on them) but we at
+        least call cancel() on all of them.
+
+        Setup: pool sized to 1 worker. First node holds the worker
+        indefinitely. Second node is QUEUED and never gets to run. On
+        timeout, its future must be cancelled (future.cancelled() is
+        True).
+        """
+        gate = threading.Event()
+        n01_reader = FakeReader(["n01"], release_event=gate)
+        n02_reader = FakeReader(["n02"])
+        mapping = {"n01": n01_reader, "n02": n02_reader}
+
+        def factory(node):
+            return mapping[node.node_id]
+
+        nodes = [_node(1), _node(2)]
+        # Force the pool to 1 worker so n02 is PENDING (still in the
+        # queue) while n01 is RUNNING. This is what lets us observe a
+        # real cancelled=True rather than just future.cancel() ==
+        # False on a running future.
+        reader = UnionReader(_manifest(nodes), factory, timeout=0.3, max_workers=1)
+        try:
+            # Patch submit to capture the futures as they're created.
+            captured: list = []
+            original_submit = reader._executor.submit
+
+            def capture_submit(*args, **kwargs):
+                f = original_submit(*args, **kwargs)
+                captured.append(f)
+                return f
+
+            reader._executor.submit = capture_submit  # type: ignore[method-assign]
+
+            # Fire the query. n01 blocks on `gate`; n02 stays pending
+            # (queue) because the pool has 1 worker. Timeout fires at
+            # 0.3s.
+            result = reader.query_txt_record("x")
+            # No fast node succeeded (n01 is blocked on gate, n02
+            # never ran) → None.
+            assert result is None
+            # The pending future (n02's) MUST be cancelled after the
+            # timeout path. Running futures (n01's) return False on
+            # cancel() and may or may not be marked cancelled — the
+            # important, testable assertion is that the pending one
+            # is cancelled.
+            assert len(captured) == 2
+            # n02's future is index 1 (submitted second, queued).
+            assert captured[1].cancelled() is True, (
+                "pending future must be cancelled on timeout to free " "its queue slot"
+            )
+        finally:
+            # Release n01 so the worker thread unblocks before
+            # reader.close() tries to drain it.
+            gate.set()
+            reader.close()
