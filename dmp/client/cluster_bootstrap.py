@@ -212,15 +212,40 @@ class ClusterClient:
         this directly as a synchronous "tick" even when no background
         thread is running.
 
+        Atomicity contract
+        ------------------
+        The install is atomic across the :class:`FanoutWriter` and
+        :class:`UnionReader`: either both sides advance to the new
+        manifest's seq, or neither does. There is no intermediate state
+        in which writes land on one node set while reads target another
+        — which would make freshly published records invisible during a
+        rollout window.
+
+        To achieve this, the method first dry-runs both per-node
+        factories against every node of the newly fetched manifest. If
+        any factory raises (e.g. a malformed ``http_endpoint`` slipped
+        through operator publishing, or a ``dns_endpoint`` the reader
+        factory cannot parse), the refresh is abandoned: both
+        ``install_manifest`` calls are skipped and the existing
+        installations stay untouched. Once the dry-run has succeeded,
+        the subsequent ``install_manifest`` calls on both sides
+        re-invoke the factories internally — but since we just
+        demonstrated they don't raise for this manifest, the per-node
+        build on the real install is guaranteed not to surface a
+        factory exception.
+
         Failures that return ``False`` (not raise):
         - bootstrap reader returns no record / all records fail verify,
         - newly fetched manifest has ``seq <= current.seq`` (the
           underlying install returns False for stale),
-        - the new manifest is already expired.
+        - the new manifest is already expired,
+        - the dry-run factory probe raises for any node in the new
+          manifest (logged at WARNING; both sides stay at old seq).
 
-        Truly unexpected exceptions (e.g. a bug in a factory) are
-        allowed to propagate so they surface in logs rather than being
-        silently swallowed by the refresh loop.
+        Truly unexpected exceptions (e.g. a library bug in
+        ``install_manifest`` itself) are allowed to propagate so they
+        surface in logs rather than being silently swallowed by the
+        refresh loop.
         """
         new_manifest = fetch_cluster_manifest(
             self._base_domain,
@@ -229,20 +254,45 @@ class ClusterClient:
         )
         if new_manifest is None:
             return False
-        # FanoutWriter / UnionReader both enforce seq-monotonicity and
-        # expiry internally. Install atomically: if the reader install
-        # raises (e.g. a reader_factory can't parse a new dns_endpoint),
-        # we must not have already swapped the writer — otherwise
-        # writes would land on the new node set while reads stay on
-        # the old one, and newly published messages become invisible.
-        # Try reader first: it has the richer failure surface (its
-        # factory consumes dns_endpoint, which ClusterManifest does
-        # not validate). If reader install succeeds, writer install
-        # for the same seq is guaranteed to succeed (same
-        # monotonicity rules, writer_factory consumes http_endpoint
-        # which is also unvalidated — if it raises here, we at worst
-        # have reader-ahead-of-writer for one cycle, which the next
-        # refresh will reconcile).
+        # Dry-run BOTH factories against every node in the new manifest
+        # before touching either install_manifest. If any factory raises
+        # (e.g. a malformed http_endpoint in a newly published manifest,
+        # an unparseable dns_endpoint) we discard the probe instances
+        # and return False — neither side advances. This prevents the
+        # reader-then-writer split-brain where reads move to the new
+        # node set while writes remain on the old one, which would make
+        # freshly published records briefly invisible.
+        #
+        # The probes are cheap and discarded: the subsequent
+        # install_manifest calls build their own per-node instances via
+        # the same factory. Since we've just shown the factory doesn't
+        # raise on any node in this manifest, those internal builds are
+        # guaranteed not to trip a factory exception.
+        # We deliberately DO NOT call close() on probe instances. Factories
+        # are allowed to return shared/singleton objects — `_make_cluster_reader_factory`
+        # hands back the live bootstrap reader for nodes without a
+        # `dns_endpoint`, and tests commonly use pre-built shared writers.
+        # Closing a probe could tear down a live instance the installed
+        # ClusterClient is actively using. The probe objects are cheap
+        # Python references; dropping them at function exit lets the GC
+        # reclaim any throwaway instances without risking shared ones.
+        for node in new_manifest.nodes:
+            try:
+                self._writer_factory(node)
+                self._reader_factory(node)
+            except Exception as exc:
+                log.warning(
+                    "cluster manifest refresh aborted: factory "
+                    "probe failed for node %r: %s",
+                    node.node_id,
+                    exc,
+                )
+                return False
+        # Dry-run passed: both install_manifest calls will succeed at
+        # the factory layer. Any remaining False return is a
+        # monotonicity/expiry rejection, which both sides apply
+        # identically (same seq, same `now`-adjacent is_expired window),
+        # so they cannot disagree on accept vs reject.
         #
         # Both sides receive their own deepcopy of the same fetched
         # manifest so install-time mutation on one side can't
