@@ -5,98 +5,127 @@ This is the honest gap between what ships today and what the
 critical path for tagging `v0.2.0-beta` and then a `v1.0` that earns the
 word "decentralized" in the tagline.
 
-**Status:** `v0.1.0-alpha`, pre-audit. Two rounds of automated code review
-(Codex) completed. Third-party cryptographic audit is the gate for
-`v0.2.0-beta`.
+**Status (2026-04-21):** `v0.1.0-alpha`, pre-external-audit. M1 through
+M4.1 are shipped. Node-side federation backfill (M2.4/M2.5/M2.6),
+node-to-node gossip (M3.3), and the external cryptographic audit (M4.2–
+M4.4) are the remaining gates to `v0.2.0-beta`. See the per-milestone
+status below.
+
+Atomic tasks for the current sprint live in [`TASKS.md`](TASKS.md);
+long-horizon items stay here until they get lifted into a sprint.
 
 ## Milestones
 
-### M1 — Resolver resilience (1.5 weeks)
+### M1 — Resolver resilience — SHIPPED
 
-Turn "works where you configured it" into "works wherever DNS works." Small
-and high-value.
+Client-side resolver pool with multi-upstream failover. `dmp` keeps
+working when the primary configured resolver starts returning NXDOMAIN
+or SERVFAIL for DMP-shaped names.
 
-- [ ] **M1.1** `ResolverPool` class: multiple upstream resolvers, per-host
-      health, automatic failover on NXDOMAIN/SERVFAIL/timeout. (2 days)
-- [ ] **M1.2** CLI exposes `--dns-resolvers 8.8.8.8,1.1.1.1,9.9.9.9`,
-      falls back to system. (1 day)
-- [ ] **M1.3** Dynamic resolver discovery: probe a set of well-known public
-      resolvers, add working ones to the pool. (3 days)
-- [ ] **M1.4** Integration tests: simulate one resolver blocking DMP
-      names, confirm the client recovers via another. (2 days)
+- [x] **M1.1** `ResolverPool` with per-host health, oracle-based
+      demotion, cooldown-as-preference fallback — commits `7cb8d7f..12376a4`.
+- [x] **M1.2** CLI `--dns-resolvers 8.8.8.8,1.1.1.1,9.9.9.9`, falls
+      back to legacy single-host — commit `3096eb0`.
+- [x] **M1.3** Dynamic resolver discovery (`dmp resolvers discover
+      [--save]` / `dmp resolvers list`) — commit `d39cb56`.
+- [x] **M1.4** Integration tests: two local UDP DNS stubs, one serving
+      correctly, one NXDOMAIN'ing; client survives — commits `29c5c44`,
+      `6108c66`.
+- [x] **M1.5** Per-host ports in `ResolverPool` + retroactive Codex
+      cleanup on M1.2 / M1.3 — commits `9bfab67..f9d3dfa`.
 
-**Exit criteria:** client continues to work when the primary configured
-resolver starts returning NXDOMAIN for DMP-shaped names.
+### M2 — Client-side federation — SHIPPED (partial; see M2.4–M2.6)
 
-### M2 — Multi-node federation + 3× redundancy (6–8 weeks)
+Clients can fan writes across multiple nodes and read-union across
+them. This is real, tested federation *from the client's perspective*.
+What's still missing is node-side backfill: if a node goes offline
+while a client wrote elsewhere, the node has no background sync to
+pick up what it missed.
 
-This is the milestone that makes "decentralized" honest. Without it, a
-single node is the single point of failure.
+- [x] **M2.1** `ClusterManifest` record type — signed TXT at
+      `cluster.<base>` listing the cluster's nodes — commits
+      `548c5b7..b3bc8be`.
+- [x] **M2.2** `FanoutWriter`: publish/delete to every node in parallel;
+      return True iff ≥ `ceil(N/2)` ack within timeout — commits
+      `9c71332..b55c93b`.
+- [x] **M2.3** `UnionReader`: query every node concurrently, union
+      dedup'd TXT answers — commits `7a0340e..f5e3776`.
+- [x] **M2.wire** CLI + client integration (`dmp cluster pin/fetch/
+      enable/disable/status`, cluster-mode in `_make_client`) — commits
+      `94964d9..31eba4e`; plus polish (`M2.wire-polish`) +
+      `cluster-composite-reader` (cross-domain reads) +
+      `cluster-atomic-refresh` (no split-brain on manifest refresh).
+- [ ] **M2.4** *(NOT SHIPPED)* Inter-node anti-entropy: a node that was
+      offline catches up on records it missed by pulling from peers.
+      Without this, client-side fan-out masks the gap only as long as
+      clients keep writing.
+- [ ] **M2.5** *(NOT SHIPPED)* Federation integration test suite: spin
+      up 3 separate dmp-node containers in compose, kill one, verify no
+      message is lost. Today's cluster tests are in-process or
+      single-container.
+- [ ] **M2.6** *(NOT SHIPPED)* `docker-compose.cluster.yml` operator
+      sample.
 
-- [ ] **M2.1** Node cluster manifest: each node publishes a signed record
-      naming the other nodes it replicates with. (1 week)
-- [ ] **M2.2** Write-fan-out: `DMPClient.send_message` picks `r_w` nodes
-      (default 3) from its configured set and publishes each chunk/manifest
-      to all of them. Fail only if fewer than `r_w / 2` succeed. (1.5 weeks)
-- [ ] **M2.3** Read-union: `receive_messages` queries all known nodes for
-      each mailbox slot, dedupes by `(sender_spk, msg_id)`. (1 week)
-- [ ] **M2.4** Inter-node sync: lightweight anti-entropy protocol so a
-      node that was offline catches up on records it missed. (2 weeks)
-- [ ] **M2.5** Federation integration test suite: spin up 3 nodes in
-      compose, kill one, verify no message is lost. (1 week)
-- [ ] **M2.6** `docker-compose.cluster.yml` sample for operators. (3 days)
+**Exit criteria for M2 *complete*:** three-node compose cluster; killing
+any one node at any time still delivers every message AND a node that
+rejoins catches up.
 
-**Exit criteria:** three-node compose cluster; killing any one node at
-any time still delivers every message.
+### M3 — Bootstrap and discovery — SHIPPED (partial; see M3.3)
 
-### M3 — Bootstrap and discovery (1–2 weeks)
+A user given just `alice@example.com` can auto-discover the cluster
+serving that domain. The two-hop trust chain (bootstrap signer →
+cluster operator) verifies before any config is written.
 
-Federation without discovery means every client is a manual configuration
-exercise. This closes the usability gap.
+- [x] **M3.1** `BootstrapRecord` at `_dmp.<user_domain>` — signed pointer
+      from a user domain to one or more clusters with priority-ordered
+      fallback — commits `cd2f383..5c33cd5`, plus `81f1dd7`.
+- [x] **M3.2-wire** `dmp bootstrap pin/fetch/discover [--auto-pin]` +
+      `identity fetch --via-bootstrap` — commits `20a83fe..d21c305`.
+- [ ] **M3.3** *(NOT SHIPPED)* Node-to-node gossip: nodes periodically
+      exchange peer lists so a warmed-up node knows about newcomers
+      within minutes. Currently the node set is static — operators
+      update the signed cluster manifest manually.
 
-- [ ] **M3.1** Bootstrap-domain record type: a signed TXT at a well-known
-      name listing currently-live nodes with their DNS + HTTP endpoints.
-      (3 days)
-- [ ] **M3.2** Client `dmp bootstrap <bootstrap.example.com>` pulls the
-      list and appends to config. (1 day)
-- [ ] **M3.3** Node-to-node gossip: nodes periodically exchange peer
-      lists so a warmed-up node knows about newcomers within minutes.
-      (4 days)
+**Exit criteria for M3 *complete*:** a fresh client with only
+`--bootstrap <one-name>` can onboard AND the node set can evolve
+without manual manifest republishing per change.
 
-**Exit criteria:** a fresh client with only `--bootstrap <one-name>` can
-send and receive messages without any further manual setup.
+### M4 — Formal spec + external audit — SHIPPED M4.1; M4.2–M4.4 BLOCKING BETA
 
-### M4 — External cryptographic audit (calendar time, ~8–12 weeks)
-
-Not code work, but blocking for `v0.2.0-beta`. Parallel with M2 and M3
-where possible.
-
-- [ ] **M4.1** Write a formal wire-format + protocol spec document
-      separate from the code (expanded from `docs/protocol/`).
-- [ ] **M4.2** Freeze the protocol surface for audit (tag `v0.2.0-rc1`).
-- [ ] **M4.3** Engage an auditor. Recommended scope: crypto composition,
-      replay + forward-secrecy claims, DoS surfaces, erasure-coding
-      soundness.
-- [ ] **M4.4** Address findings. Retest. Publish the report.
+- [x] **M4.1** Formal wire-format + protocol spec under
+      `docs/protocol/` (spec.md, wire-encoding.md, routing.md, flows.md,
+      threat-model.md, README.md — ~1500 lines, every constant
+      cross-verified against source) — commits `4380469..c4f18fc`.
+- [ ] **M4.2** *(NOT SHIPPED)* Freeze the protocol surface for audit
+      (tag `v0.2.0-rc1`).
+- [ ] **M4.3** *(NOT SHIPPED)* Engage an independent cryptographic
+      auditor. Recommended scope: crypto composition, replay +
+      forward-secrecy claims, DoS surfaces, erasure-coding soundness,
+      cluster-mode trust model.
+- [ ] **M4.4** *(NOT SHIPPED)* Address findings. Retest. Publish the
+      report.
 
 **Exit criteria:** independent auditor's report published and acted on.
 This is the `v0.2.0-beta` gate.
 
-### M5 — Reach (3–6 months, post-beta)
+### M5 — Reach — NOT SHIPPED (post-beta work)
 
-- [ ] **M5.1** PyPI release (1 day).
+- [ ] **M5.1** PyPI release. `setup.py` exists; package is not yet
+      published on pypi.org. (1 day once the beta gate opens.)
 - [ ] **M5.2** React Native shell app wrapping the protocol core over
-      gRPC or a local HTTP daemon. (2–3 months)
-- [ ] **M5.3** Web client using WASM crypto + Fetch for HTTP API. Works
-      anywhere a browser runs. (1 month)
-- [ ] **M5.4** Key rotation + revocation records. (2 weeks)
+      gRPC or a local HTTP daemon. (2–3 months.)
+- [ ] **M5.3** Web client using WASM crypto + Fetch for HTTP API.
+      (1 month.)
+- [ ] **M5.4** Key rotation + revocation records. (2 weeks.)
 
-### M6 — Traffic-analysis resistance (ongoing research)
+### M6 — Traffic-analysis resistance — NOT SHIPPED (research track)
 
-- [ ] **M6.1** Random per-message publish delays in a configurable window.
+- [ ] **M6.1** Random per-message publish delays in a configurable
+      window.
 - [ ] **M6.2** Fixed-size dummy chunks published on a schedule so the
       RRset size of a slot doesn't reveal message activity.
-- [ ] **M6.3** Chunk-ordering randomization (publish order ≠ chunk index).
+- [ ] **M6.3** Chunk-ordering randomization (publish order ≠ chunk
+      index).
 
 **Honest caveat:** strong traffic-analysis resistance against a
 state-level adversary is a research category, not a deliverable. M6 is
@@ -106,28 +135,22 @@ best-effort.
 
 These appear in the design-intent docs but are unlikely to ship as-spec:
 
-- **Mesh routing with Dijkstra / flooding fallback.** If M2 federation
-  works, there is no routing problem to solve beyond "which nodes to
-  query." Existing mesh libraries (Yggdrasil, cjdns) address the
-  multi-hop case better than a message-layer protocol could.
-- **All of DMP behaving as a relay for non-DMP traffic.** Out of
-  scope — DMP is an application-layer protocol, not an overlay
-  network.
+- **Mesh routing with Dijkstra / flooding fallback.** With M2/M3 in
+  place the routing problem reduces to "which cluster nodes to query."
+  Existing mesh libraries (Yggdrasil, cjdns) address the multi-hop case
+  better than a message-layer protocol could.
+- **All of DMP behaving as a relay for non-DMP traffic.** Out of scope
+  — DMP is an application-layer protocol, not an overlay network.
 
-## Critical path to "fully functional"
+## Critical path to `v0.2.0-beta`
 
-If I had to pick the shortest path from alpha to a DMP that matches the
-README's claims:
+The shortest remaining path:
 
-1. **M1** — resolver pool (1.5 weeks)
-2. **M2** — federation + redundancy (6–8 weeks)
-3. **M3** — bootstrap/discovery (1–2 weeks)
-4. **M4** — external audit (calendar time, parallel with M2/M3)
-5. **M5.1** — PyPI release (1 day, ≥ beta)
+1. **M2.4 + M2.5 + M2.6** — node-side federation backfill + 3-node
+   compose test suite + operator-facing compose sample.
+2. **M3.3** — node-to-node gossip for peer discovery.
+3. **M4.2 → M4.4** — engage an auditor, fix findings, publish report.
+4. **M5.1** — PyPI release.
 
-Total: **3–4 months of focused work** plus the audit's calendar time.
-
-## Tracking
-
-Atomic tasks for the current sprint live in [`TASKS.md`](TASKS.md).
-Long-horizon items stay here until they're lifted into a sprint.
+Items 1–2 are weeks of focused work; item 3 is calendar time bounded by
+the auditor's schedule. Item 4 is a day once items 1–3 are done.

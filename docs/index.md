@@ -152,19 +152,45 @@ anything whose secrecy matters through DMP until that audit is done.
 
 Actively shipping:
 
-- Command-line client (`dmp` on PyPI… soon)
-- Dockerized node with sqlite storage, metrics, rate limiting
-- Forward-secret messaging via one-time prekeys
-- Zone-anchored identity addresses (`user@zone.example.com`)
-- Ed25519 signature verification pinned to contacts
-- Reed-Solomon erasure coding so lost chunks still reconstruct
+- Command-line client (`dmp`, source install; PyPI release pending
+  the beta gate).
+- Dockerized node with sqlite storage, metrics, rate limiting.
+- Forward-secret messaging via one-time prekeys (prekey-consumed
+  messages only; long-term-key fallback does not get forward secrecy).
+- Zone-anchored identity addresses (`user@zone.example.com`).
+- Ed25519 signature verification pinned to contacts.
+- Reed-Solomon erasure coding so lost chunks still reconstruct.
+- **Resolver resilience** — a `ResolverPool` with oracle-based
+  demotion survives a subset of upstream DNS resolvers lying about
+  DMP-shaped names.
+- **Client-side multi-node federation** — `dmp cluster pin / enable`
+  switches the client onto a signed `ClusterManifest`; writes quorum
+  across the node set, reads union with dedup, refresh is atomic
+  across reader + writer.
+- **Bootstrap discovery** — `dmp bootstrap discover me@my-domain
+  --auto-pin` resolves the cluster from a user domain via a signed
+  `_dmp.<user_domain>` TXT record, verifies the two-hop trust chain
+  (bootstrap signer → cluster operator), and cuts over atomically.
+- **Formal protocol specification** at
+  [`docs/protocol/`]({{ site.baseurl }}/protocol/) — wire format,
+  routing, end-to-end flows, and threat model, designed so an
+  independent implementer can build interoperable clients.
 
-On the roadmap after audit:
+Not yet shipped (tracked in [`ROADMAP.md`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md)):
 
-- PyPI release
-- Multi-node federation and redundancy
-- Mobile clients
-- Formal protocol specification document (current spec is the code)
+- **Node-side federation backfill** (M2.4 anti-entropy, M3.3 gossip).
+  A node that goes offline and comes back has no background sync yet;
+  the cluster works today because clients keep writing to every node.
+- **3-node compose test suite + `docker-compose.cluster.yml` operator
+  sample** (M2.5 / M2.6).
+- **External cryptographic audit** (M4.2–M4.4). The gate for tagging
+  `v0.2.0-beta` and for treating DMP as anything other than alpha
+  software.
+- **PyPI release** (M5.1).
+- **Mobile client** (M5.2), **web/WASM client** (M5.3), **key rotation
+  and revocation records** (M5.4).
+- **Traffic-analysis resistance** (M6) — random publish delays, dummy
+  chunks, chunk-order randomization. Best-effort research track.
 
 ## Next step
 
