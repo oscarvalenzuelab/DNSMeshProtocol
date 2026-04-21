@@ -93,6 +93,14 @@ class CLIConfig:
     # operators may want distinct creds for the cluster-federation path.
     # When empty, falls back to `http_token` if set; otherwise no auth.
     cluster_node_token: str = ""
+    # Explicit cluster-mode activation switch. Decouples "I pinned the
+    # anchors" from "I want every networked command to go through the
+    # cluster path". Flipped True by `dmp cluster enable` only after a
+    # live manifest fetch succeeds; `dmp cluster pin` leaves it False
+    # so operators can `cluster fetch` to verify before cutting over.
+    # Back-compat: older configs load as False even when both anchors
+    # are pinned — upgrading requires a one-time `dmp cluster enable`.
+    cluster_enabled: bool = False
     # Each contact is {"pub": <x25519 hex>, "spk": <ed25519 hex or "">}.
     # `spk` may be empty for contacts added before Ed25519 pinning landed
     # (and for the `contacts add` shortcut that doesn't require a signing
@@ -138,6 +146,11 @@ class CLIConfig:
             cluster_operator_spk=data.get("cluster_operator_spk", "") or "",
             cluster_refresh_interval=int(data.get("cluster_refresh_interval", 3600)),
             cluster_node_token=data.get("cluster_node_token", "") or "",
+            # Back-compat: an older config (pinned anchors, no
+            # cluster_enabled key) must NOT silently enter cluster mode
+            # on upgrade. Default to False; the operator must run
+            # `dmp cluster enable` once to cut over.
+            cluster_enabled=bool(data.get("cluster_enabled", False)),
             contacts=contacts,
         )
 
@@ -356,12 +369,33 @@ def _make_reader(config: CLIConfig) -> DNSRecordReader:
 
 
 def _cluster_mode_enabled(config: CLIConfig) -> bool:
-    """A config is in cluster mode when both anchors are pinned.
+    """A config is in cluster mode when both anchors are pinned AND enabled.
 
-    Two fields gate cluster mode: the base domain we fetch `cluster.<X>`
-    TXT from, and the operator public key we trust signatures against.
-    Either one missing means we fall back to the single-endpoint legacy
-    path.
+    Three fields gate cluster mode: the base domain we fetch
+    `cluster.<X>` TXT from, the operator public key we trust signatures
+    against, and the explicit `cluster_enabled` activation switch.
+    Missing any of the three means we fall back to the single-endpoint
+    legacy path.
+
+    The `cluster_enabled` flag separates "I pinned the anchors" (setup)
+    from "I want every networked command to use the cluster path"
+    (activation). This lets operators pin + verify via
+    `dmp cluster fetch` before cutting over with `dmp cluster enable`.
+    """
+    return bool(
+        config.cluster_base_domain
+        and config.cluster_operator_spk
+        and config.cluster_enabled
+    )
+
+
+def _cluster_anchors_pinned(config: CLIConfig) -> bool:
+    """Return True when both cluster anchors are set, regardless of enable.
+
+    Used by read-only diagnostic commands (`cluster fetch`,
+    `cluster status`) that operate on the pinned manifest without
+    requiring the activation switch. Also used by `cluster enable`
+    and `cluster disable` as their precondition check.
     """
     return bool(config.cluster_base_domain and config.cluster_operator_spk)
 
@@ -1212,8 +1246,17 @@ def cmd_resolvers_list(args: argparse.Namespace) -> int:
 def cmd_cluster_pin(args: argparse.Namespace) -> int:
     """Pin a cluster operator key + base domain in config.
 
-    Writes to config; does NOT fetch. Run `dmp cluster fetch` after to
-    sanity-check that the manifest is published + verifiable.
+    Writes anchors to config; does NOT fetch and does NOT activate
+    cluster mode. Activation is a separate step: the operator first
+    runs `dmp cluster fetch` to confirm the manifest resolves and
+    verifies, then `dmp cluster enable` to flip `cluster_enabled=True`
+    so subsequent networked commands route through the cluster path.
+
+    This decoupling means pinning an operator who hasn't published
+    their manifest yet is safe — it won't wedge every `dmp send` /
+    `dmp recv` on a failed bootstrap. It also gives operators a
+    reversible activation: `dmp cluster disable` drops back to the
+    legacy endpoint without clearing the pinned anchors.
     """
     path = _config_path()
     if not path.exists():
@@ -1237,12 +1280,105 @@ def cmd_cluster_pin(args: argparse.Namespace) -> int:
         _die(1, f"invalid base_domain: {exc}")
     cfg.cluster_operator_spk = args.operator_spk.lower()
     cfg.cluster_base_domain = args.base_domain
+    # Explicitly do NOT touch `cluster_enabled` here. A fresh pin leaves
+    # it at its default (False). Repinning over an already-enabled
+    # config also drops activation so the operator re-verifies via
+    # `cluster fetch` + `cluster enable` against the new anchors.
+    cfg.cluster_enabled = False
     cfg.save(path)
     print(f"pinned cluster operator key and base domain {args.base_domain}")
-    print(
-        "next: `dmp cluster fetch` to confirm the manifest is "
-        "published and verifiable"
+    print("next:")
+    print("  1. `dmp cluster fetch` to verify the manifest resolves")
+    print("  2. `dmp cluster enable` to cut over from the legacy endpoint")
+    return 0
+
+
+def cmd_cluster_enable(args: argparse.Namespace) -> int:
+    """Activate cluster mode after a live manifest-fetch sanity check.
+
+    Requires both anchors pinned (`dmp cluster pin` beforehand). Runs a
+    `fetch_cluster_manifest` against the pinned base domain; if the
+    fetch fails (nothing published, signature mismatch, expired),
+    leaves `cluster_enabled=False` and exits 2 so the operator can
+    diagnose before cutting over. On success, prints the manifest
+    summary, sets `cluster_enabled=True`, and persists.
+
+    Idempotent: running enable on an already-enabled config re-runs
+    the fetch sanity check and reports the current state — useful as
+    a post-rollover health check.
+    """
+    path = _config_path()
+    if not path.exists():
+        _die(1, f"no config at {path} — run `dmp init <username>` first")
+    cfg = CLIConfig.load(path)
+    if not _cluster_anchors_pinned(cfg):
+        _die(
+            1,
+            "cluster anchors not pinned — run `dmp cluster pin "
+            "<operator_spk_hex> <base_domain>` first",
+        )
+    try:
+        operator_spk = bytes.fromhex(cfg.cluster_operator_spk)
+    except ValueError:
+        _die(1, "cluster_operator_spk in config is not valid hex")
+    if len(operator_spk) != 32:
+        _die(1, "cluster_operator_spk must be 32 bytes (64 hex chars)")
+
+    bootstrap_reader = _make_reader(cfg)
+    manifest = fetch_cluster_manifest(
+        cfg.cluster_base_domain, operator_spk, bootstrap_reader
     )
+    if manifest is None:
+        # Keep cluster_enabled at its current value (typically False);
+        # do NOT flip True on a failed fetch. The operator needs to
+        # fix whatever broke the bootstrap before activating.
+        print(
+            f"dmp: cluster manifest fetch failed for {cfg.cluster_base_domain} — "
+            "nothing at `cluster.<base>` TXT verified under the pinned operator key. "
+            "Cluster mode NOT enabled. Run `dmp cluster fetch` for diagnostics.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    print(f"cluster: {manifest.cluster_name}")
+    print(f"  seq:   {manifest.seq}")
+    print(f"  exp:   {manifest.exp}")
+    print(f"  nodes: {len(manifest.nodes)}")
+    already_enabled = cfg.cluster_enabled
+    cfg.cluster_enabled = True
+    cfg.save(path)
+    if already_enabled:
+        print("cluster mode already enabled — manifest verified, state unchanged.")
+    else:
+        print("cluster mode enabled.")
+    return 0
+
+
+def cmd_cluster_disable(args: argparse.Namespace) -> int:
+    """Turn cluster mode off without clearing the pinned anchors.
+
+    Sets `cluster_enabled=False`. Subsequent networked commands use
+    the legacy single-endpoint path (`config.endpoint` + the
+    configured reader). The cluster anchors
+    (`cluster_base_domain` + `cluster_operator_spk`) stay put so
+    re-enabling later doesn't require a re-pin.
+
+    Idempotent: running disable on an already-disabled config just
+    reports the current state and returns 0.
+    """
+    path = _config_path()
+    if not path.exists():
+        _die(1, f"no config at {path} — run `dmp init <username>` first")
+    cfg = CLIConfig.load(path)
+    was_enabled = cfg.cluster_enabled
+    cfg.cluster_enabled = False
+    cfg.save(path)
+    if was_enabled:
+        print(
+            "cluster mode disabled — next commands will use the legacy endpoint path."
+        )
+    else:
+        print("cluster mode already disabled — state unchanged.")
     return 0
 
 
@@ -1261,7 +1397,7 @@ def cmd_cluster_fetch(args: argparse.Namespace) -> int:
     if not path.exists():
         _die(1, f"no config at {path} — run `dmp init <username>` first")
     cfg = CLIConfig.load(path)
-    if not _cluster_mode_enabled(cfg):
+    if not _cluster_anchors_pinned(cfg):
         _die(
             1,
             "cluster not configured — run `dmp cluster pin <operator_spk_hex> "
@@ -1340,7 +1476,7 @@ def cmd_cluster_status(args: argparse.Namespace) -> int:
     if not path.exists():
         _die(1, f"no config at {path} — run `dmp init <username>` first")
     cfg = CLIConfig.load(path)
-    if not _cluster_mode_enabled(cfg):
+    if not _cluster_anchors_pinned(cfg):
         _die(
             1,
             "cluster not configured — run `dmp cluster pin <operator_spk_hex> "
@@ -1372,6 +1508,11 @@ def cmd_cluster_status(args: argparse.Namespace) -> int:
     try:
         m = cc.manifest
         print(f"cluster: {m.cluster_name} (seq={m.seq}, exp={m.exp})")
+        # Surface the activation flag so operators running `status` can
+        # tell whether commands are actually using cluster mode. A
+        # snapshot showing pinned anchors + enabled=False is a common
+        # pre-cutover state we want to make visible.
+        print(f"cluster_enabled: {cfg.cluster_enabled}")
         print("fan-out writer snapshot:")
         for row in cc.writer.snapshot():  # type: ignore[attr-defined]
             print(
@@ -1589,6 +1730,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="build the cluster client and print fanout/union health",
     )
     p_cl_status.set_defaults(func=cmd_cluster_status)
+    p_cl_enable = sub_cl.add_parser(
+        "enable",
+        help="activate cluster mode after a successful manifest fetch "
+        "(flips cluster_enabled=True)",
+    )
+    p_cl_enable.set_defaults(func=cmd_cluster_enable)
+    p_cl_disable = sub_cl.add_parser(
+        "disable",
+        help="deactivate cluster mode without clearing the pinned anchors "
+        "(flips cluster_enabled=False)",
+    )
+    p_cl_disable.set_defaults(func=cmd_cluster_disable)
 
     # node (convenience launcher)
     p_n = sub.add_parser("node", help="run a dmp node in the foreground")

@@ -983,6 +983,349 @@ class TestClusterCommand:
             assert f"n{i:02d}" in out
 
 
+class TestClusterEnableDisable:
+    """Pin-vs-enable decoupling (M2.wire-polish).
+
+    `dmp cluster pin` now only writes anchors; cluster mode is
+    activated separately via `dmp cluster enable` (which runs a live
+    manifest fetch sanity check) and deactivated via `dmp cluster
+    disable`. Before this split, pinning immediately flipped cluster
+    mode on, which broke every networked command when the manifest
+    wasn't yet published under the pinned anchors.
+    """
+
+    def _patch_reader(self, monkeypatch, store):
+        class _StoreReader:
+            def query_txt_record(self, name):
+                return store.query_txt_record(name)
+
+        monkeypatch.setattr(cli, "_make_reader", lambda cfg: _StoreReader())
+
+    def _build_signed_manifest(
+        self, *, cluster_name="mesh.example.com", seq=1, n_nodes=2
+    ):
+        import time as _time
+
+        from dmp.core.cluster import ClusterManifest, ClusterNode
+        from dmp.core.crypto import DMPCrypto
+
+        op = DMPCrypto()
+        nodes = [
+            ClusterNode(
+                node_id=f"n{i:02d}",
+                http_endpoint=f"https://n{i}.example.com:8053",
+                dns_endpoint=f"203.0.113.{i}:53",
+            )
+            for i in range(1, n_nodes + 1)
+        ]
+        manifest = ClusterManifest(
+            cluster_name=cluster_name,
+            operator_spk=op.get_signing_public_key_bytes(),
+            nodes=nodes,
+            seq=seq,
+            exp=int(_time.time()) + 3600,
+        )
+        return op, manifest.sign(op), manifest
+
+    def test_pin_does_not_enable_cluster_mode(self, config_home, monkeypatch):
+        """Bare `cluster pin` leaves cluster_enabled=False even with both
+        anchors set; `_cluster_mode_enabled` returns False; a subsequent
+        `_make_client` uses the legacy single-endpoint path."""
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_base_domain == "mesh.example.com"
+        assert cfg.cluster_operator_spk == hex_spk
+        assert cfg.cluster_enabled is False
+        # Key invariant: both anchors set, but cluster mode is NOT on.
+        assert cli._cluster_mode_enabled(cfg) is False
+        assert cli._cluster_anchors_pinned(cfg) is True
+
+        # And `_make_client` must wire the legacy endpoint, not the
+        # cluster bootstrap. We monkeypatch fetch_cluster_manifest to
+        # detect any accidental cluster-path invocation.
+        import dmp.cli as cli_mod
+
+        def boom_fetch(*args, **kwargs):  # pragma: no cover
+            raise AssertionError(
+                "fetch_cluster_manifest must NOT be called when "
+                "cluster_enabled is False"
+            )
+
+        monkeypatch.setattr(cli_mod, "fetch_cluster_manifest", boom_fetch)
+        client = cli._make_client(cfg, "pw")
+        try:
+            assert client._cluster_client is None
+            # Legacy writer → plain _HttpWriter, not FanoutWriter.
+            from dmp.network.fanout_writer import FanoutWriter
+
+            assert not isinstance(client.writer, FanoutWriter)
+        finally:
+            cli._close_client(client)
+
+    def test_enable_requires_both_anchors(self, config_home, capsys):
+        """`cluster enable` with no anchors pinned exits 1 with a clear
+        error and does NOT flip cluster_enabled."""
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["cluster", "enable"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "anchors not pinned" in err
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_enabled is False
+
+    def test_enable_rejects_unreachable_manifest(
+        self, config_home, monkeypatch, capsys
+    ):
+        """Anchors pinned but manifest unpublished: `cluster enable`
+        exits 2, leaves cluster_enabled=False, and the error message
+        tells the operator how to diagnose."""
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+
+        # Empty store: no manifest published.
+        store = InMemoryDNSStore()
+        self._patch_reader(monkeypatch, store)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["cluster", "enable"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "cluster manifest fetch failed" in err
+        assert "NOT enabled" in err
+
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_enabled is False
+
+    def test_enable_happy_path(self, config_home, monkeypatch, capsys):
+        """With a signed manifest published, `cluster enable` flips
+        the flag and subsequent `_make_client` calls go through the
+        cluster path."""
+        from dmp.core.cluster import cluster_rrset_name
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        op, wire, manifest = self._build_signed_manifest(n_nodes=2)
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+        self._patch_reader(monkeypatch, store)
+        capsys.readouterr()
+
+        rc = cli.main(["cluster", "enable"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "cluster mode enabled." in out
+        # Manifest summary is part of the output so operators see what
+        # they just activated against.
+        assert "cluster: mesh.example.com" in out
+        assert "seq:   1" in out
+        assert "nodes: 2" in out
+
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_enabled is True
+        assert cli._cluster_mode_enabled(cfg) is True
+
+        # Build a client and confirm we're actually on the cluster path.
+        client = cli._make_client(cfg, "pw")
+        try:
+            from dmp.network.composite_reader import CompositeReader
+            from dmp.network.fanout_writer import FanoutWriter
+            from dmp.network.union_reader import UnionReader
+
+            assert client._cluster_client is not None
+            assert isinstance(client.writer, FanoutWriter)
+            # Reader is wrapped in a CompositeReader so cross-domain
+            # lookups route through the bootstrap resolver — the
+            # cluster-local side is a UnionReader.
+            assert isinstance(client.reader, CompositeReader)
+            assert isinstance(client.reader._cluster_reader, UnionReader)
+        finally:
+            cli._close_client(client)
+
+    def test_disable_reverts_to_legacy(self, config_home, monkeypatch, capsys):
+        """After enable, `disable` flips cluster_enabled back to False
+        without clearing the anchors. Subsequent `_make_client` uses
+        the legacy endpoint path."""
+        from dmp.core.cluster import cluster_rrset_name
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+        self._patch_reader(monkeypatch, store)
+        cli.main(["cluster", "enable"])
+        capsys.readouterr()
+
+        rc = cli.main(["cluster", "disable"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "cluster mode disabled" in out
+        assert "legacy endpoint" in out
+
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_enabled is False
+        # Anchors still pinned — operator can re-enable without re-pin.
+        assert cfg.cluster_base_domain == "mesh.example.com"
+        assert cfg.cluster_operator_spk == hex_spk
+        assert cli._cluster_mode_enabled(cfg) is False
+        assert cli._cluster_anchors_pinned(cfg) is True
+
+        # Legacy path is active — no cluster client, no FanoutWriter.
+        import dmp.cli as cli_mod
+
+        def boom_fetch(*args, **kwargs):  # pragma: no cover
+            raise AssertionError(
+                "fetch_cluster_manifest must NOT be called after disable"
+            )
+
+        monkeypatch.setattr(cli_mod, "fetch_cluster_manifest", boom_fetch)
+        client = cli._make_client(cfg, "pw")
+        try:
+            assert client._cluster_client is None
+        finally:
+            cli._close_client(client)
+
+    def test_disable_idempotent_when_already_disabled(self, config_home, capsys):
+        """Running `cluster disable` on a never-enabled config is a
+        no-op that exits 0 and reports current state."""
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        capsys.readouterr()
+        rc = cli.main(["cluster", "disable"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "already disabled" in out
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_enabled is False
+
+    def test_enable_idempotent(self, config_home, monkeypatch, capsys):
+        """Running `cluster enable` twice re-runs the fetch sanity
+        check and reports the current state (second run returns 0)."""
+        from dmp.core.cluster import cluster_rrset_name
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+        self._patch_reader(monkeypatch, store)
+
+        # First run: cluster_enabled False -> True, prints "enabled".
+        cli.main(["cluster", "enable"])
+        capsys.readouterr()
+
+        # Second run: cluster_enabled already True, must still call
+        # fetch (verified by the reader returning the same manifest),
+        # and exits 0 with an "already enabled" message.
+        rc = cli.main(["cluster", "enable"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "already enabled" in out
+        # Manifest summary printed again as a sanity-check confirmation.
+        assert "cluster: mesh.example.com" in out
+
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_enabled is True
+
+    def test_enable_idempotent_fails_if_manifest_disappears(
+        self, config_home, monkeypatch, capsys
+    ):
+        """A previously-enabled config whose manifest goes unpublished
+        must exit 2 on the next `cluster enable` run (re-verification
+        fails). Does NOT touch the on-disk enabled flag — the operator
+        may want to keep it on and diagnose separately."""
+        from dmp.core.cluster import cluster_rrset_name
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+        self._patch_reader(monkeypatch, store)
+        cli.main(["cluster", "enable"])
+        capsys.readouterr()
+
+        # Now simulate the manifest disappearing — empty store.
+        empty_store = InMemoryDNSStore()
+        self._patch_reader(monkeypatch, empty_store)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["cluster", "enable"])
+        assert exc.value.code == 2
+
+    def test_status_shows_enabled_flag(self, config_home, monkeypatch, capsys):
+        """`cluster status` surfaces `cluster_enabled: False` after pin
+        and `cluster_enabled: True` after enable."""
+        from dmp.core.cluster import cluster_rrset_name
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+        self._patch_reader(monkeypatch, store)
+        capsys.readouterr()
+
+        # After pin (not enabled).
+        rc = cli.main(["cluster", "status"])
+        assert rc == 0
+        out_before = capsys.readouterr().out
+        assert "cluster_enabled: False" in out_before
+
+        # After enable.
+        cli.main(["cluster", "enable"])
+        capsys.readouterr()
+        rc = cli.main(["cluster", "status"])
+        assert rc == 0
+        out_after = capsys.readouterr().out
+        assert "cluster_enabled: True" in out_after
+
+    def test_fetch_works_without_cluster_enabled(
+        self, config_home, monkeypatch, capsys
+    ):
+        """`cluster fetch` is a read-only diagnostic; it must work on a
+        pinned-but-not-enabled config (that's its primary pre-enable
+        use case)."""
+        from dmp.core.cluster import cluster_rrset_name
+        from dmp.network.memory import InMemoryDNSStore
+
+        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        op, wire, manifest = self._build_signed_manifest()
+        hex_spk = op.get_signing_public_key_bytes().hex()
+        cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
+        store = InMemoryDNSStore()
+        store.publish_txt_record(cluster_rrset_name("mesh.example.com"), wire)
+        self._patch_reader(monkeypatch, store)
+        capsys.readouterr()
+
+        # cluster_enabled is False here by design.
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        assert cfg.cluster_enabled is False
+
+        rc = cli.main(["cluster", "fetch"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "cluster: mesh.example.com" in out
+
+
 class TestClusterConfigPersistence:
     """CLIConfig round-trips the new cluster_* fields."""
 
@@ -994,6 +1337,9 @@ class TestClusterConfigPersistence:
         assert cfg.get("cluster_base_domain", "") == ""
         assert cfg.get("cluster_operator_spk", "") == ""
         assert cfg.get("cluster_refresh_interval", 3600) == 3600
+        # M2.wire-polish: cluster_enabled defaults False on fresh init
+        # so a bare config is never accidentally in cluster mode.
+        assert cfg.get("cluster_enabled", False) is False
 
     def test_load_tolerates_absent_cluster_fields(self, config_home):
         """An older config (pre-M2.wire) without cluster_* keys loads cleanly."""
@@ -1015,6 +1361,41 @@ class TestClusterConfigPersistence:
         assert loaded.cluster_base_domain == ""
         assert loaded.cluster_operator_spk == ""
         assert loaded.cluster_refresh_interval == 3600
+        assert loaded.cluster_enabled is False
+
+    def test_load_back_compat_pinned_anchors_default_disabled(self, config_home):
+        """A pre-polish config with anchors pinned but no cluster_enabled
+        key MUST load as cluster_enabled=False.
+
+        This is the back-compat contract: upgrading the CLI over an
+        existing cluster-pinned config must NOT silently flip cluster
+        mode on. Operators must explicitly run `dmp cluster enable`
+        once to opt in.
+        """
+        cfg_path = config_home / "config.yaml"
+        config_home.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(
+            yaml.safe_dump(
+                {
+                    "username": "alice",
+                    "domain": "mesh.local",
+                    "endpoint": "http://x",
+                    "kdf_salt": "aa" * 32,
+                    "cluster_base_domain": "mesh.example.com",
+                    "cluster_operator_spk": "aa" * 32,
+                    # No cluster_enabled key at all — mimics a pre-polish
+                    # config on disk.
+                }
+            )
+        )
+        loaded = cli.CLIConfig.load(cfg_path)
+        assert loaded.cluster_base_domain == "mesh.example.com"
+        assert loaded.cluster_operator_spk == "aa" * 32
+        assert loaded.cluster_enabled is False
+        # And therefore cluster mode is NOT active even with both
+        # anchors set — operator has to enable explicitly.
+        assert cli._cluster_mode_enabled(loaded) is False
+        assert cli._cluster_anchors_pinned(loaded) is True
 
 
 class TestClusterModeInMakeClient:
@@ -1066,6 +1447,10 @@ class TestClusterModeInMakeClient:
                 "mesh.example.com",
             ]
         )
+        # Pin no longer activates cluster mode (M2.wire-polish). The
+        # operator must `cluster enable` — with the manifest published
+        # above, this one-shot fetch sanity check should succeed.
+        cli.main(["cluster", "enable"])
 
         cfg = cli.CLIConfig.load(config_home / "config.yaml")
         client = cli._make_client(cfg, "pw")
@@ -1254,6 +1639,21 @@ class TestLocalOnlyClusterBootstrap:
 
         monkeypatch.setattr(cli_mod, "fetch_cluster_manifest", failing_fetch)
 
+    def _force_cluster_enabled(self, config_home):
+        """Flip cluster_enabled=True on disk directly.
+
+        Post-M2.wire-polish, cluster mode requires explicit activation
+        via `dmp cluster enable` — but enable runs a live fetch check
+        that these tests are specifically trying to simulate failing.
+        Writing the flag straight into config.yaml bypasses the live
+        check so we can exercise the cluster-mode bootstrap-failure
+        paths (identity show stays local, send fails loudly).
+        """
+        cfg_path = config_home / "config.yaml"
+        data = yaml.safe_load(cfg_path.read_text())
+        data["cluster_enabled"] = True
+        cfg_path.write_text(yaml.safe_dump(data, sort_keys=True))
+
     def test_identity_show_works_when_cluster_fetch_fails(
         self, config_home, monkeypatch, capsys
     ):
@@ -1261,7 +1661,7 @@ class TestLocalOnlyClusterBootstrap:
         pinned cluster manifest is unreachable."""
         from dmp.core.crypto import DMPCrypto
 
-        # Pin a cluster (both anchors set -> cluster mode on).
+        # Pin a cluster (both anchors set -> cluster mode on after enable).
         cli.main(["init", "alice", "--endpoint", "http://x"])
         op = DMPCrypto()
         cli.main(
@@ -1272,6 +1672,10 @@ class TestLocalOnlyClusterBootstrap:
                 "mesh.unreachable.example",
             ]
         )
+        # Force cluster_enabled=True on disk (bypasses the live fetch
+        # check in `cluster enable` since this test is specifically
+        # about the fetch-failure path).
+        self._force_cluster_enabled(config_home)
         capsys.readouterr()
 
         # Simulate DNS outage — manifest fetch returns None.
@@ -1302,6 +1706,7 @@ class TestLocalOnlyClusterBootstrap:
                 "mesh.unreachable.example",
             ]
         )
+        self._force_cluster_enabled(config_home)
         capsys.readouterr()
 
         self._pin_cluster_unreachable(monkeypatch)
@@ -1331,6 +1736,7 @@ class TestLocalOnlyClusterBootstrap:
                 "mesh.unreachable.example",
             ]
         )
+        self._force_cluster_enabled(config_home)
         # Stash a contact so send gets past the unknown-contact check.
         cli.main(["contacts", "add", "bob", "aa" * 32])
         capsys.readouterr()
@@ -1384,6 +1790,7 @@ class TestLocalOnlyClusterBootstrap:
                 "mesh.never.fetched.example",
             ]
         )
+        self._force_cluster_enabled(config_home)
 
         called = {"fetch_calls": 0}
 
