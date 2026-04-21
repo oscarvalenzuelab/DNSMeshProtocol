@@ -740,6 +740,29 @@ class TestClusterManifestNameValidation:
         assert parsed is not None
         assert cluster_rrset_name(parsed.cluster_name) == "cluster.mesh.example.com"
 
+    def test_trailing_dot_not_counted_against_length_cap(self):
+        # The 64-byte UTF-8 cap is about label content, not the canonical
+        # trailing dot. A 63-byte name with a trailing dot is 64 bytes of
+        # utf-8 but normalizes to 63 bytes of labels — which is inside
+        # MAX_CLUSTER_NAME_LEN. Without this normalization, the
+        # sign/parse path would reject canonical FQDNs at the boundary.
+        operator = _make_operator()
+        # Construct a 63-byte name (exactly at the cap) + trailing dot.
+        # Labels must each be <= 63 chars, letters/digits/hyphens; use
+        # shorter labels that total 63 bytes.
+        name = "a" * 55 + ".bcd.ef"  # 55 + 1 + 3 + 1 + 2 = 62 bytes
+        name = name + "g"  # pad to 63 bytes
+        assert len(name) == 63
+        fqdn = name + "."
+        assert len(fqdn.encode("utf-8")) == 64
+        mf = _make_manifest(operator, cluster_name=fqdn)
+        wire = mf.sign(operator)
+        parsed = ClusterManifest.parse_and_verify(
+            wire, operator.get_signing_public_key_bytes()
+        )
+        assert parsed is not None
+        assert parsed.cluster_name == fqdn
+
     @pytest.mark.parametrize(
         "bad_name,reason_substr",
         [
