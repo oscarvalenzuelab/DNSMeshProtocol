@@ -384,9 +384,7 @@ class DMPNode:
         http_operator_spk: Optional[bytes] = None
         if self.config.sync_cluster_operator_spk_hex:
             try:
-                raw = bytes.fromhex(
-                    self.config.sync_cluster_operator_spk_hex.strip()
-                )
+                raw = bytes.fromhex(self.config.sync_cluster_operator_spk_hex.strip())
                 if len(raw) == 32:
                     http_operator_spk = raw
             except ValueError:
