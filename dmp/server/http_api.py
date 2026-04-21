@@ -286,10 +286,22 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
     # ---- anti-entropy sync routes -----------------------------------------
 
     def _handle_sync_digest(self, query_string: str) -> int:
-        """GET /v1/sync/digest?since=<unix_ts>&limit=<int>
+        """GET /v1/sync/digest?cursor=<opaque>&limit=<int>
 
-        Returns compact hash-per-record entries the peer can diff
-        against. Expired records are not returned (same cutoff as
+        Preferred entry point for the M2.4-followup worker. ``cursor`` is
+        an opaque ``"<ts>:<name>"`` string the server previously emitted
+        as ``next_cursor`` in a digest response — carrying both halves of
+        the compound ``(stored_ts, name)`` watermark makes pagination
+        correct even when > ``limit`` records land in the same millisecond.
+
+        Legacy ``?since=<ts>`` is still accepted (the original M2.4 shape);
+        it is equivalent to ``cursor="<ts>:"`` and logs a one-line warning
+        so operators can see when a stale peer is still calling it.
+
+        Returns compact hash-per-record entries the peer can diff against.
+        ``next_cursor`` is always emitted — terminal pages carry the
+        cursor of the last row so the peer can persist it as the final
+        watermark. Expired records are not returned (same cutoff as
         query_txt_record). Rate limiting applies to the caller's IP.
         """
         if not self._check_rate_limit():
@@ -307,14 +319,34 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             return 501
 
         params = parse_qs(query_string or "")
-        try:
-            since = int(params.get("since", ["0"])[0])
-        except (ValueError, TypeError):
-            self._send_json(400, {"error": "since must be an integer"})
-            return 400
-        if since < 0:
-            self._send_json(400, {"error": "since must be >= 0"})
-            return 400
+        cursor_tuple: Optional[tuple] = None
+        if "cursor" in params:
+            raw = params["cursor"][0]
+            parsed = _parse_digest_cursor(raw)
+            if parsed is None:
+                self._send_json(400, {"error": "cursor must be '<ts>:<name>'"})
+                return 400
+            cursor_tuple = parsed
+        elif "since" in params:
+            # Legacy shape. Still supported, but warn so an operator can
+            # see when their peer is still on the old wire.
+            try:
+                since = int(params.get("since", ["0"])[0])
+            except (ValueError, TypeError):
+                self._send_json(400, {"error": "since must be an integer"})
+                return 400
+            if since < 0:
+                self._send_json(400, {"error": "since must be >= 0"})
+                return 400
+            log.warning(
+                "anti-entropy: legacy since=<ts> digest call from %s; "
+                "peer should upgrade to cursor=<opaque>",
+                self.address_string(),
+            )
+            cursor_tuple = (since, "")
+        else:
+            cursor_tuple = (0, "")
+
         try:
             limit = int(params.get("limit", [_SYNC_DIGEST_DEFAULT_LIMIT])[0])
         except (ValueError, TypeError):
@@ -328,7 +360,7 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
 
         # Over-fetch by one to detect whether more rows exist without
         # paying for a count query. Trim before serializing.
-        rows = iter_fn(since, limit=limit + 1)
+        rows = iter_fn(cursor=cursor_tuple, limit=limit + 1)
         has_more = len(rows) > limit
         if has_more:
             rows = rows[:limit]
@@ -353,7 +385,25 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
                     "ttl": max(1, int(r.ttl_remaining)),
                 }
             )
-        self._send_json(200, {"records": entries, "has_more": has_more})
+
+        # next_cursor: the (ts, name) of the last row emitted, encoded as
+        # "<ts>:<name>". Emitted even on the terminal page so the worker
+        # persists it as its watermark. If the store was empty, echo the
+        # caller's input cursor back — there is nowhere newer to advance.
+        if entries:
+            last = entries[-1]
+            next_cursor = f"{int(last['ts'])}:{last['name']}"
+        else:
+            next_cursor = f"{int(cursor_tuple[0])}:{cursor_tuple[1]}"
+
+        self._send_json(
+            200,
+            {
+                "records": entries,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            },
+        )
         return 200
 
     def _handle_sync_pull(self) -> int:
@@ -438,6 +488,34 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
     def _reader(self) -> Optional[DNSRecordReader]:
         store = self.server.store
         return store if isinstance(store, DNSRecordReader) else None
+
+
+def _parse_digest_cursor(raw: str) -> Optional[tuple]:
+    """Parse an opaque digest cursor ``"<ts>:<name>"`` into ``(int, str)``.
+
+    Returns ``None`` on malformed input so callers can 400. The ``:``
+    delimiter is safe because DNS names never contain colons (labels are
+    ``[a-zA-Z0-9-]`` separated by ``.``). We split on the *first* colon
+    only; a future slot/mailbox label scheme that somehow introduced a
+    ``:`` in the second half wouldn't silently corrupt the ts.
+    """
+    if not isinstance(raw, str):
+        return None
+    parts = raw.split(":", 1)
+    if len(parts) != 2:
+        return None
+    ts_str, name = parts
+    try:
+        ts = int(ts_str)
+    except (ValueError, TypeError):
+        return None
+    if ts < 0:
+        return None
+    # name may be empty — that's the "from the beginning of this ms" form
+    # used by legacy since-only callers.
+    if len(name) > 253:
+        return None
+    return (ts, name)
 
 
 def _consteq(a: str, b: str) -> bool:
