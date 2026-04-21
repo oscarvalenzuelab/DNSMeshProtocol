@@ -40,6 +40,18 @@ Environment variables (all optional, sensible defaults for dev):
     DMP_SYNC_INTERVAL_SECONDS  alias for DMP_SYNC_INTERVAL (operator-facing name)
     DMP_SYNC_OPERATOR_SPK      hex ed25519 operator pubkey for
                                cluster-record re-verify             default: none
+    DMP_CLUSTER_BASE_DOMAIN    cluster_name (e.g. "mesh.example.com")
+                               gossiped manifests MUST bind to. When
+                               set together with DMP_SYNC_OPERATOR_SPK
+                               the anti-entropy worker also gossips the
+                               signed manifest across peers (M3.3).
+                               If unset, derived from the on-disk
+                               cluster manifest.                     default: none
+    DMP_SYNC_SELF_ENDPOINT     this node's HTTP URL on the peer
+                               network (e.g. "http://dmp-node-a:8053")
+                               used to filter self out of a gossiped
+                               manifest so a node never syncs with
+                               itself.                               default: none
 
 Peer URLs from DMP_SYNC_PEERS point at the OTHER nodes' HTTP base (e.g.
 ``http://dmp-node-b:8053``). The worker appends ``/v1/sync/digest`` and
@@ -193,6 +205,22 @@ class DMPNodeConfig:
     # fine for most operators (the node's own operator deployed the
     # cluster.json anyway).
     sync_cluster_operator_spk_hex: Optional[str] = None
+    # M3.3 manifest gossip. When cluster_base_domain is set AND
+    # sync_cluster_operator_spk_hex is set, the anti-entropy worker
+    # gossips the signed manifest across peers: one tick after the
+    # operator rolls a higher-seq manifest onto any one node, the rest
+    # install it automatically. Without base_domain the worker cannot
+    # bind the incoming manifest to the expected cluster_name, so
+    # gossip stays off. Derived from the manifest on disk when unset
+    # so existing deployments pick up the feature for free.
+    cluster_base_domain: Optional[str] = None
+    # Operator-facing URL this node exposes on the peer HTTP network.
+    # Used to filter self out of a gossiped manifest's node list — a
+    # node that lists itself in the peer set would otherwise create an
+    # infinite-tick self-sync loop. Defaults to None (self-exclusion
+    # then relies on ``node_id`` alone, which is correct for the
+    # compose-sample setup).
+    sync_self_endpoint: Optional[str] = None
     # M2.5/M2.6 direct-peer-list env wiring. When non-empty, these URLs
     # become the SyncPeer list directly and cluster_file is ignored. Each
     # entry is an HTTP base URL (no trailing path); the anti-entropy
@@ -235,6 +263,16 @@ class DMPNodeConfig:
         raw_peers = os.environ.get("DMP_SYNC_PEERS") or ""
         sync_peers = [p.strip() for p in raw_peers.split(",") if p.strip()]
 
+        # M3.3 gossip. ``DMP_CLUSTER_BASE_DOMAIN`` pins the cluster_name
+        # gossiped manifests must bind to. Without a pinned operator
+        # public key on top, gossip stays off regardless — a log warning
+        # fires in ``_make_anti_entropy_worker`` so operators catch the
+        # misconfig. ``DMP_SYNC_SELF_ENDPOINT`` is the URL this node
+        # exposes on the peer HTTP network; used to drop self out of a
+        # gossiped manifest's node list.
+        cluster_base_domain = os.environ.get("DMP_CLUSTER_BASE_DOMAIN") or None
+        sync_self_endpoint = os.environ.get("DMP_SYNC_SELF_ENDPOINT") or None
+
         return cls(
             db_path=os.environ.get("DMP_DB_PATH", cls.db_path),
             dns_host=os.environ.get("DMP_DNS_HOST", cls.dns_host),
@@ -273,6 +311,8 @@ class DMPNodeConfig:
                 os.environ.get("DMP_SYNC_OPERATOR_SPK") or None
             ),
             sync_peers=sync_peers,
+            cluster_base_domain=cluster_base_domain,
+            sync_self_endpoint=sync_self_endpoint,
         )
 
 
@@ -328,6 +368,29 @@ class DMPNode:
             ),
             max_concurrency=self.config.dns_max_concurrency,
         )
+        # Derive the cluster base domain for the gossip endpoint — same
+        # derivation path the anti-entropy worker uses. Configured
+        # override wins; fall back to the on-disk manifest's signed
+        # cluster_name so existing deployments pick the endpoint up
+        # without a config change.
+        gossip_base = (
+            self.config.cluster_base_domain
+            or self._derive_cluster_base_domain()
+            or self._derive_cluster_base_domain_from_store()
+        )
+        # Parse operator_spk once so the HTTP endpoint can filter
+        # unverified wires from the cluster RRset before picking the
+        # highest-seq candidate. Falls back to structural-only selection
+        # when not set (back-compat path; gossip is disabled in that
+        # mode anyway).
+        http_operator_spk: Optional[bytes] = None
+        if self.config.sync_cluster_operator_spk_hex:
+            try:
+                raw = bytes.fromhex(self.config.sync_cluster_operator_spk_hex.strip())
+                if len(raw) == 32:
+                    http_operator_spk = raw
+            except ValueError:
+                http_operator_spk = None
         self.http = DMPHttpApi(
             self.store,
             host=self.config.http_host,
@@ -342,6 +405,8 @@ class DMPNode:
                 burst=self.config.http_burst,
             ),
             sync_peer_token=self.config.sync_peer_token,
+            cluster_base_domain=gossip_base,
+            sync_cluster_operator_spk=http_operator_spk,
         )
         self.cleanup = CleanupWorker(
             self.store.cleanup_expired,
@@ -391,17 +456,32 @@ class DMPNode:
             return
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                wire = fh.read().strip()
+                raw = fh.read().strip()
         except OSError as e:
             log.warning("cluster manifest: cannot read %s: %s", path, e)
             return
-        # The same path may carry a JSON peer list (legacy
-        # DMP_CLUSTER_FILE shape) or a signed wire blob. Only the
-        # signed form gets published; JSON is ignored here.
+        # The same path can carry either the raw wire string OR the
+        # JSON envelope ``{"wire": "..."}`` used by
+        # ``load_peers_from_cluster_json``. Extract the wire from both
+        # shapes; genuine JSON peer-list files (no "wire" key) are
+        # silently ignored here.
         from dmp.core.cluster import RECORD_PREFIX as _CLUSTER_PREFIX
         from dmp.core.cluster import ClusterManifest, cluster_rrset_name
 
-        if not wire.startswith(_CLUSTER_PREFIX):
+        wire: Optional[str] = None
+        if raw.startswith(_CLUSTER_PREFIX):
+            wire = raw
+        elif raw.startswith("{"):
+            try:
+                import json as _json
+
+                doc = _json.loads(raw)
+            except Exception:
+                return
+            candidate = doc.get("wire") if isinstance(doc, dict) else None
+            if isinstance(candidate, str) and candidate.startswith(_CLUSTER_PREFIX):
+                wire = candidate
+        if wire is None:
             return
         # If the operator pinned an operator_spk for sync, use it for
         # verification before publishing. Otherwise publish opaquely
@@ -428,7 +508,8 @@ class DMPNode:
                 return
         else:
             # Best-effort parse without signature verification just so
-            # we can derive the cluster_name for the TXT owner.
+            # we can derive the cluster_name for the TXT owner AND the
+            # exp for a sensible TTL.
             try:
                 import base64
                 import struct
@@ -436,6 +517,7 @@ class DMPNode:
                 blob = base64.b64decode(wire[len(_CLUSTER_PREFIX) :], validate=True)
                 body = blob[:-64]
                 # Magic(7) + seq(8) + exp(8) + operator_spk(32) + name_len(1)
+                manifest_exp = int.from_bytes(body[15:23], "big")
                 name_len = body[55]
                 cluster_name = body[56 : 56 + name_len].decode("utf-8").rstrip(".")
             except Exception as e:
@@ -447,9 +529,22 @@ class DMPNode:
 
             manifest = _Bag()
             manifest.cluster_name = cluster_name
+            manifest.exp = manifest_exp
 
         rrset = cluster_rrset_name(manifest.cluster_name)
-        ttl = min(300, self.config.max_ttl)
+        # TTL tracks the manifest's own signed expiry, NOT max_ttl. The
+        # generic max_ttl cap exists to bound untrusted publishes via
+        # the public HTTP API; the cluster manifest is operator-signed
+        # and parse_and_verify already rejects past-exp records, so
+        # clamping here just reintroduces early expiry — a manifest
+        # valid for multiple days would still vanish from the local
+        # store after max_ttl (default 86400s), breaking
+        # /v1/sync/cluster-manifest for late-joining peers. Trust the
+        # signed exp.
+        import time as _time
+
+        now = int(_time.time())
+        ttl = max(1, int(manifest.exp) - now)
         assert self.store is not None
         if self.store.publish_txt_record(rrset, wire, ttl=ttl):
             log.info(
@@ -508,13 +603,196 @@ class DMPNode:
             except ValueError as e:
                 log.warning("anti-entropy: invalid operator_spk hex: %s", e)
                 operator_spk = None
+
+        # M3.3 gossip anchors. The worker needs both (operator_spk,
+        # base_domain) to install a gossiped manifest; without base_domain
+        # we can still derive it from the on-disk manifest.
+        base_domain = self.config.cluster_base_domain
+        if operator_spk is not None and not base_domain:
+            base_domain = self._derive_cluster_base_domain()
+
+        # Operator wiring check: if DMP_SYNC_PEERS was used (so there's
+        # no signed manifest on disk to derive trust from) AND the
+        # operator didn't pin a signing key, manifest gossip is off. Log
+        # a warning so the operator notices they're missing the M3.3
+        # benefit — anti-entropy data sync still works.
+        if self.config.sync_peers and operator_spk is None:
+            log.warning(
+                "anti-entropy: DMP_SYNC_PEERS set but DMP_SYNC_OPERATOR_SPK "
+                "is not; manifest gossip is DISABLED. Operators must "
+                "continue to push new cluster manifests to each node "
+                "by hand. Pin an operator public key to enable gossip."
+            )
+        elif operator_spk is not None and not base_domain:
+            log.warning(
+                "anti-entropy: DMP_SYNC_OPERATOR_SPK set but no cluster "
+                "base domain could be determined (set DMP_CLUSTER_BASE_DOMAIN "
+                "or mount a cluster manifest file); manifest gossip is "
+                "DISABLED."
+            )
+
         return AntiEntropyWorker(
             store=self.store,
             peers=peers,
             sync_token=self.config.sync_peer_token,
             interval_seconds=self.config.sync_interval,
             cluster_operator_spk=operator_spk,
+            base_domain=base_domain,
+            self_node_id=self.config.node_id,
+            self_http_endpoint=self.config.sync_self_endpoint,
         )
+
+    def _derive_cluster_base_domain_from_store(self) -> Optional[str]:
+        """Recover ``cluster_base_domain`` from a previously-gossiped
+        manifest persisted in the local sqlite store.
+
+        A gossip-only node (bootstrapped via ``DMP_SYNC_PEERS`` +
+        ``DMP_SYNC_OPERATOR_SPK``, no cluster_file, no
+        ``DMP_CLUSTER_BASE_DOMAIN``) used to come back from a restart
+        with manifest gossip DISABLED: neither env nor file provided a
+        base_domain, so ``_make_anti_entropy_worker`` couldn't wire the
+        gossip path even though a valid manifest was already sitting in
+        the local store. This method scans the store for any
+        ``cluster.*`` TXT value that verifies under the pinned
+        operator_spk and returns the cluster_name from the highest-seq
+        match.
+
+        Requires ``DMP_SYNC_OPERATOR_SPK`` to be set — without a trust
+        anchor we won't pull a base_domain out of unverified store
+        contents.
+        """
+        if not self.config.sync_cluster_operator_spk_hex:
+            return None
+        try:
+            operator_spk = bytes.fromhex(
+                self.config.sync_cluster_operator_spk_hex.strip()
+            )
+            if len(operator_spk) != 32:
+                return None
+        except ValueError:
+            return None
+        if self.store is None or not hasattr(self.store, "list_names"):
+            return None
+        try:
+            names = self.store.list_names()
+        except Exception:
+            return None
+        from dmp.core.cluster import ClusterManifest
+
+        best_seq = -1
+        best_name: Optional[str] = None
+        for name in names:
+            if not name.startswith("cluster."):
+                continue
+            try:
+                values = self.store.query_txt_record(name)
+            except Exception:
+                continue
+            for wire in values or []:
+                if not isinstance(wire, str):
+                    continue
+                m = ClusterManifest.parse_and_verify(wire, operator_spk)
+                if m is not None and m.seq > best_seq:
+                    best_seq = m.seq
+                    best_name = m.cluster_name
+        return best_name
+
+    def _derive_cluster_base_domain(self) -> Optional[str]:
+        """Extract ``cluster_name`` from the on-disk cluster file when
+        ``DMP_CLUSTER_BASE_DOMAIN`` is unset.
+
+        Security: when ``DMP_SYNC_OPERATOR_SPK`` is pinned, the file's
+        wire must VERIFY under that key before we trust its
+        cluster_name. Without this check, a stale or wrong-zone
+        cluster_file on disk could set ``expected_cluster_name`` for
+        the gossip layer — the node would then accept gossiped
+        manifests for the wrong cluster name, even though
+        ``_publish_cluster_manifest_from_file`` already refused to
+        publish that same file.
+
+        Falls back to structural parse only when no operator_spk is
+        configured (gossip is disabled in that mode anyway, so the
+        base_domain is informational).
+
+        Returns None on missing file, malformed content, or signature
+        rejection — gossip then stays off.
+        """
+        path = self.config.cluster_file
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read().strip()
+        except OSError:
+            return None
+        from dmp.core.cluster import ClusterManifest
+        from dmp.core.cluster import RECORD_PREFIX as _CLUSTER_PREFIX
+
+        # cluster_file has two supported shapes:
+        #   1) the raw wire string ``v=dmp1;t=cluster;<base64>``
+        #   2) a JSON envelope ``{"wire": "v=dmp1;t=cluster;..."}`` —
+        #      this is the shape load_peers_from_cluster_json already
+        #      accepts for peer discovery. Without this branch, nodes
+        #      using the JSON form silently fall through to "no gossip"
+        #      because the raw-wire prefix check fails.
+        wire: str
+        if raw.startswith(_CLUSTER_PREFIX):
+            wire = raw
+        elif raw.startswith("{"):
+            try:
+                import json as _json
+
+                doc = _json.loads(raw)
+            except Exception:
+                return None
+            candidate = doc.get("wire") if isinstance(doc, dict) else None
+            if not isinstance(candidate, str) or not candidate.startswith(
+                _CLUSTER_PREFIX
+            ):
+                return None
+            wire = candidate
+        else:
+            return None
+
+        # If the operator key is pinned, require the file to verify
+        # under it before we trust the embedded cluster_name. This
+        # prevents a stale / wrong-zone cluster_file from steering the
+        # gossip layer into the wrong cluster.
+        if self.config.sync_cluster_operator_spk_hex:
+            try:
+                operator_spk = bytes.fromhex(
+                    self.config.sync_cluster_operator_spk_hex.strip()
+                )
+            except ValueError:
+                return None
+            if len(operator_spk) != 32:
+                return None
+            parsed = ClusterManifest.parse_and_verify(wire, operator_spk)
+            if parsed is None:
+                log.warning(
+                    "anti-entropy: cluster_file %s does not verify under "
+                    "DMP_SYNC_OPERATOR_SPK; refusing to derive base_domain "
+                    "from it. Set DMP_CLUSTER_BASE_DOMAIN explicitly or "
+                    "replace the file.",
+                    path,
+                )
+                return None
+            return parsed.cluster_name
+
+        try:
+            import base64 as _b64
+
+            blob = _b64.b64decode(wire[len(_CLUSTER_PREFIX) :], validate=True)
+        except Exception:
+            return None
+        if len(blob) < 56 + 64:
+            return None
+        body = blob[:-64]
+        try:
+            name_len = body[55]
+            return body[56 : 56 + name_len].decode("utf-8").rstrip(".")
+        except Exception:
+            return None
 
     def stop(self) -> None:
         log.info("DMP node shutting down")

@@ -130,6 +130,122 @@ Each node runs a background thread (`AntiEntropyWorker`) that every
 5. Writes validated records to the local store and advances the
    per-peer watermark (compound cursor `(ts, name, value_hash)`).
 
+## Gossip and manifest rotation (M3.3)
+
+Before M3.3, rolling out a new signed manifest meant pushing the
+`cluster-manifest.wire` file to every node's disk and restarting — or
+at minimum re-publishing the manifest on every node out-of-band.
+Operators of larger clusters will rotate endpoints or add/drop nodes
+often enough that the manual push is a footgun.
+
+With M3.3, the anti-entropy worker **also gossips the signed cluster
+manifest** every tick. Operators push the new manifest to ONE node;
+the rest pick it up within one or two `DMP_SYNC_INTERVAL_SECONDS` and
+install it automatically.
+
+### Requirements to enable gossip
+
+All three must be set on every node:
+
+- `DMP_SYNC_OPERATOR_SPK` — hex-encoded Ed25519 operator public key.
+  **This is the trust anchor.** A gossiped manifest that does not
+  verify under this key is silently dropped. Without a pinned
+  operator key, gossip stays off entirely — trust-on-first-use for a
+  new cluster operator would be a security leak.
+- `DMP_CLUSTER_BASE_DOMAIN` — the cluster name (e.g.
+  `mesh.example.com`). Binds each gossiped manifest to the expected
+  cluster; a manifest correctly signed by the operator but naming a
+  different cluster is rejected. Defaults to the cluster name
+  embedded in the on-disk manifest, so existing compose deployments
+  get gossip for free once they pin `DMP_SYNC_OPERATOR_SPK`.
+- `DMP_SYNC_PEER_TOKEN` — as for other sync endpoints. The
+  `/v1/sync/cluster-manifest` endpoint shares this token with
+  `/v1/sync/digest` and `/v1/sync/pull`.
+
+`DMP_SYNC_SELF_ENDPOINT` is optional but recommended: it lists this
+node's own HTTP URL on the peer network so a manifest that includes
+self in the node set never produces a self-sync loop. The
+`node_id`-based self filter covers the compose-sample case already;
+this is belt-and-suspenders.
+
+### How a manifest rolls through the cluster
+
+```
+                 seq=5, signed                    seq=5
+                 by operator                      (gossiped)
+    operator ────────────────▶ node-a ──────────▶ node-b
+                                │                    │
+                                │ seq=5 (gossiped)   │ seq=5
+                                ▼                    ▼
+                              node-c              node-c
+```
+
+1. Operator regenerates the manifest with a bumped `seq` (and any
+   endpoint or node-list changes) using
+   `docker/cluster/generate-cluster-manifest.py`.
+2. Operator pushes the new wire to ONE node — for example by writing
+   it to that node's `cluster.<base>` TXT via the HTTP publish API,
+   or by replacing the mounted manifest file and sending SIGHUP.
+3. Within one or two `DMP_SYNC_INTERVAL_SECONDS`, every peer gossip
+   worker:
+   - GETs `/v1/sync/cluster-manifest` from its round-robin peer,
+   - verifies the returned wire under the pinned operator key and
+     expected cluster name,
+   - checks that `seq` is strictly higher than any manifest it has
+     seen before (downgrades silently rejected),
+   - republishes the wire under `cluster.<base>` TXT in the local
+     store (append-semantics keeps the old wire during the TTL
+     window — clients pick highest-seq that verifies),
+   - swaps the live anti-entropy peer set to the new node list.
+     Retained peers keep their watermarks. New peers start at the
+     `(0, "", "")` sentinel. Dropped peers have their state cleared.
+
+### Rotation playbook
+
+```bash
+# 1. Bump seq and rotate (example: add node-d, drop node-c).
+python docker/cluster/generate-cluster-manifest.py \
+    --cluster-name mesh.example.com \
+    --manifest-out /tmp/cluster-manifest.wire \
+    --operator-key-in ~/.dmp/operator-ed25519.hex \
+    --node node-a,http://dmp-node-a:8053 \
+    --node node-b,http://dmp-node-b:8053 \
+    --node node-d,http://dmp-node-d:8053
+
+# 2. Push to ONE node via the HTTP publish API. The bearer token is
+#    the node's DMP_HTTP_TOKEN, not DMP_SYNC_PEER_TOKEN.
+curl -X POST \
+    -H "Authorization: Bearer $NODE_A_HTTP_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"value\": \"$(cat /tmp/cluster-manifest.wire)\", \"ttl\": 300}" \
+    http://127.0.0.1:8101/v1/records/cluster.mesh.example.com
+
+# 3. Wait one or two DMP_SYNC_INTERVAL_SECONDS and verify convergence:
+for port in 8101 8102 8103; do
+    curl -s \
+        -H "Authorization: Bearer $DMP_SYNC_PEER_TOKEN" \
+        http://127.0.0.1:${port}/v1/sync/cluster-manifest \
+        | jq '.seq'
+done
+# All three should print the new seq.
+```
+
+### Gossip security invariants
+
+| Property | Enforced where |
+|---|---|
+| A gossiped manifest must verify under the **pinned** operator key | `ClusterManifest.parse_and_verify` with `operator_spk` arg |
+| A gossiped manifest must bind to the **expected** cluster_name | `parse_and_verify` with `expected_cluster_name=base_domain` |
+| A gossiped manifest must have `seq` **strictly greater** than the highest seen locally | Worker `_current_installed_seq` check before install |
+| A gossiped manifest must not be **expired** | `parse_and_verify` checks `exp > now` |
+| Gossip is **OFF** when operator key is not pinned | Worker `_gossip_enabled()` short-circuits |
+| A node **cannot sync with itself** | `_filter_self` drops any peer entry matching `self_node_id` or `self_http_endpoint` |
+
+A compromised peer can at worst serve an older or unrelated manifest,
+which `parse_and_verify` rejects. It cannot install a forged
+manifest — the signature is checked against the locally-pinned
+operator key.
+
 ## Trust model and failure modes
 
 | Failure | Behavior |
@@ -141,6 +257,9 @@ Each node runs a background thread (`AntiEntropyWorker`) that every
 | Peer fabricates a `next_cursor` | Ignored; watermark only advances to the max of validated-and-handled entries. |
 | Shared `DMP_SYNC_PEER_TOKEN` leaks | An attacker who reaches the peer HTTP ports can read and inject. Rotate immediately and firewall-restrict peer access to the cluster network. |
 | Operator key leaks | An attacker can sign a forged cluster manifest pointing at their nodes. Rotate out-of-band; clients that have pinned the old operator key must re-pin. |
+| Peer serves an older manifest via `/v1/sync/cluster-manifest` | Rejected by `seq <= current_local_seq` check — gossip never downgrades. |
+| Peer serves a manifest signed by a different key | Rejected by signature verification against the pinned `DMP_SYNC_OPERATOR_SPK`. |
+| Peer serves a manifest bound to a different cluster | Rejected by `expected_cluster_name` binding. |
 
 ## Test suite
 

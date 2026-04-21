@@ -6,11 +6,12 @@ operator runs this service and exposes the endpoint; clients POST records
 which the node then serves via its DNS side.
 
 Endpoints:
-    POST   /v1/records/{name}    body: {"value": "...", "ttl": 300}
-    DELETE /v1/records/{name}    optional body: {"value": "..."}
-    GET    /v1/records/{name}    debug; returns {"values": [...]}
-    GET    /v1/sync/digest       anti-entropy: (name, hash, ts) index
-    POST   /v1/sync/pull         anti-entropy: pull values by name list
+    POST   /v1/records/{name}           body: {"value": "...", "ttl": 300}
+    DELETE /v1/records/{name}           optional body: {"value": "..."}
+    GET    /v1/records/{name}           debug; returns {"values": [...]}
+    GET    /v1/sync/digest              anti-entropy: (name, hash, ts) index
+    POST   /v1/sync/pull                anti-entropy: pull values by name list
+    GET    /v1/sync/cluster-manifest    gossip: current signed manifest wire
     GET    /health
     GET    /stats
 
@@ -153,6 +154,8 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/sync/digest":
             return self._handle_sync_digest(parsed.query)
+        if parsed.path == "/v1/sync/cluster-manifest":
+            return self._handle_sync_cluster_manifest()
         if self._match_name() is not None:
             if not self._check_rate_limit():
                 return 429
@@ -426,6 +429,158 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         )
         return 200
 
+    def _handle_sync_cluster_manifest(self) -> int:
+        """GET /v1/sync/cluster-manifest
+
+        Returns the signed cluster manifest wire this node currently
+        serves under ``cluster.<cluster_base_domain>`` TXT — the same
+        record it publishes on startup from a mounted manifest file and
+        refreshes via gossip. Peer gossip workers fetch this to learn
+        whether the operator has rolled out a higher-seq manifest.
+
+        Response:
+            200 ``{"wire": "...", "seq": N, "exp": N, "cluster_name": "..."}``
+                when a parseable manifest wire is present at
+                ``cluster.<cluster_base_domain>``. If multiple TXT
+                values co-reside (rollout window), we return the
+                highest-seq that parses structurally — the caller
+                re-verifies the signature against its pinned
+                ``operator_spk`` and decides whether to install.
+            204 no content, when no manifest is known to this node
+                (file never mounted, not yet installed via gossip, or
+                ``cluster_base_domain`` was not configured).
+            403 wrong / missing sync token.
+            429 rate-limited.
+
+        Auth: shares ``sync_peer_token`` with /v1/sync/digest and
+        /v1/sync/pull. The manifest wire is a signed, publishable
+        record — but the peer-to-peer channel is still cluster-private
+        and an anonymous caller has no business hitting this surface.
+
+        The server does NOT verify the signature or enforce an expected
+        operator key here. The gossip worker does both with its pinned
+        trust anchor; the server is just a cache of whatever wire was
+        last installed locally, and re-verifying here would only mask a
+        local-state inconsistency (the node would 204 on a manifest it
+        has in-store). A compromised server can at worst serve an older
+        or unrelated manifest, which ``parse_and_verify`` rejects
+        client-side.
+        """
+        if not self._check_rate_limit():
+            return 429
+        if not self._sync_authorized():
+            self._send_json(403, {"error": "forbidden"})
+            return 403
+
+        base = self.server.cluster_base_domain
+        if not base:
+            # No base domain configured → the server doesn't know which
+            # RRset to read. Treated as "no manifest known to this node".
+            self._send_empty(204)
+            return 204
+
+        # Derive the RRset the node publishes under. Mirror the same
+        # cluster.<base> convention used by `_publish_cluster_manifest_from_file`.
+        from dmp.core.cluster import RECORD_PREFIX as _CLUSTER_PREFIX
+        from dmp.core.cluster import cluster_rrset_name
+
+        try:
+            rrset = cluster_rrset_name(base)
+        except ValueError:
+            # Operator misconfigured cluster_base_domain; a 204 beats a
+            # 500 here — gossip will simply never install from this node.
+            self._send_empty(204)
+            return 204
+
+        reader = self._reader()
+        if reader is None:
+            self._send_empty(204)
+            return 204
+
+        values = reader.query_txt_record(rrset)
+        if not values:
+            self._send_empty(204)
+            return 204
+
+        # Pick the highest-seq wire that (a) parses structurally AND
+        # (b) verifies under the pinned operator_spk when one is set.
+        # Without the verification filter, a stray TXT value with a
+        # higher seq (bad key, malformed body, wrong cluster) would
+        # mask every valid manifest below it — the gossip client
+        # rejects the bad wire in parse_and_verify() and never falls
+        # back to the next candidate, so rollout stalls until the bad
+        # TXT expires. Filtering server-side means only a verified
+        # wire ever wins the highest-seq race.
+        #
+        # If no operator_spk is configured (back-compat: older nodes
+        # without DMP_SYNC_OPERATOR_SPK), fall back to the prior
+        # structural-only behavior. Gossip is disabled in that mode
+        # anyway (see _make_anti_entropy_worker), so correctness of
+        # the highest-seq pick only matters for manually-issued
+        # diagnostic curls and we keep those working.
+        operator_spk: Optional[bytes] = getattr(
+            self.server, "sync_cluster_operator_spk", None
+        )
+        from dmp.core.cluster import ClusterManifest as _ClusterManifest
+
+        best_wire: Optional[str] = None
+        best_seq = -1
+        best_exp = 0
+        best_name = ""
+        import base64 as _b64
+
+        for wire in values:
+            if not isinstance(wire, str) or not wire.startswith(_CLUSTER_PREFIX):
+                continue
+            try:
+                blob = _b64.b64decode(wire[len(_CLUSTER_PREFIX) :], validate=True)
+            except Exception:
+                continue
+            # magic(7) + seq(8) + exp(8) + spk(32) + name_len(1) = 56
+            # + 64-byte sig trailer.
+            if len(blob) < 56 + 64:
+                continue
+            body = blob[:-64]
+            try:
+                seq = int.from_bytes(body[7:15], "big")
+                exp = int.from_bytes(body[15:23], "big")
+                name_len = body[55]
+                cluster_name = body[56 : 56 + name_len].decode("utf-8").rstrip(".")
+            except Exception:
+                continue
+            if operator_spk is not None:
+                # Signature + cluster-name binding. Skip silently on
+                # failure — peer-view is informational, not authoritative.
+                if (
+                    _ClusterManifest.parse_and_verify(
+                        wire,
+                        operator_spk,
+                        expected_cluster_name=base if base else None,
+                    )
+                    is None
+                ):
+                    continue
+            if seq > best_seq:
+                best_wire = wire
+                best_seq = seq
+                best_exp = exp
+                best_name = cluster_name
+
+        if best_wire is None:
+            self._send_empty(204)
+            return 204
+
+        self._send_json(
+            200,
+            {
+                "wire": best_wire,
+                "seq": best_seq,
+                "exp": best_exp,
+                "cluster_name": best_name,
+            },
+        )
+        return 200
+
     def _handle_sync_pull(self) -> int:
         """POST /v1/sync/pull {"names": [...]} -> TXT values for those names.
 
@@ -598,6 +753,8 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         max_values_per_name,
         max_concurrency,
         sync_peer_token=None,
+        cluster_base_domain=None,
+        sync_cluster_operator_spk=None,
     ):
         super().__init__(addr, handler)
         self.store = store
@@ -608,6 +765,8 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.max_values_per_name = max_values_per_name
         self.max_concurrency = max_concurrency
         self.sync_peer_token = sync_peer_token
+        self.cluster_base_domain = cluster_base_domain
+        self.sync_cluster_operator_spk = sync_cluster_operator_spk
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -654,6 +813,8 @@ class DMPHttpApi:
         max_values_per_name: int = DEFAULT_MAX_VALUES_PER_NAME,
         max_concurrency: int = 64,
         sync_peer_token: Optional[str] = None,
+        cluster_base_domain: Optional[str] = None,
+        sync_cluster_operator_spk: Optional[bytes] = None,
     ):
         self.store = store
         self.host = host
@@ -669,6 +830,8 @@ class DMPHttpApi:
         self.max_values_per_name = int(max_values_per_name)
         self.max_concurrency = int(max_concurrency)
         self.sync_peer_token = sync_peer_token
+        self.cluster_base_domain = cluster_base_domain
+        self.sync_cluster_operator_spk = sync_cluster_operator_spk
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -692,6 +855,8 @@ class DMPHttpApi:
             self.max_values_per_name,
             self.max_concurrency,
             sync_peer_token=self.sync_peer_token,
+            cluster_base_domain=self.cluster_base_domain,
+            sync_cluster_operator_spk=self.sync_cluster_operator_spk,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
