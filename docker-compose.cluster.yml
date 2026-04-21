@@ -36,6 +36,7 @@ version: "3.8"
 
 services:
   node-a:
+    build: .
     image: dmp-node:latest
     container_name: dmp-node-a
     env_file: docker/cluster/node-a.env
@@ -56,6 +57,7 @@ services:
       retries: 3
 
   node-b:
+    build: .
     image: dmp-node:latest
     container_name: dmp-node-b
     env_file: docker/cluster/node-b.env
@@ -74,6 +76,7 @@ services:
       retries: 3
 
   node-c:
+    build: .
     image: dmp-node:latest
     container_name: dmp-node-c
     env_file: docker/cluster/node-c.env
