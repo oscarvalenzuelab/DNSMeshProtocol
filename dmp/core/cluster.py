@@ -147,8 +147,16 @@ def cluster_rrset_name(cluster_name: str) -> str:
     Convention: `cluster.<cluster_name>`. Kept as a function so we can
     evolve it (e.g., to `_dmp-cluster.<cluster_name>` SRV-style) without
     churning call sites.
+
+    A single trailing dot is stripped (canonical FQDN form). Doubled
+    trailing dots indicate an empty final label — we refuse to silently
+    rewrite them into a different owner name, which would mask a caller
+    typo and publish to the wrong RRset.
     """
-    return f"cluster.{cluster_name.rstrip('.')}"
+    if cluster_name.endswith(".."):
+        raise ValueError("cluster_name contains empty label at the end")
+    normalized = cluster_name[:-1] if cluster_name.endswith(".") else cluster_name
+    return f"cluster.{normalized}"
 
 
 @dataclass

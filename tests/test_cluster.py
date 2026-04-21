@@ -826,6 +826,12 @@ class TestClusterRrsetName:
     def test_trailing_dot_stripped(self):
         assert cluster_rrset_name("mesh.example.com.") == "cluster.mesh.example.com"
 
+    def test_doubled_trailing_dot_rejected(self):
+        # Previously rstrip('.') collapsed ".." to the base name, hiding
+        # a caller typo and publishing to the wrong RRset. We now refuse.
+        with pytest.raises(ValueError, match="empty label"):
+            cluster_rrset_name("mesh.example.com..")
+
 
 # ---- cluster_name DNS-name validation -------------------------------------
 
