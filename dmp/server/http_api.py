@@ -502,11 +502,27 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             self._send_empty(204)
             return 204
 
-        # Pick the highest-seq wire that parses structurally. We do NOT
-        # re-verify the signature — the caller pins the trust anchor and
-        # will re-verify itself. A structurally-parseable wire is enough
-        # to expose ``seq`` / ``exp`` / ``cluster_name`` in the response
-        # envelope for log / debug purposes.
+        # Pick the highest-seq wire that (a) parses structurally AND
+        # (b) verifies under the pinned operator_spk when one is set.
+        # Without the verification filter, a stray TXT value with a
+        # higher seq (bad key, malformed body, wrong cluster) would
+        # mask every valid manifest below it — the gossip client
+        # rejects the bad wire in parse_and_verify() and never falls
+        # back to the next candidate, so rollout stalls until the bad
+        # TXT expires. Filtering server-side means only a verified
+        # wire ever wins the highest-seq race.
+        #
+        # If no operator_spk is configured (back-compat: older nodes
+        # without DMP_SYNC_OPERATOR_SPK), fall back to the prior
+        # structural-only behavior. Gossip is disabled in that mode
+        # anyway (see _make_anti_entropy_worker), so correctness of
+        # the highest-seq pick only matters for manually-issued
+        # diagnostic curls and we keep those working.
+        operator_spk: Optional[bytes] = getattr(
+            self.server, "sync_cluster_operator_spk", None
+        )
+        from dmp.core.cluster import ClusterManifest as _ClusterManifest
+
         best_wire: Optional[str] = None
         best_seq = -1
         best_exp = 0
@@ -532,6 +548,18 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
                 cluster_name = body[56 : 56 + name_len].decode("utf-8").rstrip(".")
             except Exception:
                 continue
+            if operator_spk is not None:
+                # Signature + cluster-name binding. Skip silently on
+                # failure — peer-view is informational, not authoritative.
+                if (
+                    _ClusterManifest.parse_and_verify(
+                        wire,
+                        operator_spk,
+                        expected_cluster_name=base if base else None,
+                    )
+                    is None
+                ):
+                    continue
             if seq > best_seq:
                 best_wire = wire
                 best_seq = seq
@@ -726,6 +754,7 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         max_concurrency,
         sync_peer_token=None,
         cluster_base_domain=None,
+        sync_cluster_operator_spk=None,
     ):
         super().__init__(addr, handler)
         self.store = store
@@ -737,6 +766,7 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.max_concurrency = max_concurrency
         self.sync_peer_token = sync_peer_token
         self.cluster_base_domain = cluster_base_domain
+        self.sync_cluster_operator_spk = sync_cluster_operator_spk
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -784,6 +814,7 @@ class DMPHttpApi:
         max_concurrency: int = 64,
         sync_peer_token: Optional[str] = None,
         cluster_base_domain: Optional[str] = None,
+        sync_cluster_operator_spk: Optional[bytes] = None,
     ):
         self.store = store
         self.host = host
@@ -800,6 +831,7 @@ class DMPHttpApi:
         self.max_concurrency = int(max_concurrency)
         self.sync_peer_token = sync_peer_token
         self.cluster_base_domain = cluster_base_domain
+        self.sync_cluster_operator_spk = sync_cluster_operator_spk
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -824,6 +856,7 @@ class DMPHttpApi:
             self.max_concurrency,
             sync_peer_token=self.sync_peer_token,
             cluster_base_domain=self.cluster_base_domain,
+            sync_cluster_operator_spk=self.sync_cluster_operator_spk,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
