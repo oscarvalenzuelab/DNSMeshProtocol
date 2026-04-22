@@ -310,6 +310,78 @@ class TestIdentityPublishFetch:
         assert "--accept-fingerprint" in err
 
 
+class TestIdentityRotateExperimental:
+    """`dmp identity rotate` — EXPERIMENTAL (M5.4).
+
+    The CLI surface ships flagged experimental; the underlying wire
+    format is subject to revision after the external crypto audit.
+    """
+
+    def test_rotate_without_flag_errors(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["identity", "rotate", "--yes"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "EXPERIMENTAL" in err
+        assert "--experimental" in err
+
+    def test_rotate_publishes_records(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
+
+        rc = cli.main(["identity", "rotate", "--yes", "--experimental"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        err = capsys.readouterr().err
+        assert "published RotationRecord" in out
+        assert "published new IdentityRecord" in out
+
+        # Record actually landed in the shared store. Subject is
+        # alice@mesh.local (no identity_domain set on the default init).
+        from dmp.core.rotation import (
+            RECORD_PREFIX_ROTATION,
+            rotation_rrset_name_user_identity,
+        )
+
+        # Default domain on init is "mesh.local".
+        rrset = rotation_rrset_name_user_identity("alice", "mesh.local")
+        records = shared_store.query_txt_record(rrset)
+        assert records is not None and len(records) == 1
+        assert records[0].startswith(RECORD_PREFIX_ROTATION)
+
+    def test_rotate_rejects_same_passphrase(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-pass")
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["identity", "rotate", "--yes", "--experimental"])
+        assert exc.value.code == 1
+
+    def test_rotate_warning_banner_emitted(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
+        cli.main(["identity", "rotate", "--yes", "--experimental"])
+        captured = capsys.readouterr()
+        # Banner goes to stderr so it doesn't contaminate piped-to-json.
+        assert "EXPERIMENTAL" in captured.err
+        assert "draft" in captured.err or "change in v0.3.0" in captured.err
+
+
 class TestContacts:
     def test_add_and_list(self, config_home, capsys):
         cli.main(["init", "alice", "--endpoint", "http://x"])

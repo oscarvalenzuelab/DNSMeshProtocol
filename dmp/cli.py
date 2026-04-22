@@ -26,6 +26,7 @@ import ipaddress
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -904,6 +905,197 @@ def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
         return 0
     finally:
         _close_client(client)
+
+
+def cmd_identity_rotate(args: argparse.Namespace) -> int:
+    """EXPERIMENTAL (M5.4): rotate the user identity key.
+
+    Publishes a co-signed RotationRecord at the user's rotation RRset
+    plus a fresh IdentityRecord for the new key. Does NOT mutate the
+    local config — rotating the on-disk identity is a separate manual
+    step (re-run ``dmp init --force`` with the new passphrase once
+    all pinned contacts are known to have migrated).
+
+    Wire format subject to revision after the M4 external crypto audit;
+    v0.3.0 may introduce a breaking ``v=dmp2;t=rotation;``. See
+    ``docs/protocol/rotation.md``.
+    """
+    if not getattr(args, "experimental", False):
+        _die(
+            1,
+            "key rotation is EXPERIMENTAL and subject to revision after the "
+            "external crypto audit — re-run with --experimental to proceed.",
+        )
+
+    # Print a loud banner so the operator cannot miss the caveat.
+    print(
+        "WARNING: identity rotation is EXPERIMENTAL.",
+        file=sys.stderr,
+    )
+    print(
+        "  The wire format for rotation + revocation records is draft and "
+        "may change in v0.3.0 after the external crypto audit.",
+        file=sys.stderr,
+    )
+    print(
+        "  See docs/protocol/rotation.md for the threat model and limits.",
+        file=sys.stderr,
+    )
+
+    from dmp.core.identity import (
+        identity_domain,
+        make_record,
+        zone_anchored_identity_name,
+    )
+    from dmp.core.rotation import (
+        RotationRecord,
+        SUBJECT_TYPE_USER_IDENTITY,
+        rotation_rrset_name_user_identity,
+        rotation_rrset_name_zone_anchored,
+    )
+
+    cfg = CLIConfig.load(_config_path())
+
+    # Load the CURRENT identity via the usual passphrase path.
+    old_passphrase = _load_passphrase(cfg)
+
+    # Load the NEW identity material from --new-passphrase-file, or an
+    # env var, or an interactive prompt. We deliberately avoid accepting
+    # the new passphrase on argv — it would end up in shell history.
+    new_passphrase: Optional[str] = None
+    if args.new_passphrase_file:
+        fp = Path(args.new_passphrase_file).expanduser()
+        if not fp.exists():
+            _die(1, f"--new-passphrase-file: {fp} does not exist")
+        new_passphrase = fp.read_text().strip()
+    elif env_pw := os.environ.get("DMP_NEW_PASSPHRASE"):
+        new_passphrase = env_pw
+    else:
+        new_passphrase = getpass.getpass("New passphrase: ")
+    if not new_passphrase:
+        _die(1, "new passphrase is empty")
+
+    # Build the two DMPCrypto identities. Both use the SAME kdf_salt as
+    # the existing config: two passphrases with the same salt produce
+    # different keys, and re-using the salt matches how a real operator
+    # would rotate (they don't want to re-randomize the salt mid-flow).
+    kdf_salt = bytes.fromhex(cfg.kdf_salt) if cfg.kdf_salt else None
+    from dmp.core.crypto import DMPCrypto
+
+    old_crypto = DMPCrypto.from_passphrase(old_passphrase, salt=kdf_salt)
+    new_crypto = DMPCrypto.from_passphrase(new_passphrase, salt=kdf_salt)
+
+    if (
+        old_crypto.get_signing_public_key_bytes()
+        == new_crypto.get_signing_public_key_bytes()
+    ):
+        _die(
+            1,
+            "new passphrase derives the same key as the current one — "
+            "choose a distinct passphrase for rotation to take effect",
+        )
+
+    # Confirmation gate unless --yes. Rotation is a protocol-visible
+    # event and we want the operator to eyeball the new fingerprint
+    # before publishing.
+    new_spk_hex = new_crypto.get_signing_public_key_bytes().hex()
+    print(f"current signing key: {old_crypto.get_signing_public_key_bytes().hex()}")
+    print(f"new signing key:     {new_spk_hex}")
+    if not args.yes:
+        resp = input("Publish RotationRecord? [y/N] ").strip().lower()
+        if resp not in ("y", "yes"):
+            print("aborted.")
+            return 1
+
+    # Construct the subject. We use the zone-anchored form when the
+    # config has identity_domain set (so subject = user@identity_domain);
+    # otherwise fall back to user@effective_domain.
+    effective_domain = _effective_domain(cfg)
+    if cfg.identity_domain:
+        subject = f"{cfg.username}@{cfg.identity_domain}"
+    else:
+        subject = f"{cfg.username}@{effective_domain}"
+
+    # Seq numbering: start at unix-seconds so a fresh CLI run always
+    # produces a strictly monotonic seq across multiple rotations. A
+    # longer-horizon store-backed counter is out of scope for this pass;
+    # the audit may recommend a different scheme.
+    now_ts = int(time.time())
+    seq = now_ts
+    ts = now_ts
+
+    rotation = RotationRecord(
+        subject_type=SUBJECT_TYPE_USER_IDENTITY,
+        subject=subject,
+        old_spk=old_crypto.get_signing_public_key_bytes(),
+        new_spk=new_crypto.get_signing_public_key_bytes(),
+        seq=seq,
+        ts=ts,
+        exp=ts + int(args.exp_seconds),
+    )
+    try:
+        rotation_wire = rotation.sign(old_crypto, new_crypto)
+    except ValueError as exc:
+        _die(1, f"failed to co-sign RotationRecord: {exc}")
+
+    # Publish. Needs a writer; go through _make_client to get the same
+    # transport the rest of the CLI uses. We use the OLD passphrase for
+    # this client — it's still the on-disk identity.
+    client = _make_client(cfg, old_passphrase)
+    try:
+        if cfg.identity_domain:
+            rrset_name = rotation_rrset_name_zone_anchored(cfg.identity_domain)
+            identity_rrset = zone_anchored_identity_name(cfg.identity_domain)
+        else:
+            rrset_name = rotation_rrset_name_user_identity(
+                cfg.username, effective_domain
+            )
+            identity_rrset = identity_domain(cfg.username, effective_domain)
+
+        ok = client.writer.publish_txt_record(
+            rrset_name, rotation_wire, ttl=int(args.ttl)
+        )
+        if not ok:
+            _die(2, f"publish of RotationRecord to {rrset_name} failed")
+        print(f"published RotationRecord to {rrset_name}")
+
+        # Also publish a fresh IdentityRecord for the NEW key so that
+        # non-rotation-aware contacts still see the new key pinned
+        # correctly on a plain `dmp identity fetch`.
+        new_identity = make_record(new_crypto, cfg.username)
+        ok = client.writer.publish_txt_record(
+            identity_rrset, new_identity.sign(new_crypto), ttl=int(args.ttl)
+        )
+        if not ok:
+            print(
+                f"warning: RotationRecord published, but IdentityRecord "
+                f"for the new key FAILED to publish at {identity_rrset} — "
+                f"re-run `dmp identity publish` after updating the local "
+                f"config to the new passphrase.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"published new IdentityRecord to {identity_rrset}")
+    finally:
+        _close_client(client)
+
+    print()
+    print("Next steps:")
+    print(
+        "  1. Pinned contacts running with rotation_chain_enabled=True will "
+        "pick up the new key automatically."
+    )
+    print(
+        "  2. Other contacts must manually re-pin: "
+        "`dmp identity fetch <user>@<host> --add` against the new key."
+    )
+    print(
+        "  3. Update this config to the new passphrase (re-run "
+        "`dmp init --force` with the new passphrase) ONLY after you have "
+        "confirmed contacts can still reach you — the on-disk identity "
+        "is NOT rotated automatically to avoid mid-flow lockout."
+    )
+    return 0
 
 
 def cmd_identity_fetch(args: argparse.Namespace) -> int:
@@ -2145,6 +2337,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="per-prekey TTL in seconds (default: 86400 = 1 day)",
     )
     p_id_pk.set_defaults(func=cmd_identity_refresh_prekeys)
+
+    p_id_rotate = sub_id.add_parser(
+        "rotate",
+        help="EXPERIMENTAL (M5.4): rotate to a new identity key. "
+        "Co-signs a RotationRecord and publishes it + a fresh IdentityRecord "
+        "for the new key. Wire format subject to revision after the crypto audit.",
+    )
+    p_id_rotate.add_argument(
+        "--new-passphrase-file",
+        dest="new_passphrase_file",
+        default=None,
+        help="path to a file containing the new passphrase. Alternative: "
+        "DMP_NEW_PASSPHRASE env var, or interactive prompt.",
+    )
+    p_id_rotate.add_argument(
+        "--ttl",
+        type=int,
+        default=86400,
+        help="TTL seconds for the published TXT records (default 86400)",
+    )
+    p_id_rotate.add_argument(
+        "--exp-seconds",
+        dest="exp_seconds",
+        type=int,
+        default=86400 * 365,
+        help="seconds until the RotationRecord's exp field (default 1 year)",
+    )
+    p_id_rotate.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the interactive confirmation prompt",
+    )
+    p_id_rotate.add_argument(
+        "--experimental",
+        action="store_true",
+        help="required — acknowledges the feature is experimental and "
+        "subject to revision after the external crypto audit.",
+    )
+    p_id_rotate.set_defaults(func=cmd_identity_rotate)
 
     p_id_fetch = sub_id.add_parser(
         "fetch", help="resolve someone's identity record from DNS"
