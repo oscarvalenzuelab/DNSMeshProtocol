@@ -55,10 +55,16 @@ def shared_store(monkeypatch):
             replay_cache_path=replay_path,
         )
         for name, entry in config.contacts.items():
+            # Mirror the real _make_client: use the persisted
+            # `domain` (cross-zone contacts added via
+            # `identity fetch user@host --add`) or fall back to the
+            # local config.domain. Back-compat for legacy
+            # `{pub, spk}` entries missing the field.
+            contact_domain = entry.get("domain", "") or config.domain
             client.add_contact(
                 name,
                 entry.get("pub", ""),
-                domain=config.domain,
+                domain=contact_domain,
                 signing_key_hex=entry.get("spk", ""),
             )
         return client
@@ -234,6 +240,50 @@ class TestIdentityPublishFetch:
 
         cli.main(["contacts", "list"])
         assert "alice" in capsys.readouterr().out
+
+    def test_zone_anchored_fetch_add_persists_remote_domain(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """`identity fetch user@host --add` stores `domain=host` on the contact.
+
+        Regression for the rotation-chain cross-domain walk: without
+        the remote host persisted, `_make_client` reconstructs the
+        contact with the local effective domain and the walker queries
+        the wrong zone's rotate RRset.
+        """
+        import yaml as _yaml
+
+        # Alice publishes under her own zone.
+        cli.main(
+            [
+                "init",
+                "alice",
+                "--endpoint",
+                "http://x",
+                "--identity-domain",
+                "alice.example.com",
+            ]
+        )
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        cli.main(["identity", "publish"])
+        capsys.readouterr()
+
+        # Bob (different local domain) fetches + adds.
+        bob_home = config_home.parent / "bob-cross-zone"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(["init", "bob", "--endpoint", "http://x", "--domain", "bob.local"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+        capsys.readouterr()
+
+        cli.main(["identity", "fetch", "alice@alice.example.com", "--add"])
+
+        cfg_data = _yaml.safe_load((bob_home / "config.yaml").read_text())
+        entry = cfg_data["contacts"]["alice"]
+        # The persisted entry must carry the REMOTE host, not bob's
+        # local domain. Rotation fallback reads this field.
+        assert entry["domain"] == "alice.example.com"
+        assert entry["pub"]
+        assert entry["spk"]
 
     def test_zone_anchored_fetch_rejects_username_mismatch(
         self, config_home, shared_store, monkeypatch, capsys
