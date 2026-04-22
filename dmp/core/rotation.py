@@ -548,16 +548,42 @@ class RevocationRecord:
         expected_subject: Optional[str] = None,
         *,
         now: Optional[int] = None,
-        max_age_seconds: int = 86_400 * 365,
+        max_age_seconds: Optional[int] = None,
     ) -> Optional["RevocationRecord"]:
         """Parse, verify single signature. Never raises.
 
-        ``max_age_seconds`` bounds how old a revocation we accept. A year
-        is the default — old enough to catch a client that was offline
-        across a rotation cycle, short enough that an attacker cannot
-        replay a stale revocation indefinitely. Callers that want to
-        accept arbitrarily old revocations (e.g. a forensic audit tool)
-        can pass a large value.
+        **Revocations are permanent assertions.** A valid revocation
+        signed by ``revoked_spk`` at any point in the past remains a
+        valid revocation: "this key is dead" is not a statement that
+        expires. The default ``max_age_seconds=None`` disables the
+        age gate entirely.
+
+        The historical 1-year cap introduced a silent regression: once
+        the cap expired, `dmp identity fetch` could no longer filter
+        the old IdentityRecord out of the mailbox RRset (append
+        semantics lets the old record stay live if re-published), and
+        the fetch path saw BOTH old and new identities as valid —
+        rotation regressed to "ambiguous, re-pin out-of-band" without
+        any operator action. The permanent-assertion model eliminates
+        that regression.
+
+        Callers with custom freshness policies (forensic replay
+        windows, stale-log pruning) can still pass
+        ``max_age_seconds=<int>`` explicitly; a concrete integer
+        re-enables the same ``ts + max_age < now`` gate the old
+        default implemented. Back-compat for existing call sites
+        carrying ``max_age_seconds=86400*365``: behavior is unchanged.
+
+        A small positive clock-skew guard (+300 s on ``ts``) is
+        preserved regardless of ``max_age_seconds`` — a revocation
+        whose ``ts`` claims to be in the far future is still rejected,
+        otherwise an attacker with skewed clocks could game the
+        freshness gate when a caller DOES opt in.
+
+        See docs/protocol/rotation.md §6 for the application-level
+        discussion (revocations are permanent at the DMP layer; the
+        TXT TTL layer still needs periodic re-publication as DNS
+        records age out).
         """
         if not isinstance(wire, str) or not wire.startswith(RECORD_PREFIX_REVOCATION):
             return None
@@ -597,13 +623,18 @@ class RevocationRecord:
             ) != _normalize_subject(record.subject_type, expected_subject):
                 return None
 
-        # Freshness window. Reject stale revocations to limit an attacker's
-        # ability to re-inject an old revocation long after the fact. Also
-        # reject revocations whose ts is absurdly in the future (clock-skew
-        # attacks that could extend the freshness window).
+        # Freshness window. Default (None) = no cap: a revocation is a
+        # permanent assertion. Callers that opt in with an explicit
+        # int get the classical ts + max_age < now gate. The future-ts
+        # guard is always on (clock-skew attacks must not game the
+        # freshness window even in the no-cap default case — it still
+        # matters because a future-dated record could be used to
+        # pre-authorize a revocation the attacker wants to land later
+        # once they've acquired the signing key).
         now_ts = int(time.time()) if now is None else int(now)
-        if record.ts + int(max_age_seconds) < now_ts:
-            return None
+        if max_age_seconds is not None:
+            if record.ts + int(max_age_seconds) < now_ts:
+                return None
         # Allow a small positive clock drift (300s, matching typical Kerberos
         # defaults). Beyond that, reject — a future-ts record is either
         # a clock problem or a replay-protection attack.

@@ -898,7 +898,14 @@ def gen_revocation_record_cases() -> list[dict[str, Any]]:
         }
     )
 
-    # 4. Stale revocation: ts older than max_age_seconds window.
+    # 4. Stale revocation with EXPLICIT max_age_seconds.
+    #
+    # Revocations are permanent assertions under the default
+    # (max_age_seconds=None, no cap). This vector instead exercises
+    # the OPTIONAL caller-provided freshness window: a client that
+    # deliberately wants to prune old revocations (forensic replay
+    # windows, audit tools) passes an explicit integer, and the
+    # classical ts + max_age < now gate kicks back in.
     rec_stale = RevocationRecord(
         subject_type=SUBJECT_TYPE_USER_IDENTITY,
         subject="alice@example.com",
@@ -909,7 +916,10 @@ def gen_revocation_record_cases() -> list[dict[str, Any]]:
     wire_stale = rec_stale.sign(revoked)
     cases.append(
         {
-            "description": "stale: revocation older than default max_age_seconds",
+            "description": (
+                "stale-with-explicit-cap: revocation rejected only when "
+                "the caller opts in to max_age_seconds"
+            ),
             "revoked_seed_hex": revoked_seed.hex(),
             "inputs": {
                 "subject_type": SUBJECT_TYPE_USER_IDENTITY,
@@ -919,9 +929,16 @@ def gen_revocation_record_cases() -> list[dict[str, Any]]:
                 "ts": TS_2030,
             },
             "expected_wire_hex": wire_stale.encode("utf-8").hex(),
-            # Two years after ts, default 1-year max_age → reject.
+            # Two years after ts, caller passes 1-year explicit cap → reject.
             "verify_with_now": TS_2030 + 86400 * 365 * 2,
+            "verify_with_max_age_seconds": 86400 * 365,
             "expected_parse_result": "none",
+            "notes": (
+                "Permanent-assertion model: the default "
+                "max_age_seconds=None accepts this same wire. The "
+                "rejection here requires the explicit cap in "
+                "verify_with_max_age_seconds."
+            ),
         }
     )
 
