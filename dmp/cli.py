@@ -981,7 +981,7 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
     )
     from dmp.core.rotation import (
         REASON_COMPROMISE,
-        REASON_ROUTINE,
+        REASON_LOST_KEY,
         RevocationRecord,
         RotationRecord,
         SUBJECT_TYPE_USER_IDENTITY,
@@ -1079,27 +1079,41 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
     except ValueError as exc:
         _die(1, f"failed to co-sign RotationRecord: {exc}")
 
-    # Self-signed revocation of the OLD key at the rotate RRset. Lets
-    # non-rotation-aware `dmp identity fetch` filter the old
-    # IdentityRecord out of the mailbox-name RRset (append semantics
-    # leaves both old and new records there otherwise, triggering the
-    # "multiple valid records, ambiguous" exit). See Finding 3 /
-    # Option C in docs/protocol/rotation.md.
-    reason_str = getattr(args, "reason", "routine") or "routine"
-    reason_code = (
-        REASON_COMPROMISE if reason_str.lower() == "compromise" else REASON_ROUTINE
-    )
-    revocation = RevocationRecord(
-        subject_type=SUBJECT_TYPE_USER_IDENTITY,
-        subject=subject,
-        revoked_spk=old_crypto.get_signing_public_key_bytes(),
-        reason_code=reason_code,
-        ts=ts,
-    )
-    try:
-        revocation_wire = revocation.sign(old_crypto)
-    except ValueError as exc:
-        _die(1, f"failed to sign RevocationRecord: {exc}")
+    # Revocation policy depends on --reason.
+    #
+    # compromise / lost_key: publish a RevocationRecord for the old
+    # key. Contacts using rotation-chain walking will ABORT trust on
+    # the old key entirely (correct — it's no longer safe to follow
+    # ANY chain starting from the compromised key; holders of the old
+    # key must re-pin out-of-band). Non-rotation-aware contacts
+    # running `dmp identity fetch` will filter the old identity
+    # record out of the mailbox-name RRset and see only the new one.
+    #
+    # routine: do NOT publish a revocation. A routine rotation is a
+    # hygiene step, not a compromise; contacts should auto-follow
+    # A→B via chain walk, which would be impossible if we published
+    # a revocation of A (the walker aborts on any path-revocation).
+    # For non-rotation-aware fetchers, the multi-record ambiguity
+    # is resolved by `cmd_identity_fetch` which now prefers the
+    # chain-head identity when a rotation exists — see finding-3
+    # follow-up in docs/protocol/rotation.md.
+    reason_str = (getattr(args, "reason", "routine") or "routine").lower()
+    revocation_wire: Optional[str] = None
+    if reason_str in ("compromise", "lost_key"):
+        reason_code = (
+            REASON_COMPROMISE if reason_str == "compromise" else REASON_LOST_KEY
+        )
+        revocation = RevocationRecord(
+            subject_type=SUBJECT_TYPE_USER_IDENTITY,
+            subject=subject,
+            revoked_spk=old_crypto.get_signing_public_key_bytes(),
+            reason_code=reason_code,
+            ts=ts,
+        )
+        try:
+            revocation_wire = revocation.sign(old_crypto)
+        except ValueError as exc:
+            _die(1, f"failed to sign RevocationRecord: {exc}")
 
     # Publish. Needs a writer; go through _make_client to get the same
     # transport the rest of the CLI uses. We use the OLD passphrase for
@@ -1122,23 +1136,32 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
             _die(2, f"publish of RotationRecord to {rrset_name} failed")
         print(f"published RotationRecord to {rrset_name}")
 
-        # Revocation publishes at the same rrset_name so a single RRset
-        # read surfaces both the chain-forward hint (rotation) and the
-        # filter-out-old-identity hint (revocation).
-        ok_rev = client.writer.publish_txt_record(
-            rrset_name, revocation_wire, ttl=int(args.ttl)
-        )
-        if not ok_rev:
-            print(
-                f"warning: RotationRecord published, but RevocationRecord "
-                f"of the old key FAILED to publish at {rrset_name} — "
-                f"non-rotation-aware `dmp identity fetch` will see BOTH "
-                f"the old and new IdentityRecords and exit ambiguous. "
-                f"Re-publish the revocation manually.",
-                file=sys.stderr,
+        # Revocation publish is conditional on --reason. Routine rotations
+        # deliberately skip it so contacts can auto-follow via chain walk.
+        # See revocation-policy docstring above.
+        if revocation_wire is not None:
+            ok_rev = client.writer.publish_txt_record(
+                rrset_name, revocation_wire, ttl=int(args.ttl)
             )
+            if not ok_rev:
+                print(
+                    f"warning: RotationRecord published, but RevocationRecord "
+                    f"of the old key FAILED to publish at {rrset_name} — "
+                    f"non-rotation-aware `dmp identity fetch` will see BOTH "
+                    f"the old and new IdentityRecords and exit ambiguous. "
+                    f"Re-publish the revocation manually.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"published RevocationRecord (old key, "
+                    f"reason={reason_str}) to {rrset_name}"
+                )
         else:
-            print(f"published RevocationRecord (old key) to {rrset_name}")
+            print(
+                "reason=routine: skipping RevocationRecord so "
+                "rotation_chain_enabled contacts can auto-follow the new key"
+            )
 
         # Also publish a fresh IdentityRecord for the NEW key so that
         # non-rotation-aware contacts still see the new key pinned
@@ -1419,12 +1442,16 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         resolved_username = args.username
         name = identity_domain(args.username, args.domain or _effective_domain(cfg))
 
-    try:
-        records = reader.query_txt_record(name)
-    finally:
+    # Keep cluster_handle OPEN across both the identity lookup AND the
+    # subsequent rotation-RRset revocation filter. Closing after only
+    # the first query runs the revocation check through a closed
+    # UnionReader (which returns None), silently disabling the filter
+    # in cluster mode. The broader try/finally closes after the full
+    # revocation filter completes below.
+    records = reader.query_txt_record(name)
+    if not records:
         if cluster_handle is not None:
             cluster_handle.close()
-    if not records:
         _die(2, f"no identity record at {name}")
 
     # Append-semantics mailbox means the identity domain can hold multiple
@@ -1518,12 +1545,21 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         # If filtering drops ALL candidates, don't silently explode:
         # surface the state so the caller can re-pin out-of-band.
         if not filtered:
+            if cluster_handle is not None:
+                cluster_handle.close()
             _die(
                 2,
                 f"all IdentityRecords at {name} are revoked by a matching "
                 f"RevocationRecord at the rotate RRset — re-pin out-of-band.",
             )
         valid = filtered
+
+    # Revocation filter is done — safe to close the one-shot cluster
+    # client now. Any remaining work (fingerprint display, contact
+    # save) only touches local state.
+    if cluster_handle is not None:
+        cluster_handle.close()
+        cluster_handle = None
 
     def _fingerprint(rec: IdentityRecord) -> str:
         # 16-char hex fingerprint over (x25519_pk || ed25519_spk).
