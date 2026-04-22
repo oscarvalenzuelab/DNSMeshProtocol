@@ -208,7 +208,10 @@ class RotationRecord:
         magic:              b"DMPROT1"              (7 bytes)
         subject_type:       uint8                   (1 byte)
         subject_len:        uint8                   (1 byte)
-        subject:            utf-8 bytes             (var, <= 64)
+        subject:            utf-8 bytes             (var, <= 64 for
+                                                     cluster/bootstrap;
+                                                     <= 255 for
+                                                     user_identity)
         old_spk:            32 bytes
         new_spk:            32 bytes
         seq:                uint64 big-endian       (8 bytes)
@@ -464,7 +467,10 @@ class RevocationRecord:
         magic:              b"DMPRV01"              (7 bytes)
         subject_type:       uint8                   (1 byte)
         subject_len:        uint8                   (1 byte)
-        subject:            utf-8 bytes             (var, <= 64)
+        subject:            utf-8 bytes             (var, <= 64 for
+                                                     cluster/bootstrap;
+                                                     <= 255 for
+                                                     user_identity)
         revoked_spk:        32 bytes
         reason_code:        uint8                   (1 byte)
         ts:                 uint64 big-endian       (8 bytes)
