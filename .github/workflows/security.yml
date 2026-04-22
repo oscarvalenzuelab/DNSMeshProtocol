@@ -40,13 +40,19 @@ jobs:
       - name: Audit dev lockfile
         run: pip-audit -r requirements-dev.lock --strict
 
-      - name: Install package into environment
-        run: pip install -e ".[dev]"
+      - name: Install package from the hashed lockfile
+        # Use the lockfile as the source of truth so the audited
+        # dependency set is byte-identical to what CI executes. A plain
+        # `.[dev]` install would resolve from PyPI at job time and drift
+        # from the just-audited set; --require-hashes makes drift
+        # impossible.
+        run: |
+          pip install --require-hashes -r requirements-dev.lock
+          pip install -e . --no-deps
 
       - name: Audit installed environment
-        # Catches drift: if an editable install, a transitive resolution
-        # or an IDE-inserted dep brings in a version that doesn't match
-        # the lockfile, this picks it up.
+        # Final drift check: confirms the audited lockfile is what's
+        # actually resolvable in a fresh environment.
         run: pip-audit --strict
 
   fuzz-wire-parsers:
@@ -60,11 +66,14 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install
+      - name: Install from the hashed lockfile
+        # Source-of-truth install: the lockfile is what pip-audit
+        # approves, so fuzz/nightly jobs run against the exact
+        # dependency set we reviewed.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-          pip install hypothesis
+          pip install --require-hashes -r requirements-dev.lock
+          pip install -e . --no-deps
 
       - name: Run fuzz harness
         # PR + push budget: 500 examples per property (fast; seconds, not
@@ -83,11 +92,14 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install
+      - name: Install from the hashed lockfile
+        # Source-of-truth install: the lockfile is what pip-audit
+        # approves, so fuzz/nightly jobs run against the exact
+        # dependency set we reviewed.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-          pip install hypothesis
+          pip install --require-hashes -r requirements-dev.lock
+          pip install -e . --no-deps
 
       - name: Run fuzz harness (extended)
         env:
