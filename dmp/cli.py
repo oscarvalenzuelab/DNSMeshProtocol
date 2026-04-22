@@ -911,10 +911,18 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
     """EXPERIMENTAL (M5.4): rotate the user identity key.
 
     Publishes a co-signed RotationRecord at the user's rotation RRset
-    plus a fresh IdentityRecord for the new key. Does NOT mutate the
-    local config — rotating the on-disk identity is a separate manual
-    step (re-run ``dmp init --force`` with the new passphrase once
-    all pinned contacts are known to have migrated).
+    plus a fresh IdentityRecord for the new key.
+
+    With ``--yes``, the command ALSO performs the local swap atomically:
+    the config's ``kdf_salt`` stays the same, the ``passphrase_file``
+    is pointed at the new passphrase file (if ``--new-passphrase-file``
+    was provided), so the next config load + passphrase derive yields
+    the same keypair the rotation just published. Without ``--yes``
+    the command still publishes (after the interactive confirmation),
+    but leaves the on-disk identity untouched — the operator must
+    manually point their passphrase source at the new passphrase; do
+    NOT regenerate ``kdf_salt``, because the current salt + new
+    passphrase is what derives the rotated keypair.
 
     Wire format subject to revision after the M4 external crypto audit;
     v0.3.0 may introduce a breaking ``v=dmp2;t=rotation;``. See
@@ -1079,6 +1087,38 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
     finally:
         _close_client(client)
 
+    # Atomic local identity swap under --yes. The load-bearing insight:
+    # the same kdf_salt + new passphrase derives the new keypair the
+    # rotation just published. So we keep the salt, point the passphrase
+    # source at the new passphrase file, and the next config load yields
+    # the rotated identity with no re-init required.
+    swapped_locally = False
+    if args.yes:
+        new_pp_file = args.new_passphrase_file
+        if new_pp_file:
+            cfg.passphrase_file = str(Path(new_pp_file).expanduser())
+            cfg.save(_config_path())
+            swapped_locally = True
+            print(
+                f"local identity swapped atomically (config.yaml "
+                f"passphrase_file -> {cfg.passphrase_file}; kdf_salt "
+                f"preserved). Local pubkey: {new_spk_hex}"
+            )
+        else:
+            # New passphrase came from DMP_NEW_PASSPHRASE or interactive
+            # prompt — no file path to persist. The operator must set
+            # DMP_PASSPHRASE=<new> on subsequent invocations (or
+            # subsequently point `passphrase_file` at a new file and
+            # re-run) for the on-disk identity to match the published
+            # rotation. kdf_salt stays as-is.
+            print(
+                "note: --yes without --new-passphrase-file leaves the "
+                "config's passphrase source untouched; set "
+                "DMP_PASSPHRASE=<new> on subsequent invocations. "
+                f"kdf_salt is preserved; current salt + new passphrase "
+                f"derives pubkey {new_spk_hex}."
+            )
+
     print()
     print("Next steps:")
     print(
@@ -1089,12 +1129,21 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
         "  2. Other contacts must manually re-pin: "
         "`dmp identity fetch <user>@<host> --add` against the new key."
     )
-    print(
-        "  3. Update this config to the new passphrase (re-run "
-        "`dmp init --force` with the new passphrase) ONLY after you have "
-        "confirmed contacts can still reach you — the on-disk identity "
-        "is NOT rotated automatically to avoid mid-flow lockout."
-    )
+    if swapped_locally:
+        print(
+            "  3. The local identity has already been swapped atomically; "
+            "`dmp identity show` will report the new pubkey. `dmp identity "
+            "publish` will re-publish the new IdentityRecord under the "
+            "rotated key."
+        )
+    else:
+        print(
+            "  3. Point your passphrase source at the new passphrase "
+            "(edit `passphrase_file` in config.yaml, or set DMP_PASSPHRASE). "
+            "Do NOT regenerate kdf_salt — the current salt + new passphrase "
+            "derives the rotated keypair. Re-running `dmp init --force` "
+            "would break local adoption."
+        )
     return 0
 
 

@@ -381,6 +381,85 @@ class TestIdentityRotateExperimental:
         assert "EXPERIMENTAL" in captured.err
         assert "draft" in captured.err or "change in v0.3.0" in captured.err
 
+    def test_rotate_yes_swaps_local_identity_atomically(
+        self, config_home, shared_store, monkeypatch, tmp_path, capsys
+    ):
+        """--yes + --new-passphrase-file atomically rewires the local
+        config so that reloading + deriving with the new passphrase
+        yields a keypair whose Ed25519 pubkey matches new_spk in the
+        published RotationRecord. The kdf_salt MUST stay the same — the
+        same salt + new passphrase is what derives the rotated keypair.
+        """
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.rotation import (
+            RECORD_PREFIX_ROTATION,
+            RotationRecord,
+            rotation_rrset_name_user_identity,
+        )
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+
+        # Seed the old passphrase via file (so we drive the full
+        # "config points at a passphrase file" path, which is what
+        # operators typically use).
+        old_pp_file = tmp_path / "old.pp"
+        old_pp_file.write_text("alice-pass")
+        new_pp_file = tmp_path / "new.pp"
+        new_pp_file.write_text("alice-new-pass")
+
+        # Point config.passphrase_file at the old file.
+        cfg_path = config_home / "config.yaml"
+        cfg_text = cfg_path.read_text()
+        # yaml rewrite: inject passphrase_file.
+        import yaml as _y
+
+        doc = _y.safe_load(cfg_text)
+        doc["passphrase_file"] = str(old_pp_file)
+        cfg_path.write_text(_y.safe_dump(doc, sort_keys=True))
+        salt_before = doc["kdf_salt"]
+
+        # DMP_PASSPHRASE must NOT be set or _load_passphrase prefers
+        # the env var over the file path; clear it to exercise the
+        # passphrase-file path.
+        monkeypatch.delenv("DMP_PASSPHRASE", raising=False)
+        monkeypatch.delenv("DMP_NEW_PASSPHRASE", raising=False)
+
+        rc = cli.main(
+            [
+                "identity",
+                "rotate",
+                "--yes",
+                "--experimental",
+                "--new-passphrase-file",
+                str(new_pp_file),
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "local identity swapped atomically" in out
+
+        # Read back the config. Salt preserved, passphrase_file now
+        # points at the NEW file.
+        doc2 = _y.safe_load(cfg_path.read_text())
+        assert doc2["kdf_salt"] == salt_before, "kdf_salt MUST be preserved"
+        assert doc2["passphrase_file"] == str(new_pp_file)
+
+        # Derive the identity with the NEW passphrase + preserved salt
+        # — it must match the new_spk published in the RotationRecord.
+        rrset = rotation_rrset_name_user_identity("alice", "mesh.local")
+        records = shared_store.query_txt_record(rrset)
+        assert records is not None
+        rotations = [r for r in records if r.startswith(RECORD_PREFIX_ROTATION)]
+        assert len(rotations) == 1
+        rec = RotationRecord.parse_and_verify(rotations[0])
+        assert rec is not None
+
+        derived = DMPCrypto.from_passphrase(
+            "alice-new-pass", salt=bytes.fromhex(salt_before)
+        )
+        assert derived.get_signing_public_key_bytes() == bytes(rec.new_spk)
+
 
 class TestContacts:
     def test_add_and_list(self, config_home, capsys):
