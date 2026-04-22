@@ -37,6 +37,34 @@ docker build -t dmp-node:latest .
 pytest tests/test_docker_integration.py -v
 ```
 
+### Dependency lockfiles
+
+Day-to-day development uses `pip install -e ".[dev]"` — it's fast and
+picks up editable-mode changes to the package itself. **But** production
+installs and CI must use the hashed lockfiles:
+
+```bash
+# Runtime-only (what a node operator installs on a fresh host).
+pip install --require-hashes -r requirements.lock
+
+# Dev tooling (tests + linters + fuzzers + supply-chain tools).
+pip install --require-hashes -r requirements-dev.lock
+```
+
+The lockfiles pin every transitive dep to a specific version AND a
+sha256 of the wheel/sdist, so a compromised mirror can't swap a release
+under us. Regenerate after changing `requirements.txt` or
+`requirements-dev.txt`:
+
+```bash
+pip-compile --generate-hashes --output-file=requirements.lock requirements.txt
+pip-compile --generate-hashes --allow-unsafe --output-file=requirements-dev.lock requirements-dev.txt
+```
+
+Run `pip-audit -r requirements.lock --strict` before you push if your
+PR bumps a dependency — CI does the same thing on every PR, but
+catching it locally saves a round trip.
+
 ## Code style
 
 - Black is the formatter. CI runs `black --check dmp tests`. Run
@@ -44,7 +72,9 @@ pytest tests/test_docker_integration.py -v
 - Type hints on public APIs. `mypy dmp` should not grow net new errors.
 - Don't add new top-level dependencies without a clear reason. The
   runtime deps today are `cryptography`, `dnspython`, `reedsolo`,
-  `pyyaml`, `requests`, `boto3`. CLI + server rely on stdlib.
+  `pyyaml`, `argon2-cffi`, `zfec`, `requests`, `boto3`,
+  `asyncio-throttle`. CLI + server rely on stdlib otherwise. Adding a
+  dep means regenerating both lockfiles (see above).
 - Default to writing no comments. If removing a comment wouldn't confuse
   a future reader, don't write it. Reserve comments for *why* something
   non-obvious is the way it is — a subtle invariant, a workaround for a

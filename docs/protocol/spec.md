@@ -274,15 +274,34 @@ defended and out-of-scope attacks.
 - **Client orchestration**: `dmp/client/client.py` (send / receive),
   `cluster_bootstrap.py` (cluster-mode refresh),
   `bootstrap_discovery.py` (user-domain → cluster fetch).
-- **Interop test vectors**: `tests/test_*.py`. The test suite is the
-  authoritative interop benchmark — an independent implementation
-  should run against the same fixtures. Of particular interest for a
-  new parser:
+- **Canonical byte-level test vectors**:
+  [`docs/protocol/vectors/`](vectors/). One JSON file per record type
+  (`cluster_manifest.json`, `bootstrap_record.json`,
+  `identity_record.json`, `slot_manifest.json`, `prekey.json`). Each
+  case carries a deterministic seed + structured inputs + the
+  expected wire bytes (as hex). Third-party implementers SHOULD
+  verify against these canonical vectors before claiming interop:
+  given the documented inputs, their sign routine must produce the
+  same ``expected_wire_hex``, and their ``parse_and_verify`` must
+  return the documented result on the signature-failure / expired
+  cases. The generator lives at
+  [`docs/protocol/vectors/_generate.py`](vectors/_generate.py); it is
+  reproducible (running it twice produces byte-identical files).
+  ``tests/test_vectors.py`` enforces the byte-match on every build.
+- **Interop test vectors (Python-specific)**: `tests/test_*.py`. The
+  test suite exercises edge cases beyond the cross-impl vector set —
+  helpful for implementers who want to stress their parser against
+  the same corner cases:
   - `tests/test_manifest.py` — slot manifest wire vectors.
   - `tests/test_identity.py` — identity wire vectors.
   - `tests/test_prekeys.py` — prekey wire vectors.
   - `tests/test_cluster_manifest.py` — cluster manifest wire vectors.
   - `tests/test_bootstrap_record.py` — bootstrap record wire vectors.
+- **Fuzz harness**: [`tests/fuzz/`](../../tests/fuzz/) — one
+  Hypothesis-based property test per wire parser. A new
+  implementation should maintain the same invariant:
+  ``parse_and_verify`` must never raise, only return ``None`` or a
+  valid record, on any byte-string input.
 
 ## 7. Cross-references
 

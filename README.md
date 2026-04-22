@@ -113,6 +113,10 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
 See [Deployment](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment).
+**Before shipping to production, read the
+[operator hardening guide](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/hardening)** —
+mandatory checklist covering TLS, token hygiene, operator signing-key
+handling, DNS zone hygiene, file permissions, and network exposure.
 
 ## Project layout
 
