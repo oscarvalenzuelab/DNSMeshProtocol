@@ -341,13 +341,15 @@ class TestIdentityRotateExperimental:
         rc = cli.main(["identity", "rotate", "--yes", "--experimental"])
         assert rc == 0
         out = capsys.readouterr().out
-        err = capsys.readouterr().err
         assert "published RotationRecord" in out
+        assert "published RevocationRecord" in out
         assert "published new IdentityRecord" in out
 
-        # Record actually landed in the shared store. Subject is
-        # alice@mesh.local (no identity_domain set on the default init).
+        # Both a RotationRecord AND a RevocationRecord of the OLD key
+        # land at the rotate RRset. Subject is alice@mesh.local
+        # (no identity_domain set on the default init).
         from dmp.core.rotation import (
+            RECORD_PREFIX_REVOCATION,
             RECORD_PREFIX_ROTATION,
             rotation_rrset_name_user_identity,
         )
@@ -355,8 +357,11 @@ class TestIdentityRotateExperimental:
         # Default domain on init is "mesh.local".
         rrset = rotation_rrset_name_user_identity("alice", "mesh.local")
         records = shared_store.query_txt_record(rrset)
-        assert records is not None and len(records) == 1
-        assert records[0].startswith(RECORD_PREFIX_ROTATION)
+        assert records is not None and len(records) == 2
+        kinds = sorted(r.split(";")[1] for r in records)
+        assert kinds == ["t=revocation", "t=rotation"]
+        assert any(r.startswith(RECORD_PREFIX_ROTATION) for r in records)
+        assert any(r.startswith(RECORD_PREFIX_REVOCATION) for r in records)
 
     def test_rotate_rejects_same_passphrase(
         self, config_home, shared_store, monkeypatch, capsys
@@ -459,6 +464,177 @@ class TestIdentityRotateExperimental:
             "alice-new-pass", salt=bytes.fromhex(salt_before)
         )
         assert derived.get_signing_public_key_bytes() == bytes(rec.new_spk)
+
+    def test_rotate_publishes_revocation_of_old_identity(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """After rotate --yes --experimental, the rotate RRset contains
+        a RevocationRecord whose revoked_spk == the old ed25519_spk."""
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.rotation import (
+            RECORD_PREFIX_REVOCATION,
+            REASON_ROUTINE,
+            RevocationRecord,
+            rotation_rrset_name_user_identity,
+        )
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
+
+        # Snapshot the old identity's pubkey before we rotate.
+        import yaml as _y
+
+        cfg_doc = _y.safe_load((config_home / "config.yaml").read_text())
+        salt = bytes.fromhex(cfg_doc["kdf_salt"])
+        old_crypto = DMPCrypto.from_passphrase("alice-pass", salt=salt)
+        old_spk = old_crypto.get_signing_public_key_bytes()
+
+        rc = cli.main(["identity", "rotate", "--yes", "--experimental"])
+        assert rc == 0
+        capsys.readouterr()
+
+        rrset = rotation_rrset_name_user_identity("alice", "mesh.local")
+        records = shared_store.query_txt_record(rrset)
+        revocations = [r for r in records if r.startswith(RECORD_PREFIX_REVOCATION)]
+        assert len(revocations) == 1
+        rev = RevocationRecord.parse_and_verify(revocations[0])
+        assert rev is not None
+        assert bytes(rev.revoked_spk) == old_spk
+        assert rev.reason_code == REASON_ROUTINE
+
+    def test_rotate_compromise_reason_tags_revocation(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """--reason compromise propagates to reason_code on the revocation."""
+        from dmp.core.rotation import (
+            RECORD_PREFIX_REVOCATION,
+            REASON_COMPROMISE,
+            RevocationRecord,
+            rotation_rrset_name_user_identity,
+        )
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
+
+        rc = cli.main(
+            [
+                "identity",
+                "rotate",
+                "--yes",
+                "--experimental",
+                "--reason",
+                "compromise",
+            ]
+        )
+        assert rc == 0
+        capsys.readouterr()
+
+        rrset = rotation_rrset_name_user_identity("alice", "mesh.local")
+        records = shared_store.query_txt_record(rrset)
+        revocations = [r for r in records if r.startswith(RECORD_PREFIX_REVOCATION)]
+        assert len(revocations) == 1
+        rev = RevocationRecord.parse_and_verify(revocations[0])
+        assert rev is not None
+        assert rev.reason_code == REASON_COMPROMISE
+
+    def test_identity_fetch_filters_revoked_records(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """Publish an old IdentityRecord keyed off the SAME salt the
+        rotate command uses, rotate (which publishes new IdentityRecord
+        + RevocationRecord of old), then `dmp identity fetch` returns
+        the new identity and does NOT raise the ambiguous-error.
+        """
+        import json as _json
+        import yaml as _y
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.identity import identity_domain, make_record
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+
+        # Derive the OLD identity with the salt that `cmd_identity_rotate`
+        # reads from config. Publishing this directly sidesteps the
+        # test-fixture's DMPClient-without-kdf_salt quirk (which would
+        # otherwise leave identity-publish and identity-rotate keyed off
+        # two different salts, so no revocation would match).
+        alice_doc = _y.safe_load((config_home / "config.yaml").read_text())
+        alice_salt = bytes.fromhex(alice_doc["kdf_salt"])
+        old_crypto = DMPCrypto.from_passphrase("alice-pass", salt=alice_salt)
+        old_record = make_record(old_crypto, "alice")
+        shared_store.publish_txt_record(
+            identity_domain("alice", "mesh.local"),
+            old_record.sign(old_crypto),
+        )
+
+        # Rotate: publishes a RotationRecord + Revocation of old + new
+        # IdentityRecord (all under the same shared store).
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
+        rc = cli.main(["identity", "rotate", "--yes", "--experimental"])
+        assert rc == 0
+        capsys.readouterr()
+
+        # At this point the identity RRset holds BOTH the old and new
+        # IdentityRecords. A naive fetch would exit 2 with ambiguous.
+        # With the revocation filter the OLD one is dropped.
+        bob_home = config_home.parent / "bob-revoke-filter"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(["init", "bob", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+
+        rc = cli.main(["identity", "fetch", "alice", "--json"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        parsed = _json.loads(out)
+
+        # The surviving identity must be the NEW one: its ed25519_spk
+        # is the salt-derived key under the new passphrase.
+        new_crypto = DMPCrypto.from_passphrase("alice-new-pass", salt=alice_salt)
+        assert (
+            parsed["signing_public_key"]
+            == new_crypto.get_signing_public_key_bytes().hex()
+        )
+
+    def test_identity_fetch_still_ambiguous_on_concurrent_rotations(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """Two non-revoked IdentityRecords at the same name → still
+        exits with the ambiguous-error. Regression guard: the revocation
+        filter must not silently merge legitimate concurrent rotations.
+        """
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.identity import identity_domain, make_record
+
+        # Real alice publishes.
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        cli.main(["identity", "publish"])
+        capsys.readouterr()
+
+        # A second, unrevoked identity also lands at the same name
+        # (squatter or pathological concurrent rotation).
+        squatter = DMPCrypto()
+        wire = make_record(squatter, "alice").sign(squatter)
+        shared_store.publish_txt_record(identity_domain("alice", "mesh.local"), wire)
+
+        bob_home = config_home.parent / "bob-concurrent"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(["init", "bob", "--endpoint", "http://x"])
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["identity", "fetch", "alice"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "ambiguous" in err
 
 
 class TestContacts:
