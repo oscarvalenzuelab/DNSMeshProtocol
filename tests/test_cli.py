@@ -413,6 +413,104 @@ class TestIdentityRotateExperimental:
         assert any(r.startswith(RECORD_PREFIX_ROTATION) for r in records)
         assert any(r.startswith(RECORD_PREFIX_REVOCATION) for r in records)
 
+    def test_rotate_twice_fast_produces_distinct_seq(
+        self, config_home, shared_store, monkeypatch, tmp_path, capsys
+    ):
+        """Two rotations fired within the same second must produce
+        distinct `seq` values. The chain walker REJECTS same-seq hops
+        (seq must strictly increase), so a second-resolution seq would
+        leave the second rotation invisible. Fix: seq is
+        int(time.time() * 1000), which gives >1000 distinct values
+        per second — plenty for rapid-fire recovery scenarios.
+        """
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.rotation import (
+            RECORD_PREFIX_ROTATION,
+            RotationRecord,
+            rotation_rrset_name_user_identity,
+        )
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+
+        pp1 = tmp_path / "pp1.pp"
+        pp1.write_text("alice-pass")
+        pp2 = tmp_path / "pp2.pp"
+        pp2.write_text("alice-pass-2")
+        pp3 = tmp_path / "pp3.pp"
+        pp3.write_text("alice-pass-3")
+
+        # Point config at pp1; each --yes --new-passphrase-file rotate
+        # atomically repoints the config so the next rotate loads the
+        # new passphrase as its "current".
+        cfg_path = config_home / "config.yaml"
+        import yaml as _y
+
+        doc = _y.safe_load(cfg_path.read_text())
+        doc["passphrase_file"] = str(pp1)
+        cfg_path.write_text(_y.safe_dump(doc, sort_keys=True))
+        salt = bytes.fromhex(doc["kdf_salt"])
+        monkeypatch.delenv("DMP_PASSPHRASE", raising=False)
+        monkeypatch.delenv("DMP_NEW_PASSPHRASE", raising=False)
+
+        # Rotate #1: pp1 → pp2.
+        rc1 = cli.main(
+            [
+                "identity",
+                "rotate",
+                "--yes",
+                "--experimental",
+                "--new-passphrase-file",
+                str(pp2),
+            ]
+        )
+        assert rc1 == 0
+        capsys.readouterr()
+
+        # Rotate #2 IMMEDIATELY (no sleep). Config now points at pp2;
+        # the new target is pp3. Same wall-clock second as rotate #1.
+        rc2 = cli.main(
+            [
+                "identity",
+                "rotate",
+                "--yes",
+                "--experimental",
+                "--new-passphrase-file",
+                str(pp3),
+            ]
+        )
+        assert rc2 == 0
+        capsys.readouterr()
+
+        rrset = rotation_rrset_name_user_identity("alice", "mesh.local")
+        records = shared_store.query_txt_record(rrset) or []
+        rotations = [
+            RotationRecord.parse_and_verify(r)
+            for r in records
+            if r.startswith(RECORD_PREFIX_ROTATION)
+        ]
+        rotations = [r for r in rotations if r is not None]
+
+        pp2_spk = DMPCrypto.from_passphrase(
+            "alice-pass-2", salt=salt
+        ).get_signing_public_key_bytes()
+        pp3_spk = DMPCrypto.from_passphrase(
+            "alice-pass-3", salt=salt
+        ).get_signing_public_key_bytes()
+
+        seqs = {
+            bytes(r.new_spk): r.seq
+            for r in rotations
+            if bytes(r.new_spk) in (pp2_spk, pp3_spk)
+        }
+        assert pp2_spk in seqs, "rotation #1 not present"
+        assert pp3_spk in seqs, "rotation #2 not present"
+        assert seqs[pp2_spk] != seqs[pp3_spk], (
+            "two rotations in the same second produced the same seq — "
+            "regression of the ms-resolution fix"
+        )
+        assert seqs[pp3_spk] > seqs[pp2_spk], "seq must strictly increase"
+
     def test_rotate_rejects_same_passphrase(
         self, config_home, shared_store, monkeypatch, capsys
     ):

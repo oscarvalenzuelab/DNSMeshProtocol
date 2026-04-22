@@ -79,7 +79,7 @@ subject_len:        uint8                   (1 byte)
 subject:            utf-8 bytes             (var, <= 64)
 old_spk:            32 bytes                (Ed25519 key being rotated FROM)
 new_spk:            32 bytes                (Ed25519 key being rotated TO)
-seq:                uint64 big-endian       (8 bytes; strictly increasing along a chain)
+seq:                uint64 big-endian       (8 bytes; strictly increasing along a chain — see §2.1.1)
 ts:                 uint64 big-endian       (8 bytes; unix epoch seconds)
 exp:                uint64 big-endian       (8 bytes; unix epoch seconds)
 
@@ -105,6 +105,29 @@ prove you're the one picking up the new one" — left-to-right the body
 reads as a chronological succession. Both orderings would verify; this
 one is documented so auditors can reason about ordering-dependent
 attacks without first reverse-engineering the intent.
+
+#### 2.1.1 `seq` is millisecond-resolution unix time
+
+The reference CLI sets `seq = int(time.time() * 1000)` — that is,
+milliseconds since the unix epoch. It is a monotonic ordering number
+that happens to be clock-derived; it is **not** a wall-clock
+timestamp. The wall-clock timestamp is `ts` (seconds since epoch).
+
+Motivation: the chain walker requires `seq` to **strictly** increase
+between hops (see §5). A second-resolution `seq` would make two
+rotations fired within the same wall-clock second collide — the
+second rotation's hop would be rejected, and contacts would not
+follow to the new key without re-pinning manually. Millisecond
+resolution gives >1000 distinct values per second, which is more
+than sufficient for test re-rotations, scripted disaster recovery
+cutovers, and any other rapid-fire scenarios. uint64 ms epoch does
+not overflow until the year ~292M, which is acceptable headroom.
+
+A third-party publisher is free to use any monotonically-increasing
+uint64 for `seq` — a store-backed counter, hybrid logical clock, etc.
+The wire format places no semantics on `seq` beyond "strictly
+increases along a chain"; the ms-epoch choice is a policy decision
+inside the reference CLI.
 
 ### 2.2 `RevocationRecord` — `v=dmp1;t=revocation;`
 
