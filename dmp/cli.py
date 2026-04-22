@@ -910,8 +910,11 @@ def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
 def cmd_identity_rotate(args: argparse.Namespace) -> int:
     """EXPERIMENTAL (M5.4): rotate the user identity key.
 
-    Publishes a co-signed RotationRecord at the user's rotation RRset
-    plus a fresh IdentityRecord for the new key.
+    Publishes a co-signed RotationRecord at the user's rotation RRset,
+    a self-signed RevocationRecord for the OLD key at the same RRset
+    (so non-rotation-aware fetches can filter the old IdentityRecord
+    out of the mailbox-name RRset), plus a fresh IdentityRecord for
+    the new key.
 
     With ``--yes``, the command ALSO performs the local swap atomically:
     the config's ``kdf_salt`` stays the same, the ``passphrase_file``
@@ -956,6 +959,9 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
         zone_anchored_identity_name,
     )
     from dmp.core.rotation import (
+        REASON_COMPROMISE,
+        REASON_ROUTINE,
+        RevocationRecord,
         RotationRecord,
         SUBJECT_TYPE_USER_IDENTITY,
         rotation_rrset_name_user_identity,
@@ -1046,6 +1052,28 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
     except ValueError as exc:
         _die(1, f"failed to co-sign RotationRecord: {exc}")
 
+    # Self-signed revocation of the OLD key at the rotate RRset. Lets
+    # non-rotation-aware `dmp identity fetch` filter the old
+    # IdentityRecord out of the mailbox-name RRset (append semantics
+    # leaves both old and new records there otherwise, triggering the
+    # "multiple valid records, ambiguous" exit). See Finding 3 /
+    # Option C in docs/protocol/rotation.md.
+    reason_str = getattr(args, "reason", "routine") or "routine"
+    reason_code = (
+        REASON_COMPROMISE if reason_str.lower() == "compromise" else REASON_ROUTINE
+    )
+    revocation = RevocationRecord(
+        subject_type=SUBJECT_TYPE_USER_IDENTITY,
+        subject=subject,
+        revoked_spk=old_crypto.get_signing_public_key_bytes(),
+        reason_code=reason_code,
+        ts=ts,
+    )
+    try:
+        revocation_wire = revocation.sign(old_crypto)
+    except ValueError as exc:
+        _die(1, f"failed to sign RevocationRecord: {exc}")
+
     # Publish. Needs a writer; go through _make_client to get the same
     # transport the rest of the CLI uses. We use the OLD passphrase for
     # this client — it's still the on-disk identity.
@@ -1066,6 +1094,24 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
         if not ok:
             _die(2, f"publish of RotationRecord to {rrset_name} failed")
         print(f"published RotationRecord to {rrset_name}")
+
+        # Revocation publishes at the same rrset_name so a single RRset
+        # read surfaces both the chain-forward hint (rotation) and the
+        # filter-out-old-identity hint (revocation).
+        ok_rev = client.writer.publish_txt_record(
+            rrset_name, revocation_wire, ttl=int(args.ttl)
+        )
+        if not ok_rev:
+            print(
+                f"warning: RotationRecord published, but RevocationRecord "
+                f"of the old key FAILED to publish at {rrset_name} — "
+                f"non-rotation-aware `dmp identity fetch` will see BOTH "
+                f"the old and new IdentityRecords and exit ambiguous. "
+                f"Re-publish the revocation manually.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"published RevocationRecord (old key) to {rrset_name}")
 
         # Also publish a fresh IdentityRecord for the NEW key so that
         # non-rotation-aware contacts still see the new key pinned
@@ -1324,6 +1370,92 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
             valid.append(parsed[0])
     if not valid:
         _die(2, f"found TXT records at {name} but none verified as a DMP identity")
+
+    # Rotation-aware filter (M5.4 Option C): fetch the same subject's
+    # rotate RRset (if any), collect self-signed RevocationRecords, and
+    # drop any IdentityRecord whose ed25519_spk matches a revocation.
+    # This closes the "ambiguous after rotate" hole where the old + new
+    # IdentityRecords coexist under append semantics. A compromised key
+    # that re-publishes the old IdentityRecord is still filtered because
+    # the revocation sits alongside it; see docs/protocol/rotation.md
+    # "Revocation model" for the trade-off.
+    from dmp.core.rotation import (
+        RECORD_PREFIX_REVOCATION,
+        RevocationRecord,
+        SUBJECT_TYPE_USER_IDENTITY,
+        _normalize_subject,
+        rotation_rrset_name_user_identity,
+        rotation_rrset_name_zone_anchored,
+    )
+
+    if parsed_addr is not None:
+        _user, _host = parsed_addr
+        fetch_subject = f"{_user}@{_host}"
+        # Try BOTH forms of the rotate RRset for robustness — a peer
+        # might publish the rotation under either. Zone-anchored first
+        # (the preferred form for zone-anchored identities); then the
+        # hash form as a fallback.
+        rotate_rrset_candidates = [
+            rotation_rrset_name_zone_anchored(_host),
+            rotation_rrset_name_user_identity(_user, _host),
+        ]
+    else:
+        fetch_subject = f"{resolved_username}@{args.domain or _effective_domain(cfg)}"
+        rotate_rrset_candidates = [
+            rotation_rrset_name_user_identity(
+                resolved_username, args.domain or _effective_domain(cfg)
+            ),
+        ]
+
+    revoked_spks: set[bytes] = set()
+    for candidate in rotate_rrset_candidates:
+        try:
+            rotate_records = reader.query_txt_record(candidate)
+        except Exception:
+            rotate_records = None
+        if not rotate_records:
+            continue
+        for txt in rotate_records:
+            if not isinstance(txt, str):
+                continue
+            if not txt.startswith(RECORD_PREFIX_REVOCATION):
+                continue
+            rev = RevocationRecord.parse_and_verify(txt)
+            if rev is None:
+                continue
+            if rev.subject_type != SUBJECT_TYPE_USER_IDENTITY:
+                continue
+            # Subject match is loose here: the fetch_subject is
+            # user@effective-domain, and zone-anchored RotationRecords
+            # carry user@identity_domain (which might differ from the
+            # mesh domain). Matching too strictly would let the
+            # operator's own rotation fail to filter. We accept any
+            # revocation whose subject's user half matches and whose
+            # host half matches the rotate-RRset zone — effectively,
+            # the RRset name is the trust anchor, not the embedded
+            # subject.
+            if _normalize_subject(rev.subject_type, rev.subject) != _normalize_subject(
+                rev.subject_type, fetch_subject
+            ):
+                # Still keep the revocation if the username half matches
+                # and we're querying the unanchored form — the publisher
+                # may use a different domain in the subject than the
+                # one we queried under. Conservative: only accept exact
+                # subject matches.
+                continue
+            revoked_spks.add(bytes(rev.revoked_spk))
+
+    if revoked_spks:
+        filtered = [rec for rec in valid if bytes(rec.ed25519_spk) not in revoked_spks]
+        # If filtering drops ALL candidates, don't silently explode:
+        # surface the state so the caller can re-pin out-of-band.
+        if not filtered:
+            _die(
+                2,
+                f"all IdentityRecords at {name} are revoked by a matching "
+                f"RevocationRecord at the rotate RRset — re-pin out-of-band.",
+            )
+        valid = filtered
 
     def _fingerprint(rec: IdentityRecord) -> str:
         # 16-char hex fingerprint over (x25519_pk || ed25519_spk).
@@ -2417,6 +2549,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="skip the interactive confirmation prompt",
+    )
+    p_id_rotate.add_argument(
+        "--reason",
+        choices=("routine", "compromise"),
+        default="routine",
+        help="reason_code for the RevocationRecord of the OLD key. "
+        "'routine' (default) marks a normal key rollover; 'compromise' "
+        "flags the old key as assumed-leaked so chain-walkers abort trust "
+        "immediately instead of merely following the chain forward.",
     )
     p_id_rotate.add_argument(
         "--experimental",
