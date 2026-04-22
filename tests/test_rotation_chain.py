@@ -676,3 +676,87 @@ class TestDMPClientRotationChainIntegration:
 
         alice2.send_message("bob", "attempt after revoke")
         assert bob.receive_messages() == []
+
+    def test_rotation_chain_finds_cross_domain_contact(self):
+        """Contact pinned as alice@other-zone.example resolves against
+        the REMOTE zone's rotate RRset — not bob's local effective domain.
+
+        Regression: the rotation fallback used to build the subject from
+        ``contact.domain``, and CLI-persisted contacts had their domain
+        clobbered to bob's effective domain at ``_make_client`` time.
+        The walker then queried ``alice@<bob-local>`` instead of
+        ``alice@other-zone.example`` and never found the published
+        rotation.
+
+        This test asserts that when a contact carries a remote domain
+        (persisted by ``dmp identity fetch user@host --add``), the
+        chain walker queries the remote zone's rrset and resolves the
+        rotation.
+        """
+        from dmp.client.client import DMPClient
+        from dmp.core.rotation import rotation_rrset_name_user_identity
+        from dmp.network.memory import InMemoryDNSStore
+
+        store = InMemoryDNSStore()
+        # Alice's identity lives under "other-zone.example"; bob runs
+        # locally on "mesh.local". This is the cross-zone case:
+        # alice was pinned via `dmp identity fetch alice@other-zone.example --add`.
+        alice = DMPClient(
+            "alice", "alice-pass", domain="other-zone.example", store=store
+        )
+        alice2 = DMPClient(
+            "alice", "alice-new-pass", domain="other-zone.example", store=store
+        )
+
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.local",
+            store=store,
+            rotation_chain_enabled=True,
+        )
+        # Bob pins alice WITH the remote domain — exactly what the CLI
+        # does after the M5.4-followup fix (persist contact.domain from
+        # the `user@host` address).
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="other-zone.example",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+
+        # Alice's rotation record lives at the REMOTE zone's rrset,
+        # subject "alice@other-zone.example". Publish it seeded at the
+        # zone-anchored rrset (the preferred form for zone-anchored
+        # identities) so the walker's union fetch finds it.
+        wire = _sign_rotation(
+            old=alice.crypto,
+            new=alice2.crypto,
+            seq=1,
+            subject="alice@other-zone.example",
+        )
+        rrset = rotation_rrset_name_user_identity("alice", "other-zone.example")
+        store.publish_txt_record(rrset, wire)
+
+        # The walker reads contact.domain; if the fix is correct,
+        # the subject is "alice@other-zone.example" and the rrset is
+        # the remote zone's — so the walk finds the rotation.
+        resolved = bob._rotation_chain.resolve_current_spk(
+            alice.crypto.get_signing_public_key_bytes(),
+            f"alice@{bob.contacts['alice'].domain}",
+            SUBJECT_TYPE_USER_IDENTITY,
+        )
+        assert resolved == alice2.crypto.get_signing_public_key_bytes()
+        # And end-to-end: a send from the rotated key is accepted.
+        alice2.add_contact("bob", bob.get_public_key_hex(), domain="mesh.local")
+        # Cross-domain send: alice2 uses bob's mesh for the slot/chunk
+        # RRsets. Because bob's mailbox addressing is tied to bob's
+        # domain, alice2 must publish there.
+        alice2_in_bob_zone = DMPClient(
+            "alice", "alice-new-pass", domain="mesh.local", store=store
+        )
+        alice2_in_bob_zone.add_contact("bob", bob.get_public_key_hex())
+        alice2_in_bob_zone.send_message("bob", "cross-zone rotated hello")
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"cross-zone rotated hello"

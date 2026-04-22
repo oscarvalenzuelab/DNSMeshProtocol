@@ -119,10 +119,17 @@ class CLIConfig:
     # must explicitly `bootstrap pin` or pass anchors per-call.
     bootstrap_user_domain: str = ""  # e.g. "example.com"
     bootstrap_signer_spk: str = ""  # hex Ed25519 pubkey of the zone operator
-    # Each contact is {"pub": <x25519 hex>, "spk": <ed25519 hex or "">}.
+    # Each contact is {"pub": <x25519 hex>, "spk": <ed25519 hex or "">,
+    # "domain": <remote host or "">}.
     # `spk` may be empty for contacts added before Ed25519 pinning landed
     # (and for the `contacts add` shortcut that doesn't require a signing
     # key). Pinned `spk` is what gates incoming manifests from that sender.
+    # `domain` holds the remote host for a contact added via
+    # `dmp identity fetch user@host --add`; it's consulted by the
+    # rotation fallback so chain walks resolve against the remote zone
+    # (not the operator's local effective domain). Legacy configs predating
+    # this field leave it empty and fall back to the local effective
+    # domain for all addressing (back-compat).
     contacts: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
     @classmethod
@@ -137,11 +144,16 @@ class CLIConfig:
         for name, value in raw_contacts.items():
             if isinstance(value, str):
                 # Legacy format: username -> pubkey_hex.
-                contacts[name] = {"pub": value, "spk": ""}
+                contacts[name] = {"pub": value, "spk": "", "domain": ""}
             elif isinstance(value, dict):
+                # `domain` is optional (added post-M5.4 for cross-zone
+                # rotation-chain walks). Absent means "use the local
+                # effective domain" — preserves behavior for pre-existing
+                # `{pub, spk}` entries.
                 contacts[name] = {
                     "pub": value.get("pub", ""),
                     "spk": value.get("spk", ""),
+                    "domain": value.get("domain", ""),
                 }
         raw_resolvers = data.get("dns_resolvers", []) or []
         # Be generous in what we accept: a single-string config (legacy
@@ -728,15 +740,24 @@ def _make_client(
     # intentionally unintrusive — we do not modify DMPClient itself,
     # per the M2.wire hard-rules constraint.
     client._cluster_client = cluster_client  # type: ignore[attr-defined]
-    # Contacts must use the same effective domain as the client itself;
-    # otherwise send_message() builds prekey_rrset_name under the legacy
-    # domain while refresh_prekeys publishes under the cluster base,
-    # silently disabling forward secrecy on every send.
+    # Contacts must use the same effective domain as the client itself
+    # for mailbox-local addressing (slot/chunk RRsets); otherwise
+    # send_message() builds prekey_rrset_name under the legacy domain
+    # while refresh_prekeys publishes under the cluster base, silently
+    # disabling forward secrecy on every send.
+    #
+    # For CROSS-ZONE contacts (pinned via `dmp identity fetch
+    # alice@other-zone.example --add`), we persist the remote host as
+    # `entry.domain`. Using that here lets the rotation-chain walker
+    # resolve against the remote zone's `rotate.dmp.<remote-host>`
+    # RRset. Legacy contacts (no `domain` field) fall back to the
+    # local effective domain — back-compat for pre-M5.4 configs.
     for name, entry in config.contacts.items():
+        contact_domain = entry.get("domain", "") or effective_domain
         client.add_contact(
             name,
             entry.get("pub", ""),
-            domain=effective_domain,
+            domain=contact_domain,
             signing_key_hex=entry.get("spk", ""),
         )
     return client
@@ -1531,10 +1552,17 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         if contact_key in cfg.contacts:
             print(f"(contact `{contact_key}` already exists — not overwriting)")
         else:
-            cfg.contacts[contact_key] = {
+            # Persist the remote host so the rotation fallback can walk
+            # chains against the right zone. `parsed_addr` is non-None
+            # only for `user@host` form; legacy bare-username adds
+            # leave `domain` empty and inherit the local effective
+            # domain at _make_client time (pre-M5.4-followup behavior).
+            entry: Dict[str, str] = {
                 "pub": identity.x25519_pk.hex(),
                 "spk": identity.ed25519_spk.hex(),
+                "domain": parsed_addr[1] if parsed_addr is not None else "",
             }
+            cfg.contacts[contact_key] = entry
             cfg.save(_config_path())
             print(f"added contact {contact_key} (pinned signing key)")
     return 0
@@ -1557,9 +1585,15 @@ def cmd_contacts_add(args: argparse.Namespace) -> int:
             _die(1, "signing key must be 32 bytes (64 hex characters)")
         spk_hex = args.signing_key.lower()
 
+    # `domain` empty here: `dmp contacts add` takes no remote host, so
+    # cross-zone rotation-chain resolution isn't available via this
+    # path — the client falls back to the local effective domain.
+    # Use `dmp identity fetch user@host --add` to persist the remote
+    # host and enable chain walks against the remote zone.
     cfg.contacts[args.name] = {
         "pub": args.pubkey.lower(),
         "spk": spk_hex,
+        "domain": "",
     }
     cfg.save(_config_path())
     if spk_hex:
