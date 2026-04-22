@@ -1,7 +1,7 @@
 title: DNS Mesh Protocol
 description: >-
-  Decentralized P2P messaging that tunnels encrypted messages through DNS TXT
-  records. End-to-end encrypted, forward-secret, sender-authenticated, signed.
+  Federated end-to-end encrypted messaging that tunnels through DNS TXT records.
+  Sender-authenticated, signed, with forward secrecy for prekey-consumed messages.
 
 # Pretty URLs and relative links that work both under GitHub Pages (served at
 # /DNSMeshProtocol/) and when previewing locally with `bundle exec jekyll serve`.

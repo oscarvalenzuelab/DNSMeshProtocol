@@ -16,7 +16,7 @@ one node, one sqlite store. Treat as design intent, not current behavior.
 
 ## Project Overview
 
-Implement a decentralized peer-to-peer messaging system that leverages the global DNS infrastructure to create a resilient, censorship-resistant communication network. The system uses DNS queries and responses to transport encrypted messages across a distributed network of DNS resolvers.
+Implement a federated end-to-end encrypted messaging protocol that leverages the global DNS infrastructure to create a resilient, censorship-resistant communication network. The system uses DNS queries and responses to transport encrypted messages across a distributed network of DNS resolvers and federated nodes, with user-sovereign trust anchors (pinned operator keys) rather than a single central authority.
 
 ## Core Requirements
 
@@ -396,7 +396,7 @@ def send_message(username: str, passphrase: str, recipient: str, content: str):
 #### 13.2 Privacy Features
 - Public key-based identity (no real names required)
 - Encrypted message content and metadata
-- Decentralized architecture with no central logging
+- Federated architecture with no central logging authority (each node operator logs independently)
 - Anonymous routing through mesh network
 
 ### 14. Testing and Validation Requirements

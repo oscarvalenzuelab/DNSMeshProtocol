@@ -144,11 +144,16 @@ is a few thousand lines of Python plus SQLite.
 ## Current maturity
 
 {: .warning }
-DMP is **alpha, pre-audit software**. The protocol and API are unstable.
-It's had two rounds of independent code review (via OpenAI Codex) that
-surfaced and closed multiple real issues; a proper third-party
-cryptographic audit is the gate for tagging beta. Do not route
-anything whose secrecy matters through DMP until that audit is done.
+DMP is **alpha, pre-external-audit software**. The protocol and API
+are unstable. **Don't route secrets through DMP until the external
+cryptographic audit is done.** The codebase has had ~40+ rounds of
+automated code review (via OpenAI Codex) across all milestones, which
+surfaced and closed many real issues — but automated review is not a
+substitute for professional cryptanalysis. A human auditor catches a
+different class of bugs (crypto composition errors, side channels,
+protocol-level attacks, spec-vs-implementation drift) that pattern
+matching cannot find. Until the audit is published, treat DMP as
+experimental for confidentiality-critical traffic.
 
 Actively shipping:
 

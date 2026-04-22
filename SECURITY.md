@@ -1,9 +1,33 @@
 # Security
 
-This is **alpha, pre-audit software**. The protocol has had a design review
-and an independent code review of the current implementation, but it has not
-been through a professional audit. Don't use it for anything whose secrecy
-actually matters until that changes.
+This is **alpha, pre-external-audit software**. **Don't route secrets
+through DMP until the external cryptographic audit is done.**
+
+The codebase has had ~40+ rounds of automated code review (OpenAI Codex)
+across every milestone, plus a design review of the protocol. That
+automated review surfaced and closed many real issues — but **automated
+review is not a substitute for professional cryptanalysis**. A human
+auditor catches a different class of defect:
+
+- **Crypto composition errors** — our stack composes X25519 ECDH +
+  HKDF + ChaCha20-Poly1305 AEAD + Ed25519 + Argon2id. Each primitive
+  is fine in isolation; the composition may have subtle bugs that
+  require expert cryptanalysis to find (see, e.g., Signal's early
+  domain-separation issues).
+- **Side channels** — timing, cache, memory-dump recoverability of
+  ephemeral keys. Auditors run timing harnesses.
+- **Protocol-level attacks** — cross-record replay, key reuse across
+  rotation, trust-chain shortcuts. LLM review is local; adversarial
+  reasoning across the full protocol surface is not what it does.
+- **Spec-vs-implementation drift** — the protocol spec says "bind AAD
+  to the header"; an auditor verifies the code actually does it
+  under every edge case.
+- **Novel mechanisms** — DMP's chunking + Reed-Solomon + zfec erasure
+  composition is unusual for a messaging protocol. Original research
+  surface that only human cryptanalysis covers.
+
+Until the external audit is published, treat DMP as experimental for
+confidentiality-critical traffic.
 
 ## Reporting a vulnerability
 

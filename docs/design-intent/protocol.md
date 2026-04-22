@@ -50,7 +50,7 @@ This mesh topology provides resilience against node failures and network partiti
 
 Users generate cryptographic key pairs that serve as their identities. The public key becomes the user's address on the network, while the private key remains secret. A user publishes their identity by creating DNS records that map human readable usernames to public keys. These identity records get replicated across multiple DNS zones for redundancy.
 
-To find another user, a client queries DNS for their identity record, retrieves their public key, and verifies the cryptographic signature. This decentralized identity system requires no central authority or certificate infrastructure.
+To find another user, a client queries DNS for their identity record, retrieves their public key, and verifies the cryptographic signature. This federated identity system requires no central authority or certificate infrastructure; each zone operator is independent.
 
 ### Offline Message Handling
 
@@ -88,7 +88,7 @@ Storage scales through the distributed storage node system. As more nodes join, 
 
 ## Security Properties
 
-The protocol provides end to end encryption, ensuring only intended recipients can read messages. Forward secrecy protects past communications even if long term keys get compromised. Message authentication prevents tampering and forgery. The decentralized architecture eliminates single points of failure that could be targeted for surveillance or censorship.
+The protocol provides end to end encryption, ensuring only intended recipients can read messages. Forward secrecy protects past prekey-consumed communications even if long term keys get compromised (pool exhaustion falls back to the long-term key path). Message authentication prevents tampering and forgery. The federated architecture with user-sovereign trust anchors eliminates the single-company single-point-of-failure that centralized platforms expose to surveillance or censorship pressure.
 
 The use of standard DNS makes the protocol difficult to block without disrupting internet functionality. Even sophisticated deep packet inspection struggles to distinguish DMP traffic from legitimate DNS queries. The mesh topology ensures multiple paths exist for message delivery, requiring widespread blocking to prevent communication.
 
