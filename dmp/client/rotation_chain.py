@@ -101,15 +101,40 @@ class RotationChain:
         if not isinstance(pinned_spk, (bytes, bytearray)) or len(pinned_spk) != 32:
             return None
 
-        name = rrset_name or self._derive_rrset_name(subject, subject_type)
-        if name is None:
-            return None
+        # Resolve candidate RRset name(s). When the caller pins one via
+        # ``rrset_name=``, we use only that. Otherwise derive the set of
+        # plausible names — for user_identity subjects this includes
+        # BOTH the zone-anchored form (``rotate.dmp.<host>``) and the
+        # hash form (``rotate.dmp.id-<hash12>.<host>``), because a
+        # contact may have been pinned in either shape and the publisher
+        # may use either. We union the results so a contact that rotated
+        # during an identity-form migration still resolves.
+        if rrset_name is not None:
+            names: List[str] = [rrset_name]
+        else:
+            derived = self._derive_rrset_names(subject, subject_type)
+            if not derived:
+                return None
+            names = derived
 
-        # 1. Fetch.
-        try:
-            records = self._reader.query_txt_record(name)
-        except Exception:
-            return None
+        # 1. Fetch — union the results across candidates, dedup on wire
+        # text so two names returning the same record don't double-count.
+        seen: set[str] = set()
+        records: List[str] = []
+        for candidate in names:
+            try:
+                chunk = self._reader.query_txt_record(candidate)
+            except Exception:
+                chunk = None
+            if not chunk:
+                continue
+            for txt in chunk:
+                if not isinstance(txt, str):
+                    continue
+                if txt in seen:
+                    continue
+                seen.add(txt)
+                records.append(txt)
         if not records:
             # No chain records published; caller falls back to pinned_spk.
             return None
@@ -203,28 +228,60 @@ class RotationChain:
 
     # ---- helpers ----------------------------------------------------------
 
-    def _derive_rrset_name(self, subject: str, subject_type: int) -> Optional[str]:
-        """Map (subject_type, subject) → rotation RRset owner name.
+    def _derive_rrset_names(self, subject: str, subject_type: int) -> List[str]:
+        """Map (subject_type, subject) → candidate rotation RRset owner names.
+
+        Returns an ordered list of candidate names, dedup'd. For
+        user-identity subjects we return BOTH the zone-anchored form
+        (``rotate.dmp.<host>``) and the hash form
+        (``rotate.dmp.id-<hash12>.<host>``) — a contact added as
+        ``alice@example.com`` may have rotations published under either
+        depending on how the publisher configured its identity. Trying
+        zone-anchored first matches the preferred deployment shape;
+        walker unions results so a publisher that migrated from one
+        form to the other still resolves. Cluster / bootstrap subjects
+        have a single canonical RRset and return a single-element list.
 
         Uses the publishing convention from ``dmp.core.rotation``.
-        Returns None on unknown subject_type. Callers that fetched the
-        RRset themselves (e.g. because they published under an unusual
-        name) should pass ``rrset_name=`` directly to ``resolve_current_spk``.
+        Returns [] on unknown subject_type or unparseable subject.
+        Callers that fetched the RRset themselves (e.g. because they
+        published under an unusual name) should pass ``rrset_name=``
+        directly to ``resolve_current_spk``.
         """
         try:
             if subject_type == SUBJECT_TYPE_USER_IDENTITY:
                 # user@host form
                 if "@" not in subject:
-                    return None
+                    return []
                 user, _, host = subject.partition("@")
-                return rotation_rrset_name_user_identity(user.strip(), host.strip())
+                user = user.strip()
+                host = host.strip()
+                if not user or not host:
+                    return []
+                # Zone-anchored first (matches the preferred form), hash
+                # form second. Dedup on the off-chance both derive to
+                # the same string — they won't for real inputs, but a
+                # degenerate subject like ``""@host`` already fails the
+                # guards above, so this is belt-and-suspenders.
+                out: List[str] = []
+                try:
+                    out.append(rotation_rrset_name_zone_anchored(host))
+                except ValueError:
+                    pass
+                try:
+                    hash_form = rotation_rrset_name_user_identity(user, host)
+                    if hash_form not in out:
+                        out.append(hash_form)
+                except ValueError:
+                    pass
+                return out
             if subject_type == SUBJECT_TYPE_CLUSTER_OPERATOR:
-                return rotation_rrset_name_cluster(subject)
+                return [rotation_rrset_name_cluster(subject)]
             if subject_type == SUBJECT_TYPE_BOOTSTRAP_SIGNER:
-                return rotation_rrset_name_bootstrap(subject)
+                return [rotation_rrset_name_bootstrap(subject)]
         except ValueError:
-            return None
-        return None
+            return []
+        return []
 
     def _partition(
         self,

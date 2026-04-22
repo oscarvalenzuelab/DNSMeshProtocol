@@ -30,6 +30,7 @@ from dmp.core.rotation import (
     RotationRecord,
     SUBJECT_TYPE_USER_IDENTITY,
     rotation_rrset_name_user_identity,
+    rotation_rrset_name_zone_anchored,
 )
 from dmp.network.base import DNSRecordReader
 
@@ -497,6 +498,58 @@ def test_duplicate_same_record_accepted():
         SUBJECT_TYPE_USER_IDENTITY,
     )
     assert result == b.get_signing_public_key_bytes()
+
+
+def test_chain_walk_finds_zone_anchored_rotation():
+    """Rotation published at the ZONE-ANCHORED name (rotate.dmp.<zone>)
+    resolves for a contact pinned as user@zone. The walker must try
+    BOTH the zone-anchored form and the hash form; a publisher that
+    uses a user-controlled zone writes under the zone-anchored name,
+    while a legacy hash-form contact would look under the hash name.
+    Both are plausible for the same logical contact, so we union them.
+    """
+    a = DMPCrypto()
+    b = DMPCrypto()
+    _, _, host = SUBJECT.partition("@")
+    zone_anchored_rrset = rotation_rrset_name_zone_anchored(host)
+    # Publish ONLY at the zone-anchored name — the hash-form name is empty.
+    reader = _StubReader({zone_anchored_rrset: [_sign_rotation(old=a, new=b, seq=1)]})
+    chain = RotationChain(reader)
+    result = chain.resolve_current_spk(
+        a.get_signing_public_key_bytes(),
+        SUBJECT,
+        SUBJECT_TYPE_USER_IDENTITY,
+    )
+    assert result == b.get_signing_public_key_bytes()
+
+
+def test_chain_walk_unions_zone_anchored_and_hash_form():
+    """A publisher that migrates between identity forms may have
+    partial rotations published under each name. The walker unions
+    both RRsets so the chain resolves end-to-end even during the
+    transition window.
+    """
+    a = DMPCrypto()
+    b = DMPCrypto()
+    c = DMPCrypto()
+    _, _, host = SUBJECT.partition("@")
+    user, _, _ = SUBJECT.partition("@")
+    zone_anchored_rrset = rotation_rrset_name_zone_anchored(host)
+    hash_form_rrset = rotation_rrset_name_user_identity(user, host)
+    # a→b under zone-anchored, b→c under hash form.
+    reader = _StubReader(
+        {
+            zone_anchored_rrset: [_sign_rotation(old=a, new=b, seq=1)],
+            hash_form_rrset: [_sign_rotation(old=b, new=c, seq=2)],
+        }
+    )
+    chain = RotationChain(reader)
+    result = chain.resolve_current_spk(
+        a.get_signing_public_key_bytes(),
+        SUBJECT,
+        SUBJECT_TYPE_USER_IDENTITY,
+    )
+    assert result == c.get_signing_public_key_bytes()
 
 
 # ---- DMPClient integration (EXPERIMENTAL feature flag) --------------------
