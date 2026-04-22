@@ -134,7 +134,9 @@ dmp/
 
 docs/          Jekyll docs site (Just the Docs theme, GitHub Pages)
                Includes docs/protocol/ — the formal wire spec
-tests/         670+ unit, integration, and docker-in-the-loop tests
+tests/         800+ unit, integration, fuzz, and docker-in-the-loop tests
+               Includes tests/fuzz/ (hypothesis property tests) and
+               tests/test_vectors.py (golden interop test vectors).
 Dockerfile, docker-compose.yml, docker-compose.prod.yml, Caddyfile
 ```
 
@@ -142,9 +144,17 @@ Dockerfile, docker-compose.yml, docker-compose.prod.yml, Caddyfile
 
 ```bash
 pip install -e ".[dev]"
-pytest                                         # ~678 tests
+pytest                                         # ~805 tests (incl. fuzz)
 docker build -t dmp-node:latest .
 pytest tests/test_docker_integration.py        # 4 docker tests
+pytest tests/test_compose_cluster.py           # 3 compose-cluster tests
+```
+
+Production installs use the hashed lockfile:
+
+```bash
+pip install --require-hashes -r requirements.lock
+pip install . --no-deps
 ```
 
 ## Not a good fit for
