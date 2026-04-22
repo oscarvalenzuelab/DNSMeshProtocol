@@ -8,7 +8,7 @@ setup(
     version="0.1.0",
     author="Oscar Valenzuela B",
     author_email="oscar.valenzuela.b@gmail.com",
-    description="A decentralized peer-to-peer messaging system using DNS infrastructure",
+    description="A federated end-to-end encrypted messaging protocol delivered over DNS",
     long_description=long_description,
     long_description_content_type="text/markdown",
     packages=find_packages(),

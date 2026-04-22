@@ -8,13 +8,23 @@ internet already runs on.**
 
 ---
 
-> **Status: alpha, pre-external-audit.** Client-side federation,
-> bootstrap discovery, and the formal protocol spec are shipped; the
-> node-side federation backfill (anti-entropy + gossip) and the
-> third-party cryptographic audit remain as gates to `v0.2.0-beta`.
-> Do not route anything whose secrecy matters through DMP until the
-> audit is done. See [SECURITY.md](SECURITY.md) and
-> [ROADMAP.md](ROADMAP.md).
+> **Status: alpha, pre-external-audit.** Full federation (client
+> fan-out + union reader + node-side anti-entropy + manifest gossip),
+> bootstrap discovery, and the formal protocol spec are shipped. The
+> remaining path to `v1.0` is a certification backlog: external
+> cryptographic audit, mobile/web clients, key rotation records,
+> traffic-analysis hardening.
+>
+> **Don't route secrets through DMP until the external cryptographic
+> audit is done.** The codebase has had ~40+ rounds of automated
+> review across all milestones, but automated review is not a
+> substitute for professional cryptanalysis — a human auditor catches
+> a different class of bugs (crypto composition errors, side-channel
+> weaknesses, protocol-level attacks, implementation-vs-spec drift)
+> that no amount of LLM-driven pattern matching will find. The audit
+> is a post-beta deliverable; until then treat DMP as experimental
+> for confidentiality-critical traffic. See [SECURITY.md](SECURITY.md)
+> and [ROADMAP.md](ROADMAP.md).
 
 ## The pitch
 
