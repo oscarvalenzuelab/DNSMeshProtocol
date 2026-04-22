@@ -1160,9 +1160,28 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
     # source at the new passphrase file, and the next config load yields
     # the rotated identity with no re-init required.
     swapped_locally = False
+    env_passphrase_mismatch = False
     if args.yes:
         new_pp_file = args.new_passphrase_file
         if new_pp_file:
+            # Subtle footgun: `_load_passphrase` prefers DMP_PASSPHRASE
+            # over the file. If the operator rotated while the OLD
+            # DMP_PASSPHRASE is still exported in their shell, every
+            # subsequent `dmp *` command keeps deriving the OLD
+            # identity — "atomic swap" would be a lie. Detect the
+            # mismatch and refuse to claim success; a matching env var
+            # (operator already rotated their shell) is silently fine.
+            env_pp = os.environ.get("DMP_PASSPHRASE")
+            if env_pp is not None:
+                try:
+                    new_pp_contents = Path(new_pp_file).expanduser().read_text().strip()
+                except OSError as exc:
+                    _die(
+                        1,
+                        f"--new-passphrase-file {new_pp_file!r} is not readable: {exc}",
+                    )
+                if env_pp != new_pp_contents:
+                    env_passphrase_mismatch = True
             cfg.passphrase_file = str(Path(new_pp_file).expanduser())
             cfg.save(_config_path())
             swapped_locally = True
@@ -1171,6 +1190,22 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
                 f"passphrase_file -> {cfg.passphrase_file}; kdf_salt "
                 f"preserved). Local pubkey: {new_spk_hex}"
             )
+            if env_passphrase_mismatch:
+                # Non-zero exit so the operator can't miss it in a script.
+                # The rotation was published (publish succeeded above) and
+                # the config file was rewritten — there's nothing to
+                # unwind. The operator just needs to fix their shell.
+                print(
+                    "WARNING: DMP_PASSPHRASE is set in your environment "
+                    "and does not match the contents of "
+                    f"--new-passphrase-file ({new_pp_file}); "
+                    "`_load_passphrase` prefers the env var over the "
+                    "file, so subsequent `dmp` commands in this shell "
+                    "will keep deriving the OLD identity. Run "
+                    "`unset DMP_PASSPHRASE` or "
+                    "`export DMP_PASSPHRASE=<new>` to finish the swap.",
+                    file=sys.stderr,
+                )
         else:
             # New passphrase came from DMP_NEW_PASSPHRASE or interactive
             # prompt — no file path to persist. The operator must set
@@ -1211,6 +1246,12 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
             "derives the rotated keypair. Re-running `dmp init --force` "
             "would break local adoption."
         )
+    # Non-zero exit when the env-passphrase mismatch was detected so a
+    # script can tell that the rotation published correctly BUT the
+    # operator needs to fix their shell before the next invocation.
+    # Rotation wire is already on the DNS; no rollback.
+    if env_passphrase_mismatch:
+        return 3
     return 0
 
 

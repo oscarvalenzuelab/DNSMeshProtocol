@@ -515,6 +515,99 @@ class TestIdentityRotateExperimental:
         )
         assert derived.get_signing_public_key_bytes() == bytes(rec.new_spk)
 
+    def test_rotate_warns_when_env_passphrase_mismatches(
+        self, config_home, shared_store, monkeypatch, tmp_path, capsys
+    ):
+        """--yes --new-passphrase-file while DMP_PASSPHRASE is ALSO
+        exported (and mismatches the file) must warn the operator and
+        exit non-zero.
+
+        `_load_passphrase` prefers the env var over the file. Without
+        this detection, the command claims "atomic swap" but every
+        subsequent invocation in the same shell keeps deriving the OLD
+        identity. The warning text names the culprit env var so the
+        fix is obvious.
+        """
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+
+        old_pp_file = tmp_path / "old.pp"
+        old_pp_file.write_text("alice-pass")
+        new_pp_file = tmp_path / "new.pp"
+        new_pp_file.write_text("alice-new-pass")
+
+        # Point config at the old file so rotate can load the old
+        # identity; then ALSO export DMP_PASSPHRASE with a *different*
+        # value from what will end up in the new-passphrase file.
+        cfg_path = config_home / "config.yaml"
+        import yaml as _y
+
+        doc = _y.safe_load(cfg_path.read_text())
+        doc["passphrase_file"] = str(old_pp_file)
+        cfg_path.write_text(_y.safe_dump(doc, sort_keys=True))
+
+        # DMP_PASSPHRASE == alice-pass (the OLD one). When rotate
+        # completes, the config points at new_pp_file (content
+        # "alice-new-pass"). Mismatch — must warn + exit non-zero.
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.delenv("DMP_NEW_PASSPHRASE", raising=False)
+
+        rc = cli.main(
+            [
+                "identity",
+                "rotate",
+                "--yes",
+                "--experimental",
+                "--new-passphrase-file",
+                str(new_pp_file),
+            ]
+        )
+        # Non-zero exit: the rotation did publish, but the env var is
+        # going to undermine the swap until the operator fixes it.
+        assert rc == 3
+        captured = capsys.readouterr()
+        stderr = captured.err
+        assert "DMP_PASSPHRASE is set" in stderr
+        assert "unset DMP_PASSPHRASE" in stderr or "export DMP_PASSPHRASE" in stderr
+
+    def test_rotate_no_env_passphrase_no_warning(
+        self, config_home, shared_store, monkeypatch, tmp_path, capsys
+    ):
+        """DMP_PASSPHRASE unset: --yes --new-passphrase-file exits 0
+        with no env-mismatch warning (the only other path to
+        `_load_passphrase` is the file, which we've already rewritten)."""
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+
+        old_pp_file = tmp_path / "old.pp"
+        old_pp_file.write_text("alice-pass")
+        new_pp_file = tmp_path / "new.pp"
+        new_pp_file.write_text("alice-new-pass")
+
+        cfg_path = config_home / "config.yaml"
+        import yaml as _y
+
+        doc = _y.safe_load(cfg_path.read_text())
+        doc["passphrase_file"] = str(old_pp_file)
+        cfg_path.write_text(_y.safe_dump(doc, sort_keys=True))
+
+        monkeypatch.delenv("DMP_PASSPHRASE", raising=False)
+        monkeypatch.delenv("DMP_NEW_PASSPHRASE", raising=False)
+
+        rc = cli.main(
+            [
+                "identity",
+                "rotate",
+                "--yes",
+                "--experimental",
+                "--new-passphrase-file",
+                str(new_pp_file),
+            ]
+        )
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "WARNING: DMP_PASSPHRASE" not in captured.err
+
     def test_rotate_publishes_revocation_of_old_identity(
         self, config_home, shared_store, monkeypatch, capsys
     ):
