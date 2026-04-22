@@ -33,6 +33,7 @@ from dmp.core.crypto import DMPCrypto
 from dmp.core.identity import IdentityRecord
 from dmp.core.manifest import SlotManifest
 from dmp.core.prekeys import Prekey
+from dmp.core.rotation import RevocationRecord, RotationRecord
 
 VECTORS_DIR = Path(__file__).resolve().parent.parent / "docs" / "protocol" / "vectors"
 
@@ -278,6 +279,107 @@ class TestPrekeyVectors:
         assert pk.is_expired(now=case["inputs"]["exp"] + 1)
 
 
+# --- RotationRecord (EXPERIMENTAL — M5.4) -----------------------------------
+
+
+class TestRotationRecordVectors:
+    @pytest.fixture(scope="class")
+    def cases(self) -> list[dict[str, Any]]:
+        return _load("rotation_record")
+
+    def _build(self, case: dict[str, Any]) -> str:
+        inputs = case["inputs"]
+        old_crypto = DMPCrypto.from_private_bytes(bytes.fromhex(case["old_seed_hex"]))
+        new_crypto = DMPCrypto.from_private_bytes(bytes.fromhex(case["new_seed_hex"]))
+        rec = RotationRecord(
+            subject_type=inputs["subject_type"],
+            subject=inputs["subject"],
+            old_spk=bytes.fromhex(inputs["old_spk_hex"]),
+            new_spk=bytes.fromhex(inputs["new_spk_hex"]),
+            seq=inputs["seq"],
+            ts=inputs["ts"],
+            exp=inputs["exp"],
+        )
+        return rec.sign(old_crypto, new_crypto)
+
+    def test_round_trip_user_byte_identical(self, cases):
+        case = cases[0]
+        assert self._build(case) == _wire_from_hex(case)
+
+    def test_round_trip_cluster_byte_identical(self, cases):
+        case = cases[1]
+        assert self._build(case) == _wire_from_hex(case)
+
+    def test_round_trip_bootstrap_byte_identical(self, cases):
+        case = cases[2]
+        assert self._build(case) == _wire_from_hex(case)
+
+    def test_cosign_failure_rejected(self, cases):
+        case = cases[3]
+        wire = _wire_from_hex(case)
+        assert RotationRecord.parse_and_verify(wire) is None
+
+    def test_expired_rejected(self, cases):
+        case = cases[4]
+        wire = _wire_from_hex(case)
+        assert (
+            RotationRecord.parse_and_verify(wire, now=case["verify_with_now"]) is None
+        )
+
+
+# --- RevocationRecord (EXPERIMENTAL — M5.4) ---------------------------------
+
+
+class TestRevocationRecordVectors:
+    @pytest.fixture(scope="class")
+    def cases(self) -> list[dict[str, Any]]:
+        return _load("revocation_record")
+
+    def _build(self, case: dict[str, Any]) -> str:
+        inputs = case["inputs"]
+        crypto = DMPCrypto.from_private_bytes(bytes.fromhex(case["revoked_seed_hex"]))
+        rec = RevocationRecord(
+            subject_type=inputs["subject_type"],
+            subject=inputs["subject"],
+            revoked_spk=bytes.fromhex(inputs["revoked_spk_hex"]),
+            reason_code=inputs["reason_code"],
+            ts=inputs["ts"],
+        )
+        return rec.sign(crypto)
+
+    def test_round_trip_user_byte_identical(self, cases):
+        case = cases[0]
+        wire = self._build(case)
+        assert wire == _wire_from_hex(case)
+        # And parse-with-now-in-range succeeds.
+        parsed = RevocationRecord.parse_and_verify(wire, now=case["verify_with_now"])
+        assert parsed is not None
+
+    def test_round_trip_cluster_byte_identical(self, cases):
+        case = cases[1]
+        assert self._build(case) == _wire_from_hex(case)
+
+    def test_binding_failure_wrong_revoked_spk(self, cases):
+        case = cases[2]
+        wire = _wire_from_hex(case)
+        wrong = bytes.fromhex(case["verify_with_expected_revoked_spk_hex"])
+        assert (
+            RevocationRecord.parse_and_verify(
+                wire,
+                expected_revoked_spk=wrong,
+                now=case["verify_with_now"],
+            )
+            is None
+        )
+
+    def test_stale_revocation_rejected(self, cases):
+        case = cases[3]
+        wire = _wire_from_hex(case)
+        assert (
+            RevocationRecord.parse_and_verify(wire, now=case["verify_with_now"]) is None
+        )
+
+
 # --- Regen-sanity: make sure every JSON file can be parsed. -----------------
 
 
@@ -289,6 +391,8 @@ class TestPrekeyVectors:
         "identity_record",
         "slot_manifest",
         "prekey",
+        "rotation_record",
+        "revocation_record",
     ],
 )
 def test_vector_file_is_well_formed(name: str):
