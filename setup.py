@@ -40,9 +40,20 @@ setup(
             "pytest>=7.0",
             "pytest-asyncio>=0.21.0",
             "pytest-cov>=4.0",
+            "pytest-timeout>=2.0",
             "black>=23.0.0",
             "mypy>=1.0.0",
             "pylint>=2.17.0",
+            # Property-based fuzz harness for wire parsers (tests/fuzz/).
+            # Required to collect the test suite — CI runs
+            # `pip install -e .[dev]` and will fail to collect fuzz
+            # modules without it.
+            "hypothesis>=6.0",
+            # Supply-chain toolchain: pip-compile generates the hashed
+            # lockfiles (requirements.lock / requirements-dev.lock);
+            # pip-audit scans for known CVEs in CI.
+            "pip-tools>=7.0",
+            "pip-audit>=2.6",
         ]
     },
     entry_points={

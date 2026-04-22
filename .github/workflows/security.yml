@@ -1,0 +1,109 @@
+name: security
+
+# Supply-chain hygiene + wire-parser fuzzing. Runs on every PR, every
+# push to main, and on a weekly cadence so a vulnerability that lands in
+# a transitive dep between commits doesn't sit unnoticed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 06:17 UTC every Monday. Slightly off the hour to avoid piling on
+    # GitHub's cron runners at the top of the hour.
+    - cron: "17 6 * * 1"
+
+jobs:
+  pip-audit:
+    name: pip-audit (lockfiles + environment)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+
+      - name: Audit runtime lockfile
+        # --strict fails the job on ANY finding (not just HIGH/CRITICAL).
+        # We pin hashes, so a finding means "a dep we shipped has a CVE"
+        # and demands attention regardless of severity. Adjust scope
+        # later if we want to gate only on HIGH/CRITICAL.
+        run: pip-audit -r requirements.lock --strict
+
+      - name: Audit dev lockfile
+        run: pip-audit -r requirements-dev.lock --strict
+
+      - name: Install package from the hashed lockfile
+        # Use the lockfile as the source of truth so the audited
+        # dependency set is byte-identical to what CI executes. A plain
+        # `.[dev]` install would resolve from PyPI at job time and drift
+        # from the just-audited set; --require-hashes makes drift
+        # impossible.
+        run: |
+          pip install --require-hashes -r requirements-dev.lock
+          pip install -e . --no-deps
+
+      - name: Audit installed environment
+        # Final drift check: confirms the audited lockfile is what's
+        # actually resolvable in a fresh environment.
+        run: pip-audit --strict
+
+  fuzz-wire-parsers:
+    name: hypothesis fuzz (wire parsers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install from the hashed lockfile
+        # Source-of-truth install: the lockfile is what pip-audit
+        # approves, so fuzz/nightly jobs run against the exact
+        # dependency set we reviewed.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements-dev.lock
+          pip install -e . --no-deps
+
+      - name: Run fuzz harness
+        # PR + push budget: 500 examples per property (fast; seconds, not
+        # minutes). The weekly scheduled run below ramps it up to 5000.
+        run: pytest tests/fuzz/ -v
+
+  fuzz-wire-parsers-nightly:
+    name: hypothesis fuzz — extended
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install from the hashed lockfile
+        # Source-of-truth install: the lockfile is what pip-audit
+        # approves, so fuzz/nightly jobs run against the exact
+        # dependency set we reviewed.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements-dev.lock
+          pip install -e . --no-deps
+
+      - name: Run fuzz harness (extended)
+        env:
+          # Picked up by tests/fuzz/conftest.py to widen `max_examples`
+          # on the weekly cron run. PR CI leaves it unset → default 500.
+          DMP_FUZZ_MAX_EXAMPLES: "5000"
+        run: pytest tests/fuzz/ -v
