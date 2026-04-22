@@ -147,6 +147,11 @@ class TestHttpOps:
             a.stop()
 
     def test_metrics_endpoint_exposes_counters(self, api):
+        """When a bearer token is configured, /metrics requires it too
+        (not just /v1/records/*). This fixture runs with no token set,
+        so /metrics stays open — see the "requires_token" /
+        "open_when_no_token" tests below for the two configurations.
+        """
         server, store = api
         base = f"http://127.0.0.1:{server.port}"
         # Generate one successful POST to bump the counter.
@@ -159,6 +164,95 @@ class TestHttpOps:
         assert r.status_code == 200
         assert "dmp_http_requests_total" in r.text
         assert 'method="POST"' in r.text
+
+    def test_metrics_endpoint_requires_token_when_configured(self):
+        """With a bearer token set, /metrics refuses unauthenticated GETs.
+
+        Metrics leak publish rate, rate-limit hits, per-operation error
+        counters — for a privacy-oriented protocol that's an activity
+        indicator the operator does not want open to the world.
+        """
+        store = InMemoryDNSStore()
+        a = DMPHttpApi(
+            store,
+            host="127.0.0.1",
+            port=_free_port(),
+            bearer_token="s3cret-token",
+        )
+        a.start()
+        try:
+            base = f"http://127.0.0.1:{a.port}"
+
+            # No token → 401.
+            r = requests.get(f"{base}/metrics", timeout=2)
+            assert r.status_code == 401
+
+            # Wrong token → 401.
+            r = requests.get(
+                f"{base}/metrics",
+                headers={"Authorization": "Bearer wrong-token"},
+                timeout=2,
+            )
+            assert r.status_code == 401
+
+            # Correct token → 200 with prometheus body.
+            r = requests.get(
+                f"{base}/metrics",
+                headers={"Authorization": "Bearer s3cret-token"},
+                timeout=2,
+            )
+            assert r.status_code == 200
+            assert "dmp_http_requests_total" in r.text
+        finally:
+            a.stop()
+
+    def test_metrics_endpoint_open_when_no_token(self):
+        """Dev path: no bearer_token configured → /metrics is reachable
+        without auth. The server logs a startup WARNING so this is not
+        silently shipped to prod — see test_warning_logged_when_no_token
+        below."""
+        store = InMemoryDNSStore()
+        a = DMPHttpApi(store, host="127.0.0.1", port=_free_port())
+        a.start()
+        try:
+            r = requests.get(f"http://127.0.0.1:{a.port}/metrics", timeout=2)
+            assert r.status_code == 200
+            assert "dmp_http_requests_total" in r.text or r.text == ""
+        finally:
+            a.stop()
+
+    def test_warning_logged_when_no_token(self, caplog):
+        """When no bearer_token is configured, DMPHttpApi.start() MUST
+        log a WARNING naming DMP_HTTP_TOKEN so an operator can't
+        silently deploy an unauthenticated metrics endpoint to prod."""
+        store = InMemoryDNSStore()
+        a = DMPHttpApi(store, host="127.0.0.1", port=_free_port())
+        with caplog.at_level(logging.WARNING, logger="dmp.server.http_api"):
+            a.start()
+            try:
+                pass
+            finally:
+                a.stop()
+        assert any(
+            "metrics endpoint unauthenticated" in r.message for r in caplog.records
+        )
+        assert any("DMP_HTTP_TOKEN" in r.message for r in caplog.records)
+
+    def test_no_warning_when_token_configured(self, caplog):
+        """When a bearer_token IS configured, start() MUST NOT log the
+        'metrics endpoint unauthenticated' warning — it would be
+        misleading noise."""
+        store = InMemoryDNSStore()
+        a = DMPHttpApi(store, host="127.0.0.1", port=_free_port(), bearer_token="x")
+        with caplog.at_level(logging.WARNING, logger="dmp.server.http_api"):
+            a.start()
+            try:
+                pass
+            finally:
+                a.stop()
+        assert not any(
+            "metrics endpoint unauthenticated" in r.message for r in caplog.records
+        )
 
     def test_health_degrades_on_broken_store(self):
         class BrokenStore(InMemoryDNSStore):
