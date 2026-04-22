@@ -1051,13 +1051,19 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
     else:
         subject = f"{cfg.username}@{effective_domain}"
 
-    # Seq numbering: start at unix-seconds so a fresh CLI run always
-    # produces a strictly monotonic seq across multiple rotations. A
-    # longer-horizon store-backed counter is out of scope for this pass;
-    # the audit may recommend a different scheme.
-    now_ts = int(time.time())
-    seq = now_ts
-    ts = now_ts
+    # Seq numbering: millisecond-resolution unix time. Chosen so two
+    # rotations fired back-to-back within the same second (a test
+    # re-rotate, a scripted disaster recovery cutover) still produce
+    # strictly-monotonic seq values — the chain walker rejects
+    # same-seq hops (seq must STRICTLY increase), so second-resolution
+    # would leave the second rotation invisible until contacts re-pin
+    # manually. Uses uint64; ms epoch won't overflow until ~year 292M.
+    # Documented as ms in docs/protocol/rotation.md alongside ts (which
+    # stays at second resolution — seq is NOT a wall-clock timestamp,
+    # it's a monotonic ordering number that happens to be clock-derived).
+    now_ms = int(time.time() * 1000)
+    seq = now_ms
+    ts = int(time.time())
 
     rotation = RotationRecord(
         subject_type=SUBJECT_TYPE_USER_IDENTITY,
