@@ -852,6 +852,66 @@ class TestIdentityRotateExperimental:
             == new_crypto.get_signing_public_key_bytes().hex()
         )
 
+    def test_identity_fetch_routine_rotation_disambiguates_via_chain_head(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """Routine rotations publish a RotationRecord but NO Revocation.
+        A non-rotation-aware `dmp identity fetch` must still return the
+        new identity unambiguously by dropping any IdentityRecord whose
+        ed25519_spk appears as an old_spk in the rotation RRset.
+
+        This is the Codex round-5 P1 path: without chain-head filtering,
+        the default `dmp identity rotate` (reason=routine) would leave
+        the identity RRset ambiguous forever.
+        """
+        import json as _json
+        import yaml as _y
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.identity import identity_domain, make_record
+
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+
+        # Publish the OLD IdentityRecord under the SAME salt rotate uses
+        # (see test_identity_fetch_filters_revoked_records for why this
+        # is needed to keep keys aligned).
+        alice_doc = _y.safe_load((config_home / "config.yaml").read_text())
+        alice_salt = bytes.fromhex(alice_doc["kdf_salt"])
+        old_crypto = DMPCrypto.from_passphrase("alice-pass", salt=alice_salt)
+        old_record = make_record(old_crypto, "alice")
+        shared_store.publish_txt_record(
+            identity_domain("alice", "mesh.local"),
+            old_record.sign(old_crypto),
+        )
+
+        # Routine rotation: publishes new IdentityRecord + RotationRecord
+        # (co-signed by old + new keys) — NO RevocationRecord.
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
+        rc = cli.main(["identity", "rotate", "--yes", "--experimental"])
+        assert rc == 0
+        capsys.readouterr()
+
+        # Now both IdentityRecords live at the mailbox name and there is
+        # no revocation — the only disambiguator is the RotationRecord's
+        # old_spk. A correct fetch picks the new key.
+        bob_home = config_home.parent / "bob-routine-chain"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(["init", "bob", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
+
+        rc = cli.main(["identity", "fetch", "alice", "--json"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        parsed = _json.loads(out)
+
+        new_crypto = DMPCrypto.from_passphrase("alice-new-pass", salt=alice_salt)
+        assert (
+            parsed["signing_public_key"]
+            == new_crypto.get_signing_public_key_bytes().hex()
+        )
+
     def test_identity_fetch_still_ambiguous_on_concurrent_rotations(
         self, config_home, shared_store, monkeypatch, capsys
     ):

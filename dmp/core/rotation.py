@@ -86,17 +86,20 @@ REASON_OTHER = 4
 _REASON_CODES = (REASON_COMPROMISE, REASON_ROUTINE, REASON_LOST_KEY, REASON_OTHER)
 
 # Per-field caps. MAX_SUBJECT_LEN matches the other hardened records
-# (ClusterManifest, BootstrapRecord) at 64 bytes.
-# Per-subject-type byte cap. Bare DNS names max out around 64 octets of
-# labels (matches MAX_CLUSTER_NAME_LEN in dmp.core.cluster). User-identity
-# subjects are `user@host` concatenations — a 63-byte user plus "@" plus
-# a 63-byte host overruns a 64-byte cap cleanly, so we raise it to 128
-# for that one subject type. Wire format ceiling is 255 bytes (the
-# subject_len field is uint8), so there's room. A per-type cap keeps
-# the stricter bound on DNS-name subjects (cluster / bootstrap) where
-# overly long values would just confuse DNS later.
+# (ClusterManifest, BootstrapRecord) at 64 bytes — those are bare DNS
+# names where the 64-octet cap from MAX_CLUSTER_NAME_LEN is the natural
+# bound. User-identity subjects are ``user@host`` concatenations where a
+# 63-byte user plus "@" plus a FQDN host can easily exceed 64 bytes.
+# We set this to 255, the maximum the wire encoding's uint8 subject_len
+# field can carry. Longer zone-anchored identities that would need
+# user@very.long.fqdn totalling more than 255 bytes are rejected by
+# _validate_subject; those deployments can shorten one or both halves
+# or wait for the v0.3.0 wire revision that widens subject_len. A
+# per-subject-type cap keeps the stricter 64-byte bound on pure DNS-name
+# subjects (cluster / bootstrap) where overly long values would confuse
+# DNS later.
 MAX_SUBJECT_LEN = 64
-MAX_USER_IDENTITY_SUBJECT_LEN = 128
+MAX_USER_IDENTITY_SUBJECT_LEN = 255
 
 # Absolute wire-length cap, symmetric with the other hardened records.
 # 1200 bytes is ~4 TXT strings of 255 chars + small headroom.
