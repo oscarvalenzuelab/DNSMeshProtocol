@@ -931,11 +931,23 @@ def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
 def cmd_identity_rotate(args: argparse.Namespace) -> int:
     """EXPERIMENTAL (M5.4): rotate the user identity key.
 
-    Publishes a co-signed RotationRecord at the user's rotation RRset,
-    a self-signed RevocationRecord for the OLD key at the same RRset
-    (so non-rotation-aware fetches can filter the old IdentityRecord
-    out of the mailbox-name RRset), plus a fresh IdentityRecord for
-    the new key.
+    Publishes a co-signed RotationRecord at the user's rotation RRset
+    plus a fresh IdentityRecord for the new key at the user's identity
+    RRset.
+
+    With ``--reason compromise`` or ``--reason lost_key`` (opt-in; NOT
+    the default ``routine``), the command ALSO publishes a self-signed
+    RevocationRecord for the OLD key at the rotation RRset. A
+    revocation tells rotation-aware fetchers to refuse the old key
+    forever. Routine rotations deliberately skip the revocation: the
+    chain walker aborts trust if any key on the walked path is revoked,
+    so publishing a revocation on every rotation would break the
+    headline auto-follow workflow.
+
+    Clients that can't walk a chain (older versions, or legacy flows)
+    disambiguate the identity RRset via the RotationRecord ``old_spk``
+    list: any IdentityRecord whose ed25519_spk appears as an ``old_spk``
+    is treated as superseded.
 
     With ``--yes``, the command ALSO performs the local swap atomically:
     the config's ``kdf_salt`` stays the same, the ``passphrase_file``
@@ -1464,19 +1476,37 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         if parsed is not None:
             valid.append(parsed[0])
     if not valid:
+        if cluster_handle is not None:
+            cluster_handle.close()
+            cluster_handle = None
         _die(2, f"found TXT records at {name} but none verified as a DMP identity")
 
-    # Rotation-aware filter (M5.4 Option C): fetch the same subject's
-    # rotate RRset (if any), collect self-signed RevocationRecords, and
-    # drop any IdentityRecord whose ed25519_spk matches a revocation.
-    # This closes the "ambiguous after rotate" hole where the old + new
-    # IdentityRecords coexist under append semantics. A compromised key
-    # that re-publishes the old IdentityRecord is still filtered because
-    # the revocation sits alongside it; see docs/protocol/rotation.md
-    # "Revocation model" for the trade-off.
+    # Rotation-aware filter (M5.4): fetch the same subject's rotate
+    # RRset (if any), collect verifying RotationRecords + self-signed
+    # RevocationRecords, and drop any IdentityRecord whose ed25519_spk
+    # matches. This closes two "ambiguous after rotate" holes in one
+    # pass:
+    #
+    #   1. Revocation filter — drops any IdentityRecord whose ed25519_spk
+    #      appears as a revoked_spk in a RevocationRecord. Only fires
+    #      for compromise/lost_key rotations (routine rotations do NOT
+    #      publish revocations, see cmd_identity_rotate).
+    #   2. Chain-head filter — drops any IdentityRecord whose ed25519_spk
+    #      appears as old_spk in a verifying RotationRecord. This is
+    #      the path routine rotations rely on: the old key still has
+    #      a valid IdentityRecord and no revocation, but a co-signed
+    #      rotation points from it to the new key, so non-rotation-aware
+    #      fetches can still auto-disambiguate.
+    #
+    # A compromised key that re-publishes the old IdentityRecord is
+    # still filtered because both the rotation and the revocation (if
+    # any) sit alongside it; see docs/protocol/rotation.md "Revocation
+    # model" for the trade-off.
     from dmp.core.rotation import (
         RECORD_PREFIX_REVOCATION,
+        RECORD_PREFIX_ROTATION,
         RevocationRecord,
+        RotationRecord,
         SUBJECT_TYPE_USER_IDENTITY,
         _normalize_subject,
         rotation_rrset_name_user_identity,
@@ -1503,6 +1533,8 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         ]
 
     revoked_spks: set[bytes] = set()
+    superseded_spks: set[bytes] = set()
+    norm_fetch_subject = _normalize_subject(SUBJECT_TYPE_USER_IDENTITY, fetch_subject)
     for candidate in rotate_rrset_candidates:
         try:
             rotate_records = reader.query_txt_record(candidate)
@@ -1513,32 +1545,39 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         for txt in rotate_records:
             if not isinstance(txt, str):
                 continue
-            if not txt.startswith(RECORD_PREFIX_REVOCATION):
-                continue
-            rev = RevocationRecord.parse_and_verify(txt)
-            if rev is None:
-                continue
-            if rev.subject_type != SUBJECT_TYPE_USER_IDENTITY:
-                continue
-            # Subject match is loose here: the fetch_subject is
-            # user@effective-domain, and zone-anchored RotationRecords
-            # carry user@identity_domain (which might differ from the
-            # mesh domain). Matching too strictly would let the
-            # operator's own rotation fail to filter. We accept any
-            # revocation whose subject's user half matches and whose
-            # host half matches the rotate-RRset zone — effectively,
-            # the RRset name is the trust anchor, not the embedded
-            # subject.
-            if _normalize_subject(rev.subject_type, rev.subject) != _normalize_subject(
-                rev.subject_type, fetch_subject
-            ):
-                # Still keep the revocation if the username half matches
-                # and we're querying the unanchored form — the publisher
-                # may use a different domain in the subject than the
-                # one we queried under. Conservative: only accept exact
-                # subject matches.
-                continue
-            revoked_spks.add(bytes(rev.revoked_spk))
+            if txt.startswith(RECORD_PREFIX_REVOCATION):
+                rev = RevocationRecord.parse_and_verify(txt)
+                if rev is None:
+                    continue
+                if rev.subject_type != SUBJECT_TYPE_USER_IDENTITY:
+                    continue
+                # Subject match is strict: the RRset name is the trust
+                # anchor, but we still require the embedded subject to
+                # match the fetched subject so a stray record from a
+                # different publisher at the same name can't poison the
+                # filter.
+                if (
+                    _normalize_subject(rev.subject_type, rev.subject)
+                    != norm_fetch_subject
+                ):
+                    continue
+                revoked_spks.add(bytes(rev.revoked_spk))
+            elif txt.startswith(RECORD_PREFIX_ROTATION):
+                rot = RotationRecord.parse_and_verify(txt)
+                if rot is None:
+                    continue
+                if rot.subject_type != SUBJECT_TYPE_USER_IDENTITY:
+                    continue
+                if (
+                    _normalize_subject(rot.subject_type, rot.subject)
+                    != norm_fetch_subject
+                ):
+                    continue
+                # old_spk has been rotated away from. Its IdentityRecord
+                # at the mailbox name is superseded even without a
+                # revocation. The rotation is co-signed by BOTH old and
+                # new keys, so we trust the supersession.
+                superseded_spks.add(bytes(rot.old_spk))
 
     if revoked_spks:
         filtered = [rec for rec in valid if bytes(rec.ed25519_spk) not in revoked_spks]
@@ -1547,6 +1586,7 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         if not filtered:
             if cluster_handle is not None:
                 cluster_handle.close()
+                cluster_handle = None
             _die(
                 2,
                 f"all IdentityRecords at {name} are revoked by a matching "
@@ -1554,9 +1594,24 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
             )
         valid = filtered
 
-    # Revocation filter is done — safe to close the one-shot cluster
-    # client now. Any remaining work (fingerprint display, contact
-    # save) only touches local state.
+    # Chain-head filter: after dropping revoked records, if we still
+    # have more than one, drop any whose ed25519_spk is an old_spk in
+    # the rotation set. The remaining record(s) are chain-head
+    # candidates. Only collapse when exactly one candidate remains —
+    # zero or >1 means something pathological (all records superseded
+    # with no head published, or two concurrent rotations not yet
+    # reconciled), and we fall through to the ambiguous-error branch
+    # so the user can inspect out-of-band.
+    if len(valid) > 1 and superseded_spks:
+        chain_filtered = [
+            rec for rec in valid if bytes(rec.ed25519_spk) not in superseded_spks
+        ]
+        if len(chain_filtered) == 1:
+            valid = chain_filtered
+
+    # Revocation + chain-head filters done — safe to close the one-shot
+    # cluster client now. Any remaining work (fingerprint display,
+    # contact save) only touches local state.
     if cluster_handle is not None:
         cluster_handle.close()
         cluster_handle = None
