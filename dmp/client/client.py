@@ -211,10 +211,12 @@ class DMPClient:
 
         Called on the receive path AFTER the `known_spks` pin-list
         accepts a manifest, to catch the case where a pinned key has
-        been explicitly revoked by its sender (compromise rotation,
-        routine rotation, lost key). Without this check, a holder of
-        the revoked key can keep delivering messages to every pinned
-        contact indefinitely.
+        been explicitly revoked by its sender. Only compromise and
+        lost_key rotations publish a RevocationRecord; routine rotations
+        do not (the chain walker follows them forward instead — see
+        ``cmd_identity_rotate``). Without this check, a holder of the
+        revoked key can keep delivering messages to every pinned contact
+        indefinitely.
 
         Only fires when ``rotation_chain_enabled=True``; legacy
         clients return False and skip the check entirely.

@@ -2737,12 +2737,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_id_rotate.add_argument(
         "--reason",
-        choices=("routine", "compromise"),
+        choices=("routine", "compromise", "lost_key"),
         default="routine",
-        help="reason_code for the RevocationRecord of the OLD key. "
-        "'routine' (default) marks a normal key rollover; 'compromise' "
-        "flags the old key as assumed-leaked so chain-walkers abort trust "
-        "immediately instead of merely following the chain forward.",
+        help="reason_code for the rotation. 'routine' (default) is a "
+        "normal key rollover: publishes a RotationRecord only — no "
+        "RevocationRecord — so chain walkers auto-follow the new key. "
+        "'compromise' and 'lost_key' both additionally publish a "
+        "self-signed RevocationRecord of the old key so chain walkers "
+        "abort trust instead of following forward. Use 'compromise' if "
+        "the key was leaked and 'lost_key' if the old material is "
+        "genuinely gone.",
     )
     p_id_rotate.add_argument(
         "--experimental",
