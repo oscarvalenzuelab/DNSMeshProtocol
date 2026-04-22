@@ -75,6 +75,62 @@ class RotationChain:
 
     # ---- public API -------------------------------------------------------
 
+    def is_spk_revoked(
+        self,
+        candidate_spk: bytes,
+        subject: str,
+        subject_type: int,
+    ) -> bool:
+        """Return True iff a verifying ``RevocationRecord`` targeting
+        ``candidate_spk`` is published at any of the ``subject``'s rotate
+        RRset name(s).
+
+        Used on the receive path to filter manifests signed by a pinned
+        key that the sender has since revoked. Without this cross-check,
+        a pinned old key would keep authenticating messages even after
+        the legitimate holder published a rotation + revocation — a
+        compromised-key holder could still deliver to every pinned
+        contact.
+
+        Fetch-once-per-call; no caching. Receive is not hot-path enough
+        for the cache invalidation complexity to be worth it, and a
+        revocation that went live mid-session should take effect on the
+        next poll.
+
+        Returns False on:
+        - unknown subject_type / unparseable subject
+        - no rotate RRset reachable
+        - rotate RRset present but no verifying revocation matches
+          ``candidate_spk``
+        """
+        if (
+            not isinstance(candidate_spk, (bytes, bytearray))
+            or len(candidate_spk) != 32
+        ):
+            return False
+        names = self._derive_rrset_names(subject, subject_type)
+        if not names:
+            return False
+        target = bytes(candidate_spk)
+        seen: set[str] = set()
+        records: List[str] = []
+        for candidate in names:
+            try:
+                chunk = self._reader.query_txt_record(candidate)
+            except Exception:
+                chunk = None
+            if not chunk:
+                continue
+            for txt in chunk:
+                if not isinstance(txt, str) or txt in seen:
+                    continue
+                seen.add(txt)
+                records.append(txt)
+        if not records:
+            return False
+        _rotations, revocations = self._partition(records, subject, subject_type)
+        return any(bytes(r.revoked_spk) == target for r in revocations)
+
     def resolve_current_spk(
         self,
         pinned_spk: bytes,

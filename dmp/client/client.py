@@ -204,6 +204,40 @@ class DMPClient:
             c.signing_key_bytes for c in self.contacts.values() if c.signing_key_bytes
         }
 
+    def _rotation_manifest_revoked(self, sender_spk: bytes) -> bool:
+        """EXPERIMENTAL (M5.4): return True iff ``sender_spk`` matches a
+        pinned contact whose current rotate RRset publishes a
+        verifying revocation for that spk.
+
+        Called on the receive path AFTER the `known_spks` pin-list
+        accepts a manifest, to catch the case where a pinned key has
+        been explicitly revoked by its sender (compromise rotation,
+        routine rotation, lost key). Without this check, a holder of
+        the revoked key can keep delivering messages to every pinned
+        contact indefinitely.
+
+        Only fires when ``rotation_chain_enabled=True``; legacy
+        clients return False and skip the check entirely.
+        """
+        if not self.rotation_chain_enabled or self._rotation_chain is None:
+            return False
+        from dmp.core.rotation import SUBJECT_TYPE_USER_IDENTITY
+
+        for contact in self.contacts.values():
+            if not contact.signing_key_bytes or contact.signing_key_bytes != sender_spk:
+                continue
+            subject = f"{contact.username}@{contact.domain}"
+            try:
+                if self._rotation_chain.is_spk_revoked(
+                    sender_spk, subject, SUBJECT_TYPE_USER_IDENTITY
+                ):
+                    return True
+            except Exception:
+                # Defense-in-depth: a revocation check that somehow
+                # raises must not crash the receive path.
+                continue
+        return False
+
     def _rotation_manifest_accepted(self, sender_spk: bytes) -> bool:
         """EXPERIMENTAL (M5.4): check a rotation chain for sender_spk.
 
@@ -512,6 +546,16 @@ class DMPClient:
                     # per-receive trust decision, not a permanent re-pin.
                     if not self._rotation_manifest_accepted(manifest.sender_spk):
                         continue
+                # EXPERIMENTAL (M5.4): cross-check that a PINNED
+                # signing key hasn't itself been revoked. Without this,
+                # a sender who published (rotation A→B) + (revocation of
+                # A) would still have manifests signed by A accepted by
+                # every contact that pinned A — defeating the whole
+                # point of revocation. Only fires when rotation chain
+                # walking is enabled; legacy clients keep their byte-
+                # identical behavior.
+                elif self._rotation_manifest_revoked(manifest.sender_spk):
+                    continue
                 # Check-only here; we record in the replay cache *after* we
                 # actually decode the message. Otherwise a transient DNS miss
                 # during chunk fetch would permanently suppress a still-valid

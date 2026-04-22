@@ -1600,14 +1600,27 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
             print(f"(contact `{contact_key}` already exists — not overwriting)")
         else:
             # Persist the remote host so the rotation fallback can walk
-            # chains against the right zone. `parsed_addr` is non-None
-            # only for `user@host` form; legacy bare-username adds
-            # leave `domain` empty and inherit the local effective
-            # domain at _make_client time (pre-M5.4-followup behavior).
+            # chains against the right zone. Two shapes can supply it:
+            #   1) `dmp identity fetch alice@other.example --add`
+            #      → parsed_addr = (alice, other.example)
+            #   2) `dmp identity fetch alice --domain other.example --add`
+            #      → parsed_addr is None, args.domain carries the host
+            # Both must persist `domain` so _make_client doesn't later
+            # overwrite with the local effective_domain and break
+            # cross-zone prekey + rotation-chain lookups. Legacy bare-
+            # username adds (no args.domain, no @host) leave `domain`
+            # empty and inherit the local effective domain at
+            # _make_client time (pre-M5.4-followup behavior).
+            if parsed_addr is not None:
+                remote_host = parsed_addr[1]
+            elif args.domain:
+                remote_host = args.domain
+            else:
+                remote_host = ""
             entry: Dict[str, str] = {
                 "pub": identity.x25519_pk.hex(),
                 "spk": identity.ed25519_spk.hex(),
-                "domain": parsed_addr[1] if parsed_addr is not None else "",
+                "domain": remote_host,
             }
             cfg.contacts[contact_key] = entry
             cfg.save(_config_path())

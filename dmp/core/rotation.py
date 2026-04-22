@@ -87,7 +87,16 @@ _REASON_CODES = (REASON_COMPROMISE, REASON_ROUTINE, REASON_LOST_KEY, REASON_OTHE
 
 # Per-field caps. MAX_SUBJECT_LEN matches the other hardened records
 # (ClusterManifest, BootstrapRecord) at 64 bytes.
+# Per-subject-type byte cap. Bare DNS names max out around 64 octets of
+# labels (matches MAX_CLUSTER_NAME_LEN in dmp.core.cluster). User-identity
+# subjects are `user@host` concatenations — a 63-byte user plus "@" plus
+# a 63-byte host overruns a 64-byte cap cleanly, so we raise it to 128
+# for that one subject type. Wire format ceiling is 255 bytes (the
+# subject_len field is uint8), so there's room. A per-type cap keeps
+# the stricter bound on DNS-name subjects (cluster / bootstrap) where
+# overly long values would just confuse DNS later.
 MAX_SUBJECT_LEN = 64
+MAX_USER_IDENTITY_SUBJECT_LEN = 128
 
 # Absolute wire-length cap, symmetric with the other hardened records.
 # 1200 bytes is ~4 TXT strings of 255 chars + small headroom.
@@ -110,8 +119,16 @@ def _validate_subject(subject_type: int, subject: str) -> None:
             f"invalid subject_type {subject_type}; must be one of {_SUBJECT_TYPES}"
         )
     subject_bytes = subject.encode("utf-8")
-    if len(subject_bytes) == 0 or len(subject_bytes) > MAX_SUBJECT_LEN:
-        raise ValueError(f"subject too long (max {MAX_SUBJECT_LEN} utf-8 bytes)")
+    # User-identity subjects are ``user@host`` concatenations that can
+    # legitimately exceed the bare-DNS-name cap; raise it for that one
+    # type. See the constant definitions above.
+    cap = (
+        MAX_USER_IDENTITY_SUBJECT_LEN
+        if subject_type == SUBJECT_TYPE_USER_IDENTITY
+        else MAX_SUBJECT_LEN
+    )
+    if len(subject_bytes) == 0 or len(subject_bytes) > cap:
+        raise ValueError(f"subject too long (max {cap} utf-8 bytes)")
 
     if subject_type == SUBJECT_TYPE_USER_IDENTITY:
         _validate_user_subject(subject)
@@ -267,7 +284,15 @@ class RotationRecord:
             raise ValueError("invalid subject_type")
         subject_len = body[off]
         off += 1
-        if subject_len == 0 or subject_len > MAX_SUBJECT_LEN:
+        # Per-subject-type cap (see MAX_USER_IDENTITY_SUBJECT_LEN
+        # above). User-identity `user@host` subjects can exceed the
+        # bare-DNS cap; we must accept them on parse as we do on sign.
+        parse_cap = (
+            MAX_USER_IDENTITY_SUBJECT_LEN
+            if subject_type == SUBJECT_TYPE_USER_IDENTITY
+            else MAX_SUBJECT_LEN
+        )
+        if subject_len == 0 or subject_len > parse_cap:
             raise ValueError("invalid subject length")
         if off + subject_len > len(body):
             raise ValueError("truncated subject")
@@ -495,7 +520,15 @@ class RevocationRecord:
             raise ValueError("invalid subject_type")
         subject_len = body[off]
         off += 1
-        if subject_len == 0 or subject_len > MAX_SUBJECT_LEN:
+        # Per-subject-type cap (see MAX_USER_IDENTITY_SUBJECT_LEN
+        # above). User-identity `user@host` subjects can exceed the
+        # bare-DNS cap; we must accept them on parse as we do on sign.
+        parse_cap = (
+            MAX_USER_IDENTITY_SUBJECT_LEN
+            if subject_type == SUBJECT_TYPE_USER_IDENTITY
+            else MAX_SUBJECT_LEN
+        )
+        if subject_len == 0 or subject_len > parse_cap:
             raise ValueError("invalid subject length")
         if off + subject_len > len(body):
             raise ValueError("truncated subject")
