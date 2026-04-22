@@ -468,13 +468,47 @@ class TestRevocationRecordSecurity:
             is None
         )
 
-    def test_stale_revocation_rejected(self):
+    def test_revocation_accepted_after_10_years(self):
+        """Revocations are PERMANENT assertions under the new default.
+
+        Old behavior: default ``max_age_seconds=86400*365`` rejected
+        a 2-year-old revocation, which caused rotation to silently
+        regress to ambiguous once the cap expired on a client
+        (`dmp identity fetch` saw both old + new IdentityRecords as
+        valid because the revocation filter dropped the stale
+        revocation). New behavior: the default is no cap, so "this
+        key is dead" stays true forever.
+        """
         revoked = _crypto()
         now = int(time.time())
-        # Revocation from 2 years ago with default 1-year max_age.
-        rec = _make_revocation(revoked_crypto=revoked, ts=now - 86400 * 365 * 2)
+        # 10 years ago — well past the old 1-year default.
+        rec = _make_revocation(revoked_crypto=revoked, ts=now - 86400 * 365 * 10)
         wire = rec.sign(revoked)
-        assert RevocationRecord.parse_and_verify(wire) is None
+        parsed = RevocationRecord.parse_and_verify(wire)
+        assert parsed is not None
+        assert parsed.revoked_spk == revoked.get_signing_public_key_bytes()
+
+    def test_revocation_max_age_explicit_still_works(self):
+        """Callers with custom freshness policies (forensic replay
+        windows, stale-log pruning) can still opt in to the classical
+        ts + max_age < now gate by passing an explicit integer.
+
+        This preserves back-compat for any call site that deliberately
+        wants a time-bounded acceptance policy.
+        """
+        revoked = _crypto()
+        now = int(time.time())
+        rec = _make_revocation(revoked_crypto=revoked, ts=now - 86400 * 2)
+        wire = rec.sign(revoked)
+        # 1-day cap, 2-day-old revocation → rejected.
+        assert RevocationRecord.parse_and_verify(wire, max_age_seconds=86400) is None
+        # 7-day cap, 2-day-old revocation → accepted.
+        assert (
+            RevocationRecord.parse_and_verify(wire, max_age_seconds=86400 * 7)
+            is not None
+        )
+        # None (the new default) → accepted regardless of age.
+        assert RevocationRecord.parse_and_verify(wire, max_age_seconds=None) is not None
 
     def test_future_ts_rejected(self):
         revoked = _crypto()

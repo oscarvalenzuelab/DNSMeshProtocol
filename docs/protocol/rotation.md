@@ -333,19 +333,52 @@ is to add a **designated revocation key** field to `IdentityRecord`
 the main key). The audit is expected to evaluate whether to mandate
 that evolution as part of the breaking `v=dmp2` bump.
 
-### 6.1 Freshness window
+### 6.1 Freshness — permanent assertion, no default cap
 
-`RevocationRecord.parse_and_verify` enforces a
-`max_age_seconds` (default: one year). Revocations older than the
-window are dropped. This bounds how long an attacker can replay a
-stale revocation of the real user's key against a newly-joining
-client. Callers that need indefinite revocation (forensic tools) can
-pass a much larger value.
+**A revocation is a permanent assertion.** "This key is dead" is not
+a statement that expires. `RevocationRecord.parse_and_verify`
+defaults to `max_age_seconds=None`: the acceptance gate has no time
+cap at the APPLICATION layer. A revocation signed years ago still
+verifies today.
 
-A 300-second positive clock drift is tolerated on the `ts` field.
-Revocations with `ts` more than 300 s in the future are rejected —
-otherwise an attacker with skewed clocks could extend the freshness
-window arbitrarily.
+Rationale: the alternative (an expiring cap, previously one year)
+created a silent rotation regression. `IdentityRecord` publishes
+have append semantics; nothing forbids a compromised keyholder from
+re-publishing the old IdentityRecord indefinitely. The matching
+`RevocationRecord` lets `dmp identity fetch` filter that old record
+out. If the revocation filter silently drops stale revocations, then
+once the cap expires on a client it sees BOTH old + new
+IdentityRecords as valid and reports "ambiguous — re-pin
+out-of-band" without any operator action. The fix is to make the
+revocation gate permanent; the known-bad key stays known-bad.
+
+#### Required re-publication at the DNS layer
+
+This only shifts the freshness concern: a revocation stays
+application-accepted forever, but the DNS TXT record carrying it
+ages out under normal TTL refresh. **Operators must periodically
+re-publish a `RevocationRecord` for any permanently-revoked key they
+want contacts to keep honoring.** A stale cache on an intermediate
+recursive resolver is not enough; the authoritative zone must keep
+the wire visible. A reasonable cadence is ~1/month per revoked key;
+the reference CLI does not automate this in M5.4.
+
+#### Explicit opt-in for freshness windows
+
+Callers with legitimate reasons to bound acceptance (forensic audit
+windows, pruning policies on an archive of old rotations) can still
+pass an explicit `max_age_seconds=<int>` to `parse_and_verify`. The
+parameter is preserved for back-compat and for these specialized
+use cases; only the default changed.
+
+#### Clock-skew guard remains
+
+A 300-second positive clock drift is tolerated on the `ts` field
+regardless of `max_age_seconds`. Revocations whose `ts` claims to be
+more than 300 s in the future are rejected — an attacker with
+skewed clocks could otherwise pre-authorize a future revocation for
+a key they plan to steal later. This guard is ALWAYS on, because it
+still matters when a caller DOES opt in to a freshness window.
 
 ## 7. Audit scope
 

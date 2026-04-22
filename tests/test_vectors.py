@@ -372,11 +372,26 @@ class TestRevocationRecordVectors:
             is None
         )
 
-    def test_stale_revocation_rejected(self, cases):
+    def test_stale_revocation_rejected_with_explicit_cap(self, cases):
+        """Under the new permanent-assertion default (max_age_seconds=None),
+        old revocations verify unconditionally. The stale-rejection path
+        only kicks in when a caller explicitly opts in via the
+        verify_with_max_age_seconds sidecar — exercised here."""
         case = cases[3]
         wire = _wire_from_hex(case)
+        # Opt-in rejection: caller passes the cap.
         assert (
-            RevocationRecord.parse_and_verify(wire, now=case["verify_with_now"]) is None
+            RevocationRecord.parse_and_verify(
+                wire,
+                now=case["verify_with_now"],
+                max_age_seconds=case["verify_with_max_age_seconds"],
+            )
+            is None
+        )
+        # Default (no cap) — same wire, same now, accepted.
+        assert (
+            RevocationRecord.parse_and_verify(wire, now=case["verify_with_now"])
+            is not None
         )
 
 
