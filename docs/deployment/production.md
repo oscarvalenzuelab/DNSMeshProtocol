@@ -96,10 +96,22 @@ sees the real source, not the Caddy container's internal address.
 |---|---|
 | `DMP_HTTP_HOST` | `0.0.0.0` |
 | `DMP_HTTP_PORT` | `8053` |
-| `DMP_HTTP_TOKEN` | *(none)* — set to require bearer auth |
+| `DMP_HTTP_TOKEN` | *(none)* — set to require bearer auth on publish AND metrics |
 | `DMP_HTTP_RATE` | `10` (requests/sec per source IP) |
 | `DMP_HTTP_BURST` | `100` |
 | `DMP_HTTP_MAX_CONCURRENCY` | `64` (handler threads) |
+
+**`DMP_HTTP_TOKEN` gates both `/v1/records/*` and `/metrics`.** Metrics
+leak operational metadata — publish rate, rate-limit hits, per-operation
+error counters — which is an activity indicator for a privacy-oriented
+protocol. When the token is unset (dev / local mode), the server logs
+a startup WARNING saying `metrics endpoint unauthenticated` and
+`/metrics` remains open. Do NOT ship a node to the public internet with
+the token unset. Generate one with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
 
 ### Publish-side resource caps
 
@@ -111,7 +123,8 @@ sees the real source, not the Caddy container's internal address.
 
 ## Metrics scraping
 
-Point Prometheus at `GET /metrics`:
+Point Prometheus at `GET /metrics`. If `DMP_HTTP_TOKEN` is set, the
+scrape must carry the same bearer token as the publish side:
 
 ```yaml
 scrape_configs:
@@ -120,6 +133,9 @@ scrape_configs:
     static_configs:
       - targets: ["dmp.example.com"]
     scheme: https
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/dmp-token
 ```
 
 Useful alerts:

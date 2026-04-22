@@ -16,11 +16,19 @@ Endpoints:
     GET    /stats
 
 Auth (optional): if `bearer_token` is set, all /v1/records/* endpoints
-require `Authorization: Bearer <token>`. /health and /stats stay open.
-The /v1/sync/* endpoints use a SEPARATE shared token
+AND /metrics require `Authorization: Bearer <token>`. /health and
+/stats stay open. The /v1/sync/* endpoints use a SEPARATE shared token
 (`sync_peer_token`) so an operator can leave the publish API open to
 users while gating the bulk-dump sync surface to peer nodes only. If
 no sync token is configured the sync endpoints return 403.
+
+/metrics gating rationale: the endpoint leaks operational metadata
+(publish rate, per-operation error rates, rate-limit hits, concurrency
+saturation). For a privacy-oriented protocol that's an activity
+indicator we don't want open to the world. When no `bearer_token` is
+configured (dev / local mode), `/metrics` stays open and the server
+logs a startup WARNING so operators can't silently ship an
+unauthenticated node to the public internet.
 
 Zero third-party deps — stdlib http.server only. Not a production webserver;
 front it with nginx or caddy if you care about performance or TLS.
@@ -140,6 +148,17 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             return self._handle_health()
         if self.path == "/metrics":
+            # Metrics leak operational metadata — publish rate, per-operation
+            # error rates, rate-limit hits, concurrency ceilings. For a
+            # privacy-oriented messaging protocol that's an activity
+            # indicator we do not want open to the world. If a bearer
+            # token is configured, require it on /metrics too (same token
+            # as /v1/records/*). If no token is configured (dev mode),
+            # leave it open — the DMPHttpApi constructor logs a WARNING
+            # at startup so operators know the endpoint is unauthenticated.
+            if not self._authorized():
+                self._send_json(401, {"error": "unauthorized"})
+                return 401
             text = REGISTRY.render().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
@@ -866,6 +885,16 @@ class DMPHttpApi:
         )
         self._thread.start()
         log.info("DMP HTTP API listening on http://%s:%d", self.host, self.port)
+        if not self.bearer_token:
+            # Dev / local path is fine, but loud enough that nobody ships
+            # a node to the open internet without noticing. /metrics
+            # leaks operational metadata (publish rate, rate-limit hits,
+            # error counters) which is an activity indicator for a
+            # privacy-oriented protocol.
+            log.warning(
+                "metrics endpoint unauthenticated; do not expose this node "
+                "to the public internet without setting DMP_HTTP_TOKEN."
+            )
 
     def stop(self) -> None:
         if self._server is None:
