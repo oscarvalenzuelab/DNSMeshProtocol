@@ -71,3 +71,4 @@ NOTES.md
 # accidental commit of a real Ed25519 operator seed.
 docker/cluster/operator-ed25519.hex
 docker/cluster/cluster-manifest.wire
+venv
