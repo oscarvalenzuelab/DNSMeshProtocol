@@ -85,6 +85,7 @@ class DMPClient:
         replay_cache_path: Optional[str] = None,
         kdf_salt: Optional[bytes] = None,
         prekey_store_path: Optional[str] = None,
+        rotation_chain_enabled: bool = False,
     ):
         if store is not None:
             if writer is None:
@@ -117,6 +118,18 @@ class DMPClient:
         self.prekey_store = PrekeyStore(prekey_store_path or ":memory:")
 
         self.contacts: Dict[str, Contact] = {}
+
+        # EXPERIMENTAL (M5.4): rotation-chain walking on verify failure.
+        # Default False preserves byte-identical legacy behavior. Wire
+        # format is subject to post-audit revision in v0.3.0.
+        self.rotation_chain_enabled = rotation_chain_enabled
+        self._rotation_chain = None
+        if rotation_chain_enabled:
+            # Import lazily so the default (off) path never imports the
+            # experimental module.
+            from dmp.client.rotation_chain import RotationChain
+
+            self._rotation_chain = RotationChain(self.reader)
 
         self.identity = DMPIdentity(
             username=username,
@@ -190,6 +203,40 @@ class DMPClient:
         return {
             c.signing_key_bytes for c in self.contacts.values() if c.signing_key_bytes
         }
+
+    def _rotation_manifest_accepted(self, sender_spk: bytes) -> bool:
+        """EXPERIMENTAL (M5.4): check a rotation chain for sender_spk.
+
+        Walks each pinned contact's rotation chain; if any chain's
+        current head is ``sender_spk``, accept the manifest. A rotation
+        chain is ONLY consulted when ``rotation_chain_enabled=True``;
+        otherwise this returns False and legacy behavior is preserved.
+
+        Wire format subject to post-audit revision in v0.3.0 — see
+        ``docs/protocol/rotation.md``.
+        """
+        if not self.rotation_chain_enabled or self._rotation_chain is None:
+            return False
+        # Import lazily to avoid the cold-path import on every receive.
+        from dmp.core.rotation import SUBJECT_TYPE_USER_IDENTITY
+
+        for contact in self.contacts.values():
+            if not contact.signing_key_bytes:
+                continue
+            subject = f"{contact.username}@{contact.domain}"
+            try:
+                current = self._rotation_chain.resolve_current_spk(
+                    contact.signing_key_bytes,
+                    subject,
+                    SUBJECT_TYPE_USER_IDENTITY,
+                )
+            except Exception:
+                # Defense-in-depth: a chain walker that somehow raises
+                # must not crash the receive path.
+                continue
+            if current is not None and current == sender_spk:
+                return True
+        return False
 
     def _pick_recipient_prekey(self, contact: "Contact") -> Tuple[int, Optional[bytes]]:
         """Fetch a fresh prekey from DNS and return (prekey_id, x25519_pub).
@@ -453,7 +500,18 @@ class DMPClient:
                 # If the user has pinned any signing keys, only accept
                 # manifests from those senders. Unknown signers are dropped.
                 if known_spks and manifest.sender_spk not in known_spks:
-                    continue
+                    # EXPERIMENTAL (M5.4): if rotation-chain walking is
+                    # enabled, try walking each pinned contact's chain
+                    # forward to see if the manifest's sender_spk is the
+                    # current head of a rotation. A valid walk means the
+                    # contact rotated their identity key; we extend the
+                    # accepted set for this receive pass. If the walk
+                    # fails or aborts (revocation, ambiguity, max_hops),
+                    # the manifest stays dropped. Never modifies
+                    # self.contacts — a rotation-chain walk is a
+                    # per-receive trust decision, not a permanent re-pin.
+                    if not self._rotation_manifest_accepted(manifest.sender_spk):
+                        continue
                 # Check-only here; we record in the replay cache *after* we
                 # actually decode the message. Otherwise a transient DNS miss
                 # during chunk fetch would permanently suppress a still-valid
