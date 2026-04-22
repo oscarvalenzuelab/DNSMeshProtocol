@@ -380,9 +380,15 @@ class TestIdentityRotateExperimental:
         assert "EXPERIMENTAL" in err
         assert "--experimental" in err
 
-    def test_rotate_publishes_records(
+    def test_rotate_routine_publishes_rotation_only_no_revocation(
         self, config_home, shared_store, monkeypatch, capsys
     ):
+        """Routine rotations (the default --reason) must NOT publish a
+        RevocationRecord — doing so would abort the rotation-chain
+        walker on every rotation-chain-enabled peer and break the
+        auto-follow workflow. Routine = rotation only; contacts pick
+        up the new key via chain walk.
+        """
         cli.main(["init", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
@@ -392,26 +398,57 @@ class TestIdentityRotateExperimental:
         assert rc == 0
         out = capsys.readouterr().out
         assert "published RotationRecord" in out
-        assert "published RevocationRecord" in out
+        # Routine path skips revocation; success output calls that out.
+        assert "skipping RevocationRecord" in out
         assert "published new IdentityRecord" in out
 
-        # Both a RotationRecord AND a RevocationRecord of the OLD key
-        # land at the rotate RRset. Subject is alice@mesh.local
-        # (no identity_domain set on the default init).
         from dmp.core.rotation import (
             RECORD_PREFIX_REVOCATION,
             RECORD_PREFIX_ROTATION,
             rotation_rrset_name_user_identity,
         )
 
-        # Default domain on init is "mesh.local".
+        rrset = rotation_rrset_name_user_identity("alice", "mesh.local")
+        records = shared_store.query_txt_record(rrset)
+        assert records is not None and len(records) == 1
+        assert records[0].startswith(RECORD_PREFIX_ROTATION)
+        assert not any(r.startswith(RECORD_PREFIX_REVOCATION) for r in records)
+
+    def test_rotate_compromise_publishes_rotation_and_revocation(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """`--reason compromise` publishes BOTH a RotationRecord and a
+        RevocationRecord of the old key. The revocation forces
+        rotation-chain walkers to abort trust (correct — the old key
+        is compromised, auto-follow would be unsafe) and makes
+        non-rotation-aware fetchers filter the old IdentityRecord.
+        """
+        cli.main(["init", "alice", "--endpoint", "http://x"])
+        capsys.readouterr()
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
+        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
+
+        rc = cli.main(
+            ["identity", "rotate", "--yes", "--experimental", "--reason", "compromise"]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "published RotationRecord" in out
+        assert "published RevocationRecord" in out
+        assert "reason=compromise" in out
+        assert "published new IdentityRecord" in out
+
+        from dmp.core.rotation import (
+            RECORD_PREFIX_REVOCATION,
+            RECORD_PREFIX_ROTATION,
+            rotation_rrset_name_user_identity,
+        )
+
         rrset = rotation_rrset_name_user_identity("alice", "mesh.local")
         records = shared_store.query_txt_record(rrset)
         assert records is not None and len(records) == 2
         kinds = sorted(r.split(";")[1] for r in records)
         assert kinds == ["t=revocation", "t=rotation"]
-        assert any(r.startswith(RECORD_PREFIX_ROTATION) for r in records)
-        assert any(r.startswith(RECORD_PREFIX_REVOCATION) for r in records)
 
     def test_rotate_twice_fast_produces_distinct_seq(
         self, config_home, shared_store, monkeypatch, tmp_path, capsys
@@ -706,45 +743,6 @@ class TestIdentityRotateExperimental:
         captured = capsys.readouterr()
         assert "WARNING: DMP_PASSPHRASE" not in captured.err
 
-    def test_rotate_publishes_revocation_of_old_identity(
-        self, config_home, shared_store, monkeypatch, capsys
-    ):
-        """After rotate --yes --experimental, the rotate RRset contains
-        a RevocationRecord whose revoked_spk == the old ed25519_spk."""
-        from dmp.core.crypto import DMPCrypto
-        from dmp.core.rotation import (
-            RECORD_PREFIX_REVOCATION,
-            REASON_ROUTINE,
-            RevocationRecord,
-            rotation_rrset_name_user_identity,
-        )
-
-        cli.main(["init", "alice", "--endpoint", "http://x"])
-        capsys.readouterr()
-        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
-        monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
-
-        # Snapshot the old identity's pubkey before we rotate.
-        import yaml as _y
-
-        cfg_doc = _y.safe_load((config_home / "config.yaml").read_text())
-        salt = bytes.fromhex(cfg_doc["kdf_salt"])
-        old_crypto = DMPCrypto.from_passphrase("alice-pass", salt=salt)
-        old_spk = old_crypto.get_signing_public_key_bytes()
-
-        rc = cli.main(["identity", "rotate", "--yes", "--experimental"])
-        assert rc == 0
-        capsys.readouterr()
-
-        rrset = rotation_rrset_name_user_identity("alice", "mesh.local")
-        records = shared_store.query_txt_record(rrset)
-        revocations = [r for r in records if r.startswith(RECORD_PREFIX_REVOCATION)]
-        assert len(revocations) == 1
-        rev = RevocationRecord.parse_and_verify(revocations[0])
-        assert rev is not None
-        assert bytes(rev.revoked_spk) == old_spk
-        assert rev.reason_code == REASON_ROUTINE
-
     def test_rotate_compromise_reason_tags_revocation(
         self, config_home, shared_store, monkeypatch, capsys
     ):
@@ -812,11 +810,23 @@ class TestIdentityRotateExperimental:
             old_record.sign(old_crypto),
         )
 
-        # Rotate: publishes a RotationRecord + Revocation of old + new
-        # IdentityRecord (all under the same shared store).
+        # Rotate with --reason compromise: publishes a RotationRecord +
+        # Revocation of old + new IdentityRecord (all under the same
+        # shared store). Routine rotations wouldn't publish a revocation,
+        # so the fetch path can't use the revocation-filter to
+        # disambiguate the two identity records.
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
-        rc = cli.main(["identity", "rotate", "--yes", "--experimental"])
+        rc = cli.main(
+            [
+                "identity",
+                "rotate",
+                "--yes",
+                "--experimental",
+                "--reason",
+                "compromise",
+            ]
+        )
         assert rc == 0
         capsys.readouterr()
 
