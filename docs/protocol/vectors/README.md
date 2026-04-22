@@ -16,6 +16,14 @@ cases.
 | `identity_record.json`   | `IdentityRecord`   | round-trip, 64-byte username boundary, signature failure (corrupt trailer) |
 | `slot_manifest.json`     | `SlotManifest`     | round-trip (1 chunk, no prekey), 64-chunk erasure boundary, signature failure |
 | `prekey.json`            | `Prekey`           | round-trip, max uint32 `prekey_id` boundary, signature failure, expired |
+| `rotation_record.json`   | `RotationRecord` *(DRAFT, M5.4)*  | round-trip for each subject_type (user/cluster/bootstrap), cosign-failure (forged sig_new), expired |
+| `revocation_record.json` | `RevocationRecord` *(DRAFT, M5.4)* | round-trip for user + cluster, binding failure (wrong expected_revoked_spk), stale (beyond max_age_seconds) |
+
+> `rotation_record.json` and `revocation_record.json` are marked DRAFT:
+> the wire format is subject to revision after the external crypto
+> audit. A breaking ``v=dmp2;t=rotation;`` may ship in v0.3.0 if the
+> audit recommends structural changes. See
+> `docs/protocol/rotation.md`.
 
 Each file is a JSON array of cases. Every case carries:
 
