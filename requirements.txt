@@ -1,4 +1,8 @@
-# Core dependencies
+# Runtime dependencies — the install_requires set from setup.py.
+#
+# Dev tooling lives in requirements-dev.txt. Pinned hashed lockfiles
+# live in requirements.lock and requirements-dev.lock; production
+# installs and CI should use those with `pip install --require-hashes`.
 cryptography>=41.0.0
 dnspython>=2.4.0
 reedsolo>=1.7.0
@@ -12,11 +16,3 @@ boto3>=1.26.0
 
 # Async support
 asyncio-throttle>=1.0.0
-
-# Development dependencies
-pytest>=7.0
-pytest-asyncio>=0.21.0
-pytest-cov>=4.0
-black>=23.0.0
-mypy>=1.0.0
-pylint>=2.17.0
