@@ -12,7 +12,8 @@ gatekeeper — delivered over DNS, on the relays and infrastructure the
 internet already runs on.
 {: .fs-6 .fw-300 }
 
-[Try it in 5 minutes]({{ site.baseurl }}/getting-started){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
+[How it works]({{ site.baseurl }}/how-it-works){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
+[Try it in 5 minutes]({{ site.baseurl }}/getting-started){: .btn .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [Deploy a node]({{ site.baseurl }}/deployment){: .btn .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [GitHub](https://github.com/oscarvalenzuelab/DNSMeshProtocol){: .btn .fs-5 .mb-4 .mb-md-0 }
 
