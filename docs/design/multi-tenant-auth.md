@@ -83,8 +83,8 @@ CREATE TABLE token_audit (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     ts             INTEGER NOT NULL,
     event          TEXT NOT NULL,     -- 'issued' | 'revoked' | 'used' | 'rejected'
-    token_hash     TEXT,              -- foreign key to tokens
-    subject        TEXT,
+    token_hash     TEXT,              -- only populated for lifecycle + owner-scope events
+    subject        TEXT,              -- only populated for lifecycle + owner-scope events
     remote_addr    TEXT,
     detail         TEXT               -- JSON blob, event-specific
 );
@@ -125,6 +125,30 @@ sender. Signatures on the manifest (`sender_spk` field) and
 encryption of the chunk content prevent a malicious sender from
 impersonating someone else *at the protocol layer* — the token
 only controls who can put bytes on the node.
+
+### Audit policy is split to preserve sender anonymity
+
+Shared-pool writes have a natural privacy property worth
+protecting: the record name itself encodes only the recipient's
+hash, never the sender. We preserve that at the audit layer too:
+
+| Event source | Columns logged | Rationale |
+|---|---|---|
+| Token lifecycle (issue / revoke / rotate) | `ts`, `event`, `token_hash`, `subject`, `remote_addr` | No sender anonymity at stake — these are explicit identity operations. |
+| **Owner-exclusive write** (identity / rotation / prekey) | `ts`, `event`, `token_hash`, `subject`, `remote_addr` | The write itself is identity-bound. Attribution is the whole point. |
+| **Shared-pool write** (mailbox slot / chunk) | `ts`, `event`, `remote_addr` *only* — **no `token_hash`, no `subject`** | From-the-node's-records you cannot tell *which user delivered to whom*. Rate limiting still works (the in-memory limiter holds the mapping ephemerally); revocation still works (the verification path checks the token). Only the durable log drops the link. |
+| Rejected requests | `ts`, `event`, `remote_addr`, `detail` | Enough to diagnose abuse without leaking a user's failed attempts. |
+
+Realistic caveat: timing correlation between "Alice's token was
+seen at 14:03:07" in token lifecycle + "some chunk was written at
+14:03:07" in shared-pool audit can still deanonymize. Plus the
+reverse-proxy (Caddy / nginx) logs IPs. Full sender-anonymity
+needs Tor / a mixnet — that's M6 territory, not M5.5.
+
+The split audit policy is the *minimum useful anonymity story* at
+the node layer: an operator compelled to hand over their SQLite
+database cannot, from that database alone, produce a send-receive
+transcript for any user.
 
 ### Why chunks aren't owner-scoped
 
