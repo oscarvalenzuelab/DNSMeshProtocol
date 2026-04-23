@@ -145,6 +145,24 @@ acted on. This is what earns the `v1.0` tag.
       + Apple Silicon), and Linux (x86_64 + arm64). Ships alongside
       the PyPI release in M5.1 for users who don't want a Python
       runtime. CI job cross-builds on every release tag. (1 week.)
+- [ ] **M5.7** Cross-platform identity proofs (Keyoxide-style). New
+      signed record type (`v=dmp1;t=proof;`) that links a DMP
+      identity to an external account — GitHub / GitLab / Mastodon /
+      domain-via-.well-known / DNSSEC-anchored TXT. Alice publishes
+      a challenge on the external platform that references her DMP
+      subject; she then publishes a signed DMP `ProofRecord`
+      pointing at that external URL + a fingerprint of the
+      expected content. Verifiers fetch both sides out-of-band and
+      confirm the cross-reference. Defends against the first-fetch
+      TOFU substitution attack: even if a malicious node swaps
+      Alice's `IdentityRecord`, Bob's client can cross-check via
+      GitHub (or wherever), which the node doesn't control.
+      Pure-additive on top of M5.4 — no protocol break, existing
+      clients just ignore proofs they don't understand. Prior art:
+      [Keyoxide](https://keyoxide.org/), [keybase.io](https://keybase.io/)
+      (defunct in this form but the claim model is the reference).
+      (3–5 weeks: schema + verifier plumbing + at least 3 adapter
+      platforms + CLI UX for publish / verify.)
 
 ### M5.5 — Multi-tenant node auth (new, post-M5.4)
 
