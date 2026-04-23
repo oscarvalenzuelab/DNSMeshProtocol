@@ -244,6 +244,8 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             count = getattr(self.server.store, "record_count", lambda: None)()
             self._send_json(200, {"records": count})
             return 200
+        if self.path == "/v1/registration/challenge":
+            return self._handle_registration_challenge()
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/sync/digest":
             return self._handle_sync_digest(parsed.query)
@@ -292,6 +294,8 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/sync/pull":
             return self._handle_sync_pull()
+        if parsed.path == "/v1/registration/confirm":
+            return self._handle_registration_confirm()
         name = self._match_name()
         if name is None:
             self._send_json(404, {"error": "not found"})
@@ -386,6 +390,95 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         status = 204 if ok else 404
         self._send_empty(status)
         return status
+
+    # ---- M5.5 self-service registration -----------------------------------
+
+    def _registration_enabled(self) -> bool:
+        """Return True iff the node is configured for self-service.
+
+        Requires auth_mode=multi-tenant + DMP_REGISTRATION_ENABLED=1 +
+        a node hostname. Returns False silently — the GET/POST
+        handlers translate that into 404 so a disabled node doesn't
+        even advertise the endpoint.
+        """
+        cfg = getattr(self.server, "registration_config", None)
+        if cfg is None or not cfg.enabled:
+            return False
+        if self.server.auth_mode != "multi-tenant":
+            return False
+        if not self.server.token_store:
+            return False
+        return bool(cfg.node_hostname)
+
+    def _registration_rate_ok(self) -> bool:
+        """Per-IP limiter specifically for the registration endpoints.
+
+        Separate from the general publish limiter because the budgets
+        are very different — you want generous publish limits but a
+        tight registration limit to discourage subject-squatting.
+        """
+        limiter = getattr(self.server, "registration_rate_limiter", None)
+        if limiter is None:
+            return True
+        key = self.client_address[0] if self.client_address else "?"
+        return limiter.allow(key)
+
+    def _handle_registration_challenge(self) -> int:
+        if not self._registration_enabled():
+            self._send_json(404, {"error": "not found"})
+            return 404
+        if not self._registration_rate_ok():
+            self._send_json(429, {"error": "registration rate limit exceeded"})
+            return 429
+        store = self.server.challenge_store
+        cfg = self.server.registration_config
+        pc = store.issue(cfg.node_hostname)
+        self._send_json(200, {
+            "challenge": pc.challenge_hex,
+            "node": pc.node,
+            "expires_at": pc.expires_at,
+            "version": 1,
+        })
+        return 200
+
+    def _handle_registration_confirm(self) -> int:
+        if not self._registration_enabled():
+            self._send_json(404, {"error": "not found"})
+            return 404
+        if not self._registration_rate_ok():
+            self._send_json(429, {"error": "registration rate limit exceeded"})
+            return 429
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "invalid body"})
+            return 400
+        from dmp.server.registration import RegistrationError, confirm_registration
+
+        remote_addr = self.client_address[0] if self.client_address else ""
+        try:
+            token, row = confirm_registration(
+                store=self.server.token_store,
+                challenges=self.server.challenge_store,
+                config=self.server.registration_config,
+                body=body,
+                remote_addr=remote_addr,
+            )
+        except RegistrationError as exc:
+            self._send_json(exc.http_status, {"error": exc.reason})
+            return exc.http_status
+        except Exception:
+            # Defensive — don't leak internal stack traces over the wire.
+            self._send_json(500, {"error": "internal error"})
+            return 500
+
+        self._send_json(200, {
+            "token": token,
+            "subject": row.subject,
+            "expires_at": row.expires_at,
+            "rate_per_sec": row.rate_per_sec,
+            "rate_burst": row.rate_burst,
+        })
+        return 200
 
     # ---- anti-entropy sync routes -----------------------------------------
 
@@ -858,6 +951,9 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         sync_cluster_operator_spk=None,
         auth_mode: str = "legacy",
         token_store=None,
+        registration_config=None,
+        challenge_store=None,
+        registration_rate_limiter=None,
     ):
         super().__init__(addr, handler)
         self.store = store
@@ -879,6 +975,9 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.sync_cluster_operator_spk = sync_cluster_operator_spk
         self.auth_mode = auth_mode
         self.token_store = token_store
+        self.registration_config = registration_config
+        self.challenge_store = challenge_store
+        self.registration_rate_limiter = registration_rate_limiter
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -929,6 +1028,7 @@ class DMPHttpApi:
         sync_cluster_operator_spk: Optional[bytes] = None,
         auth_mode: Optional[str] = None,
         token_store=None,
+        registration_config=None,
     ):
         self.store = store
         self.host = host
@@ -955,6 +1055,11 @@ class DMPHttpApi:
         self.cluster_base_domain = cluster_base_domain
         self.sync_cluster_operator_spk = sync_cluster_operator_spk
         self.token_store = token_store
+        # Lazy: these are set up iff registration_config.enabled + we're
+        # in multi-tenant mode with a token_store. Created in start().
+        self.registration_config = registration_config
+        self.challenge_store = None
+        self.registration_rate_limiter = None
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -967,6 +1072,26 @@ class DMPHttpApi:
     def start(self) -> None:
         if self._server is not None:
             return
+
+        # Lazily materialize registration plumbing iff enabled + prereqs
+        # met. Keeps open / legacy deployments zero-cost (no extra
+        # threads, no extra memory).
+        if (
+            self.registration_config is not None
+            and self.registration_config.enabled
+            and self.auth_mode == "multi-tenant"
+            and self.token_store is not None
+        ):
+            from dmp.server.registration import ChallengeStore
+
+            self.challenge_store = ChallengeStore()
+            self.registration_rate_limiter = TokenBucketLimiter(
+                RateLimit(
+                    rate_per_second=self.registration_config.endpoint_rate_per_sec,
+                    burst=self.registration_config.endpoint_rate_burst,
+                )
+            )
+
         self._server = _DMPHttpServer(
             (self.host, self.port),
             _DMPHttpHandler,
@@ -982,6 +1107,9 @@ class DMPHttpApi:
             sync_cluster_operator_spk=self.sync_cluster_operator_spk,
             auth_mode=self.auth_mode,
             token_store=self.token_store,
+            registration_config=self.registration_config,
+            challenge_store=self.challenge_store,
+            registration_rate_limiter=self.registration_rate_limiter,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
