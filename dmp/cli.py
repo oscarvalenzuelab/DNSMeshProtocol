@@ -221,13 +221,22 @@ def _load_passphrase(config: CLIConfig) -> str:
 
 
 class _HttpWriter(DNSRecordWriter):
-    """Publishes records via the node's HTTP API."""
+    """Publishes records via the node's HTTP API.
+
+    M5.5 auto-attach: if ``token`` is None, fall back to a saved
+    per-node bearer at ``~/.dmp/tokens/<host>.json`` (written by
+    ``dmp register``). An explicit ``token`` wins — operators who
+    hand out a shared ``DMP_OPERATOR_TOKEN`` keep using that path.
+    """
 
     def __init__(self, endpoint: str, token: Optional[str] = None):
         import requests
+        from dmp.client.node_tokens import bearer_for_endpoint
 
         self._requests = requests
         self._endpoint = endpoint.rstrip("/")
+        if not token:
+            token = bearer_for_endpoint(self._endpoint)
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
@@ -1838,6 +1847,200 @@ def cmd_recv(args: argparse.Namespace) -> int:
         _close_client(client)
 
 
+def cmd_register(args: argparse.Namespace) -> int:
+    """M5.5 phase 4: self-service registration for a per-user publish token.
+
+    Walks the two-step ``/v1/registration/{challenge,confirm}`` flow
+    against a multi-tenant node:
+
+      1. GET /v1/registration/challenge.
+      2. Sign ``challenge || subject || node || version`` with the
+         local Ed25519 signing key (the same key that signs
+         IdentityRecords — no new keypair needed).
+      3. POST /v1/registration/confirm.
+      4. Save the returned token to ``~/.dmp/tokens/<node>.json``.
+         Every subsequent ``dmp identity publish`` / ``dmp send`` /
+         ``dmp identity refresh-prekeys`` to this node will auto-
+         attach it as a Bearer header.
+
+    Subject defaults to ``<username>@<effective-domain>`` from the
+    local config; override with ``--subject`` if you're registering
+    under a different address (e.g. for a zone-anchored identity).
+    """
+    import requests
+
+    from dmp.client.node_tokens import save_token
+
+    cfg = CLIConfig.load(_config_path())
+    if not cfg.username:
+        _die(
+            1,
+            "no local config — run `dmp init <username>` before `dmp register`",
+        )
+
+    subject = args.subject or f"{cfg.username}@{_effective_domain(cfg)}"
+
+    # Rebuild the local signer so we can sign the challenge.
+    passphrase = _load_passphrase(cfg)
+    kdf_salt = bytes.fromhex(cfg.kdf_salt) if cfg.kdf_salt else None
+    from dmp.core.crypto import DMPCrypto
+
+    crypto = DMPCrypto.from_passphrase(passphrase, salt=kdf_salt)
+    spk_hex = crypto.get_signing_public_key_bytes().hex()
+
+    base = f"{args.scheme}://{args.node}"
+    try:
+        r = requests.get(f"{base}/v1/registration/challenge", timeout=10)
+    except requests.RequestException as exc:
+        _die(2, f"cannot reach {base}: {exc}")
+    if r.status_code == 404:
+        _die(
+            1,
+            f"{args.node} did not accept the challenge request (404). The node "
+            "may not have DMP_REGISTRATION_ENABLED=1, or auth_mode is not "
+            "multi-tenant. Ask the operator.",
+        )
+    if r.status_code == 429:
+        _die(2, f"registration rate-limited (429). Try again later.")
+    if r.status_code != 200:
+        _die(2, f"challenge request failed: HTTP {r.status_code}: {r.text}")
+    try:
+        ch = r.json()
+    except ValueError:
+        _die(2, f"challenge response is not JSON: {r.text!r}")
+
+    challenge_hex = ch.get("challenge")
+    node_hostname = ch.get("node")
+    if not challenge_hex or not node_hostname:
+        _die(2, f"malformed challenge response: {ch!r}")
+
+    # Sign the challenge. Payload MUST match the server's
+    # _build_signing_payload exactly: challenge_bytes || subject-utf8
+    # || node-utf8 || version byte (0x01).
+    payload = (
+        bytes.fromhex(challenge_hex)
+        + subject.encode("utf-8")
+        + node_hostname.encode("utf-8")
+        + b"\x01"
+    )
+    signature_hex = crypto.sign_data(payload).hex()
+
+    try:
+        r2 = requests.post(
+            f"{base}/v1/registration/confirm",
+            json={
+                "subject": subject,
+                "ed25519_spk": spk_hex,
+                "challenge": challenge_hex,
+                "signature": signature_hex,
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        _die(2, f"confirm request failed to reach node: {exc}")
+
+    if r2.status_code == 401:
+        _die(
+            1,
+            "node rejected the signature (401). Usually means the signing "
+            "key stored in ~/.dmp/config.yaml doesn't match the one the "
+            "user thinks it does — re-check the passphrase.",
+        )
+    if r2.status_code == 403:
+        _die(
+            1,
+            f"subject {subject!r} is not in the node's allowlist (403). "
+            "Ask the operator to add your domain, or register for a "
+            "subject on a domain the operator permits.",
+        )
+    if r2.status_code == 409:
+        _die(
+            1,
+            f"subject {subject!r} is already held by a different key (409). "
+            "If you previously registered on another machine, use that same "
+            "passphrase here, or ask the operator to revoke the prior "
+            "token via `dmp-node-admin token revoke <subject>`.",
+        )
+    if r2.status_code != 200:
+        _die(2, f"confirm failed: HTTP {r2.status_code}: {r2.text}")
+
+    body = r2.json()
+    token = body.get("token")
+    if not isinstance(token, str) or not token:
+        _die(2, f"confirm returned no token: {body!r}")
+
+    path = save_token(
+        args.node,
+        token=token,
+        subject=body.get("subject", subject),
+        expires_at=body.get("expires_at"),
+        registered_spk=spk_hex,
+    )
+    print(f"registered {subject} on {args.node}")
+    print(f"  token saved to {path} (mode 0600)")
+    if body.get("expires_at"):
+        import time
+        ts = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(body["expires_at"]))
+        )
+        print(f"  expires at {ts}")
+    print(
+        "  subsequent `dmp identity publish` / `dmp send` to this node "
+        "will use this token automatically."
+    )
+    return 0
+
+
+def cmd_token_list(args: argparse.Namespace) -> int:
+    import json
+
+    from dmp.client.node_tokens import list_tokens
+
+    rows = list(list_tokens())
+    if args.json:
+        # Strip the raw token material — `dmp token list --json` is
+        # for scripting / inventory, not for dumping credentials to
+        # stdout. Show prefix + length so the operator can confirm
+        # "the right token" without ever printing the full value.
+        safe = []
+        for r in rows:
+            t = r.get("token", "")
+            safe.append({
+                **{k: v for k, v in r.items() if k != "token"},
+                "token_prefix": t[:16] + ("…" if len(t) > 16 else ""),
+                "token_len": len(t),
+            })
+        print(json.dumps(safe, indent=2))
+        return 0
+
+    if not rows:
+        print("(no saved tokens)")
+        return 0
+    print(f"{'NODE':<30} {'SUBJECT':<30} {'EXPIRES':<22}")
+    for r in rows:
+        exp = r.get("expires_at")
+        exp_str = "-"
+        if isinstance(exp, int):
+            import time
+            exp_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(exp))
+        print(
+            f"{r.get('node', '?'):<30} "
+            f"{r.get('subject', '?'):<30} "
+            f"{exp_str:<22}"
+        )
+    return 0
+
+
+def cmd_token_forget(args: argparse.Namespace) -> int:
+    from dmp.client.node_tokens import delete_token
+
+    if delete_token(args.node):
+        print(f"forgot token for {args.node}")
+        return 0
+    print(f"no saved token for {args.node}", file=sys.stderr)
+    return 1
+
+
 def cmd_resolvers_discover(args: argparse.Namespace) -> int:
     """Probe WELL_KNOWN_RESOLVERS and print (or save) the working subset.
 
@@ -2814,6 +3017,48 @@ def build_parser() -> argparse.ArgumentParser:
     # recv
     p_r = sub.add_parser("recv", help="poll for new messages")
     p_r.set_defaults(func=cmd_recv)
+
+    # register — mint a per-user publish token via the node's
+    # /v1/registration/* endpoints (M5.5 phase 3). Saves the
+    # resulting token to ~/.dmp/tokens/<hostname>.json; the
+    # _HttpWriter auto-attaches it on subsequent publishes.
+    p_reg = sub.add_parser(
+        "register",
+        help="register for a per-user publish token on a multi-tenant node",
+    )
+    p_reg.add_argument(
+        "--node",
+        required=True,
+        help="node hostname (e.g. dmp.example.com)",
+    )
+    p_reg.add_argument(
+        "--subject",
+        help="subject to register (default: <username>@<effective-domain>)",
+    )
+    p_reg.add_argument(
+        "--scheme",
+        choices=("https", "http"),
+        default="https",
+        help="URL scheme for the node (default: https; http only for local dev)",
+    )
+    p_reg.set_defaults(func=cmd_register)
+
+    # token — inspect / manage locally-stored per-node tokens.
+    p_tok = sub.add_parser(
+        "token",
+        help="manage per-node publish tokens saved under ~/.dmp/tokens/",
+    )
+    sub_tok = p_tok.add_subparsers(dest="sub", required=True)
+    p_tok_list = sub_tok.add_parser(
+        "list", help="list locally-saved tokens by node / subject / expiry"
+    )
+    p_tok_list.add_argument("--json", action="store_true")
+    p_tok_list.set_defaults(func=cmd_token_list)
+    p_tok_forget = sub_tok.add_parser(
+        "forget", help="delete the saved token for a node"
+    )
+    p_tok_forget.add_argument("node", help="hostname as stored (e.g. dmp.example.com)")
+    p_tok_forget.set_defaults(func=cmd_token_forget)
 
     # resolvers (discover / list public upstream DNS resolvers)
     p_rv = sub.add_parser("resolvers", help="manage upstream DNS resolvers")
