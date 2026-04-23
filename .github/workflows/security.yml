@@ -53,7 +53,12 @@ jobs:
       - name: Audit installed environment
         # Final drift check: confirms the audited lockfile is what's
         # actually resolvable in a fresh environment.
-        run: pip-audit --strict
+        #
+        # --skip-editable excludes our own package (`pip install -e .`),
+        # which pip-audit would otherwise try to resolve on PyPI and
+        # fail on since dmp is not published there. The lockfile audits
+        # above already cover every real third-party dependency.
+        run: pip-audit --strict --skip-editable
 
   fuzz-wire-parsers:
     name: hypothesis fuzz (wire parsers)
