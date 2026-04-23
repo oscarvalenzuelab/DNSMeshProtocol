@@ -134,9 +134,49 @@ acted on. This is what earns the `v1.0` tag.
       gRPC or a local HTTP daemon. (2–3 months.)
 - [ ] **M5.3** Web client using WASM crypto + Fetch for HTTP API.
       (1 month.)
-- [ ] **M5.4** Key rotation + revocation records — tracked as
-      [GH issue #1](https://github.com/oscarvalenzuelab/DNSMeshProtocol/issues/1)
-      with the full design sketch.
+- [x] **M5.4** Key rotation + revocation records — shipped in PR #2
+      (`fdd455f`); wire formats covered by unit + fuzz + golden
+      vectors, end-to-end docker coverage in
+      `tests/test_docker_integration.py` and the two demos under
+      `examples/`. Wire format is draft — may be bumped to
+      `v=dmp2;t=rotation;` after the M4 external audit.
+- [ ] **M5.6** Standalone binaries for the `dmp` CLI: PyInstaller-
+      built single-file executables for Windows (`.exe`), macOS (Intel
+      + Apple Silicon), and Linux (x86_64 + arm64). Ships alongside
+      the PyPI release in M5.1 for users who don't want a Python
+      runtime. CI job cross-builds on every release tag. (1 week.)
+
+### M5.5 — Multi-tenant node auth (new, post-M5.4)
+
+Today the node's HTTP publish API has a single shared bearer token
+(`DMP_HTTP_TOKEN`). Fine for teams / small communities, wrong for
+a community node where strangers co-tenant. Per-user tokens turn
+the node from "one trust zone" into proper multi-tenant
+infrastructure.
+
+- [ ] **M5.5.1** Token schema: sqlite table
+      `tokens(hash, subject, scope, rate_limit, expires_at)` with
+      audit-logged issuance / revocation.
+- [ ] **M5.5.2** Scoped authorization: publish requests must target
+      a record namespace that matches the token's `subject`
+      (e.g. `alice@example.com` can only write under
+      `dmp.alice.example.com` and her mailbox / chunk namespaces).
+      Leaking Alice's token must not let anyone publish as Bob.
+- [ ] **M5.5.3** Self-service registration endpoint
+      (`POST /v1/tokens/register`) that accepts an Ed25519-signed
+      challenge proving control of the subject; node mints a token
+      bound to that subject. Gated by per-IP rate limits + optional
+      operator allowlist.
+- [ ] **M5.5.4** Operator CLI (`dmp-node admin token {issue,revoke,list}`)
+      for environments that prefer issuing tokens out-of-band.
+- [ ] **M5.5.5** Per-token rate limits that stack with the existing
+      per-IP limiters.
+- [ ] **M5.5.6** Token rotation + expiry with overlap windows so
+      clients can rotate without an offline window.
+
+(Undecided: self-service first or operator-issued first. Operator-
+issued is ~half the work and sufficient for "team/org" deployments;
+self-service is the real mesh story.)
 
 ### M6 — Traffic-analysis resistance (certification backlog, research track)
 
@@ -151,6 +191,39 @@ acted on. This is what earns the `v1.0` tag.
 state-level adversary is a research program, not a product
 deliverable. M6 defines concrete hardenings we commit to shipping;
 full resistance is an ongoing research track beyond `v1.0`.
+
+### M7 — Applications on top of the protocol (long-term, post-v1.0)
+
+Reference applications built on the DMP transport. The protocol
+stops at "here's a send/receive library"; M7 is the work to make
+DMP *feel* like a product people use every day, not infrastructure
+people configure.
+
+- [ ] **M7.1** Desktop chat client — think ICQ / IRC client in the
+      2000s: persistent contact list, online / offline presence
+      (via periodically-refreshed lightweight records), 1:1 message
+      history, typing indicators, optional rich content (images,
+      file attachments). Cross-platform via Electron or Tauri;
+      signed releases per OS. (3–6 months of product work; depends
+      on M5.5 multi-tenant auth so friends can use a shared
+      community node without stepping on each other.)
+- [ ] **M7.2** Group chats — M7.1 is 1:1 only. Groups need either a
+      shared group key (simple, not FS-preserving under member
+      churn) or proper MLS-style continuous group key agreement
+      (complex, right answer). Both require protocol extensions
+      beyond the current 1:1 X3DH-style handshake.
+- [ ] **M7.3** Native mobile chat apps — the "full chat mode"
+      equivalent of M7.1 on iOS / Android. Likely builds on top of
+      M5.2 (React Native shell), not parallel to it.
+- [ ] **M7.4** Plugin / bot API — HTTP webhook surface for
+      integrations (bridges to Matrix / XMPP, CI build-notifications,
+      etc.). Depends on M5.5 token scoping so bots can hold narrow-
+      scope credentials.
+
+**Scope note:** M7 is explicitly long-horizon. The protocol is the
+primary deliverable up to `v1.0`; applications ship afterwards and
+on their own cadence. Contributors interested in any M7 item are
+welcome to prototype in a separate repo and reconverge.
 
 ## Deferred / unlikely
 
