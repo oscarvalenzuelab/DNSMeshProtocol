@@ -147,7 +147,9 @@ class TestMultiTenantRateLimit:
         # rate=1/s, burst=1 — first request goes through, immediate second
         # should 429 because the bucket can't refill in the time between.
         token, _ = tokens.issue(
-            "alice@example.com", rate_per_sec=1.0, rate_burst=1,
+            "alice@example.com",
+            rate_per_sec=1.0,
+            rate_burst=1,
         )
         assert _post(api, "dmp.alice.example.com", token) == 201
         assert _post(api, "dmp.alice.example.com", token) == 429
@@ -155,7 +157,9 @@ class TestMultiTenantRateLimit:
     def test_throttle_applies_to_shared_pool_too(self, mt_setup):
         api, _, tokens = mt_setup
         token, _ = tokens.issue(
-            "alice@example.com", rate_per_sec=1.0, rate_burst=1,
+            "alice@example.com",
+            rate_per_sec=1.0,
+            rate_burst=1,
         )
         # First chunk write against burst=1 passes; second trips the bucket.
         assert _post(api, "chunk-0001-abcdef012345.example.com", token) == 201
@@ -164,7 +168,9 @@ class TestMultiTenantRateLimit:
     def test_revoke_clears_in_memory_bucket(self, mt_setup):
         api, _, tokens = mt_setup
         token, row = tokens.issue(
-            "alice@example.com", rate_per_sec=1.0, rate_burst=1,
+            "alice@example.com",
+            rate_per_sec=1.0,
+            rate_burst=1,
         )
         _ = _post(api, "dmp.alice.example.com", token)  # consume 1
         tokens.revoke(row.token_hash)
@@ -190,7 +196,8 @@ class TestMultiTenantDelete:
         headers = {"Authorization": f"Bearer {token}"}
         r = requests.delete(
             _url(api, "dmp.alice.example.com"),
-            headers=headers, timeout=2,
+            headers=headers,
+            timeout=2,
         )
         assert r.status_code == 204
 
@@ -202,7 +209,8 @@ class TestMultiTenantDelete:
         headers = {"Authorization": f"Bearer {alice_token}"}
         r = requests.delete(
             _url(api, "dmp.bob.example.com"),
-            headers=headers, timeout=2,
+            headers=headers,
+            timeout=2,
         )
         assert r.status_code == 401
 
@@ -216,7 +224,9 @@ class TestMultiTenantDelete:
 def legacy_setup(tmp_path: Path):
     store = InMemoryDNSStore()
     api = DMPHttpApi(
-        store, host="127.0.0.1", port=_free_port(),
+        store,
+        host="127.0.0.1",
+        port=_free_port(),
         bearer_token="legacy-token",  # auth_mode derived to "legacy"
     )
     api.start()
@@ -229,7 +239,9 @@ def legacy_setup(tmp_path: Path):
 @pytest.fixture
 def open_setup(tmp_path: Path):
     store = InMemoryDNSStore()
-    api = DMPHttpApi(store, host="127.0.0.1", port=_free_port())  # no token, mode="open"
+    api = DMPHttpApi(
+        store, host="127.0.0.1", port=_free_port()
+    )  # no token, mode="open"
     api.start()
     try:
         yield api, store

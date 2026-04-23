@@ -51,7 +51,9 @@ def _make_api(
         endpoint_rate_burst=endpoint_rate_burst,
     )
     api = DMPHttpApi(
-        store, host="127.0.0.1", port=_free_port(),
+        store,
+        host="127.0.0.1",
+        port=_free_port(),
         bearer_token="op-token",
         auth_mode="multi-tenant",
         token_store=tokens,
@@ -84,7 +86,8 @@ def reg_disabled(tmp_path: Path):
 @pytest.fixture
 def reg_allowlist(tmp_path: Path):
     api, store, tokens, config = _make_api(
-        tmp_path, allowlist=("example.com",),
+        tmp_path,
+        allowlist=("example.com",),
     )
     try:
         yield api, store, tokens, config
@@ -143,7 +146,8 @@ class TestRegistrationHappyPath:
     def test_challenge_returns_expected_shape(self, reg_enabled):
         api, _, _, _ = reg_enabled
         r = requests.get(
-            f"http://127.0.0.1:{api.port}/v1/registration/challenge", timeout=2,
+            f"http://127.0.0.1:{api.port}/v1/registration/challenge",
+            timeout=2,
         )
         assert r.status_code == 200
         data = r.json()
@@ -192,7 +196,9 @@ class TestChallengeSingleUse:
         ch = _request_challenge(api)
         # First confirm succeeds.
         payload = _build_signing_payload(
-            ch["challenge"], "alice@example.com", ch["node"],
+            ch["challenge"],
+            "alice@example.com",
+            ch["node"],
         )
         sig = signer.sign(payload).hex()
         spk = signer.public_key().public_bytes_raw().hex()
@@ -229,7 +235,9 @@ class TestSignatureVerification:
         attacker = Ed25519PrivateKey.generate()
         ch = _request_challenge(api)
         payload = _build_signing_payload(
-            ch["challenge"], "alice@example.com", ch["node"],
+            ch["challenge"],
+            "alice@example.com",
+            ch["node"],
         )
         # Sign with attacker's key but claim the real signer's pubkey.
         sig = attacker.sign(payload).hex()
@@ -253,7 +261,10 @@ class TestSignatureVerification:
         # hostname, simulating an attacker trying to replay Alice's
         # signed confirm from one node to another.
         r = _sign_and_confirm(
-            api, "alice@example.com", signer, node_override="evil.example.com",
+            api,
+            "alice@example.com",
+            signer,
+            node_override="evil.example.com",
         )
         assert r.status_code == 401
 
@@ -329,8 +340,8 @@ class TestRateLimit:
         # test deterministic without sleeping.
         api, _, tokens, _ = _make_api(
             tmp_path,
-            endpoint_rate_per_sec=0.0,   # disabled-alike
-            endpoint_rate_burst=1.0,     # … but tight enough to fire
+            endpoint_rate_per_sec=0.0,  # disabled-alike
+            endpoint_rate_burst=1.0,  # … but tight enough to fire
         )
         try:
             # 1st GET is allowed.
@@ -387,9 +398,9 @@ class TestLowOrderKeyForgery:
             },
             timeout=2,
         )
-        assert r.status_code == 401, (
-            f"identity-point forgery must 401; got {r.status_code}: {r.text}"
-        )
+        assert (
+            r.status_code == 401
+        ), f"identity-point forgery must 401; got {r.status_code}: {r.text}"
 
     def test_other_low_order_point_rejected(self, reg_enabled):
         api, _, _, _ = reg_enabled
@@ -412,7 +423,8 @@ class TestNoOracleLeak:
     403 / 409 / 200 — those are only reachable by a valid signer."""
 
     def test_unsigned_confirm_for_taken_subject_returns_401_not_409(
-        self, reg_enabled,
+        self,
+        reg_enabled,
     ):
         api, _, _, _ = reg_enabled
         # Victim registers first.
@@ -438,7 +450,8 @@ class TestNoOracleLeak:
         assert r.status_code == 401
 
     def test_unsigned_confirm_for_disallowed_domain_returns_401_not_403(
-        self, reg_allowlist,
+        self,
+        reg_allowlist,
     ):
         # With allowlist=['example.com'], a confirm for other.com
         # previously leaked 403. After reorder the attacker just
@@ -494,7 +507,8 @@ class TestAtomicRotation:
         assert all(s == 200 for s in statuses), statuses
         # And the invariant holds: exactly one live self-service row.
         live = [
-            r for r in tokens.list(subject="alice@example.com")
+            r
+            for r in tokens.list(subject="alice@example.com")
             if r.is_live() and r.registered_spk is not None
         ]
         assert len(live) == 1, [r.token_hash[:8] for r in live]

@@ -433,12 +433,15 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         store = self.server.challenge_store
         cfg = self.server.registration_config
         pc = store.issue(cfg.node_hostname)
-        self._send_json(200, {
-            "challenge": pc.challenge_hex,
-            "node": pc.node,
-            "expires_at": pc.expires_at,
-            "version": 1,
-        })
+        self._send_json(
+            200,
+            {
+                "challenge": pc.challenge_hex,
+                "node": pc.node,
+                "expires_at": pc.expires_at,
+                "version": 1,
+            },
+        )
         return 200
 
     def _handle_registration_confirm(self) -> int:
@@ -471,13 +474,16 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "internal error"})
             return 500
 
-        self._send_json(200, {
-            "token": token,
-            "subject": row.subject,
-            "expires_at": row.expires_at,
-            "rate_per_sec": row.rate_per_sec,
-            "rate_burst": row.rate_burst,
-        })
+        self._send_json(
+            200,
+            {
+                "token": token,
+                "subject": row.subject,
+                "expires_at": row.expires_at,
+                "rate_per_sec": row.rate_per_sec,
+                "rate_burst": row.rate_burst,
+            },
+        )
         return 200
 
     # ---- anti-entropy sync routes -----------------------------------------

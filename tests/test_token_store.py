@@ -22,7 +22,6 @@ from dmp.server.tokens import (
     token_looks_valid,
 )
 
-
 # ---------------------------------------------------------------------------
 # Token generation + shape checks
 # ---------------------------------------------------------------------------
@@ -174,14 +173,17 @@ class TestCanonicalizeSubject:
 
     def test_plain_ascii_passes_through(self) -> None:
         from dmp.server.tokens import canonicalize_subject
+
         assert canonicalize_subject("alice@example.com") == "alice@example.com"
 
     def test_case_is_lowered(self) -> None:
         from dmp.server.tokens import canonicalize_subject
+
         assert canonicalize_subject("Alice@Example.Com") == "alice@example.com"
 
     def test_nfkc_compatibility_character_rejected_or_canonicalized(self) -> None:
         from dmp.server.tokens import canonicalize_subject
+
         # Fullwidth Latin 'a' (U+FF41) normalizes to ASCII 'a' under
         # NFKC; after normalization it passes ASCII + shape.
         out = canonicalize_subject("ａlice@example.com")
@@ -189,6 +191,7 @@ class TestCanonicalizeSubject:
 
     def test_non_nfkc_unicode_rejected(self) -> None:
         from dmp.server.tokens import canonicalize_subject
+
         # Cyrillic 'а' (U+0430) looks like Latin 'a' but has no ASCII
         # NFKC mapping — must be rejected.
         with pytest.raises(ValueError):
@@ -196,6 +199,7 @@ class TestCanonicalizeSubject:
 
     def test_empty_subject_rejected(self) -> None:
         from dmp.server.tokens import canonicalize_subject
+
         with pytest.raises(ValueError):
             canonicalize_subject("")
         with pytest.raises(ValueError):
@@ -203,6 +207,7 @@ class TestCanonicalizeSubject:
 
     def test_malformed_shape_rejected(self) -> None:
         from dmp.server.tokens import canonicalize_subject
+
         for bad in [
             "noatsign",
             "@example.com",
@@ -267,9 +272,9 @@ class TestIssuanceAndLookup:
         token, _ = store.issue("alice@example.com")
         with open(store._path, "rb") as f:
             raw = f.read()
-        assert token.encode("ascii") not in raw, (
-            "Token material leaked into on-disk sqlite"
-        )
+        assert (
+            token.encode("ascii") not in raw
+        ), "Token material leaked into on-disk sqlite"
 
     def test_issue_is_monotonic(self, store: TokenStore) -> None:
         t1, r1 = store.issue("alice@example.com")
@@ -287,7 +292,10 @@ class TestIssuanceAndLookup:
         assert [r.subject for r in live] == ["bob@example.com"]
 
         all_rows = store.list(include_revoked=True)
-        assert sorted(r.subject for r in all_rows) == ["alice@example.com", "bob@example.com"]
+        assert sorted(r.subject for r in all_rows) == [
+            "alice@example.com",
+            "bob@example.com",
+        ]
 
     def test_revoke_is_idempotent(self, store: TokenStore) -> None:
         _, row = store.issue("alice@example.com")
@@ -356,7 +364,8 @@ class TestAuthorizeOwnerExclusive:
         x25519_pk = b"\x01" * 32
         h12 = subject_hash12_for_x25519(x25519_pk)
         token, _ = store.issue(
-            "alice@example.com", subject_hash12=h12,
+            "alice@example.com",
+            subject_hash12=h12,
         )
         name_ok = f"pk-7.{h12}.example.com"
         r = store.authorize_write(token, name_ok)
@@ -367,7 +376,9 @@ class TestAuthorizeOwnerExclusive:
         r = store.authorize_write(token, f"pk-7.{h12_other}.example.com")
         assert not r.ok
 
-    def test_prekey_without_subject_hash12_on_token_rejected(self, store: TokenStore) -> None:
+    def test_prekey_without_subject_hash12_on_token_rejected(
+        self, store: TokenStore
+    ) -> None:
         token, _ = store.issue("alice@example.com")  # no subject_hash12
         r = store.authorize_write(token, "pk-0.abcdef012345.example.com")
         assert not r.ok
@@ -411,7 +422,9 @@ class TestAuthorizeOperatorOnly:
         r = store.authorize_write(token, "bootstrap.example.com")
         assert not r.ok
 
-    def test_end_user_token_cannot_publish_hash_form_rotation(self, store: TokenStore) -> None:
+    def test_end_user_token_cannot_publish_hash_form_rotation(
+        self, store: TokenStore
+    ) -> None:
         # Rotation hash form is reserved for operators in v1.
         token, _ = store.issue("alice@example.com")
         r = store.authorize_write(token, "rotate.dmp.id-abc123def456.example.com")
@@ -475,7 +488,8 @@ class TestAuditSplit:
         this sqlite cannot reconstruct who-sent-to-whom."""
         token, row = store.issue("alice@example.com")
         store.authorize_write(
-            token, "chunk-0001-abcdef012345.example.com",
+            token,
+            "chunk-0001-abcdef012345.example.com",
             remote_addr="10.0.0.7",
         )
         used = store.audit_rows(event="used")

@@ -47,7 +47,10 @@ class TestSanitizeHostname:
 
 class TestHostFromEndpoint:
     def test_extracts_from_url(self) -> None:
-        assert nt.host_from_endpoint("https://dmp.example.com/v1/records/foo") == "dmp.example.com"
+        assert (
+            nt.host_from_endpoint("https://dmp.example.com/v1/records/foo")
+            == "dmp.example.com"
+        )
 
     def test_extracts_with_port(self) -> None:
         assert nt.host_from_endpoint("http://dmp.example.com:8053") == "dmp.example.com"
@@ -64,7 +67,8 @@ class TestSaveAndLoad:
     def test_round_trip(self, fresh_home: Path) -> None:
         nt.save_token(
             "dmp.example.com",
-            token="dmp_v1_XXXX", subject="alice@example.com",
+            token="dmp_v1_XXXX",
+            subject="alice@example.com",
             expires_at=int(time.time()) + 86400,
             registered_spk="ab" * 32,
         )
@@ -76,13 +80,17 @@ class TestSaveAndLoad:
 
     def test_file_mode_is_0600(self, fresh_home: Path) -> None:
         path = nt.save_token(
-            "dmp.example.com", token="dmp_v1_X", subject="a@b.co",
+            "dmp.example.com",
+            token="dmp_v1_X",
+            subject="a@b.co",
         )
         mode = stat.S_IMODE(path.stat().st_mode)
         assert mode == 0o600, f"expected 0600, got {oct(mode)}"
 
     def test_file_mode_0600_even_under_lax_umask(
-        self, fresh_home: Path, monkeypatch,
+        self,
+        fresh_home: Path,
+        monkeypatch,
     ) -> None:
         """Regression for codex P2: under umask 022, plain open('w')
         creates 0644 and the bearer is world-readable for the window
@@ -91,12 +99,14 @@ class TestSaveAndLoad:
         old = os.umask(0o002)  # ugo-w allowed, i.e. default-ish
         try:
             path = nt.save_token(
-                "dmp.example.com", token="dmp_v1_Y", subject="a@b.co",
+                "dmp.example.com",
+                token="dmp_v1_Y",
+                subject="a@b.co",
             )
             mode = stat.S_IMODE(path.stat().st_mode)
-            assert mode == 0o600, (
-                f"under lax umask, saved token has mode {oct(mode)} (want 0o600)"
-            )
+            assert (
+                mode == 0o600
+            ), f"under lax umask, saved token has mode {oct(mode)} (want 0o600)"
         finally:
             os.umask(old)
 
@@ -107,7 +117,9 @@ class TestSaveAndLoad:
         (fresh_home / "dmp.example.com.json.tmp").write_text("stale")
         # Must not raise (previously O_EXCL would).
         nt.save_token(
-            "dmp.example.com", token="dmp_v1_Z", subject="a@b.co",
+            "dmp.example.com",
+            token="dmp_v1_Z",
+            subject="a@b.co",
         )
         body = nt.load_token("dmp.example.com")
         assert body["token"] == "dmp_v1_Z"
@@ -148,7 +160,10 @@ class TestSaveAndLoad:
 class TestBearerForEndpoint:
     def test_returns_saved_token(self, fresh_home: Path) -> None:
         nt.save_token("dmp.example.com", token="dmp_v1_ABC", subject="a@b.co")
-        assert nt.bearer_for_endpoint("https://dmp.example.com/v1/records/x") == "dmp_v1_ABC"
+        assert (
+            nt.bearer_for_endpoint("https://dmp.example.com/v1/records/x")
+            == "dmp_v1_ABC"
+        )
 
     def test_returns_none_for_unknown_host(self, fresh_home: Path) -> None:
         assert nt.bearer_for_endpoint("https://other.example.com") is None
@@ -180,8 +195,10 @@ class TestBearerForEndpoint:
 
     def test_none_expires_at_is_treated_as_infinite(self, fresh_home: Path) -> None:
         nt.save_token(
-            "dmp.example.com", token="dmp_v1_forever",
-            subject="a@b.co", expires_at=None,
+            "dmp.example.com",
+            token="dmp_v1_forever",
+            subject="a@b.co",
+            expires_at=None,
         )
         assert nt.bearer_for_endpoint("https://dmp.example.com") == "dmp_v1_forever"
 

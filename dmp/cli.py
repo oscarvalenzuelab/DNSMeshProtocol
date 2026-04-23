@@ -1980,9 +1980,8 @@ def cmd_register(args: argparse.Namespace) -> int:
     print(f"  token saved to {path} (mode 0600)")
     if body.get("expires_at"):
         import time
-        ts = time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(body["expires_at"]))
-        )
+
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(body["expires_at"])))
         print(f"  expires at {ts}")
     print(
         "  subsequent `dmp identity publish` / `dmp send` to this node "
@@ -2005,11 +2004,13 @@ def cmd_token_list(args: argparse.Namespace) -> int:
         safe = []
         for r in rows:
             t = r.get("token", "")
-            safe.append({
-                **{k: v for k, v in r.items() if k != "token"},
-                "token_prefix": t[:16] + ("…" if len(t) > 16 else ""),
-                "token_len": len(t),
-            })
+            safe.append(
+                {
+                    **{k: v for k, v in r.items() if k != "token"},
+                    "token_prefix": t[:16] + ("…" if len(t) > 16 else ""),
+                    "token_len": len(t),
+                }
+            )
         print(json.dumps(safe, indent=2))
         return 0
 
@@ -2022,6 +2023,7 @@ def cmd_token_list(args: argparse.Namespace) -> int:
         exp_str = "-"
         if isinstance(exp, int):
             import time
+
             exp_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(exp))
         print(
             f"{r.get('node', '?'):<30} "
