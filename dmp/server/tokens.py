@@ -380,6 +380,15 @@ class AuthResult:
 
 
 # ---------------------------------------------------------------------------
+
+
+class _SubjectLocked(Exception):
+    """Internal marker raised by TokenStore.rotate_self_service when
+    anti-takeover blocks the rotation. The registration layer
+    translates it to a SubjectAlreadyOwned HTTP error."""
+
+
+# ---------------------------------------------------------------------------
 # Per-token rate limiter — independent of the per-IP limiter in
 # dmp.server.rate_limit. Buckets are keyed by token_hash so a token with
 # rate_per_sec=1 throttles at 1 rps regardless of source IP.
@@ -631,6 +640,125 @@ class TokenStore:
             # the rate limiter has its own lock.
             self._rate_limiter.forget(token_hash)
         return updated
+
+    def rotate_self_service(
+        self,
+        subject: str,
+        *,
+        registered_spk: str,
+        expires_in_seconds: Optional[int] = None,
+        rate_per_sec: float = DEFAULT_RATE_PER_SEC,
+        rate_burst: int = DEFAULT_RATE_BURST,
+        remote_addr: str = "",
+    ) -> Tuple[str, TokenRow, bool]:
+        """Atomic revoke-then-issue for self-service registration.
+
+        Single lock, single commit: read the subject's current live
+        rows under the store lock, enforce the anti-takeover rule,
+        revoke any prior self-service tokens, and insert a new one —
+        all before any other thread can read or mutate state for
+        this subject. Closes the "two concurrent valid confirms both
+        mint" race that revoke()+issue() would otherwise have.
+
+        Returns ``(token, row, anti_takeover_ok)``. When the third
+        element is ``False``, NOTHING has been written — the caller
+        should treat it as a 409 SubjectAlreadyOwned and return the
+        other two values as None sentinels... but for caller
+        simplicity we instead raise in the `False` case so the happy
+        path is clean. The tuple shape stays backwards-compatible
+        with earlier sketches.
+
+        Admin-issued rows (registered_spk IS NULL) are left alone —
+        they represent an independent channel and do not lock the
+        subject.
+        """
+        try:
+            subject = canonicalize_subject(subject)
+        except ValueError as exc:
+            raise ValueError(f"subject invalid: {exc}") from exc
+        if not isinstance(registered_spk, str) or len(registered_spk) != 64:
+            raise ValueError("registered_spk must be a 64-char hex string")
+        registered_spk = registered_spk.lower()
+
+        token = generate_token()
+        token_hash = _sha256_hex(token)
+        now = int(time.time())
+        expires_at = now + expires_in_seconds if expires_in_seconds else None
+
+        freed_hashes: List[str] = []
+
+        with self._lock:
+            # Snapshot current live self-service rows for this subject.
+            rows = [
+                TokenRow(*r) for r in self._conn.execute(
+                    f"""SELECT {self._SELECT_COLS} FROM tokens
+                        WHERE subject=? AND revoked_at IS NULL
+                          AND registered_spk IS NOT NULL""",
+                    (subject,),
+                ).fetchall()
+            ]
+            # Include expiry in the liveness check — is_live() reads the
+            # row's timestamps, not the DB's.
+            live_locking = [r for r in rows if r.is_live(now=now)]
+            if live_locking and not all(
+                r.registered_spk == registered_spk for r in live_locking
+            ):
+                # Re-registration while another key holds the subject.
+                # Caller translates this into 409 SubjectAlreadyOwned.
+                # Nothing written yet — atomic.
+                raise _SubjectLocked()
+
+            # Revoke every prior self-service row for this subject
+            # (same-key rotations + any stale liveness-expired rows
+            # the cleanup sweep hasn't picked up yet).
+            for r in rows:
+                self._conn.execute(
+                    "UPDATE tokens SET revoked_at=? "
+                    "WHERE token_hash=? AND revoked_at IS NULL",
+                    (now, r.token_hash),
+                )
+                self._audit(
+                    "revoked",
+                    token_hash=r.token_hash,
+                    subject=subject,
+                    remote_addr=remote_addr,
+                    detail="self-service rotate: superseded",
+                    now=now,
+                )
+                freed_hashes.append(r.token_hash)
+
+            # Mint the new row in the SAME transaction.
+            self._conn.execute(
+                """INSERT INTO tokens(token_hash, subject, subject_type,
+                   subject_hash12, rate_per_sec, rate_burst, issued_at,
+                   expires_at, revoked_at, issuer, note, registered_spk)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    token_hash, subject, SUBJECT_TYPE_USER_IDENTITY,
+                    None, rate_per_sec, rate_burst, now,
+                    expires_at, None, "self-service", "", registered_spk,
+                ),
+            )
+            self._audit(
+                "issued",
+                token_hash=token_hash,
+                subject=subject,
+                remote_addr=remote_addr,
+                detail="self-service",
+                now=now,
+            )
+            self._conn.commit()
+
+        # Drop in-memory rate buckets for the revoked tokens (outside
+        # the DB lock — the limiter has its own).
+        for h in freed_hashes:
+            self._rate_limiter.forget(h)
+
+        # Re-fetch the canonical row so the caller gets an accurate
+        # is_live() / expires_at. Cheap, one row by PK.
+        row = self._row_by_hash(token_hash)
+        assert row is not None, "inserted row disappeared — sqlite corruption?"
+        return token, row, True
 
     def revoke_by_subject(self, subject: str, *, remote_addr: str = "") -> int:
         """Revoke every live token for ``subject``. Returns the count revoked.
