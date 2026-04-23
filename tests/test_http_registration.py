@@ -361,6 +361,52 @@ class TestRateLimit:
             tokens.close()
 
 
+class TestLowOrderKeyForgery:
+    """Regression for a real Ed25519 signature-forgery bypass.
+
+    The RFC-8032 permissive verify (cryptography's default) accepts
+    low-order public keys. With the identity point (01 00..00) as
+    A and sig = identity || 00*32, verification succeeds on EVERY
+    message — an unkeyed attacker could reach the anti-takeover
+    policy layer and probe subjects. The confirm endpoint now
+    blocks the full low-order encoding set up front.
+    """
+
+    def test_identity_point_rejected(self, reg_enabled):
+        api, _, _, _ = reg_enabled
+        ch = _request_challenge(api)
+        # The classic forgery: identity pubkey + (identity || 00*32)
+        # sig. Without the block list, this verifies on any payload.
+        r = requests.post(
+            f"http://127.0.0.1:{api.port}/v1/registration/confirm",
+            json={
+                "subject": "victim@example.com",
+                "ed25519_spk": "01" + "00" * 31,
+                "challenge": ch["challenge"],
+                "signature": "01" + "00" * 31 + "00" * 32,
+            },
+            timeout=2,
+        )
+        assert r.status_code == 401, (
+            f"identity-point forgery must 401; got {r.status_code}: {r.text}"
+        )
+
+    def test_other_low_order_point_rejected(self, reg_enabled):
+        api, _, _, _ = reg_enabled
+        ch = _request_challenge(api)
+        r = requests.post(
+            f"http://127.0.0.1:{api.port}/v1/registration/confirm",
+            json={
+                "subject": "victim@example.com",
+                "ed25519_spk": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+                "challenge": ch["challenge"],
+                "signature": "01" + "00" * 31 + "00" * 32,
+            },
+            timeout=2,
+        )
+        assert r.status_code == 401
+
+
 class TestNoOracleLeak:
     """Regression for codex P2 #1: unsigned attacker must not distinguish
     403 / 409 / 200 — those are only reachable by a valid signer."""
