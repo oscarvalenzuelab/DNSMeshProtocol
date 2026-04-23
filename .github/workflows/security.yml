@@ -40,25 +40,25 @@ jobs:
       - name: Audit dev lockfile
         run: pip-audit -r requirements-dev.lock --strict
 
-      - name: Install package from the hashed lockfile
+      - name: Install dependencies from the hashed lockfile
         # Use the lockfile as the source of truth so the audited
         # dependency set is byte-identical to what CI executes. A plain
         # `.[dev]` install would resolve from PyPI at job time and drift
         # from the just-audited set; --require-hashes makes drift
         # impossible.
-        run: |
-          pip install --require-hashes -r requirements-dev.lock
-          pip install -e . --no-deps
+        #
+        # Deliberately do NOT `pip install -e .` here: the local `dmp`
+        # package is what we're shipping, not a third-party dependency,
+        # so it doesn't belong in the vuln audit. Including it (even
+        # with --skip-editable) makes pip-audit --strict fail on the
+        # skip itself. Fuzz / test jobs install -e separately when they
+        # need the module importable.
+        run: pip install --require-hashes -r requirements-dev.lock
 
       - name: Audit installed environment
         # Final drift check: confirms the audited lockfile is what's
         # actually resolvable in a fresh environment.
-        #
-        # --skip-editable excludes our own package (`pip install -e .`),
-        # which pip-audit would otherwise try to resolve on PyPI and
-        # fail on since dmp is not published there. The lockfile audits
-        # above already cover every real third-party dependency.
-        run: pip-audit --strict --skip-editable
+        run: pip-audit --strict
 
   fuzz-wire-parsers:
     name: hypothesis fuzz (wire parsers)
