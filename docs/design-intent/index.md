@@ -8,43 +8,75 @@ permalink: /design-intent
 
 # Design Intent
 
-{: .warning }
-The documents under this section describe what the original spec
-envisioned — a multi-node mesh with peer discovery, resolver pools,
-store relays, 3× redundancy, and bootstrap gossip. The currently
-shipping code is smaller and more conservative than that. Treat
-everything here as *future work and historical context*, not as
-the protocol you're actually running.
+{: .note }
+The documents under this section are the **original project spec** —
+written before any code existed. Much of what they describe has since
+been built; some has been replaced with a different mechanism in the
+same spirit; a few items are deliberately deferred. The per-bullet
+status below tells you which is which. For ground-truth on what ships
+today, use the links in ["For what ships today"](#for-what-ships-today).
 
-For what ships today, read:
+For what ships today
+{: #for-what-ships-today }
 
-- [Home]({{ site.baseurl }}/) — overview of current capabilities
-- [Getting Started]({{ site.baseurl }}/getting-started) — how to use
-  what ships
-- [Protocol]({{ site.baseurl }}/protocol) — wire format and crypto
-  as implemented
+- [How It Works]({{ site.baseurl }}/how-it-works) — mental model +
+  deployment paths (non-aspirational).
+- [Getting Started]({{ site.baseurl }}/getting-started) — hands-on
+  install + first message.
+- [Protocol]({{ site.baseurl }}/protocol) — wire format + crypto as
+  implemented.
+- [ROADMAP.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md) —
+  milestone-by-milestone status, with commit references for every
+  shipped item.
 - [SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md) —
-  honest list of what's protected and what isn't
+  honest list of what's protected and what isn't.
 
 ## The documents
 
-- [Protocol overview (aspirational)]({{ site.baseurl }}/design-intent/protocol) —
-  original mesh / peer-discovery architecture.
-- [Implementation requirements (aspirational)]({{ site.baseurl }}/design-intent/implementation-requirements) —
-  the full spec from the start of the project.
+- [Protocol overview (historical spec)]({{ site.baseurl }}/design-intent/protocol)
+- [Implementation requirements (historical spec)]({{ site.baseurl }}/design-intent/implementation-requirements)
 
-Items present here that **do** match current code:
+## Spec → ship delta
 
-- DNS TXT record encoding strategy (still how things work).
-- ChaCha20-Poly1305 + X25519 identity (still used).
-- DNS chunking approach (still used, with different chunk sizing).
+Items from the original spec that **ship today**:
 
-Items here that **do not** match current code:
+- DNS TXT encoding of identity + chunks — ships, same shape.
+- ChaCha20-Poly1305 + X25519 message encryption — ships.
+- DNS chunking — ships (chunk sizing tuned from the spec's proposal).
+- **Resolver pool with per-host health and failover** — ships (M1:
+  `dmp/client/resolver_pool.py` + `dmp resolvers discover / list`).
+- **Multi-node storage with write redundancy** — ships (M2:
+  `FanoutWriter` writes to a quorum of cluster nodes;
+  `UnionReader` reads from all; 3-node compose cluster with
+  integration tests). The spec's "3× redundancy" is a config
+  choice over this mechanism, not a separate system.
+- **Anti-entropy sync between nodes** — ships (M2.4: digest-and-pull
+  worker so a node that was offline backfills on return).
+- **Peer discovery between nodes** — ships (M3.3: signed
+  cluster-manifest gossip over the same HTTP channel the nodes use
+  for record sync).
+- **Bootstrap-domain gossip** — ships (M3.1 `BootstrapRecord` +
+  M3.2 `dmp bootstrap discover` + M3.3 cluster-manifest gossip).
+- **User-identity key rotation + revocation** — ships (M5.4: co-
+  signed `RotationRecord` and self-signed `RevocationRecord`,
+  client-side chain-walker, docker e2e coverage).
 
-- Mesh routing / peer discovery / resolver pools (not implemented).
-- 3× storage redundancy (not implemented).
-- Bootstrap-domain gossip (not implemented).
-- "30% redundancy" from whole-message RS (replaced by per-chunk RS
-  plus cross-chunk `zfec` erasure — same spirit, different mechanism).
-- Forward secrecy via ephemeral-only sender keys (now actually FS via
-  recipient one-time prekeys).
+Items from the original spec that were **replaced with different
+mechanisms**:
+
+- "30% whole-message Reed–Solomon redundancy" → per-chunk RS + cross-
+  chunk `zfec` erasure (same durability goal; chunk-granular).
+- "Forward secrecy via ephemeral sender keys only" → real FS via
+  recipient one-time prekeys (Signal/X3DH-shaped, not ephemeral-
+  sender-only).
+
+Items from the original spec that are **deliberately deferred**:
+
+- **Dijkstra-style mesh routing** — out of scope. With the M2 +
+  M3 cluster model, routing reduces to "which cluster nodes to
+  query," and mature mesh libraries (Yggdrasil, cjdns) address
+  multi-hop IP-layer routing better than a message-layer protocol
+  could. See the "Deferred / unlikely" section of
+  [ROADMAP.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md).
+- **Using DMP as a relay for non-DMP traffic** — also deferred; DMP
+  is an application-layer protocol, not an overlay network.

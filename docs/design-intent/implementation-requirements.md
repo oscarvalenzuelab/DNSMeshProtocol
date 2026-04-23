@@ -7,12 +7,16 @@ nav_order: 2
 
 # DNS Mesh Protocol (DMP) - Implementation Requirements
 
-{: .warning }
-This document is the original implementation spec. The shipping code is
-smaller and more conservative than what's described here — no mesh routing,
-no peer discovery, no resolver pool failover, no multi-node storage, no
-3× redundancy, no bootstrap-domain gossip. Current scope is one client,
-one node, one sqlite store. Treat as design intent, not current behavior.
+{: .note }
+This is the **original implementation spec**. Most of it is now
+implemented: resolver pool failover (M1), multi-node storage with
+write redundancy + anti-entropy sync (M2), bootstrap-domain gossip
++ cluster-manifest peer discovery (M3). The deliberately-deferred
+items are Dijkstra-style mesh routing and using DMP as a relay
+for non-DMP traffic. The spec-to-ship delta is tracked line-by-line
+in the [Design Intent index]({{ site.baseurl }}/design-intent)
+page; per-milestone status and commit refs are in
+[ROADMAP.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md).
 
 ## Project Overview
 
