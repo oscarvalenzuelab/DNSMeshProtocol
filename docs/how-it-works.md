@@ -126,7 +126,7 @@ For operators who want a node for themselves, a team, or a community.
 docker run -d --name dmp-node \
   -p 53:5353/udp \
   -p 8053:8053/tcp \
-  -e DMP_HTTP_TOKEN=$(openssl rand -hex 32) \
+  -e DMP_OPERATOR_TOKEN=$(openssl rand -hex 32) \
   -v dmp-data:/var/lib/dmp \
   oscarvalenzuelab/dmp-node:latest
 ```
@@ -197,24 +197,55 @@ Concrete flow, from scratch:
 No account creation on the node side at any point. Users self-publish
 signed records; the node is a dumb filestore.
 
-## Trust model — one caveat worth knowing
+## Trust model — three auth modes
 
-The node's HTTP publish API has **one shared bearer token**
-(`DMP_HTTP_TOKEN`). Granularity is coarse:
+The node's `/v1/records/*` publish API runs in one of three modes,
+picked via `DMP_AUTH_MODE`:
 
-- **"My team shares a node"** — works well. Everyone has the token,
-  each publishes their own signed records, nobody can forge anyone
-  else's identity (signatures prevent that even if they share the
-  token).
-- **"Random strangers share a node"** — the shared token leaks
-  trivially. In that case, run the node with no token (open
-  publish), accept that anyone on the internet can write records,
-  and rely on rate limits (`DMP_HTTP_RATE`) + the signature model to
-  prevent identity spoofing.
+- **`open`** (default when no token is configured). No auth, no
+  TokenStore, no registration endpoints. Dev / trusted-LAN only.
+  `dmp identity publish` works unauthenticated. Suitable for
+  running a single-user node on your own laptop.
 
-Per-user API tokens do not exist yet. If you want proper multi-tenant
-"SaaS node" semantics, that's the natural next security milestone —
-open an issue.
+- **`legacy`** (implicit when `DMP_OPERATOR_TOKEN` / `DMP_HTTP_TOKEN`
+  is set and `DMP_AUTH_MODE` isn't). Single shared bearer token.
+  Everyone onboarded to the node holds the same secret. Fine for
+  a team or small community where key holders trust each other;
+  the token leaks the moment you hand it to a stranger. This is
+  the pre-M5.5 behavior, still supported.
+
+- **`multi-tenant`** (opt-in via `DMP_AUTH_MODE=multi-tenant`).
+  Per-user publish tokens. Each user has their own bearer, minted
+  either by the operator (`dmp-node-admin token issue`) or
+  self-service (the user runs `dmp register`, proves key control
+  with a signed challenge, and the node mints a token bound to
+  their subject). Publish requests are scope-checked:
+    - Alice's token can POST `dmp.alice.example.com` — her identity
+      record — but not `dmp.bob.example.com`.
+    - Any user's token can POST chunks + mailbox deliveries (the
+      "deliver to anyone's inbox" SMTP analogy), rate-limited
+      per-token.
+    - Neither can POST into the operator namespace (cluster
+      manifests, bootstrap records) — that still requires
+      `DMP_OPERATOR_TOKEN`.
+  Registration and the admin CLI are covered in the
+  [User Guide]({{ site.baseurl }}/guide) and the
+  [Deployment — Multi-tenant node]({{ site.baseurl }}/deployment/multi-tenant)
+  guide.
+
+**Scaling guidance:**
+
+- Self-host / one-user node → `open`.
+- Team / friends / one-trust-zone community → `legacy`.
+- Public community node, or you want per-user audit / rate-limit /
+  revocation → `multi-tenant`.
+
+**Anonymity property of `multi-tenant`:** the shared-pool writes
+(chunks + mailbox deliveries) do not log subject or token hash in
+the durable audit. An operator compelled to hand over their
+database cannot, from it alone, reconstruct which user delivered to
+whom. Full sender anonymity against a powerful observer still needs
+Tor / a mixnet — that's M6 territory.
 
 ## When NOT to use DMP
 
