@@ -91,6 +91,18 @@ from dmp.storage.sqlite_store import SqliteMailboxStore
 log = logging.getLogger(__name__)
 
 
+def _default_token_db_path(record_db_path: str) -> str:
+    """Resolve a token-DB path that sits alongside the record DB.
+
+    Matches the default used by ``dmp-node-admin --db ...``. Kept in
+    two places rather than imported from admin.py to avoid the server
+    main loop depending on an admin module.
+    """
+    from pathlib import Path as _Path
+    p = _Path(record_db_path)
+    return str(p.with_name(p.stem + "_tokens" + p.suffix))
+
+
 def _peer_id_from_url(url: str) -> str:
     """Derive a short stable peer id from an HTTP URL.
 
@@ -186,7 +198,22 @@ class DMPNodeConfig:
     dns_burst: float = 200.0
     http_host: str = "0.0.0.0"
     http_port: int = 8053
+    # `http_token` is the operator (write-anywhere) token. In M5.5+ it is
+    # also aliased as `DMP_OPERATOR_TOKEN` for clarity; `DMP_HTTP_TOKEN`
+    # remains supported for backward compatibility.
     http_token: Optional[str] = None
+    # Multi-tenant auth (M5.5):
+    #   auth_mode = "open"         — no auth, dev only. Chosen when no
+    #                                 token is configured.
+    #             = "legacy"       — single shared operator token
+    #                                 (pre-M5.5 behavior).
+    #             = "multi-tenant" — per-user tokens + operator token for
+    #                                 operator-reserved namespaces.
+    # If DMP_AUTH_MODE is unset, it's derived from whether http_token is
+    # set, so existing deploys upgrade without a config change.
+    auth_mode: Optional[str] = None
+    # Path to the sqlite token store. Defaults to sibling of db_path.
+    token_db_path: Optional[str] = None
     # Bursts are sized for legitimate bulk publishes: a fresh
     # `dmp identity refresh-prekeys --count 50` + a manifest and half a
     # dozen chunks lands under the burst, while a sustained flood is
@@ -303,7 +330,15 @@ class DMPNodeConfig:
             dns_burst=float(os.environ.get("DMP_DNS_BURST", cls.dns_burst)),
             http_host=os.environ.get("DMP_HTTP_HOST", cls.http_host),
             http_port=int(os.environ.get("DMP_HTTP_PORT", cls.http_port)),
-            http_token=os.environ.get("DMP_HTTP_TOKEN") or None,
+            # DMP_OPERATOR_TOKEN is the preferred name as of M5.5;
+            # fall back to DMP_HTTP_TOKEN for deploys that predate it.
+            http_token=(
+                os.environ.get("DMP_OPERATOR_TOKEN")
+                or os.environ.get("DMP_HTTP_TOKEN")
+                or None
+            ),
+            auth_mode=os.environ.get("DMP_AUTH_MODE") or None,
+            token_db_path=os.environ.get("DMP_TOKEN_DB_PATH") or None,
             http_rate=float(os.environ.get("DMP_HTTP_RATE", cls.http_rate)),
             http_burst=float(os.environ.get("DMP_HTTP_BURST", cls.http_burst)),
             max_ttl=int(os.environ.get("DMP_MAX_TTL", cls.max_ttl)),
@@ -412,6 +447,22 @@ class DMPNode:
                     http_operator_spk = raw
             except ValueError:
                 http_operator_spk = None
+        # Multi-tenant auth plumbing (M5.5). The TokenStore is created
+        # lazily — only when auth_mode is explicitly "multi-tenant" OR
+        # the operator set DMP_TOKEN_DB_PATH — so legacy / open-mode
+        # deploys don't grow a spurious sqlite file.
+        token_store = None
+        if (
+            self.config.auth_mode == "multi-tenant"
+            or self.config.token_db_path is not None
+        ):
+            from dmp.server.tokens import TokenStore
+
+            token_db = self.config.token_db_path or _default_token_db_path(
+                self.config.db_path
+            )
+            token_store = TokenStore(token_db)
+
         self.http = DMPHttpApi(
             self.store,
             host=self.config.http_host,
@@ -428,6 +479,8 @@ class DMPNode:
             sync_peer_token=self.config.sync_peer_token,
             cluster_base_domain=gossip_base,
             sync_cluster_operator_spk=http_operator_spk,
+            auth_mode=self.config.auth_mode,
+            token_store=token_store,
         )
         self.cleanup = CleanupWorker(
             self.store.cleanup_expired,

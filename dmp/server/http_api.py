@@ -96,13 +96,73 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _authorized(self) -> bool:
-        token = self.server.bearer_token
+        """Check the OPERATOR bearer token only.
+
+        Used for operator-reserved endpoints (metrics, operator-only
+        record namespaces). The per-user token path for
+        ``/v1/records/*`` goes through :meth:`_authorize_record_write`.
+        """
+        token = self.server.operator_token
         if not token:
             return True
         header = self.headers.get("Authorization", "")
         expected = f"Bearer {token}"
         # Use constant-time compare to keep token-guessing timing-free.
         return len(header) == len(expected) and _consteq(header, expected)
+
+    def _extract_presented_token(self) -> str:
+        """Return the raw token material from the Authorization header,
+        or '' if none was presented. The 'Bearer ' prefix is stripped."""
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return ""
+        return header[len("Bearer ") :]
+
+    def _authorize_record_write(self, record_name: str) -> bool:
+        """Mode-aware authorization for ``/v1/records/{name}`` writes.
+
+        ``auth_mode == "open"``: accept everything. Dev / trusted LAN only.
+        ``auth_mode == "legacy"``: only the operator token is accepted
+            (backward-compatible with pre-M5.5 deploys).
+        ``auth_mode == "multi-tenant"``: operator token short-circuits for
+            any scope (operators can always write). Otherwise the
+            presented token is consulted against the :class:`TokenStore`
+            via :meth:`TokenStore.authorize_write` — that call enforces
+            scope rules, rate-limit freshness, and the split audit
+            policy. If no ``token_store`` is wired, multi-tenant mode
+            fails closed on every write.
+        """
+        mode = self.server.auth_mode
+        if mode == "open":
+            return True
+
+        presented = self._extract_presented_token()
+        op_token = self.server.operator_token
+
+        # Operator token short-circuit: an operator can always write.
+        # Constant-time compare even when the operator token is unset
+        # so timing doesn't leak presence.
+        if op_token:
+            expected = op_token
+            if len(presented) == len(expected) and _consteq(presented, expected):
+                return True
+
+        if mode == "legacy":
+            return False  # only the operator token is accepted in legacy mode
+
+        if mode != "multi-tenant":
+            # Unknown mode — fail closed rather than silently widening.
+            return False
+
+        store = self.server.token_store
+        if store is None:
+            return False
+        result = store.authorize_write(
+            presented,
+            record_name,
+            remote_addr=self.client_address[0] if self.client_address else "",
+        )
+        return bool(result.ok)
 
     def _sync_authorized(self) -> bool:
         """Check the cluster-operator shared token for peer-to-peer sync.
@@ -218,12 +278,16 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/sync/pull":
             return self._handle_sync_pull()
-        if self._match_name() is None:
+        name = self._match_name()
+        if name is None:
             self._send_json(404, {"error": "not found"})
             return 404
         if not self._check_rate_limit():
             return 429
-        if not self._authorized():
+        # Mode-aware auth: in multi-tenant mode the token's scope is
+        # checked against the record name; in legacy / open modes the
+        # record name is ignored but the check still happens.
+        if not self._authorize_record_write(name):
             self._send_json(401, {"error": "unauthorized"})
             return 401
         writer = self._writer()
@@ -257,7 +321,8 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             )
             return 400
 
-        name = self._match_name()
+        # `name` was captured above (before auth) so the scope check
+        # could consult it. Re-use that value instead of re-parsing.
 
         # Per-RRset cardinality cap. Count *existing* distinct values at
         # this name; reject only when we'd add a new one past the cap.
@@ -286,12 +351,13 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         self._record_request("DELETE", status)
 
     def _handle_delete(self) -> int:
-        if self._match_name() is None:
+        name = self._match_name()
+        if name is None:
             self._send_json(404, {"error": "not found"})
             return 404
         if not self._check_rate_limit():
             return 429
-        if not self._authorized():
+        if not self._authorize_record_write(name):
             self._send_json(401, {"error": "unauthorized"})
             return 401
         writer = self._writer()
@@ -300,7 +366,7 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             return 501
         body = self._read_json_body() or {}
         value = body.get("value") if isinstance(body, dict) else None
-        ok = writer.delete_txt_record(self._match_name(), value=value)
+        ok = writer.delete_txt_record(name, value=value)
         status = 204 if ok else 404
         self._send_empty(status)
         return status
@@ -774,9 +840,18 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         sync_peer_token=None,
         cluster_base_domain=None,
         sync_cluster_operator_spk=None,
+        auth_mode: str = "legacy",
+        token_store=None,
     ):
         super().__init__(addr, handler)
         self.store = store
+        # `operator_token` is the preferred name as of M5.5 (the old
+        # `bearer_token` kwarg still works for back-compat). It's the
+        # admin-scoped token that can write anywhere, including
+        # operator-only namespaces.
+        self.operator_token = bearer_token
+        # Expose under the old name too so any existing code reading
+        # `server.bearer_token` keeps working during the transition.
         self.bearer_token = bearer_token
         self.rate_limiter = rate_limiter
         self.max_ttl = max_ttl
@@ -786,6 +861,8 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.sync_peer_token = sync_peer_token
         self.cluster_base_domain = cluster_base_domain
         self.sync_cluster_operator_spk = sync_cluster_operator_spk
+        self.auth_mode = auth_mode
+        self.token_store = token_store
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -834,11 +911,21 @@ class DMPHttpApi:
         sync_peer_token: Optional[str] = None,
         cluster_base_domain: Optional[str] = None,
         sync_cluster_operator_spk: Optional[bytes] = None,
+        auth_mode: Optional[str] = None,
+        token_store=None,
     ):
         self.store = store
         self.host = host
         self.port = port
         self.bearer_token = bearer_token
+        self.operator_token = bearer_token
+        # Default auth mode derivation, preserving pre-M5.5 behavior:
+        #   no bearer_token  -> "open"   (the old unauthenticated path)
+        #   bearer_token set -> "legacy" (the old shared-token path)
+        # Callers who want multi-tenant pass it explicitly.
+        if auth_mode is None:
+            auth_mode = "open" if not bearer_token else "legacy"
+        self.auth_mode = auth_mode
         self.rate_limiter = (
             TokenBucketLimiter(rate_limit)
             if rate_limit and rate_limit.enabled
@@ -851,6 +938,7 @@ class DMPHttpApi:
         self.sync_peer_token = sync_peer_token
         self.cluster_base_domain = cluster_base_domain
         self.sync_cluster_operator_spk = sync_cluster_operator_spk
+        self.token_store = token_store
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -876,6 +964,8 @@ class DMPHttpApi:
             sync_peer_token=self.sync_peer_token,
             cluster_base_domain=self.cluster_base_domain,
             sync_cluster_operator_spk=self.sync_cluster_operator_spk,
+            auth_mode=self.auth_mode,
+            token_store=self.token_store,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
