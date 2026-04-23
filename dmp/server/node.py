@@ -463,6 +463,14 @@ class DMPNode:
             )
             token_store = TokenStore(token_db)
 
+        # M5.5 phase 3: registration config read from env. Harmless to
+        # instantiate in open / legacy modes — DMPHttpApi only wires
+        # the plumbing when enabled + multi-tenant + a token_store
+        # exists (see DMPHttpApi.start).
+        from dmp.server.registration import RegistrationConfig
+
+        registration_config = RegistrationConfig.from_env()
+
         self.http = DMPHttpApi(
             self.store,
             host=self.config.http_host,
@@ -481,6 +489,7 @@ class DMPNode:
             sync_cluster_operator_spk=http_operator_spk,
             auth_mode=self.config.auth_mode,
             token_store=token_store,
+            registration_config=registration_config,
         )
         self.cleanup = CleanupWorker(
             self.store.cleanup_expired,

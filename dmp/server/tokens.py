@@ -326,6 +326,9 @@ class TokenRow:
     revoked_at: Optional[int]
     issuer: str
     note: str
+    # Hex-encoded 32-byte Ed25519 public key presented at registration.
+    # None for operator-issued (admin CLI) tokens; set for self-service.
+    registered_spk: Optional[str] = None
 
     def is_live(self, now: Optional[int] = None) -> bool:
         if self.revoked_at is not None:
@@ -453,7 +456,15 @@ CREATE TABLE IF NOT EXISTS tokens (
     expires_at     INTEGER,
     revoked_at     INTEGER,
     issuer         TEXT NOT NULL DEFAULT '',
-    note           TEXT NOT NULL DEFAULT ''
+    note           TEXT NOT NULL DEFAULT '',
+    -- M5.5 phase 3: Ed25519 signing pubkey (32-byte hex) that registered
+    -- this token via POST /v1/registration/confirm. NULL for operator-
+    -- issued (dmp-node-admin) tokens, which don't go through a signed
+    -- challenge. Used by the anti-takeover rule: self-service re-
+    -- registration for an existing subject must sign the new challenge
+    -- with the SAME key the prior token was registered under, so an
+    -- attacker who guesses a subject string can't silently claim it.
+    registered_spk TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tokens_subject
@@ -472,6 +483,13 @@ CREATE TABLE IF NOT EXISTS token_audit (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON token_audit(ts);
 """
 
+# One-off migration for deployments that predate phase 3. Adding a
+# column at runtime is cheaper than bumping the schema_version and the
+# `tokens` table is single-owner (no migrations of in-flight data).
+_MIGRATION_ADD_REGISTERED_SPK = """
+ALTER TABLE tokens ADD COLUMN registered_spk TEXT
+"""
+
 
 class TokenStore:
     """SQLite-backed token store. Thread-safe (module-level lock).
@@ -488,6 +506,14 @@ class TokenStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        # Best-effort additive migration for the phase-3 column.
+        # sqlite rejects "ADD COLUMN if already exists"; catch the
+        # duplicate-column error and move on.
+        try:
+            self._conn.execute(_MIGRATION_ADD_REGISTERED_SPK)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
         self._conn.commit()
         # Per-token rate limiter. In-memory, ephemeral by design —
         # rate state doesn't survive a node restart, matching how the
@@ -509,6 +535,7 @@ class TokenStore:
         issuer: str = "",
         note: str = "",
         remote_addr: str = "",
+        registered_spk: Optional[str] = None,
     ) -> Tuple[str, TokenRow]:
         """Mint a new token for ``subject``. Returns ``(token, row)``.
 
@@ -545,19 +572,20 @@ class TokenStore:
             revoked_at=None,
             issuer=issuer,
             note=note,
+            registered_spk=registered_spk,
         )
 
         with self._lock:
             self._conn.execute(
                 """INSERT INTO tokens(token_hash, subject, subject_type,
                    subject_hash12, rate_per_sec, rate_burst, issued_at,
-                   expires_at, revoked_at, issuer, note)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                   expires_at, revoked_at, issuer, note, registered_spk)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     row.token_hash, row.subject, row.subject_type,
                     row.subject_hash12, row.rate_per_sec, row.rate_burst,
                     row.issued_at, row.expires_at, None,
-                    row.issuer, row.note,
+                    row.issuer, row.note, row.registered_spk,
                 ),
             )
             self._audit(
@@ -635,12 +663,15 @@ class TokenStore:
 
     # ---- lookup ------------------------------------------------------------
 
+    _SELECT_COLS = (
+        "token_hash, subject, subject_type, subject_hash12, "
+        "rate_per_sec, rate_burst, issued_at, expires_at, "
+        "revoked_at, issuer, note, registered_spk"
+    )
+
     def _row_by_hash(self, token_hash: str) -> Optional[TokenRow]:
         r = self._conn.execute(
-            """SELECT token_hash, subject, subject_type, subject_hash12,
-                      rate_per_sec, rate_burst, issued_at, expires_at,
-                      revoked_at, issuer, note
-               FROM tokens WHERE token_hash=?""",
+            f"SELECT {self._SELECT_COLS} FROM tokens WHERE token_hash=?",
             (token_hash,),
         ).fetchone()
         return None if r is None else TokenRow(*r)
@@ -648,9 +679,7 @@ class TokenStore:
     def list(
         self, *, include_revoked: bool = False, subject: Optional[str] = None
     ) -> List[TokenRow]:
-        sql = """SELECT token_hash, subject, subject_type, subject_hash12,
-                        rate_per_sec, rate_burst, issued_at, expires_at,
-                        revoked_at, issuer, note FROM tokens"""
+        sql = f"SELECT {self._SELECT_COLS} FROM tokens"
         clauses = []
         args: List = []
         if not include_revoked:
