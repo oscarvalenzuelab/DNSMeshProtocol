@@ -1,0 +1,87 @@
+# Production single-node dmp-node deploy, runnable anywhere docker is.
+#
+# Pulls the published image from Docker Hub (no local build required).
+# Pin to a specific tag in prod — the `latest` default is fine for first-
+# run, but you want reproducibility: `oscarvalenzuelab/dmp-node:v0.2.0`.
+#
+# Why standalone (and not an overlay on docker-compose.yml /
+# docker-compose.prod.yml): compose merges `ports` lists additively, so
+# overlaying would leak the dev file's 8053/tcp public mapping out to
+# the host. A fresh file sidesteps the footgun.
+#
+# Expected env (sourced from the invoking shell or a .env file next to
+# this compose file):
+#   DMP_NODE_HOSTNAME  -- public DNS name, used by Caddy ACME
+#   DMP_HTTP_TOKEN     -- bearer token required on /v1/records/* POST|DELETE
+#   DMP_IMAGE_TAG      -- optional, defaults to :latest
+#
+# Caddyfile: downloaded next to this compose file, or symlinked in from
+# a repo checkout. Path is resolved relative to the compose file.
+
+services:
+  dmp-node:
+    image: oscarvalenzuelab/dmp-node:${DMP_IMAGE_TAG:-latest}
+    container_name: dmp-node
+    restart: unless-stopped
+
+    ports:
+      # DMP's authoritative DNS plane on the canonical port. Nothing else
+      # on the host should be holding :53 — typical blockers are
+      # systemd-resolved's stub listener (disable with
+      # `systemctl disable --now systemd-resolved`) or dnsmasq.
+      - "53:5353/udp"
+      # HTTP API stays INTERNAL — Caddy terminates TLS on 443 and reverse-
+      # proxies to dmp-node:8053 on the compose network. No `8053:8053`
+      # host mapping here on purpose.
+
+    environment:
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_HTTP_TOKEN: ${DMP_HTTP_TOKEN:?DMP_HTTP_TOKEN must be set}
+      DMP_CLEANUP_INTERVAL: "60"
+      DMP_LOG_LEVEL: INFO
+      DMP_LOG_FORMAT: json
+
+    volumes:
+      - dmp-data:/var/lib/dmp
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8053/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  caddy:
+    image: caddy:2
+    container_name: dmp-caddy
+    restart: unless-stopped
+
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+
+    environment:
+      DMP_NODE_HOSTNAME: ${DMP_NODE_HOSTNAME:?DMP_NODE_HOSTNAME must be set}
+
+    volumes:
+      # Looks for ./Caddyfile next to this compose file. Fetch it with
+      # `curl -O https://raw.githubusercontent.com/oscarvalenzuelab/DNSMeshProtocol/main/Caddyfile`
+      # before `docker compose up`.
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+    depends_on:
+      dmp-node:
+        condition: service_healthy
+
+volumes:
+  dmp-data:
+  caddy-data:
+  caddy-config:

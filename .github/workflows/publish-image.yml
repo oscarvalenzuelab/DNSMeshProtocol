@@ -1,0 +1,85 @@
+name: publish-image
+
+# Builds and pushes the dmp-node image to Docker Hub.
+#
+# Triggers:
+#   - push to main: tagged as :latest and :main
+#   - push of a v* tag: tagged as the full version + major-only alias
+#   - manual workflow_dispatch: for ad-hoc rebuilds
+#
+# Does NOT run on PRs — we build-and-test the image in the `docker`
+# job of ci.yml on every PR; this workflow is strictly for publishing.
+#
+# Required repo secrets:
+#   DOCKERHUB_USERNAME  -- the Docker Hub account that owns the repo
+#   DOCKERHUB_TOKEN     -- a Docker Hub access token (read/write/delete)
+#                          generated via hub.docker.com → Account Settings →
+#                          Security → New Access Token
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: build + push dmp-node
+    runs-on: ubuntu-latest
+    # No environment protection — this workflow is triggered only by
+    # push to main or a v* tag, both already gated by branch protection.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        # Needed for cross-arch builds (arm64 on an amd64 runner).
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/dmp-node
+          # Tag strategy:
+          #   main   -> :latest, :main, :sha-<short>
+          #   vX.Y.Z -> :X.Y.Z, :X.Y, :X, :latest, :sha-<short>
+          # The `latest` alias is attached to the HEAD of main AND to
+          # the most recent semver — both can clobber each other but
+          # the last-run workflow wins, which is fine for a single-
+          # maintainer project.
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build + push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Build cache via GHA's registry-level cache — much faster than
+          # rebuilding from scratch on every push while keeping the
+          # pushed image layers untouched.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
