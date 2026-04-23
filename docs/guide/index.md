@@ -18,3 +18,6 @@ Day-to-day use of the `dmp` CLI and the `dmp` Python library.
 - [Forward secrecy and prekeys]({{ site.baseurl }}/guide/forward-secrecy) —
   how the X3DH-style one-time prekeys keep past messages safe from
   long-term key compromise.
+- [Registering on a multi-tenant node]({{ site.baseurl }}/guide/registration) —
+  `dmp register`, per-node bearer tokens, what happens when you
+  hit 401 / 403 / 409 / 429.

@@ -7,14 +7,19 @@ nav_order: 1
 
 # DNS Mesh Protocol Technical Overview
 
-{: .warning }
-This document describes the *aspirational* DMP design — a multi-node mesh
-with peer discovery, resolver pools, store relays, and 3× redundancy. The
-current implementation is considerably smaller: one client, one node, one
-sqlite store, one UDP DNS server.
-Treat this file as **design intent**, not current behavior. For what
-actually ships, see the [Protocol]({{ site.baseurl }}/protocol) section
-and [SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md).
+{: .note }
+This is the **original project spec**, written before any code existed.
+Most of what it describes ships today — multi-node storage with write
+redundancy, peer discovery, resolver pools, and bootstrap-domain
+gossip are all implemented (M1 / M2 / M3). Some mechanisms were
+replaced in the same spirit (per-chunk RS + zfec instead of whole-
+message RS; recipient-prekey forward secrecy instead of ephemeral-
+sender-only). A small residual — Dijkstra-style mesh routing and
+using DMP as a non-DMP transport — is deliberately deferred. See
+[Design Intent index]({{ site.baseurl }}/design-intent) for the
+line-by-line spec-to-ship delta, and the
+[Protocol]({{ site.baseurl }}/protocol) section for what actually
+ships today.
 
 ## Core Concept
 

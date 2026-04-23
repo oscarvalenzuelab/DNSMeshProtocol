@@ -96,13 +96,87 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _authorized(self) -> bool:
-        token = self.server.bearer_token
+        """Check the OPERATOR bearer token only.
+
+        Used for operator-reserved endpoints (metrics, operator-only
+        record namespaces). The per-user token path for
+        ``/v1/records/*`` goes through :meth:`_authorize_record_write`.
+        """
+        token = self.server.operator_token
         if not token:
             return True
         header = self.headers.get("Authorization", "")
         expected = f"Bearer {token}"
         # Use constant-time compare to keep token-guessing timing-free.
         return len(header) == len(expected) and _consteq(header, expected)
+
+    def _auth_failure_response(self) -> tuple:
+        """Pick the right status + body when _authorize_record_write()
+        returned False. AuthResult.throttled -> 429; anything else -> 401."""
+        result = getattr(self, "_last_auth_result", None)
+        if result is not None and getattr(result, "throttled", False):
+            return 429, {"error": "per-token rate limit exceeded"}
+        return 401, {"error": "unauthorized"}
+
+    def _extract_presented_token(self) -> str:
+        """Return the raw token material from the Authorization header,
+        or '' if none was presented. The 'Bearer ' prefix is stripped."""
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return ""
+        return header[len("Bearer ") :]
+
+    def _authorize_record_write(self, record_name: str) -> bool:
+        """Mode-aware authorization for ``/v1/records/{name}`` writes.
+
+        ``auth_mode == "open"``: accept everything. Dev / trusted LAN only.
+        ``auth_mode == "legacy"``: only the operator token is accepted
+            (backward-compatible with pre-M5.5 deploys).
+        ``auth_mode == "multi-tenant"``: operator token short-circuits for
+            any scope (operators can always write). Otherwise the
+            presented token is consulted against the :class:`TokenStore`
+            via :meth:`TokenStore.authorize_write` — that call enforces
+            scope rules, rate-limit freshness, and the split audit
+            policy. If no ``token_store`` is wired, multi-tenant mode
+            fails closed on every write.
+        """
+        mode = self.server.auth_mode
+        if mode == "open":
+            return True
+
+        presented = self._extract_presented_token()
+        op_token = self.server.operator_token
+
+        # Operator token short-circuit: an operator can always write.
+        # Constant-time compare even when the operator token is unset
+        # so timing doesn't leak presence.
+        if op_token:
+            expected = op_token
+            if len(presented) == len(expected) and _consteq(presented, expected):
+                return True
+
+        if mode == "legacy":
+            return False  # only the operator token is accepted in legacy mode
+
+        if mode != "multi-tenant":
+            # Unknown mode — fail closed rather than silently widening.
+            return False
+
+        store = self.server.token_store
+        if store is None:
+            return False
+        result = store.authorize_write(
+            presented,
+            record_name,
+            remote_addr=self.client_address[0] if self.client_address else "",
+        )
+        # Stash the AuthResult on the handler so the POST/DELETE
+        # caller can translate ``throttled`` to HTTP 429 rather than
+        # the default 401. AuthResult.throttled implies the token was
+        # otherwise valid and scoped correctly — the failure is a
+        # per-token rate limit, not an authz rejection.
+        self._last_auth_result = result
+        return bool(result.ok)
 
     def _sync_authorized(self) -> bool:
         """Check the cluster-operator shared token for peer-to-peer sync.
@@ -170,6 +244,8 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             count = getattr(self.server.store, "record_count", lambda: None)()
             self._send_json(200, {"records": count})
             return 200
+        if self.path == "/v1/registration/challenge":
+            return self._handle_registration_challenge()
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/sync/digest":
             return self._handle_sync_digest(parsed.query)
@@ -218,14 +294,21 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/sync/pull":
             return self._handle_sync_pull()
-        if self._match_name() is None:
+        if parsed.path == "/v1/registration/confirm":
+            return self._handle_registration_confirm()
+        name = self._match_name()
+        if name is None:
             self._send_json(404, {"error": "not found"})
             return 404
         if not self._check_rate_limit():
             return 429
-        if not self._authorized():
-            self._send_json(401, {"error": "unauthorized"})
-            return 401
+        # Mode-aware auth: in multi-tenant mode the token's scope is
+        # checked against the record name; in legacy / open modes the
+        # record name is ignored but the check still happens.
+        if not self._authorize_record_write(name):
+            status, payload = self._auth_failure_response()
+            self._send_json(status, payload)
+            return status
         writer = self._writer()
         if writer is None:
             self._send_json(501, {"error": "writer not configured"})
@@ -257,7 +340,8 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             )
             return 400
 
-        name = self._match_name()
+        # `name` was captured above (before auth) so the scope check
+        # could consult it. Re-use that value instead of re-parsing.
 
         # Per-RRset cardinality cap. Count *existing* distinct values at
         # this name; reject only when we'd add a new one past the cap.
@@ -286,24 +370,121 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         self._record_request("DELETE", status)
 
     def _handle_delete(self) -> int:
-        if self._match_name() is None:
+        name = self._match_name()
+        if name is None:
             self._send_json(404, {"error": "not found"})
             return 404
         if not self._check_rate_limit():
             return 429
-        if not self._authorized():
-            self._send_json(401, {"error": "unauthorized"})
-            return 401
+        if not self._authorize_record_write(name):
+            status, payload = self._auth_failure_response()
+            self._send_json(status, payload)
+            return status
         writer = self._writer()
         if writer is None:
             self._send_json(501, {"error": "writer not configured"})
             return 501
         body = self._read_json_body() or {}
         value = body.get("value") if isinstance(body, dict) else None
-        ok = writer.delete_txt_record(self._match_name(), value=value)
+        ok = writer.delete_txt_record(name, value=value)
         status = 204 if ok else 404
         self._send_empty(status)
         return status
+
+    # ---- M5.5 self-service registration -----------------------------------
+
+    def _registration_enabled(self) -> bool:
+        """Return True iff the node is configured for self-service.
+
+        Requires auth_mode=multi-tenant + DMP_REGISTRATION_ENABLED=1 +
+        a node hostname. Returns False silently — the GET/POST
+        handlers translate that into 404 so a disabled node doesn't
+        even advertise the endpoint.
+        """
+        cfg = getattr(self.server, "registration_config", None)
+        if cfg is None or not cfg.enabled:
+            return False
+        if self.server.auth_mode != "multi-tenant":
+            return False
+        if not self.server.token_store:
+            return False
+        return bool(cfg.node_hostname)
+
+    def _registration_rate_ok(self) -> bool:
+        """Per-IP limiter specifically for the registration endpoints.
+
+        Separate from the general publish limiter because the budgets
+        are very different — you want generous publish limits but a
+        tight registration limit to discourage subject-squatting.
+        """
+        limiter = getattr(self.server, "registration_rate_limiter", None)
+        if limiter is None:
+            return True
+        key = self.client_address[0] if self.client_address else "?"
+        return limiter.allow(key)
+
+    def _handle_registration_challenge(self) -> int:
+        if not self._registration_enabled():
+            self._send_json(404, {"error": "not found"})
+            return 404
+        if not self._registration_rate_ok():
+            self._send_json(429, {"error": "registration rate limit exceeded"})
+            return 429
+        store = self.server.challenge_store
+        cfg = self.server.registration_config
+        pc = store.issue(cfg.node_hostname)
+        self._send_json(
+            200,
+            {
+                "challenge": pc.challenge_hex,
+                "node": pc.node,
+                "expires_at": pc.expires_at,
+                "version": 1,
+            },
+        )
+        return 200
+
+    def _handle_registration_confirm(self) -> int:
+        if not self._registration_enabled():
+            self._send_json(404, {"error": "not found"})
+            return 404
+        if not self._registration_rate_ok():
+            self._send_json(429, {"error": "registration rate limit exceeded"})
+            return 429
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "invalid body"})
+            return 400
+        from dmp.server.registration import RegistrationError, confirm_registration
+
+        remote_addr = self.client_address[0] if self.client_address else ""
+        try:
+            token, row = confirm_registration(
+                store=self.server.token_store,
+                challenges=self.server.challenge_store,
+                config=self.server.registration_config,
+                body=body,
+                remote_addr=remote_addr,
+            )
+        except RegistrationError as exc:
+            self._send_json(exc.http_status, {"error": exc.reason})
+            return exc.http_status
+        except Exception:
+            # Defensive — don't leak internal stack traces over the wire.
+            self._send_json(500, {"error": "internal error"})
+            return 500
+
+        self._send_json(
+            200,
+            {
+                "token": token,
+                "subject": row.subject,
+                "expires_at": row.expires_at,
+                "rate_per_sec": row.rate_per_sec,
+                "rate_burst": row.rate_burst,
+            },
+        )
+        return 200
 
     # ---- anti-entropy sync routes -----------------------------------------
 
@@ -774,9 +955,21 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         sync_peer_token=None,
         cluster_base_domain=None,
         sync_cluster_operator_spk=None,
+        auth_mode: str = "legacy",
+        token_store=None,
+        registration_config=None,
+        challenge_store=None,
+        registration_rate_limiter=None,
     ):
         super().__init__(addr, handler)
         self.store = store
+        # `operator_token` is the preferred name as of M5.5 (the old
+        # `bearer_token` kwarg still works for back-compat). It's the
+        # admin-scoped token that can write anywhere, including
+        # operator-only namespaces.
+        self.operator_token = bearer_token
+        # Expose under the old name too so any existing code reading
+        # `server.bearer_token` keeps working during the transition.
         self.bearer_token = bearer_token
         self.rate_limiter = rate_limiter
         self.max_ttl = max_ttl
@@ -786,6 +979,11 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.sync_peer_token = sync_peer_token
         self.cluster_base_domain = cluster_base_domain
         self.sync_cluster_operator_spk = sync_cluster_operator_spk
+        self.auth_mode = auth_mode
+        self.token_store = token_store
+        self.registration_config = registration_config
+        self.challenge_store = challenge_store
+        self.registration_rate_limiter = registration_rate_limiter
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -834,11 +1032,22 @@ class DMPHttpApi:
         sync_peer_token: Optional[str] = None,
         cluster_base_domain: Optional[str] = None,
         sync_cluster_operator_spk: Optional[bytes] = None,
+        auth_mode: Optional[str] = None,
+        token_store=None,
+        registration_config=None,
     ):
         self.store = store
         self.host = host
         self.port = port
         self.bearer_token = bearer_token
+        self.operator_token = bearer_token
+        # Default auth mode derivation, preserving pre-M5.5 behavior:
+        #   no bearer_token  -> "open"   (the old unauthenticated path)
+        #   bearer_token set -> "legacy" (the old shared-token path)
+        # Callers who want multi-tenant pass it explicitly.
+        if auth_mode is None:
+            auth_mode = "open" if not bearer_token else "legacy"
+        self.auth_mode = auth_mode
         self.rate_limiter = (
             TokenBucketLimiter(rate_limit)
             if rate_limit and rate_limit.enabled
@@ -851,6 +1060,12 @@ class DMPHttpApi:
         self.sync_peer_token = sync_peer_token
         self.cluster_base_domain = cluster_base_domain
         self.sync_cluster_operator_spk = sync_cluster_operator_spk
+        self.token_store = token_store
+        # Lazy: these are set up iff registration_config.enabled + we're
+        # in multi-tenant mode with a token_store. Created in start().
+        self.registration_config = registration_config
+        self.challenge_store = None
+        self.registration_rate_limiter = None
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -863,6 +1078,26 @@ class DMPHttpApi:
     def start(self) -> None:
         if self._server is not None:
             return
+
+        # Lazily materialize registration plumbing iff enabled + prereqs
+        # met. Keeps open / legacy deployments zero-cost (no extra
+        # threads, no extra memory).
+        if (
+            self.registration_config is not None
+            and self.registration_config.enabled
+            and self.auth_mode == "multi-tenant"
+            and self.token_store is not None
+        ):
+            from dmp.server.registration import ChallengeStore
+
+            self.challenge_store = ChallengeStore()
+            self.registration_rate_limiter = TokenBucketLimiter(
+                RateLimit(
+                    rate_per_second=self.registration_config.endpoint_rate_per_sec,
+                    burst=self.registration_config.endpoint_rate_burst,
+                )
+            )
+
         self._server = _DMPHttpServer(
             (self.host, self.port),
             _DMPHttpHandler,
@@ -876,6 +1111,11 @@ class DMPHttpApi:
             sync_peer_token=self.sync_peer_token,
             cluster_base_domain=self.cluster_base_domain,
             sync_cluster_operator_spk=self.sync_cluster_operator_spk,
+            auth_mode=self.auth_mode,
+            token_store=self.token_store,
+            registration_config=self.registration_config,
+            challenge_store=self.challenge_store,
+            registration_rate_limiter=self.registration_rate_limiter,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(

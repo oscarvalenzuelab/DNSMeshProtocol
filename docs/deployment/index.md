@@ -23,6 +23,9 @@ an item here is the most common way a DMP node gets owned.
 - [Clustered deployment]({{ site.baseurl }}/deployment/cluster) — 3-node
   federation with anti-entropy sync, for operators who need survival
   across individual node failure.
+- [Multi-tenant node]({{ site.baseurl }}/deployment/multi-tenant) —
+  per-user publish tokens (M5.5): self-service registration, operator
+  CLI, scope rules, split audit / anonymity property.
 - [Hardening]({{ site.baseurl }}/deployment/hardening) — mandatory
   operator checklist before production.
 

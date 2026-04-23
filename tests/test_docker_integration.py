@@ -486,20 +486,30 @@ def test_container_rotation_routine_chain_walk(node_container):
     alice_salt = os.urandom(32)
     bob_salt = os.urandom(32)
     alice = DMPClient(
-        "alice", "alice-pass-v1",
-        domain="mesh.docker", writer=writer, reader=reader, kdf_salt=alice_salt,
+        "alice",
+        "alice-pass-v1",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
+        kdf_salt=alice_salt,
     )
     bob = DMPClient(
-        "bob", "bob-pass",
-        domain="mesh.docker", writer=writer, reader=reader, kdf_salt=bob_salt,
+        "bob",
+        "bob-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
+        kdf_salt=bob_salt,
         rotation_chain_enabled=True,
     )
     alice.add_contact(
-        "bob", bob.get_public_key_hex(),
+        "bob",
+        bob.get_public_key_hex(),
         signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex(),
     )
     bob.add_contact(
-        "alice", alice.get_public_key_hex(),
+        "alice",
+        alice.get_public_key_hex(),
         signing_key_hex=alice.crypto.get_signing_public_key_bytes().hex(),
     )
 
@@ -514,11 +524,13 @@ def test_container_rotation_routine_chain_walk(node_container):
 
     # Re-pin with resolved head + deliver under the new key.
     bob.add_contact(
-        "alice", alice_v2.get_public_key_hex(),
+        "alice",
+        alice_v2.get_public_key_hex(),
         signing_key_hex=resolved.hex(),
     )
     alice_v2.add_contact(
-        "bob", bob.get_public_key_hex(),
+        "bob",
+        bob.get_public_key_hex(),
         signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex(),
     )
     assert alice_v2.send_message("bob", "post-rotation ping")
@@ -540,17 +552,28 @@ def test_container_rotation_compromise_revokes_old_key(node_container):
     alice_salt = os.urandom(32)
     bob_salt = os.urandom(32)
     alice = DMPClient(
-        "alice", "alice-pass-v1",
-        domain="mesh.docker", writer=writer, reader=reader, kdf_salt=alice_salt,
+        "alice",
+        "alice-pass-v1",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
+        kdf_salt=alice_salt,
     )
     bob = DMPClient(
-        "bob", "bob-pass",
-        domain="mesh.docker", writer=writer, reader=reader, kdf_salt=bob_salt,
+        "bob",
+        "bob-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
+        kdf_salt=bob_salt,
         rotation_chain_enabled=True,
     )
 
     _rotate_identity(
-        alice, "alice-pass-v2", alice_salt, revoke_reason=REASON_COMPROMISE,
+        alice,
+        "alice-pass-v2",
+        alice_salt,
+        revoke_reason=REASON_COMPROMISE,
     )
 
     # Bob still pinned on v1 — walker must refuse forward from a
