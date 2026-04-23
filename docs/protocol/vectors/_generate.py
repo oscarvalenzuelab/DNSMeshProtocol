@@ -42,6 +42,15 @@ from dmp.core.crypto import DMPCrypto
 from dmp.core.identity import IdentityRecord
 from dmp.core.manifest import SlotManifest
 from dmp.core.prekeys import Prekey
+from dmp.core.rotation import (
+    REASON_COMPROMISE,
+    REASON_ROUTINE,
+    RevocationRecord,
+    RotationRecord,
+    SUBJECT_TYPE_BOOTSTRAP_SIGNER,
+    SUBJECT_TYPE_CLUSTER_OPERATOR,
+    SUBJECT_TYPE_USER_IDENTITY,
+)
 
 VECTORS_DIR = Path(__file__).parent
 
@@ -630,6 +639,312 @@ def gen_prekey_cases() -> list[dict[str, Any]]:
     return cases
 
 
+# --- RotationRecord ---------------------------------------------------------
+
+
+def gen_rotation_record_cases() -> list[dict[str, Any]]:
+    """EXPERIMENTAL wire type (M5.4). Subject to post-audit revision.
+
+    Vectors cover the three subject_types + a co-sign-failure + expired
+    case so third-party implementers exercise both signature paths.
+    """
+    old = crypto_from_label("vectors/rotation/old-user")
+    new = crypto_from_label("vectors/rotation/new-user")
+    old_spk = old.get_signing_public_key_bytes()
+    new_spk = new.get_signing_public_key_bytes()
+    old_seed = seed_from_label("vectors/rotation/old-user")
+    new_seed = seed_from_label("vectors/rotation/new-user")
+
+    cases: list[dict[str, Any]] = []
+
+    # 1. Round-trip: user identity rotation.
+    rec_user = RotationRecord(
+        subject_type=SUBJECT_TYPE_USER_IDENTITY,
+        subject="alice@example.com",
+        old_spk=old_spk,
+        new_spk=new_spk,
+        seq=1,
+        ts=TS_2030,
+        exp=EXP_2035,
+    )
+    wire_user = rec_user.sign(old, new)
+    cases.append(
+        {
+            "description": "round-trip: user-identity rotation (alice@example.com)",
+            "old_seed_hex": old_seed.hex(),
+            "new_seed_hex": new_seed.hex(),
+            "inputs": {
+                "subject_type": SUBJECT_TYPE_USER_IDENTITY,
+                "subject": "alice@example.com",
+                "old_spk_hex": old_spk.hex(),
+                "new_spk_hex": new_spk.hex(),
+                "seq": 1,
+                "ts": TS_2030,
+                "exp": EXP_2035,
+            },
+            "expected_wire_hex": wire_user.encode("utf-8").hex(),
+            "expected_parse_subject": "alice@example.com",
+            "expected_parse_seq": 1,
+        }
+    )
+
+    # 2. Cluster-operator rotation.
+    cluster_old = crypto_from_label("vectors/rotation/old-cluster-op")
+    cluster_new = crypto_from_label("vectors/rotation/new-cluster-op")
+    rec_cluster = RotationRecord(
+        subject_type=SUBJECT_TYPE_CLUSTER_OPERATOR,
+        subject="mesh.example.com",
+        old_spk=cluster_old.get_signing_public_key_bytes(),
+        new_spk=cluster_new.get_signing_public_key_bytes(),
+        seq=7,
+        ts=TS_2030,
+        exp=EXP_2035,
+    )
+    wire_cluster = rec_cluster.sign(cluster_old, cluster_new)
+    cases.append(
+        {
+            "description": "round-trip: cluster-operator rotation (mesh.example.com)",
+            "old_seed_hex": seed_from_label("vectors/rotation/old-cluster-op").hex(),
+            "new_seed_hex": seed_from_label("vectors/rotation/new-cluster-op").hex(),
+            "inputs": {
+                "subject_type": SUBJECT_TYPE_CLUSTER_OPERATOR,
+                "subject": "mesh.example.com",
+                "old_spk_hex": cluster_old.get_signing_public_key_bytes().hex(),
+                "new_spk_hex": cluster_new.get_signing_public_key_bytes().hex(),
+                "seq": 7,
+                "ts": TS_2030,
+                "exp": EXP_2035,
+            },
+            "expected_wire_hex": wire_cluster.encode("utf-8").hex(),
+            "expected_parse_subject": "mesh.example.com",
+            "expected_parse_seq": 7,
+        }
+    )
+
+    # 3. Bootstrap-signer rotation.
+    bs_old = crypto_from_label("vectors/rotation/old-bootstrap")
+    bs_new = crypto_from_label("vectors/rotation/new-bootstrap")
+    rec_bs = RotationRecord(
+        subject_type=SUBJECT_TYPE_BOOTSTRAP_SIGNER,
+        subject="example.com",
+        old_spk=bs_old.get_signing_public_key_bytes(),
+        new_spk=bs_new.get_signing_public_key_bytes(),
+        seq=2,
+        ts=TS_2030,
+        exp=EXP_2035,
+    )
+    wire_bs = rec_bs.sign(bs_old, bs_new)
+    cases.append(
+        {
+            "description": "round-trip: bootstrap-signer rotation (example.com)",
+            "old_seed_hex": seed_from_label("vectors/rotation/old-bootstrap").hex(),
+            "new_seed_hex": seed_from_label("vectors/rotation/new-bootstrap").hex(),
+            "inputs": {
+                "subject_type": SUBJECT_TYPE_BOOTSTRAP_SIGNER,
+                "subject": "example.com",
+                "old_spk_hex": bs_old.get_signing_public_key_bytes().hex(),
+                "new_spk_hex": bs_new.get_signing_public_key_bytes().hex(),
+                "seq": 2,
+                "ts": TS_2030,
+                "exp": EXP_2035,
+            },
+            "expected_wire_hex": wire_bs.encode("utf-8").hex(),
+            "expected_parse_subject": "example.com",
+            "expected_parse_seq": 2,
+        }
+    )
+
+    # 4. Cosign failure: case 0's body but sig_new replaced by a forgery
+    #    from an unrelated key. parse_and_verify must return None.
+    blob_user = base64.b64decode(wire_user.split(";", 2)[2])
+    body_len = len(blob_user) - 128
+    body = blob_user[:body_len]
+    sig_old = blob_user[body_len : body_len + 64]
+    imposter = crypto_from_label("vectors/rotation/imposter")
+    forged_sig_new = imposter.sign_data(body)
+    forged = body + sig_old + forged_sig_new
+    # The ;t=rotation; prefix has no d= key.
+    from dmp.core.rotation import RECORD_PREFIX_ROTATION
+
+    forged_wire = RECORD_PREFIX_ROTATION + base64.b64encode(forged).decode("ascii")
+    cases.append(
+        {
+            "description": "cosign failure: sig_new forged by a third key",
+            "old_seed_hex": old_seed.hex(),
+            "new_seed_hex": new_seed.hex(),
+            "wire_from_case": 0,
+            "expected_wire_hex": forged_wire.encode("utf-8").hex(),
+            "expected_parse_result": "none",
+        }
+    )
+
+    # 5. Expired.
+    rec_expired = RotationRecord(
+        subject_type=SUBJECT_TYPE_USER_IDENTITY,
+        subject="alice@example.com",
+        old_spk=old_spk,
+        new_spk=new_spk,
+        seq=1,
+        ts=TS_2030,
+        exp=EXP_EXPIRED,
+    )
+    wire_expired = rec_expired.sign(old, new)
+    cases.append(
+        {
+            "description": "expired: exp in the distant past is rejected",
+            "old_seed_hex": old_seed.hex(),
+            "new_seed_hex": new_seed.hex(),
+            "inputs": {
+                "subject_type": SUBJECT_TYPE_USER_IDENTITY,
+                "subject": "alice@example.com",
+                "old_spk_hex": old_spk.hex(),
+                "new_spk_hex": new_spk.hex(),
+                "seq": 1,
+                "ts": TS_2030,
+                "exp": EXP_EXPIRED,
+            },
+            "expected_wire_hex": wire_expired.encode("utf-8").hex(),
+            "verify_with_now": EXP_EXPIRED + 1,
+            "expected_parse_result": "none",
+        }
+    )
+
+    return cases
+
+
+# --- RevocationRecord -------------------------------------------------------
+
+
+def gen_revocation_record_cases() -> list[dict[str, Any]]:
+    """EXPERIMENTAL wire type (M5.4). Subject to post-audit revision."""
+    revoked = crypto_from_label("vectors/revocation/revoked-user")
+    revoked_spk = revoked.get_signing_public_key_bytes()
+    revoked_seed = seed_from_label("vectors/revocation/revoked-user")
+
+    cases: list[dict[str, Any]] = []
+
+    # 1. Round-trip: user revocation, compromise.
+    rec = RevocationRecord(
+        subject_type=SUBJECT_TYPE_USER_IDENTITY,
+        subject="alice@example.com",
+        revoked_spk=revoked_spk,
+        reason_code=REASON_COMPROMISE,
+        ts=TS_2030,
+    )
+    wire = rec.sign(revoked)
+    cases.append(
+        {
+            "description": "round-trip: user-identity revocation (compromise)",
+            "revoked_seed_hex": revoked_seed.hex(),
+            "inputs": {
+                "subject_type": SUBJECT_TYPE_USER_IDENTITY,
+                "subject": "alice@example.com",
+                "revoked_spk_hex": revoked_spk.hex(),
+                "reason_code": REASON_COMPROMISE,
+                "ts": TS_2030,
+            },
+            "expected_wire_hex": wire.encode("utf-8").hex(),
+            "expected_parse_subject": "alice@example.com",
+            "expected_parse_reason_code": REASON_COMPROMISE,
+            # Revocations have a freshness window; use a `now` close to
+            # ts so default 1-year max_age_seconds accepts it.
+            "verify_with_now": TS_2030 + 60,
+        }
+    )
+
+    # 2. Round-trip: cluster revocation, routine rotation.
+    c_revoked = crypto_from_label("vectors/revocation/revoked-cluster-op")
+    c_spk = c_revoked.get_signing_public_key_bytes()
+    rec_cluster = RevocationRecord(
+        subject_type=SUBJECT_TYPE_CLUSTER_OPERATOR,
+        subject="mesh.example.com",
+        revoked_spk=c_spk,
+        reason_code=REASON_ROUTINE,
+        ts=TS_2030,
+    )
+    wire_cluster = rec_cluster.sign(c_revoked)
+    cases.append(
+        {
+            "description": "round-trip: cluster-operator revocation (routine)",
+            "revoked_seed_hex": seed_from_label(
+                "vectors/revocation/revoked-cluster-op"
+            ).hex(),
+            "inputs": {
+                "subject_type": SUBJECT_TYPE_CLUSTER_OPERATOR,
+                "subject": "mesh.example.com",
+                "revoked_spk_hex": c_spk.hex(),
+                "reason_code": REASON_ROUTINE,
+                "ts": TS_2030,
+            },
+            "expected_wire_hex": wire_cluster.encode("utf-8").hex(),
+            "expected_parse_subject": "mesh.example.com",
+            "expected_parse_reason_code": REASON_ROUTINE,
+            "verify_with_now": TS_2030 + 60,
+        }
+    )
+
+    # 3. Signature failure: correct wire, wrong expected_revoked_spk.
+    wrong = crypto_from_label("vectors/revocation/wrong-key")
+    wrong_spk = wrong.get_signing_public_key_bytes()
+    cases.append(
+        {
+            "description": "signature/binding failure: wrong expected_revoked_spk",
+            "revoked_seed_hex": revoked_seed.hex(),
+            "wire_from_case": 0,
+            "expected_wire_hex": wire.encode("utf-8").hex(),
+            "verify_with_expected_revoked_spk_hex": wrong_spk.hex(),
+            "verify_with_now": TS_2030 + 60,
+            "expected_parse_result": "none",
+        }
+    )
+
+    # 4. Stale revocation with EXPLICIT max_age_seconds.
+    #
+    # Revocations are permanent assertions under the default
+    # (max_age_seconds=None, no cap). This vector instead exercises
+    # the OPTIONAL caller-provided freshness window: a client that
+    # deliberately wants to prune old revocations (forensic replay
+    # windows, audit tools) passes an explicit integer, and the
+    # classical ts + max_age < now gate kicks back in.
+    rec_stale = RevocationRecord(
+        subject_type=SUBJECT_TYPE_USER_IDENTITY,
+        subject="alice@example.com",
+        revoked_spk=revoked_spk,
+        reason_code=REASON_COMPROMISE,
+        ts=TS_2030,
+    )
+    wire_stale = rec_stale.sign(revoked)
+    cases.append(
+        {
+            "description": (
+                "stale-with-explicit-cap: revocation rejected only when "
+                "the caller opts in to max_age_seconds"
+            ),
+            "revoked_seed_hex": revoked_seed.hex(),
+            "inputs": {
+                "subject_type": SUBJECT_TYPE_USER_IDENTITY,
+                "subject": "alice@example.com",
+                "revoked_spk_hex": revoked_spk.hex(),
+                "reason_code": REASON_COMPROMISE,
+                "ts": TS_2030,
+            },
+            "expected_wire_hex": wire_stale.encode("utf-8").hex(),
+            # Two years after ts, caller passes 1-year explicit cap → reject.
+            "verify_with_now": TS_2030 + 86400 * 365 * 2,
+            "verify_with_max_age_seconds": 86400 * 365,
+            "expected_parse_result": "none",
+            "notes": (
+                "Permanent-assertion model: the default "
+                "max_age_seconds=None accepts this same wire. The "
+                "rejection here requires the explicit cap in "
+                "verify_with_max_age_seconds."
+            ),
+        }
+    )
+
+    return cases
+
+
 # --- driver -----------------------------------------------------------------
 
 
@@ -647,6 +962,8 @@ def main() -> None:
     write_vectors("identity_record", gen_identity_record_cases())
     write_vectors("slot_manifest", gen_slot_manifest_cases())
     write_vectors("prekey", gen_prekey_cases())
+    write_vectors("rotation_record", gen_rotation_record_cases())
+    write_vectors("revocation_record", gen_revocation_record_cases())
 
 
 if __name__ == "__main__":

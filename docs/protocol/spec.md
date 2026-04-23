@@ -81,10 +81,18 @@ The canonical registry of wire record types defined by DMP today:
 | `prekey`    | One-time prekey       | `v=dmp1;t=prekey;d=`     | [wire-format §Prekeys](wire-format.md#prekeys) |
 | `cluster`   | Cluster manifest      | `v=dmp1;t=cluster;`      | [cluster.md](cluster.md)               |
 | `bootstrap` | Bootstrap record      | `v=dmp1;t=bootstrap;`    | [bootstrap.md](bootstrap.md)           |
+| `rotation`  | Key rotation *(DRAFT)* | `v=dmp1;t=rotation;`    | [rotation.md](rotation.md)             |
+| `revocation`| Key revocation *(DRAFT)* | `v=dmp1;t=revocation;` | [rotation.md](rotation.md)             |
 
 Constants verified against `dmp/core/{manifest,identity,prekeys,cluster,
-bootstrap}.py::RECORD_PREFIX` and
+bootstrap,rotation}.py::RECORD_PREFIX*` and
 `dmp/core/chunking.py::MessageChunker.DATA_PER_CHUNK` docstring.
+
+> **DRAFT — `rotation` and `revocation`.** These wire types shipped in
+> M5.4 ahead of the external crypto audit. The audit may recommend
+> structural changes; if so, `v0.3.0` will introduce
+> `v=dmp2;t=rotation;` as a breaking replacement. See
+> [rotation.md](rotation.md) for the full draft-status banner.
 
 > **IMPLEMENTATION NOTE.** The `cluster` and `bootstrap` prefixes end
 > at `;` (the body is emitted directly as a raw base64 string with no
