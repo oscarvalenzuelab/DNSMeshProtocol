@@ -26,6 +26,7 @@ import argparse
 import binascii
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -66,24 +67,39 @@ def _default_db_path() -> str:
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 86400 * 7}
 
+# ASCII-strict duration shape. Deliberately tight: a bare digit run
+# (seconds) or digits followed by exactly one of s/m/h/d/w. Rejects
+# Unicode digits (Arabic-Indic, Devanagari, etc.) and non-ASCII
+# whitespace that Python's .isdigit() and int() both silently accept.
+_DURATION_RE = re.compile(r"^[0-9]+[smhdw]?$")
+
 
 def parse_duration(s: str) -> int:
-    """Parse '90d' / '12h' / '45m' / '300s' / '4w'. Bare digits = seconds."""
-    s = s.strip()
+    """Parse '90d' / '12h' / '45m' / '300s' / '4w'. Bare digits = seconds.
+
+    ASCII-strict: non-ASCII digits and non-ASCII whitespace are
+    rejected, not silently coerced. ``int('١٠')`` returns 10 (Arabic-
+    Indic digits); we want ``--expires ١٠s`` to fail loudly so an
+    operator copy-pasting from a mixed-locale context gets an error
+    instead of a surprising value.
+    """
+    if not isinstance(s, str):
+        raise ValueError("duration must be a string")
+    # strip() removes non-ASCII whitespace too; we only want to be
+    # forgiving of leading/trailing ASCII space, so match-on-stripped
+    # and also reject anything outside our regex.
+    s = s.strip(" \t\r\n")
     if not s:
         raise ValueError("empty duration")
-    if s[-1].isdigit():
-        return int(s)
-    unit = s[-1].lower()
-    if unit not in _DURATION_UNITS:
-        raise ValueError(f"unknown duration unit {unit!r}; use s/m/h/d/w")
-    try:
+    if not _DURATION_RE.match(s):
+        raise ValueError(
+            f"bad duration {s!r}: expected digits with optional unit s/m/h/d/w"
+        )
+    if s[-1].isascii() and s[-1] in _DURATION_UNITS:
+        unit = s[-1]
         n = int(s[:-1])
-    except ValueError as exc:
-        raise ValueError(f"bad duration number: {s[:-1]!r}") from exc
-    if n < 0:
-        raise ValueError("duration must be non-negative")
-    return n * _DURATION_UNITS[unit]
+        return n * _DURATION_UNITS[unit]
+    return int(s)
 
 
 # ---------------------------------------------------------------------------

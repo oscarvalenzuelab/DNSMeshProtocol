@@ -29,10 +29,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -55,6 +57,51 @@ _TOKEN_BODY_LEN = 52  # base32 of 32 bytes = 52 chars without padding
 # everyone else on the same NAT.
 DEFAULT_RATE_PER_SEC = 10.0
 DEFAULT_RATE_BURST = 50
+
+
+# ASCII-only subject policy (security-critical):
+#
+# Token subjects are stored and compared as lowercase ASCII. Unicode
+# subjects are rejected at issuance time. Motivation: Python's
+# ``str.lower()`` is not Unicode-safe for equality — some compatibility
+# characters collapse to the same casefold (e.g. fullwidth Latin letters,
+# mathematical script letters, certain Greek / Cyrillic homoglyphs).
+# Allowing non-ASCII here would let a token issued to
+# ``a\ufo15ce@example.com`` authorize writes under ``alice@example.com``.
+#
+# Since DMP record names also traverse DNS (case-insensitive, ASCII for
+# non-IDN zones), restricting subjects to ASCII is the pragmatic choice
+# for v1. Internationalized subjects are a future milestone and will need
+# IDNA encoding + NFC normalization at issuance + comparison.
+_SUBJECT_ASCII_RE = re.compile(
+    r"^[a-z0-9][a-z0-9._+-]*@[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+)
+
+
+def canonicalize_subject(raw: str) -> str:
+    """Return the canonical ASCII-lowercase form of a subject, or raise.
+
+    Policy: NFKC-normalize input to expose compatibility-character
+    collisions, then require the result is pure ASCII and matches the
+    ``<local>@<fqdn>`` shape. Callers who want to reject non-ASCII at
+    their layer should catch :class:`ValueError` here.
+    """
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("subject must be a non-empty string")
+    norm = unicodedata.normalize("NFKC", raw).strip().lower()
+    # Re-encode through ASCII to catch any non-ASCII that survives the
+    # NFKC pass (rare but possible for scripts with no ASCII mapping).
+    try:
+        norm.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            f"subject must be ASCII; got non-ASCII character at position {exc.start}"
+        ) from exc
+    if not _SUBJECT_ASCII_RE.match(norm):
+        raise ValueError(
+            f"subject does not match <local>@<fqdn> shape: {raw!r}"
+        )
+    return norm
 
 
 def _b32_no_pad(raw: bytes) -> str:
@@ -112,110 +159,153 @@ class ScopeClass:
         return f"ScopeClass(kind={self.kind!r}, subject={self.subject!r})"
 
 
-# Record-name patterns. Kept narrow on purpose — anything the
-# classifier doesn't explicitly recognize falls to OPERATOR_ONLY,
-# so forgetting to extend this table fails closed, not open.
+# Record-name patterns, fail-closed.
 #
-# Identity: dmp.<user>.<domain>
-#   We accept both zone-anchored (single label 'dmp' prefix) and
-#   any deeper qualifier the CLI might choose to use; the rule is
-#   "starts with dmp." and isn't one of the other reserved
-#   prefixes.
+# SECURITY: strict-shape matches only. `startswith("slot-")` on the
+# first label without validating the REST of the name lets a crafted
+# name like `slot-1..example.com` or `slot-x.bootstrap.example.com`
+# smuggle itself through as SHARED_POOL. Anything that doesn't match
+# the full expected shape falls through to OPERATOR_ONLY (or UNKNOWN
+# when malformed), so a classifier gap widens nothing.
 #
-# Rotation: rotate.dmp.<user>.<domain> or rotate.dmp.id-<hash12>.<domain>
+# ASCII-only at the classifier level for the same reason we enforce
+# it on subjects: Unicode label equality is not safe. DNS labels in
+# any non-IDN zone are ASCII anyway; IDN support is a future milestone.
 #
-# Prekeys: pk-<id>.<hash12>.<domain>  (hash12 == first 12 hex of
-#   sha256(x25519_pubkey))
+# Shapes:
+#   Identity:  dmp.<user>.<domain>
+#   Rotation:  rotate.dmp.<user>.<domain>
+#              rotate.dmp.id-<hash12>.<domain>   (operator-only in v1)
+#   Prekey:    pk-<id>.<hash12>.<domain>
+#   Mailbox:   slot-<N>.mb-<hash12>.<domain>
+#   Chunk:     chunk-<NNNN>-<msgkey12>.<domain>
 #
-# Mailbox: slot-<N>.mb-<hash12>.<domain>
-#
-# Chunks: chunk-<NNNN>-<msgkey12>.<domain>
+# All record names are the concatenation of ASCII labels (0-9, a-z,
+# '-') separated by single dots, with no empty labels. The patterns
+# below enforce that explicitly — no relying on "just split and
+# check the first element".
+
+# Single DNS label: ASCII letters/digits/hyphen, neither starts nor
+# ends with '-', 1..63 chars. The FQDN is >=1 such label joined by
+# single dots; we use a non-anchored sub-pattern so we can compose it.
+_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+_HASH12 = r"[0-9a-f]{12}"
+
+# Username is a SINGLE label; domain is everything after it (>=2
+# labels to form a real FQDN). This matches how DMPClient addresses
+# identities: `dmp.<username>.<domain>` where username cannot contain
+# dots. Permitting a multi-label username would make the user/domain
+# split ambiguous (e.g. `dmp.alice.sub.example.co.uk` could be
+# alice@sub.example.co.uk or alice.sub.example@co.uk).
+_IDENTITY_RE = re.compile(
+    rf"^dmp\.(?P<user>{_LABEL})\.(?P<domain>{_LABEL}(?:\.{_LABEL})+)$"
+)
+_ROTATION_ZONE_RE = re.compile(
+    rf"^rotate\.dmp\.(?P<user>{_LABEL})\.(?P<domain>{_LABEL}(?:\.{_LABEL})+)$"
+)
+_ROTATION_HASH_RE = re.compile(
+    rf"^rotate\.dmp\.id-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$"
+)
+_PREKEY_RE = re.compile(
+    rf"^pk-[0-9]+\.(?P<hash12>{_HASH12})\.{_LABEL}(?:\.{_LABEL})+$"
+)
+_MAILBOX_RE = re.compile(
+    rf"^slot-[0-9]+\.mb-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$"
+)
+_CHUNK_RE = re.compile(
+    rf"^chunk-[0-9]+-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$"
+)
 
 
 def classify_name(name: str) -> ScopeClass:
     """Classify a record name for auth scope enforcement.
 
-    Parse-only: this does NOT hit the database. The returned
+    Strict-shape match, ASCII-only, fail-closed: any name that
+    doesn't fully match one of the recognized record patterns falls
+    to OPERATOR_ONLY (reserved prefix / unknown) or UNKNOWN
+    (malformed / empty labels).
+
+    This function does NOT hit the database. The returned
     :class:`ScopeClass` is then handed to
-    :meth:`TokenStore.authorize_write` along with the caller's
-    token to make the auth decision.
+    :meth:`TokenStore.authorize_write`.
     """
-    if not name:
+    if not name or not isinstance(name, str):
         return ScopeClass(ScopeClass.UNKNOWN, reason="empty name")
 
-    # Strip trailing dot; lowercase for consistent matching. DNS
-    # names are case-insensitive.
     n = name.rstrip(".").lower()
+    if not n:
+        return ScopeClass(ScopeClass.UNKNOWN, reason="name was only dots")
 
-    parts = n.split(".")
-    if len(parts) < 2:
-        return ScopeClass(ScopeClass.UNKNOWN, reason="too few labels")
+    # Reject anything outside the ASCII label alphabet (letters,
+    # digits, hyphen, dot). Catches Unicode labels that would slip
+    # past a more permissive classifier.
+    if not re.fullmatch(r"[a-z0-9.\-]+", n):
+        return ScopeClass(ScopeClass.UNKNOWN, reason="non-ASCII or disallowed chars")
 
-    first = parts[0]
+    # Empty labels (consecutive dots) are a fast-path reject. Every
+    # shape-specific regex also enforces this, but rejecting early
+    # means we don't accidentally classify something like
+    # `slot-1..example.com` based on a partial prefix match.
+    if ".." in n or n.startswith(".") or n.endswith("."):
+        return ScopeClass(ScopeClass.UNKNOWN, reason="empty label(s) in name")
 
-    # Rotation is a two-label prefix: rotate.dmp.<rest>
-    if first == "rotate":
-        if len(parts) < 3 or parts[1] != "dmp":
-            return ScopeClass(
-                ScopeClass.UNKNOWN, reason="rotate.* without dmp label"
-            )
-        # Subject = everything after 'rotate.dmp.' — either
-        # '<user>.<domain>' (zone-anchored) or 'id-<hash12>.<domain>'
-        # (hash form). The hash form cannot be mapped to a specific
-        # subject string without a lookup; we treat it as owner-
-        # exclusive with subject=None and let authorize_write
-        # reject unless the token explicitly covers it. M5.5 v1
-        # rejects hash-form rotation publishes from end-user tokens
-        # to keep the auth model simple; operators can still publish
-        # them via DMP_OPERATOR_TOKEN.
-        rest = parts[2:]
-        if rest and rest[0].startswith("id-"):
-            return ScopeClass(
-                ScopeClass.OPERATOR_ONLY,
-                reason="hash-form rotation not issuable to end-user tokens in v1",
-            )
-        if len(rest) < 2:
-            return ScopeClass(ScopeClass.UNKNOWN, reason="rotate.dmp.<user>.<domain> missing")
-        user = rest[0]
-        domain = ".".join(rest[1:])
+    # Not an FQDN at all (no dot) — malformed rather than merely
+    # reserved. Classify as UNKNOWN so the rejection path reports
+    # the root cause and we don't silently treat bare labels as
+    # operator-reserved names.
+    if "." not in n:
+        return ScopeClass(ScopeClass.UNKNOWN, reason="no dots — not an FQDN")
+
+    # Identity: dmp.<user>.<domain>  (enforced: user + at least 2 domain labels)
+    m = _IDENTITY_RE.match(n)
+    if m:
         return ScopeClass(
-            ScopeClass.OWNER_EXCLUSIVE, subject=f"{user}@{domain}",
+            ScopeClass.OWNER_EXCLUSIVE,
+            subject=f"{m.group('user')}@{m.group('domain')}",
         )
 
-    if first == "dmp":
-        # Identity record: dmp.<user>.<domain>
-        if len(parts) < 3:
-            return ScopeClass(ScopeClass.UNKNOWN, reason="dmp.* missing user/domain")
-        user = parts[1]
-        domain = ".".join(parts[2:])
+    # Rotation hash form is operator-only in v1; check before the zone form
+    # because both match 'rotate.dmp....' but the hash form has the id-*
+    # label at a fixed position.
+    if _ROTATION_HASH_RE.match(n):
         return ScopeClass(
-            ScopeClass.OWNER_EXCLUSIVE, subject=f"{user}@{domain}",
+            ScopeClass.OPERATOR_ONLY,
+            reason="hash-form rotation not issuable to end-user tokens in v1",
         )
 
-    if first.startswith("pk-"):
-        # Prekey: pk-<id>.<hash12>.<domain>. We can't map hash12 back
-        # to a subject without a DB lookup, but we CAN require that
-        # the token presents itself as the owner by including a
-        # subject-derived hash12 on the token (added in the store
-        # at issuance). The caller passes the expected hash12 in;
-        # classify_name only extracts the name's hash12.
-        if len(parts) < 3:
-            return ScopeClass(ScopeClass.UNKNOWN, reason="pk-* missing hash12/domain")
-        hash12 = parts[1]
-        # Flag as owner-exclusive with the HASH in subject; the
-        # TokenStore checks subject-hash equality.
+    # Rotation zone-anchored: rotate.dmp.<user>.<domain>
+    m = _ROTATION_ZONE_RE.match(n)
+    if m:
         return ScopeClass(
-            ScopeClass.OWNER_EXCLUSIVE, subject=f"#{hash12}",
+            ScopeClass.OWNER_EXCLUSIVE,
+            subject=f"{m.group('user')}@{m.group('domain')}",
+        )
+
+    # Prekey: pk-<id>.<hash12>.<domain>
+    m = _PREKEY_RE.match(n)
+    if m:
+        return ScopeClass(
+            ScopeClass.OWNER_EXCLUSIVE,
+            subject=f"#{m.group('hash12')}",
             reason="prekey hash-scoped",
         )
 
-    if first.startswith("slot-"):
+    # Mailbox: slot-<N>.mb-<hash12>.<domain>
+    if _MAILBOX_RE.match(n):
         return ScopeClass(ScopeClass.SHARED_POOL, reason="mailbox slot")
-    if first.startswith("chunk-"):
+
+    # Chunk: chunk-<NNNN>-<msgkey12>.<domain>
+    if _CHUNK_RE.match(n):
         return ScopeClass(ScopeClass.SHARED_POOL, reason="message chunk")
 
-    # cluster.<base> / bootstrap.<zone> / anything else reserved
-    return ScopeClass(ScopeClass.OPERATOR_ONLY, reason=f"reserved prefix: {first}")
+    # Anything else is reserved for the operator token. Includes
+    # cluster.*, bootstrap.*, and any future prefix we haven't
+    # taught the classifier yet. Fail closed — widening this table
+    # is a deliberate change, not a classifier oversight.
+    return ScopeClass(
+        ScopeClass.OPERATOR_ONLY,
+        reason="reserved or unrecognized record namespace",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +448,14 @@ class TokenStore:
         same subject; callers who want "one live token per subject"
         semantics should revoke first. The self-service registration
         flow enforces this via its challenge-verify step.
+
+        The ``subject`` is NFKC-normalized, lowercased, and required
+        to match the ASCII ``<local>@<fqdn>`` shape — this closes
+        the Unicode-homoglyph bypass where
+        ``a４ce@example.com`` and ``alice@example.com`` would
+        compare equal under plain ``.lower()``.
         """
+        subject = canonicalize_subject(subject)
         token = generate_token()
         token_hash = _sha256_hex(token)
         now = int(time.time())
@@ -431,7 +528,16 @@ class TokenStore:
             return updated
 
     def revoke_by_subject(self, subject: str, *, remote_addr: str = "") -> int:
-        """Revoke every live token for ``subject``. Returns the count revoked."""
+        """Revoke every live token for ``subject``. Returns the count revoked.
+
+        The subject is canonicalized before lookup so a lookup of
+        ``Alice@Example.com`` matches rows issued as ``alice@example.com``.
+        Malformed / non-ASCII subjects raise before touching the DB.
+        """
+        try:
+            subject = canonicalize_subject(subject)
+        except ValueError:
+            return 0
         now = int(time.time())
         with self._lock:
             cur = self._conn.execute(
@@ -473,8 +579,16 @@ class TokenStore:
         if not include_revoked:
             clauses.append("revoked_at IS NULL")
         if subject:
-            clauses.append("subject = ?")
-            args.append(subject)
+            try:
+                subject = canonicalize_subject(subject)
+            except ValueError:
+                # An invalid subject filter matches nothing, not
+                # every row. Add an impossible clause so the query
+                # returns [] without us special-casing the return.
+                clauses.append("1=0")
+            else:
+                clauses.append("subject = ?")
+                args.append(subject)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY issued_at DESC"
@@ -562,7 +676,13 @@ class TokenStore:
                             reason="subject hash does not match record namespace",
                         )
                 else:
-                    if row.subject.lower() != expected.lower():
+                    # Both sides already canonical: row.subject went
+                    # through canonicalize_subject at issuance, and
+                    # `expected` comes from classify_name which is
+                    # already ASCII-lowercase (non-ASCII names fall
+                    # to UNKNOWN earlier in this function). Plain
+                    # equality is sufficient; no .lower() needed.
+                    if row.subject != expected:
                         self._audit(
                             "rejected",
                             token_hash=token_hash, subject=row.subject,

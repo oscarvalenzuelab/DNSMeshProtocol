@@ -119,6 +119,122 @@ class TestClassifyName:
         assert classify_name("dmp").kind == ScopeClass.UNKNOWN
 
 
+class TestClassifyRegressions:
+    """Regression tests for codex-flagged fail-open bypasses."""
+
+    def test_slot_with_empty_label_rejected(self) -> None:
+        # Without strict shape validation, `slot-1..example.com` would
+        # classify as SHARED_POOL on first-label prefix alone.
+        s = classify_name("slot-1..example.com")
+        assert s.kind == ScopeClass.UNKNOWN
+
+    def test_slot_without_mb_label_rejected(self) -> None:
+        # A name whose first label is slot-* but whose second label
+        # isn't `mb-<hash12>` is malformed, not a mailbox.
+        s = classify_name("slot-1.dmp.alice.example.com")
+        assert s.kind != ScopeClass.SHARED_POOL
+
+    def test_slot_bogus_hash12_rejected(self) -> None:
+        # hash12 must be exactly 12 hex chars; a shorter string
+        # would previously sneak through.
+        s = classify_name("slot-1.mb-abc.example.com")
+        assert s.kind != ScopeClass.SHARED_POOL
+
+    def test_chunk_with_bootstrap_suffix_rejected(self) -> None:
+        # `chunk-x.bootstrap.example.com` used to be SHARED_POOL on
+        # first-label startswith match; now rejected.
+        s = classify_name("chunk-x.bootstrap.example.com")
+        assert s.kind != ScopeClass.SHARED_POOL
+
+    def test_chunk_wrong_prefix_shape_rejected(self) -> None:
+        s = classify_name("chunk-foo-bar.example.com")
+        assert s.kind != ScopeClass.SHARED_POOL
+
+    def test_non_ascii_name_rejected(self) -> None:
+        # Unicode labels must not slip through — DMP names are ASCII
+        # only. Uses fullwidth Latin 'a' which lowercases differently
+        # but looks like ASCII.
+        s = classify_name("dmp.ａlice.example.com")
+        assert s.kind == ScopeClass.UNKNOWN
+
+    def test_leading_or_trailing_dot_rejected(self) -> None:
+        assert classify_name(".dmp.alice.example.com").kind == ScopeClass.UNKNOWN
+
+    def test_identity_requires_single_label_user(self) -> None:
+        # dmp.<user>.<domain> — user must be a single label, otherwise
+        # user/domain split is ambiguous.
+        s = classify_name("dmp.alice.sub.example.com")
+        # alice, sub.example.com — this is the intended interpretation.
+        assert s.kind == ScopeClass.OWNER_EXCLUSIVE
+        assert s.subject == "alice@sub.example.com"
+
+
+class TestCanonicalizeSubject:
+    """Regression tests for the Unicode-homoglyph subject-compare P1."""
+
+    def test_plain_ascii_passes_through(self) -> None:
+        from dmp.server.tokens import canonicalize_subject
+        assert canonicalize_subject("alice@example.com") == "alice@example.com"
+
+    def test_case_is_lowered(self) -> None:
+        from dmp.server.tokens import canonicalize_subject
+        assert canonicalize_subject("Alice@Example.Com") == "alice@example.com"
+
+    def test_nfkc_compatibility_character_rejected_or_canonicalized(self) -> None:
+        from dmp.server.tokens import canonicalize_subject
+        # Fullwidth Latin 'a' (U+FF41) normalizes to ASCII 'a' under
+        # NFKC; after normalization it passes ASCII + shape.
+        out = canonicalize_subject("ａlice@example.com")
+        assert out == "alice@example.com"
+
+    def test_non_nfkc_unicode_rejected(self) -> None:
+        from dmp.server.tokens import canonicalize_subject
+        # Cyrillic 'а' (U+0430) looks like Latin 'a' but has no ASCII
+        # NFKC mapping — must be rejected.
+        with pytest.raises(ValueError):
+            canonicalize_subject("аlice@example.com")
+
+    def test_empty_subject_rejected(self) -> None:
+        from dmp.server.tokens import canonicalize_subject
+        with pytest.raises(ValueError):
+            canonicalize_subject("")
+        with pytest.raises(ValueError):
+            canonicalize_subject("   ")
+
+    def test_malformed_shape_rejected(self) -> None:
+        from dmp.server.tokens import canonicalize_subject
+        for bad in [
+            "noatsign",
+            "@example.com",
+            "alice@",
+            "alice@example",  # need >=2 domain labels
+            "alice with space@example.com",
+        ]:
+            with pytest.raises(ValueError, match="subject"):
+                canonicalize_subject(bad)
+
+    def test_issue_canonicalizes(self, store: TokenStore) -> None:
+        _, row = store.issue("Alice@Example.COM")
+        assert row.subject == "alice@example.com"
+
+    def test_issue_rejects_non_ascii(self, store: TokenStore) -> None:
+        with pytest.raises(ValueError):
+            store.issue("аlice@example.com")  # Cyrillic 'а'
+
+    def test_homoglyph_does_not_authorize(self, store: TokenStore) -> None:
+        """The headline P1 regression: a token for one subject must
+        not authorize writes under a visually-identical but distinct
+        subject."""
+        # Token for Cyrillic-а subject cannot be issued at all.
+        with pytest.raises(ValueError):
+            store.issue("аlice@example.com")
+        # Plain ASCII token cannot publish under a Cyrillic-lookalike
+        # record name either — classify_name rejects non-ASCII.
+        token, _ = store.issue("alice@example.com")
+        r = store.authorize_write(token, "dmp.аlice.example.com")
+        assert not r.ok
+
+
 # ---------------------------------------------------------------------------
 # Store: issuance / revocation / lookup
 # ---------------------------------------------------------------------------
