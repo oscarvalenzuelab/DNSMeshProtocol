@@ -139,6 +139,48 @@ class TestMultiTenantMissingCreds:
         assert _post(api, "dmp.alice.example.com", "not-a-real-token") == 401
 
 
+class TestMultiTenantRateLimit:
+    """Regression for codex P2: per-token rate limit must actually throttle."""
+
+    def test_rate_per_sec_1_burst_1_allows_one_then_throttles(self, mt_setup):
+        api, _, tokens = mt_setup
+        # rate=1/s, burst=1 — first request goes through, immediate second
+        # should 429 because the bucket can't refill in the time between.
+        token, _ = tokens.issue(
+            "alice@example.com", rate_per_sec=1.0, rate_burst=1,
+        )
+        assert _post(api, "dmp.alice.example.com", token) == 201
+        assert _post(api, "dmp.alice.example.com", token) == 429
+
+    def test_throttle_applies_to_shared_pool_too(self, mt_setup):
+        api, _, tokens = mt_setup
+        token, _ = tokens.issue(
+            "alice@example.com", rate_per_sec=1.0, rate_burst=1,
+        )
+        # First chunk write against burst=1 passes; second trips the bucket.
+        assert _post(api, "chunk-0001-abcdef012345.example.com", token) == 201
+        assert _post(api, "chunk-0002-abcdef012345.example.com", token) == 429
+
+    def test_revoke_clears_in_memory_bucket(self, mt_setup):
+        api, _, tokens = mt_setup
+        token, row = tokens.issue(
+            "alice@example.com", rate_per_sec=1.0, rate_burst=1,
+        )
+        _ = _post(api, "dmp.alice.example.com", token)  # consume 1
+        tokens.revoke(row.token_hash)
+        # Now revoked — should be 401, not 429. Verifies that the
+        # rate-limiter's "already thirsty" bucket doesn't mask the
+        # revocation.
+        assert _post(api, "dmp.alice.example.com", token) == 401
+
+    def test_operator_token_is_not_rate_limited(self, mt_setup):
+        api, _, _ = mt_setup
+        # Operator short-circuit bypasses the TokenStore entirely, so
+        # per-token rate limits don't apply to it.
+        for _ in range(10):
+            assert _post(api, "dmp.alice.example.com", "op-token") == 201
+
+
 class TestMultiTenantDelete:
     def test_user_can_delete_own_identity(self, mt_setup):
         api, store, tokens = mt_setup

@@ -110,6 +110,14 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         # Use constant-time compare to keep token-guessing timing-free.
         return len(header) == len(expected) and _consteq(header, expected)
 
+    def _auth_failure_response(self) -> tuple:
+        """Pick the right status + body when _authorize_record_write()
+        returned False. AuthResult.throttled -> 429; anything else -> 401."""
+        result = getattr(self, "_last_auth_result", None)
+        if result is not None and getattr(result, "throttled", False):
+            return 429, {"error": "per-token rate limit exceeded"}
+        return 401, {"error": "unauthorized"}
+
     def _extract_presented_token(self) -> str:
         """Return the raw token material from the Authorization header,
         or '' if none was presented. The 'Bearer ' prefix is stripped."""
@@ -162,6 +170,12 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             record_name,
             remote_addr=self.client_address[0] if self.client_address else "",
         )
+        # Stash the AuthResult on the handler so the POST/DELETE
+        # caller can translate ``throttled`` to HTTP 429 rather than
+        # the default 401. AuthResult.throttled implies the token was
+        # otherwise valid and scoped correctly — the failure is a
+        # per-token rate limit, not an authz rejection.
+        self._last_auth_result = result
         return bool(result.ok)
 
     def _sync_authorized(self) -> bool:
@@ -288,8 +302,9 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         # checked against the record name; in legacy / open modes the
         # record name is ignored but the check still happens.
         if not self._authorize_record_write(name):
-            self._send_json(401, {"error": "unauthorized"})
-            return 401
+            status, payload = self._auth_failure_response()
+            self._send_json(status, payload)
+            return status
         writer = self._writer()
         if writer is None:
             self._send_json(501, {"error": "writer not configured"})
@@ -358,8 +373,9 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         if not self._check_rate_limit():
             return 429
         if not self._authorize_record_write(name):
-            self._send_json(401, {"error": "unauthorized"})
-            return 401
+            status, payload = self._auth_failure_response()
+            self._send_json(status, payload)
+            return status
         writer = self._writer()
         if writer is None:
             self._send_json(501, {"error": "writer not configured"})
