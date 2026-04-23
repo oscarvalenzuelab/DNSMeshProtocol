@@ -340,7 +340,10 @@ class TokenRow:
 class AuthResult:
     """Outcome of TokenStore.authorize_write. Exposes:
 
-    - ``ok``: True iff the request is authorized.
+    - ``ok``: True iff the request is authorized AND not rate-limited.
+    - ``throttled``: True iff authorization succeeded but the token's
+      per-token rate-limit bucket is empty. Distinguishes 401-worthy
+      failures from 429-worthy ones on the HTTP side.
     - ``row``: the live TokenRow that authorized it (or None).
     - ``scope``: the ScopeClass classification that applied.
     - ``reason``: human-readable rejection reason when ``ok`` is False.
@@ -348,17 +351,19 @@ class AuthResult:
       to log the subject in audit.
     """
 
-    __slots__ = ("ok", "row", "scope", "reason")
+    __slots__ = ("ok", "throttled", "row", "scope", "reason")
 
     def __init__(
         self,
         ok: bool,
         *,
+        throttled: bool = False,
         row: Optional[TokenRow] = None,
         scope: Optional[ScopeClass] = None,
         reason: str = "",
     ):
         self.ok = ok
+        self.throttled = throttled
         self.row = row
         self.scope = scope
         self.reason = reason
@@ -369,6 +374,68 @@ class AuthResult:
 
     def __bool__(self) -> bool:  # pragma: no cover — convenience
         return self.ok
+
+
+# ---------------------------------------------------------------------------
+# Per-token rate limiter — independent of the per-IP limiter in
+# dmp.server.rate_limit. Buckets are keyed by token_hash so a token with
+# rate_per_sec=1 throttles at 1 rps regardless of source IP.
+# ---------------------------------------------------------------------------
+
+
+class _PerTokenBucket:
+    """Minimal thread-safe token-bucket keyed by token_hash.
+
+    The per-IP ``TokenBucketLimiter`` in dmp.server.rate_limit uses a
+    single ``RateLimit`` for all keys. We need per-key rate + burst
+    because each issued token carries its own ``rate_per_sec`` and
+    ``rate_burst``. Rather than extend that limiter's surface, keep a
+    purpose-built one here — small, obvious, and scoped to M5.5.
+    """
+
+    __slots__ = ("_lock", "_buckets", "_max_tracked")
+
+    def __init__(self, max_tracked: int = 10_000) -> None:
+        self._lock = threading.Lock()
+        # token_hash -> (tokens_remaining, last_refill_monotonic)
+        self._buckets: dict = {}
+        self._max_tracked = max_tracked
+
+    def allow(self, token_hash: str, rate_per_sec: float, burst: int) -> bool:
+        """Spend 1 unit against the bucket. Return False if throttled.
+
+        Disabled (always-allow) when rate_per_sec <= 0 OR burst <= 0 —
+        mirroring the semantics of RateLimit.enabled in rate_limit.py.
+        """
+        if rate_per_sec <= 0 or burst <= 0:
+            return True
+        now = time.monotonic()
+        with self._lock:
+            tokens, last = self._buckets.get(token_hash, (float(burst), now))
+            tokens = min(float(burst), tokens + (now - last) * rate_per_sec)
+            if tokens < 1.0:
+                # Store the refilled-but-still-empty state so rapid
+                # retries don't refill from the original timestamp.
+                self._buckets[token_hash] = (tokens, now)
+                self._evict_if_needed()
+                return False
+            self._buckets[token_hash] = (tokens - 1.0, now)
+            self._evict_if_needed()
+            return True
+
+    def forget(self, token_hash: str) -> None:
+        """Drop a bucket — called on revoke so revoked tokens don't
+        hold memory."""
+        with self._lock:
+            self._buckets.pop(token_hash, None)
+
+    def _evict_if_needed(self) -> None:
+        # LRU-ish: just trim arbitrary entries when we hit the ceiling.
+        # Simpler than OrderedDict housekeeping and the bucket cap is
+        # a memory guard, not a correctness guarantee.
+        if len(self._buckets) > self._max_tracked:
+            for k in list(self._buckets.keys())[: len(self._buckets) - self._max_tracked]:
+                self._buckets.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +489,11 @@ class TokenStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Per-token rate limiter. In-memory, ephemeral by design —
+        # rate state doesn't survive a node restart, matching how the
+        # per-IP limiter behaves. Reissuing a throttled token via a
+        # restart is a documented failure mode in the operator guide.
+        self._rate_limiter = _PerTokenBucket()
 
     # ---- issuance ----------------------------------------------------------
 
@@ -525,7 +597,12 @@ class TokenStore:
                     now=now,
                 )
             self._conn.commit()
-            return updated
+        if updated:
+            # Drop the in-memory rate bucket so a revoked token doesn't
+            # leave state hanging around. Outside the DB lock because
+            # the rate limiter has its own lock.
+            self._rate_limiter.forget(token_hash)
+        return updated
 
     def revoke_by_subject(self, subject: str, *, remote_addr: str = "") -> int:
         """Revoke every live token for ``subject``. Returns the count revoked.
@@ -695,6 +772,27 @@ class TokenStore:
                             reason="subject does not match record owner",
                         )
 
+                # Per-token rate limit: check AFTER the authz decision
+                # so a rejected auth still logs 'rejected' (not
+                # 'throttled'). If the bucket is empty we log
+                # 'throttled' and return ok=False, throttled=True —
+                # the HTTP layer translates to 429.
+                if not self._rate_limiter.allow(
+                    token_hash, row.rate_per_sec, row.rate_burst
+                ):
+                    if log_use:
+                        self._audit(
+                            "throttled",
+                            token_hash=token_hash, subject=row.subject,
+                            remote_addr=remote_addr,
+                            detail="owner-exclusive",
+                        )
+                        self._conn.commit()
+                    return AuthResult(
+                        False, throttled=True, row=row, scope=scope,
+                        reason="per-token rate limit exceeded",
+                    )
+
                 if log_use:
                     self._audit(
                         "used",
@@ -707,7 +805,25 @@ class TokenStore:
 
             # Shared pool: any live token is fine. Deliberately do
             # NOT populate token_hash / subject on the audit row —
-            # that's the split-audit policy.
+            # that's the split-audit policy. Per-token rate limit is
+            # enforced the same way as for owner-exclusive, but the
+            # throttled audit row ALSO drops token_hash/subject to
+            # keep the split-audit invariant: an operator with the DB
+            # cannot tell which user was throttled on a chunk write.
+            if not self._rate_limiter.allow(
+                token_hash, row.rate_per_sec, row.rate_burst
+            ):
+                if log_use:
+                    self._audit(
+                        "throttled",
+                        remote_addr=remote_addr,
+                        detail="shared-pool",
+                    )
+                    self._conn.commit()
+                return AuthResult(
+                    False, throttled=True, row=row, scope=scope,
+                    reason="per-token rate limit exceeded",
+                )
             if log_use:
                 self._audit(
                     "used", remote_addr=remote_addr, detail="shared-pool",
