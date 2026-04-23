@@ -59,6 +59,7 @@ setup(
     entry_points={
         "console_scripts": [
             "dmp = dmp.cli:main",
+            "dmp-node-admin = dmp.server.admin:main",
         ],
     },
 )
