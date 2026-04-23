@@ -26,6 +26,7 @@ import ipaddress
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -118,10 +119,17 @@ class CLIConfig:
     # must explicitly `bootstrap pin` or pass anchors per-call.
     bootstrap_user_domain: str = ""  # e.g. "example.com"
     bootstrap_signer_spk: str = ""  # hex Ed25519 pubkey of the zone operator
-    # Each contact is {"pub": <x25519 hex>, "spk": <ed25519 hex or "">}.
+    # Each contact is {"pub": <x25519 hex>, "spk": <ed25519 hex or "">,
+    # "domain": <remote host or "">}.
     # `spk` may be empty for contacts added before Ed25519 pinning landed
     # (and for the `contacts add` shortcut that doesn't require a signing
     # key). Pinned `spk` is what gates incoming manifests from that sender.
+    # `domain` holds the remote host for a contact added via
+    # `dmp identity fetch user@host --add`; it's consulted by the
+    # rotation fallback so chain walks resolve against the remote zone
+    # (not the operator's local effective domain). Legacy configs predating
+    # this field leave it empty and fall back to the local effective
+    # domain for all addressing (back-compat).
     contacts: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
     @classmethod
@@ -136,11 +144,16 @@ class CLIConfig:
         for name, value in raw_contacts.items():
             if isinstance(value, str):
                 # Legacy format: username -> pubkey_hex.
-                contacts[name] = {"pub": value, "spk": ""}
+                contacts[name] = {"pub": value, "spk": "", "domain": ""}
             elif isinstance(value, dict):
+                # `domain` is optional (added post-M5.4 for cross-zone
+                # rotation-chain walks). Absent means "use the local
+                # effective domain" — preserves behavior for pre-existing
+                # `{pub, spk}` entries.
                 contacts[name] = {
                     "pub": value.get("pub", ""),
                     "spk": value.get("spk", ""),
+                    "domain": value.get("domain", ""),
                 }
         raw_resolvers = data.get("dns_resolvers", []) or []
         # Be generous in what we accept: a single-string config (legacy
@@ -727,15 +740,24 @@ def _make_client(
     # intentionally unintrusive — we do not modify DMPClient itself,
     # per the M2.wire hard-rules constraint.
     client._cluster_client = cluster_client  # type: ignore[attr-defined]
-    # Contacts must use the same effective domain as the client itself;
-    # otherwise send_message() builds prekey_rrset_name under the legacy
-    # domain while refresh_prekeys publishes under the cluster base,
-    # silently disabling forward secrecy on every send.
+    # Contacts must use the same effective domain as the client itself
+    # for mailbox-local addressing (slot/chunk RRsets); otherwise
+    # send_message() builds prekey_rrset_name under the legacy domain
+    # while refresh_prekeys publishes under the cluster base, silently
+    # disabling forward secrecy on every send.
+    #
+    # For CROSS-ZONE contacts (pinned via `dmp identity fetch
+    # alice@other-zone.example --add`), we persist the remote host as
+    # `entry.domain`. Using that here lets the rotation-chain walker
+    # resolve against the remote zone's `rotate.dmp.<remote-host>`
+    # RRset. Legacy contacts (no `domain` field) fall back to the
+    # local effective domain — back-compat for pre-M5.4 configs.
     for name, entry in config.contacts.items():
+        contact_domain = entry.get("domain", "") or effective_domain
         client.add_contact(
             name,
             entry.get("pub", ""),
-            domain=effective_domain,
+            domain=contact_domain,
             signing_key_hex=entry.get("spk", ""),
         )
     return client
@@ -906,6 +928,374 @@ def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
         _close_client(client)
 
 
+def cmd_identity_rotate(args: argparse.Namespace) -> int:
+    """EXPERIMENTAL (M5.4): rotate the user identity key.
+
+    Publishes a co-signed RotationRecord at the user's rotation RRset
+    plus a fresh IdentityRecord for the new key at the user's identity
+    RRset.
+
+    With ``--reason compromise`` or ``--reason lost_key`` (opt-in; NOT
+    the default ``routine``), the command ALSO publishes a self-signed
+    RevocationRecord for the OLD key at the rotation RRset. A
+    revocation tells rotation-aware fetchers to refuse the old key
+    forever. Routine rotations deliberately skip the revocation: the
+    chain walker aborts trust if any key on the walked path is revoked,
+    so publishing a revocation on every rotation would break the
+    headline auto-follow workflow.
+
+    Clients that can't walk a chain (older versions, or legacy flows)
+    disambiguate the identity RRset via the RotationRecord ``old_spk``
+    list: any IdentityRecord whose ed25519_spk appears as an ``old_spk``
+    is treated as superseded.
+
+    With ``--yes``, the command ALSO performs the local swap atomically:
+    the config's ``kdf_salt`` stays the same, the ``passphrase_file``
+    is pointed at the new passphrase file (if ``--new-passphrase-file``
+    was provided), so the next config load + passphrase derive yields
+    the same keypair the rotation just published. Without ``--yes``
+    the command still publishes (after the interactive confirmation),
+    but leaves the on-disk identity untouched — the operator must
+    manually point their passphrase source at the new passphrase; do
+    NOT regenerate ``kdf_salt``, because the current salt + new
+    passphrase is what derives the rotated keypair.
+
+    Wire format subject to revision after the M4 external crypto audit;
+    v0.3.0 may introduce a breaking ``v=dmp2;t=rotation;``. See
+    ``docs/protocol/rotation.md``.
+    """
+    if not getattr(args, "experimental", False):
+        _die(
+            1,
+            "key rotation is EXPERIMENTAL and subject to revision after the "
+            "external crypto audit — re-run with --experimental to proceed.",
+        )
+
+    # Print a loud banner so the operator cannot miss the caveat.
+    print(
+        "WARNING: identity rotation is EXPERIMENTAL.",
+        file=sys.stderr,
+    )
+    print(
+        "  The wire format for rotation + revocation records is draft and "
+        "may change in v0.3.0 after the external crypto audit.",
+        file=sys.stderr,
+    )
+    print(
+        "  See docs/protocol/rotation.md for the threat model and limits.",
+        file=sys.stderr,
+    )
+
+    from dmp.core.identity import (
+        identity_domain,
+        make_record,
+        zone_anchored_identity_name,
+    )
+    from dmp.core.rotation import (
+        REASON_COMPROMISE,
+        REASON_LOST_KEY,
+        RevocationRecord,
+        RotationRecord,
+        SUBJECT_TYPE_USER_IDENTITY,
+        rotation_rrset_name_user_identity,
+        rotation_rrset_name_zone_anchored,
+    )
+
+    cfg = CLIConfig.load(_config_path())
+
+    # Load the CURRENT identity via the usual passphrase path.
+    old_passphrase = _load_passphrase(cfg)
+
+    # Load the NEW identity material from --new-passphrase-file, or an
+    # env var, or an interactive prompt. We deliberately avoid accepting
+    # the new passphrase on argv — it would end up in shell history.
+    new_passphrase: Optional[str] = None
+    if args.new_passphrase_file:
+        fp = Path(args.new_passphrase_file).expanduser()
+        if not fp.exists():
+            _die(1, f"--new-passphrase-file: {fp} does not exist")
+        new_passphrase = fp.read_text().strip()
+    elif env_pw := os.environ.get("DMP_NEW_PASSPHRASE"):
+        new_passphrase = env_pw
+    else:
+        new_passphrase = getpass.getpass("New passphrase: ")
+    if not new_passphrase:
+        _die(1, "new passphrase is empty")
+
+    # Build the two DMPCrypto identities. Both use the SAME kdf_salt as
+    # the existing config: two passphrases with the same salt produce
+    # different keys, and re-using the salt matches how a real operator
+    # would rotate (they don't want to re-randomize the salt mid-flow).
+    kdf_salt = bytes.fromhex(cfg.kdf_salt) if cfg.kdf_salt else None
+    from dmp.core.crypto import DMPCrypto
+
+    old_crypto = DMPCrypto.from_passphrase(old_passphrase, salt=kdf_salt)
+    new_crypto = DMPCrypto.from_passphrase(new_passphrase, salt=kdf_salt)
+
+    if (
+        old_crypto.get_signing_public_key_bytes()
+        == new_crypto.get_signing_public_key_bytes()
+    ):
+        _die(
+            1,
+            "new passphrase derives the same key as the current one — "
+            "choose a distinct passphrase for rotation to take effect",
+        )
+
+    # Confirmation gate unless --yes. Rotation is a protocol-visible
+    # event and we want the operator to eyeball the new fingerprint
+    # before publishing.
+    new_spk_hex = new_crypto.get_signing_public_key_bytes().hex()
+    print(f"current signing key: {old_crypto.get_signing_public_key_bytes().hex()}")
+    print(f"new signing key:     {new_spk_hex}")
+    if not args.yes:
+        resp = input("Publish RotationRecord? [y/N] ").strip().lower()
+        if resp not in ("y", "yes"):
+            print("aborted.")
+            return 1
+
+    # Construct the subject. We use the zone-anchored form when the
+    # config has identity_domain set (so subject = user@identity_domain);
+    # otherwise fall back to user@effective_domain.
+    effective_domain = _effective_domain(cfg)
+    if cfg.identity_domain:
+        subject = f"{cfg.username}@{cfg.identity_domain}"
+    else:
+        subject = f"{cfg.username}@{effective_domain}"
+
+    # Seq numbering: millisecond-resolution unix time. Chosen so two
+    # rotations fired back-to-back within the same second (a test
+    # re-rotate, a scripted disaster recovery cutover) still produce
+    # strictly-monotonic seq values — the chain walker rejects
+    # same-seq hops (seq must STRICTLY increase), so second-resolution
+    # would leave the second rotation invisible until contacts re-pin
+    # manually. Uses uint64; ms epoch won't overflow until ~year 292M.
+    # Documented as ms in docs/protocol/rotation.md alongside ts (which
+    # stays at second resolution — seq is NOT a wall-clock timestamp,
+    # it's a monotonic ordering number that happens to be clock-derived).
+    now_ms = int(time.time() * 1000)
+    seq = now_ms
+    ts = int(time.time())
+
+    rotation = RotationRecord(
+        subject_type=SUBJECT_TYPE_USER_IDENTITY,
+        subject=subject,
+        old_spk=old_crypto.get_signing_public_key_bytes(),
+        new_spk=new_crypto.get_signing_public_key_bytes(),
+        seq=seq,
+        ts=ts,
+        exp=ts + int(args.exp_seconds),
+    )
+    try:
+        rotation_wire = rotation.sign(old_crypto, new_crypto)
+    except ValueError as exc:
+        _die(1, f"failed to co-sign RotationRecord: {exc}")
+
+    # Revocation policy depends on --reason.
+    #
+    # compromise / lost_key: publish a RevocationRecord for the old
+    # key. Contacts using rotation-chain walking will ABORT trust on
+    # the old key entirely (correct — it's no longer safe to follow
+    # ANY chain starting from the compromised key; holders of the old
+    # key must re-pin out-of-band). Non-rotation-aware contacts
+    # running `dmp identity fetch` will filter the old identity
+    # record out of the mailbox-name RRset and see only the new one.
+    #
+    # routine: do NOT publish a revocation. A routine rotation is a
+    # hygiene step, not a compromise; contacts should auto-follow
+    # A→B via chain walk, which would be impossible if we published
+    # a revocation of A (the walker aborts on any path-revocation).
+    # For non-rotation-aware fetchers, the multi-record ambiguity
+    # is resolved by `cmd_identity_fetch` which now prefers the
+    # chain-head identity when a rotation exists — see finding-3
+    # follow-up in docs/protocol/rotation.md.
+    reason_str = (getattr(args, "reason", "routine") or "routine").lower()
+    revocation_wire: Optional[str] = None
+    if reason_str in ("compromise", "lost_key"):
+        reason_code = (
+            REASON_COMPROMISE if reason_str == "compromise" else REASON_LOST_KEY
+        )
+        revocation = RevocationRecord(
+            subject_type=SUBJECT_TYPE_USER_IDENTITY,
+            subject=subject,
+            revoked_spk=old_crypto.get_signing_public_key_bytes(),
+            reason_code=reason_code,
+            ts=ts,
+        )
+        try:
+            revocation_wire = revocation.sign(old_crypto)
+        except ValueError as exc:
+            _die(1, f"failed to sign RevocationRecord: {exc}")
+
+    # Publish. Needs a writer; go through _make_client to get the same
+    # transport the rest of the CLI uses. We use the OLD passphrase for
+    # this client — it's still the on-disk identity.
+    client = _make_client(cfg, old_passphrase)
+    try:
+        if cfg.identity_domain:
+            rrset_name = rotation_rrset_name_zone_anchored(cfg.identity_domain)
+            identity_rrset = zone_anchored_identity_name(cfg.identity_domain)
+        else:
+            rrset_name = rotation_rrset_name_user_identity(
+                cfg.username, effective_domain
+            )
+            identity_rrset = identity_domain(cfg.username, effective_domain)
+
+        ok = client.writer.publish_txt_record(
+            rrset_name, rotation_wire, ttl=int(args.ttl)
+        )
+        if not ok:
+            _die(2, f"publish of RotationRecord to {rrset_name} failed")
+        print(f"published RotationRecord to {rrset_name}")
+
+        # Revocation publish is conditional on --reason. Routine rotations
+        # deliberately skip it so contacts can auto-follow via chain walk.
+        # See revocation-policy docstring above.
+        if revocation_wire is not None:
+            ok_rev = client.writer.publish_txt_record(
+                rrset_name, revocation_wire, ttl=int(args.ttl)
+            )
+            if not ok_rev:
+                print(
+                    f"warning: RotationRecord published, but RevocationRecord "
+                    f"of the old key FAILED to publish at {rrset_name} — "
+                    f"non-rotation-aware `dmp identity fetch` will see BOTH "
+                    f"the old and new IdentityRecords and exit ambiguous. "
+                    f"Re-publish the revocation manually.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"published RevocationRecord (old key, "
+                    f"reason={reason_str}) to {rrset_name}"
+                )
+        else:
+            print(
+                "reason=routine: skipping RevocationRecord so "
+                "rotation_chain_enabled contacts can auto-follow the new key"
+            )
+
+        # Also publish a fresh IdentityRecord for the NEW key so that
+        # non-rotation-aware contacts still see the new key pinned
+        # correctly on a plain `dmp identity fetch`.
+        new_identity = make_record(new_crypto, cfg.username)
+        ok = client.writer.publish_txt_record(
+            identity_rrset, new_identity.sign(new_crypto), ttl=int(args.ttl)
+        )
+        if not ok:
+            print(
+                f"warning: RotationRecord published, but IdentityRecord "
+                f"for the new key FAILED to publish at {identity_rrset} — "
+                f"re-run `dmp identity publish` after updating the local "
+                f"config to the new passphrase.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"published new IdentityRecord to {identity_rrset}")
+    finally:
+        _close_client(client)
+
+    # Atomic local identity swap under --yes. The load-bearing insight:
+    # the same kdf_salt + new passphrase derives the new keypair the
+    # rotation just published. So we keep the salt, point the passphrase
+    # source at the new passphrase file, and the next config load yields
+    # the rotated identity with no re-init required.
+    swapped_locally = False
+    env_passphrase_mismatch = False
+    if args.yes:
+        new_pp_file = args.new_passphrase_file
+        if new_pp_file:
+            # Subtle footgun: `_load_passphrase` prefers DMP_PASSPHRASE
+            # over the file. If the operator rotated while the OLD
+            # DMP_PASSPHRASE is still exported in their shell, every
+            # subsequent `dmp *` command keeps deriving the OLD
+            # identity — "atomic swap" would be a lie. Detect the
+            # mismatch and refuse to claim success; a matching env var
+            # (operator already rotated their shell) is silently fine.
+            env_pp = os.environ.get("DMP_PASSPHRASE")
+            if env_pp is not None:
+                try:
+                    new_pp_contents = Path(new_pp_file).expanduser().read_text().strip()
+                except OSError as exc:
+                    _die(
+                        1,
+                        f"--new-passphrase-file {new_pp_file!r} is not readable: {exc}",
+                    )
+                if env_pp != new_pp_contents:
+                    env_passphrase_mismatch = True
+            cfg.passphrase_file = str(Path(new_pp_file).expanduser())
+            cfg.save(_config_path())
+            swapped_locally = True
+            print(
+                f"local identity swapped atomically (config.yaml "
+                f"passphrase_file -> {cfg.passphrase_file}; kdf_salt "
+                f"preserved). Local pubkey: {new_spk_hex}"
+            )
+            if env_passphrase_mismatch:
+                # Non-zero exit so the operator can't miss it in a script.
+                # The rotation was published (publish succeeded above) and
+                # the config file was rewritten — there's nothing to
+                # unwind. The operator just needs to fix their shell.
+                print(
+                    "WARNING: DMP_PASSPHRASE is set in your environment "
+                    "and does not match the contents of "
+                    f"--new-passphrase-file ({new_pp_file}); "
+                    "`_load_passphrase` prefers the env var over the "
+                    "file, so subsequent `dmp` commands in this shell "
+                    "will keep deriving the OLD identity. Run "
+                    "`unset DMP_PASSPHRASE` or "
+                    "`export DMP_PASSPHRASE=<new>` to finish the swap.",
+                    file=sys.stderr,
+                )
+        else:
+            # New passphrase came from DMP_NEW_PASSPHRASE or interactive
+            # prompt — no file path to persist. The operator must set
+            # DMP_PASSPHRASE=<new> on subsequent invocations (or
+            # subsequently point `passphrase_file` at a new file and
+            # re-run) for the on-disk identity to match the published
+            # rotation. kdf_salt stays as-is.
+            print(
+                "note: --yes without --new-passphrase-file leaves the "
+                "config's passphrase source untouched; set "
+                "DMP_PASSPHRASE=<new> on subsequent invocations. "
+                f"kdf_salt is preserved; current salt + new passphrase "
+                f"derives pubkey {new_spk_hex}."
+            )
+
+    print()
+    print("Next steps:")
+    print(
+        "  1. Pinned contacts running with rotation_chain_enabled=True will "
+        "pick up the new key automatically."
+    )
+    print(
+        "  2. Other contacts must manually re-pin: "
+        "`dmp identity fetch <user>@<host> --add` against the new key."
+    )
+    if swapped_locally:
+        print(
+            "  3. The local identity has already been swapped atomically; "
+            "`dmp identity show` will report the new pubkey. `dmp identity "
+            "publish` will re-publish the new IdentityRecord under the "
+            "rotated key."
+        )
+    else:
+        print(
+            "  3. Point your passphrase source at the new passphrase "
+            "(edit `passphrase_file` in config.yaml, or set DMP_PASSPHRASE). "
+            "Do NOT regenerate kdf_salt — the current salt + new passphrase "
+            "derives the rotated keypair. Re-running `dmp init --force` "
+            "would break local adoption."
+        )
+    # Non-zero exit when the env-passphrase mismatch was detected so a
+    # script can tell that the rotation published correctly BUT the
+    # operator needs to fix their shell before the next invocation.
+    # Rotation wire is already on the DNS; no rollback.
+    if env_passphrase_mismatch:
+        return 3
+    return 0
+
+
 def cmd_identity_fetch(args: argparse.Namespace) -> int:
     """Resolve an identity record from DNS and optionally add it as a contact.
 
@@ -1064,12 +1454,16 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         resolved_username = args.username
         name = identity_domain(args.username, args.domain or _effective_domain(cfg))
 
-    try:
-        records = reader.query_txt_record(name)
-    finally:
+    # Keep cluster_handle OPEN across both the identity lookup AND the
+    # subsequent rotation-RRset revocation filter. Closing after only
+    # the first query runs the revocation check through a closed
+    # UnionReader (which returns None), silently disabling the filter
+    # in cluster mode. The broader try/finally closes after the full
+    # revocation filter completes below.
+    records = reader.query_txt_record(name)
+    if not records:
         if cluster_handle is not None:
             cluster_handle.close()
-    if not records:
         _die(2, f"no identity record at {name}")
 
     # Append-semantics mailbox means the identity domain can hold multiple
@@ -1082,7 +1476,145 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         if parsed is not None:
             valid.append(parsed[0])
     if not valid:
+        if cluster_handle is not None:
+            cluster_handle.close()
+            cluster_handle = None
         _die(2, f"found TXT records at {name} but none verified as a DMP identity")
+
+    # Rotation-aware filter (M5.4): fetch the same subject's rotate
+    # RRset (if any), collect verifying RotationRecords + self-signed
+    # RevocationRecords, and drop any IdentityRecord whose ed25519_spk
+    # matches. This closes two "ambiguous after rotate" holes in one
+    # pass:
+    #
+    #   1. Revocation filter — drops any IdentityRecord whose ed25519_spk
+    #      appears as a revoked_spk in a RevocationRecord. Only fires
+    #      for compromise/lost_key rotations (routine rotations do NOT
+    #      publish revocations, see cmd_identity_rotate).
+    #   2. Chain-head filter — drops any IdentityRecord whose ed25519_spk
+    #      appears as old_spk in a verifying RotationRecord. This is
+    #      the path routine rotations rely on: the old key still has
+    #      a valid IdentityRecord and no revocation, but a co-signed
+    #      rotation points from it to the new key, so non-rotation-aware
+    #      fetches can still auto-disambiguate.
+    #
+    # A compromised key that re-publishes the old IdentityRecord is
+    # still filtered because both the rotation and the revocation (if
+    # any) sit alongside it; see docs/protocol/rotation.md "Revocation
+    # model" for the trade-off.
+    from dmp.core.rotation import (
+        RECORD_PREFIX_REVOCATION,
+        RECORD_PREFIX_ROTATION,
+        RevocationRecord,
+        RotationRecord,
+        SUBJECT_TYPE_USER_IDENTITY,
+        _normalize_subject,
+        rotation_rrset_name_user_identity,
+        rotation_rrset_name_zone_anchored,
+    )
+
+    if parsed_addr is not None:
+        _user, _host = parsed_addr
+        fetch_subject = f"{_user}@{_host}"
+        # Try BOTH forms of the rotate RRset for robustness — a peer
+        # might publish the rotation under either. Zone-anchored first
+        # (the preferred form for zone-anchored identities); then the
+        # hash form as a fallback.
+        rotate_rrset_candidates = [
+            rotation_rrset_name_zone_anchored(_host),
+            rotation_rrset_name_user_identity(_user, _host),
+        ]
+    else:
+        fetch_subject = f"{resolved_username}@{args.domain or _effective_domain(cfg)}"
+        rotate_rrset_candidates = [
+            rotation_rrset_name_user_identity(
+                resolved_username, args.domain or _effective_domain(cfg)
+            ),
+        ]
+
+    revoked_spks: set[bytes] = set()
+    superseded_spks: set[bytes] = set()
+    norm_fetch_subject = _normalize_subject(SUBJECT_TYPE_USER_IDENTITY, fetch_subject)
+    for candidate in rotate_rrset_candidates:
+        try:
+            rotate_records = reader.query_txt_record(candidate)
+        except Exception:
+            rotate_records = None
+        if not rotate_records:
+            continue
+        for txt in rotate_records:
+            if not isinstance(txt, str):
+                continue
+            if txt.startswith(RECORD_PREFIX_REVOCATION):
+                rev = RevocationRecord.parse_and_verify(txt)
+                if rev is None:
+                    continue
+                if rev.subject_type != SUBJECT_TYPE_USER_IDENTITY:
+                    continue
+                # Subject match is strict: the RRset name is the trust
+                # anchor, but we still require the embedded subject to
+                # match the fetched subject so a stray record from a
+                # different publisher at the same name can't poison the
+                # filter.
+                if (
+                    _normalize_subject(rev.subject_type, rev.subject)
+                    != norm_fetch_subject
+                ):
+                    continue
+                revoked_spks.add(bytes(rev.revoked_spk))
+            elif txt.startswith(RECORD_PREFIX_ROTATION):
+                rot = RotationRecord.parse_and_verify(txt)
+                if rot is None:
+                    continue
+                if rot.subject_type != SUBJECT_TYPE_USER_IDENTITY:
+                    continue
+                if (
+                    _normalize_subject(rot.subject_type, rot.subject)
+                    != norm_fetch_subject
+                ):
+                    continue
+                # old_spk has been rotated away from. Its IdentityRecord
+                # at the mailbox name is superseded even without a
+                # revocation. The rotation is co-signed by BOTH old and
+                # new keys, so we trust the supersession.
+                superseded_spks.add(bytes(rot.old_spk))
+
+    if revoked_spks:
+        filtered = [rec for rec in valid if bytes(rec.ed25519_spk) not in revoked_spks]
+        # If filtering drops ALL candidates, don't silently explode:
+        # surface the state so the caller can re-pin out-of-band.
+        if not filtered:
+            if cluster_handle is not None:
+                cluster_handle.close()
+                cluster_handle = None
+            _die(
+                2,
+                f"all IdentityRecords at {name} are revoked by a matching "
+                f"RevocationRecord at the rotate RRset — re-pin out-of-band.",
+            )
+        valid = filtered
+
+    # Chain-head filter: after dropping revoked records, if we still
+    # have more than one, drop any whose ed25519_spk is an old_spk in
+    # the rotation set. The remaining record(s) are chain-head
+    # candidates. Only collapse when exactly one candidate remains —
+    # zero or >1 means something pathological (all records superseded
+    # with no head published, or two concurrent rotations not yet
+    # reconciled), and we fall through to the ambiguous-error branch
+    # so the user can inspect out-of-band.
+    if len(valid) > 1 and superseded_spks:
+        chain_filtered = [
+            rec for rec in valid if bytes(rec.ed25519_spk) not in superseded_spks
+        ]
+        if len(chain_filtered) == 1:
+            valid = chain_filtered
+
+    # Revocation + chain-head filters done — safe to close the one-shot
+    # cluster client now. Any remaining work (fingerprint display,
+    # contact save) only touches local state.
+    if cluster_handle is not None:
+        cluster_handle.close()
+        cluster_handle = None
 
     def _fingerprint(rec: IdentityRecord) -> str:
         # 16-char hex fingerprint over (x25519_pk || ed25519_spk).
@@ -1158,10 +1690,30 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         if contact_key in cfg.contacts:
             print(f"(contact `{contact_key}` already exists — not overwriting)")
         else:
-            cfg.contacts[contact_key] = {
+            # Persist the remote host so the rotation fallback can walk
+            # chains against the right zone. Two shapes can supply it:
+            #   1) `dmp identity fetch alice@other.example --add`
+            #      → parsed_addr = (alice, other.example)
+            #   2) `dmp identity fetch alice --domain other.example --add`
+            #      → parsed_addr is None, args.domain carries the host
+            # Both must persist `domain` so _make_client doesn't later
+            # overwrite with the local effective_domain and break
+            # cross-zone prekey + rotation-chain lookups. Legacy bare-
+            # username adds (no args.domain, no @host) leave `domain`
+            # empty and inherit the local effective domain at
+            # _make_client time (pre-M5.4-followup behavior).
+            if parsed_addr is not None:
+                remote_host = parsed_addr[1]
+            elif args.domain:
+                remote_host = args.domain
+            else:
+                remote_host = ""
+            entry: Dict[str, str] = {
                 "pub": identity.x25519_pk.hex(),
                 "spk": identity.ed25519_spk.hex(),
+                "domain": remote_host,
             }
+            cfg.contacts[contact_key] = entry
             cfg.save(_config_path())
             print(f"added contact {contact_key} (pinned signing key)")
     return 0
@@ -1184,9 +1736,15 @@ def cmd_contacts_add(args: argparse.Namespace) -> int:
             _die(1, "signing key must be 32 bytes (64 hex characters)")
         spk_hex = args.signing_key.lower()
 
+    # `domain` empty here: `dmp contacts add` takes no remote host, so
+    # cross-zone rotation-chain resolution isn't available via this
+    # path — the client falls back to the local effective domain.
+    # Use `dmp identity fetch user@host --add` to persist the remote
+    # host and enable chain walks against the remote zone.
     cfg.contacts[args.name] = {
         "pub": args.pubkey.lower(),
         "spk": spk_hex,
+        "domain": "",
     }
     cfg.save(_config_path())
     if spk_hex:
@@ -2145,6 +2703,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="per-prekey TTL in seconds (default: 86400 = 1 day)",
     )
     p_id_pk.set_defaults(func=cmd_identity_refresh_prekeys)
+
+    p_id_rotate = sub_id.add_parser(
+        "rotate",
+        help="EXPERIMENTAL (M5.4): rotate to a new identity key. "
+        "Co-signs a RotationRecord and publishes it + a fresh IdentityRecord "
+        "for the new key. Wire format subject to revision after the crypto audit.",
+    )
+    p_id_rotate.add_argument(
+        "--new-passphrase-file",
+        dest="new_passphrase_file",
+        default=None,
+        help="path to a file containing the new passphrase. Alternative: "
+        "DMP_NEW_PASSPHRASE env var, or interactive prompt.",
+    )
+    p_id_rotate.add_argument(
+        "--ttl",
+        type=int,
+        default=86400,
+        help="TTL seconds for the published TXT records (default 86400)",
+    )
+    p_id_rotate.add_argument(
+        "--exp-seconds",
+        dest="exp_seconds",
+        type=int,
+        default=86400 * 365,
+        help="seconds until the RotationRecord's exp field (default 1 year)",
+    )
+    p_id_rotate.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the interactive confirmation prompt",
+    )
+    p_id_rotate.add_argument(
+        "--reason",
+        choices=("routine", "compromise", "lost_key"),
+        default="routine",
+        help="reason_code for the rotation. 'routine' (default) is a "
+        "normal key rollover: publishes a RotationRecord only — no "
+        "RevocationRecord — so chain walkers auto-follow the new key. "
+        "'compromise' and 'lost_key' both additionally publish a "
+        "self-signed RevocationRecord of the old key so chain walkers "
+        "abort trust instead of following forward. Use 'compromise' if "
+        "the key was leaked and 'lost_key' if the old material is "
+        "genuinely gone.",
+    )
+    p_id_rotate.add_argument(
+        "--experimental",
+        action="store_true",
+        help="required — acknowledges the feature is experimental and "
+        "subject to revision after the external crypto audit.",
+    )
+    p_id_rotate.set_defaults(func=cmd_identity_rotate)
 
     p_id_fetch = sub_id.add_parser(
         "fetch", help="resolve someone's identity record from DNS"
