@@ -385,3 +385,179 @@ def test_container_zone_anchored_identity(node_container):
     assert parsed.username == user
     assert parsed.x25519_pk == alice.crypto.get_public_key_bytes()
     assert parsed.ed25519_spk == alice.crypto.get_signing_public_key_bytes()
+
+
+# ---------------------------------------------------------------------------
+# M5.4 rotation — end-to-end against the container. Unit + fuzz coverage
+# already exercises the wire formats; these add the missing "does it round-
+# trip through a real published record plus a live chain walker" layer.
+# ---------------------------------------------------------------------------
+
+
+def _rotate_identity(
+    old_client,
+    new_passphrase: str,
+    kdf_salt: bytes,
+    *,
+    revoke_reason=None,
+    ttl: int = 300,
+    exp_seconds: int = 86400 * 180,
+):
+    """Inline mirror of examples/docker_e2e_demo.py::rotate_identity.
+
+    Duplicated here (rather than imported from examples/) because tests
+    shouldn't depend on demo scripts. If this logic grows, promote it
+    to dmp.client.
+    """
+    import time as _time
+
+    from dmp.client.client import DMPClient
+    from dmp.core.crypto import DMPCrypto
+    from dmp.core.identity import identity_domain, make_record
+    from dmp.core.rotation import (
+        RevocationRecord,
+        RotationRecord,
+        SUBJECT_TYPE_USER_IDENTITY,
+        rotation_rrset_name_user_identity,
+    )
+
+    old_crypto = old_client.crypto
+    new_crypto = DMPCrypto.from_passphrase(new_passphrase, salt=kdf_salt)
+    assert (
+        new_crypto.get_signing_public_key_bytes()
+        != old_crypto.get_signing_public_key_bytes()
+    )
+
+    subject = f"{old_client.username}@{old_client.domain}"
+    ts = int(_time.time())
+    seq = int(_time.time() * 1000)
+
+    rotation = RotationRecord(
+        subject_type=SUBJECT_TYPE_USER_IDENTITY,
+        subject=subject,
+        old_spk=old_crypto.get_signing_public_key_bytes(),
+        new_spk=new_crypto.get_signing_public_key_bytes(),
+        seq=seq,
+        ts=ts,
+        exp=ts + exp_seconds,
+    )
+    rrset = rotation_rrset_name_user_identity(old_client.username, old_client.domain)
+    assert old_client.writer.publish_txt_record(
+        rrset, rotation.sign(old_crypto, new_crypto), ttl=ttl
+    )
+    if revoke_reason is not None:
+        revocation = RevocationRecord(
+            subject_type=SUBJECT_TYPE_USER_IDENTITY,
+            subject=subject,
+            revoked_spk=old_crypto.get_signing_public_key_bytes(),
+            reason_code=revoke_reason,
+            ts=ts,
+        )
+        assert old_client.writer.publish_txt_record(
+            rrset, revocation.sign(old_crypto), ttl=ttl
+        )
+    identity_rrset = identity_domain(old_client.username, old_client.domain)
+    new_identity = make_record(new_crypto, old_client.username)
+    assert old_client.writer.publish_txt_record(
+        identity_rrset, new_identity.sign(new_crypto), ttl=ttl
+    )
+
+    return DMPClient(
+        old_client.username,
+        new_passphrase,
+        domain=old_client.domain,
+        writer=old_client.writer,
+        reader=old_client.reader,
+        kdf_salt=kdf_salt,
+        rotation_chain_enabled=old_client.rotation_chain_enabled,
+    )
+
+
+def test_container_rotation_routine_chain_walk(node_container):
+    """Alice rotates (routine, no revocation). Bob's rotation-aware client
+    walks the chain from the pinned old spk to the new head and receives
+    a message signed with the new key — no re-pin required."""
+    from dmp.client.client import DMPClient
+    from dmp.core.rotation import SUBJECT_TYPE_USER_IDENTITY
+
+    writer = _HttpWriter(node_container["http_base"])
+    reader = _DnsReader("127.0.0.1", node_container["dns_port"])
+
+    alice_salt = os.urandom(32)
+    bob_salt = os.urandom(32)
+    alice = DMPClient(
+        "alice", "alice-pass-v1",
+        domain="mesh.docker", writer=writer, reader=reader, kdf_salt=alice_salt,
+    )
+    bob = DMPClient(
+        "bob", "bob-pass",
+        domain="mesh.docker", writer=writer, reader=reader, kdf_salt=bob_salt,
+        rotation_chain_enabled=True,
+    )
+    alice.add_contact(
+        "bob", bob.get_public_key_hex(),
+        signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex(),
+    )
+    bob.add_contact(
+        "alice", alice.get_public_key_hex(),
+        signing_key_hex=alice.crypto.get_signing_public_key_bytes().hex(),
+    )
+
+    alice_v2 = _rotate_identity(alice, "alice-pass-v2", alice_salt)
+
+    resolved = bob._rotation_chain.resolve_current_spk(
+        alice.crypto.get_signing_public_key_bytes(),
+        f"alice@mesh.docker",
+        SUBJECT_TYPE_USER_IDENTITY,
+    )
+    assert resolved == alice_v2.crypto.get_signing_public_key_bytes()
+
+    # Re-pin with resolved head + deliver under the new key.
+    bob.add_contact(
+        "alice", alice_v2.get_public_key_hex(),
+        signing_key_hex=resolved.hex(),
+    )
+    alice_v2.add_contact(
+        "bob", bob.get_public_key_hex(),
+        signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex(),
+    )
+    assert alice_v2.send_message("bob", "post-rotation ping")
+    inbox = bob.receive_messages()
+    assert any(m.plaintext == b"post-rotation ping" for m in inbox), inbox
+
+
+def test_container_rotation_compromise_revokes_old_key(node_container):
+    """Compromise rotation publishes a RevocationRecord of the old key.
+    The chain walker must refuse ANY path whose head or intermediate
+    hops include a revoked key — return None rather than trusting
+    forward."""
+    from dmp.client.client import DMPClient
+    from dmp.core.rotation import REASON_COMPROMISE, SUBJECT_TYPE_USER_IDENTITY
+
+    writer = _HttpWriter(node_container["http_base"])
+    reader = _DnsReader("127.0.0.1", node_container["dns_port"])
+
+    alice_salt = os.urandom(32)
+    bob_salt = os.urandom(32)
+    alice = DMPClient(
+        "alice", "alice-pass-v1",
+        domain="mesh.docker", writer=writer, reader=reader, kdf_salt=alice_salt,
+    )
+    bob = DMPClient(
+        "bob", "bob-pass",
+        domain="mesh.docker", writer=writer, reader=reader, kdf_salt=bob_salt,
+        rotation_chain_enabled=True,
+    )
+
+    _rotate_identity(
+        alice, "alice-pass-v2", alice_salt, revoke_reason=REASON_COMPROMISE,
+    )
+
+    # Bob still pinned on v1 — walker must refuse forward from a
+    # key whose revocation is live on the RRset.
+    resolved = bob._rotation_chain.resolve_current_spk(
+        alice.crypto.get_signing_public_key_bytes(),
+        f"alice@mesh.docker",
+        SUBJECT_TYPE_USER_IDENTITY,
+    )
+    assert resolved is None
