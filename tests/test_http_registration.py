@@ -361,6 +361,99 @@ class TestRateLimit:
             tokens.close()
 
 
+class TestNoOracleLeak:
+    """Regression for codex P2 #1: unsigned attacker must not distinguish
+    403 / 409 / 200 — those are only reachable by a valid signer."""
+
+    def test_unsigned_confirm_for_taken_subject_returns_401_not_409(
+        self, reg_enabled,
+    ):
+        api, _, _, _ = reg_enabled
+        # Victim registers first.
+        victim = Ed25519PrivateKey.generate()
+        r1 = _sign_and_confirm(api, "alice@example.com", victim)
+        assert r1.status_code == 200
+
+        # Attacker requests a fresh challenge and fires a confirm
+        # with a garbage signature + a random pubkey for the SAME
+        # subject. Before the reorder, they'd get 409 (subject taken).
+        # Now they must get 401 — subject existence hidden.
+        ch = _request_challenge(api)
+        r = requests.post(
+            f"http://127.0.0.1:{api.port}/v1/registration/confirm",
+            json={
+                "subject": "alice@example.com",
+                "ed25519_spk": "00" * 32,
+                "challenge": ch["challenge"],
+                "signature": "00" * 64,
+            },
+            timeout=2,
+        )
+        assert r.status_code == 401
+
+    def test_unsigned_confirm_for_disallowed_domain_returns_401_not_403(
+        self, reg_allowlist,
+    ):
+        # With allowlist=['example.com'], a confirm for other.com
+        # previously leaked 403. After reorder the attacker just
+        # sees 401 from the signature check.
+        api, _, _, _ = reg_allowlist
+        ch = _request_challenge(api)
+        r = requests.post(
+            f"http://127.0.0.1:{api.port}/v1/registration/confirm",
+            json={
+                "subject": "alice@other.com",
+                "ed25519_spk": "00" * 32,
+                "challenge": ch["challenge"],
+                "signature": "00" * 64,
+            },
+            timeout=2,
+        )
+        assert r.status_code == 401
+
+
+class TestAtomicRotation:
+    """Regression for codex P2 #2: the one-live-self-service-token-per-
+    subject invariant must hold even under concurrent confirms."""
+
+    def test_concurrent_rotations_keep_only_one_live(self, reg_enabled):
+        api, _, tokens, _ = reg_enabled
+        import threading
+
+        signer = Ed25519PrivateKey.generate()
+        # Seed one token so subsequent rotations revoke-and-reissue.
+        r0 = _sign_and_confirm(api, "alice@example.com", signer)
+        assert r0.status_code == 200
+
+        # Fire N concurrent same-key rotations. Each gets a fresh
+        # challenge then confirms. The atomic rotate_self_service
+        # holds the store lock so at most one mint+revoke pair is
+        # in flight at a time; post-run there must be exactly ONE
+        # live self-service row.
+        statuses: list = []
+        lock = threading.Lock()
+
+        def _worker():
+            r = _sign_and_confirm(api, "alice@example.com", signer)
+            with lock:
+                statuses.append(r.status_code)
+
+        threads = [threading.Thread(target=_worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Every rotation should have succeeded (same signer).
+        assert all(s == 200 for s in statuses), statuses
+        # And the invariant holds: exactly one live self-service row.
+        live = [
+            r for r in tokens.list(subject="alice@example.com")
+            if r.is_live() and r.registered_spk is not None
+        ]
+        assert len(live) == 1, [r.token_hash[:8] for r in live]
+
+
 class TestMalformedBodies:
     def test_missing_fields(self, reg_enabled):
         api, _, _, _ = reg_enabled

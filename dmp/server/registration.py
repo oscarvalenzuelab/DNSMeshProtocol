@@ -42,6 +42,7 @@ from dmp.server.tokens import (
     DEFAULT_RATE_PER_SEC,
     SUBJECT_TYPE_USER_IDENTITY,
     TokenStore,
+    _SubjectLocked,
     canonicalize_subject,
 )
 
@@ -317,10 +318,25 @@ def confirm_registration(
     """Verify a confirm request end-to-end. Returns ``(token, row)``.
 
     Raises a subclass of :class:`RegistrationError` on any failure.
-    Consumes the challenge on success AND on verified-but-rejected
-    paths (signature good, but subject not allowed / already owned)
-    so an attacker can't probe for "is this subject taken" by
-    repeatedly spending the same challenge.
+
+    Order of checks (matters for the "no subject-existence oracle"
+    property):
+
+      1. Feature-gate + config sanity (404 / 500).
+      2. Parse + canonicalize inputs (400).
+      3. Consume challenge (400 if expired/unknown — single-use).
+      4. VERIFY SIGNATURE (401). An attacker without the private key
+         never reaches steps 5-7, so allowlist-membership and
+         subject-ownership state are NOT observable via HTTP status
+         codes by unsigned requests.
+      5. Allowlist check (403) — only visible to signed requests.
+      6. Anti-takeover + mint (atomic, single TokenStore method;
+         returns 409 if another key already owns the subject).
+
+    The challenge is consumed at step 3 regardless of whether steps
+    4-6 succeed. That's deliberate: a signed request that proves key
+    control still consumes one nonce, preventing a signer from
+    trivially spamming the rest of the pipeline.
     """
     if not config.enabled:
         raise RegistrationError(
@@ -359,53 +375,42 @@ def confirm_registration(
     # Challenge is a 32-byte nonce; verify shape before any DB ops.
     _parse_hex(challenge_hex, 32, "challenge")
 
-    # Consume the challenge. Single-use. ConsumeRaises ChallengeExpired
-    # on miss/expired. We do this BEFORE signature check so an attacker
-    # can't use a stolen signed-confirm to drain challenges for
-    # subjects they don't own.
+    # Single-use challenge. Raises ChallengeExpired on miss/expired.
     pc = challenges.consume(challenge_hex, now=now)
 
-    # Anti-takeover: if a token for this subject already exists, the
-    # new registration must be signed with its registered_spk.
-    # Canonical lookup is case-normalized by canonicalize_subject.
-    existing = [r for r in store.list(subject=subject) if r.is_live()]
-    if existing:
-        # The schema allows multiple live tokens per subject (e.g. if
-        # admin minted one AND the user self-registered). Anti-takeover
-        # only applies to OTHER self-service tokens — operator-issued
-        # rows have registered_spk=None and don't lock the subject.
-        locking = [r for r in existing if r.registered_spk]
-        if locking:
-            if not any(r.registered_spk == spk_hex.lower() for r in locking):
-                raise SubjectAlreadyOwned()
-
-    # Domain allowlist. Empty = allow all.
-    if not _domain_allowed(subject, config.allowlist):
-        raise SubjectNotAllowed()
-
-    # Verify Ed25519 signature over (challenge || subject || node || version).
+    # Signature FIRST — this is the gate that decides whether an
+    # unauthenticated attacker gets to see any other policy
+    # feedback. Codex review called out that checking allowlist /
+    # anti-takeover before the signature turned /confirm into an
+    # oracle for "does subject X exist" and "is domain Y
+    # allowlisted". After reordering, an attacker without the
+    # private key sees only 401 (or 400 on parse failures) and
+    # cannot distinguish 403 / 409.
     payload = _build_signing_payload(challenge_hex, subject, pc.node)
     try:
         Ed25519PublicKey.from_public_bytes(spk_bytes).verify(sig_bytes, payload)
     except InvalidSignature as exc:
         raise SignatureInvalid() from exc
 
-    # Atomically: revoke any prior self-service tokens for this subject
-    # and mint a fresh one. Admin-minted tokens are not touched — they
-    # have registered_spk=None and represent an independent channel.
-    for r in existing:
-        if r.registered_spk is not None:
-            store.revoke(r.token_hash, remote_addr=remote_addr)
+    # The signer proved key control. Now apply policy.
+    if not _domain_allowed(subject, config.allowlist):
+        raise SubjectNotAllowed()
 
-    token, row = store.issue(
-        subject,
-        subject_type=SUBJECT_TYPE_USER_IDENTITY,
-        rate_per_sec=config.issued_rate_per_sec,
-        rate_burst=config.issued_rate_burst,
-        expires_in_seconds=config.expires_in_seconds,
-        issuer="self-service",
-        note="",
-        remote_addr=remote_addr,
-        registered_spk=spk_hex.lower(),
-    )
+    # Atomic revoke-old-self-service + issue-new. The method holds the
+    # DB lock for the duration so two concurrent valid confirms for
+    # the same subject cannot both mint — codex review found a race
+    # here in the previous implementation where revoke() and issue()
+    # took separate locks.
+    try:
+        token, row, _ = store.rotate_self_service(
+            subject,
+            registered_spk=spk_hex.lower(),
+            expires_in_seconds=config.expires_in_seconds,
+            rate_per_sec=config.issued_rate_per_sec,
+            rate_burst=config.issued_rate_burst,
+            remote_addr=remote_addr,
+        )
+    except _SubjectLocked as exc:
+        raise SubjectAlreadyOwned() from exc
+
     return token, row
