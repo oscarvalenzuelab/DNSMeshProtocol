@@ -64,7 +64,12 @@ from __future__ import annotations
 import copy
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+)
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -564,11 +569,18 @@ class FanoutWriter(DNSRecordWriter):
                         if not f.done():
                             f.cancel()
                     return True
-        except TimeoutError:
+        except FuturesTimeoutError:
             # Deadline exceeded before quorum; cancel pending futures
             # so their queue slots don't accumulate across calls. Any
             # currently-running ones will finish in their own time and
             # update health through _run_on_node.
+            #
+            # Imported as FuturesTimeoutError because on Python 3.10
+            # concurrent.futures.TimeoutError is a distinct class that
+            # does NOT inherit from the builtin TimeoutError; a bare
+            # `except TimeoutError` lets the exception escape on 3.10.
+            # (3.11+ made them aliases, so the old form masked the bug
+            # until the first 3.10 run.)
             for f in futures:
                 if not f.done():
                     f.cancel()
