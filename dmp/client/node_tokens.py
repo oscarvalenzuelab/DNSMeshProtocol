@@ -126,11 +126,31 @@ def save_token(
         "saved_at": int(time.time()),
     }
     tmp = target.with_suffix(".json.tmp")
-    # Write + chmod 0600 BEFORE rename so an attacker can't see a
-    # world-readable intermediate even briefly.
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(body, f, indent=2)
-    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+    # Open the tmp file with mode 0600 from the very first syscall
+    # (os.open+O_CREAT honors the `mode` arg, unlike plain open()
+    # which honors the process umask). Under a normal umask 022,
+    # `open("w")` would create 0644 and only later chmod down —
+    # a brief window during which another local user could read
+    # the bearer. Using O_CREAT|O_EXCL also refuses to stomp on an
+    # existing tmp left over from a prior crashed write.
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TRUNC
+    # O_EXCL fails if tmp exists (e.g. previous crash). Clear it so
+    # the atomic write still goes through.
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(body, f, indent=2)
+    except Exception:
+        # Don't leave a partial write around on failure.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     os.replace(tmp, target)
     return target
 
@@ -209,12 +229,18 @@ def bearer_for_endpoint(endpoint: str) -> Optional[str]:
     token = body.get("token")
     if not isinstance(token, str) or not token:
         return None
-    # Soft expiry check: if the file has expires_at and it's in the
-    # past, refuse to return it so a stale token doesn't get sent
-    # (the node would reject anyway, but failing early here gives a
-    # cleaner CLI error message). `None` expires_at means "unknown /
-    # never expires".
+    # Soft expiry check with clock-skew grace. If the file says
+    # expires_at is deep in the past, refuse — sending it is a
+    # guaranteed server-side 401 and an eager client-side reject
+    # gives a cleaner CLI error. BUT: a client whose clock is a
+    # few seconds fast (or a server whose clock is a few seconds
+    # slow) would turn a perfectly valid token into a local
+    # false-negative. Allow a 5-minute grace window and let the
+    # server be authoritative for anything inside it.
+    # `None` expires_at means "unknown / never expires".
     exp = body.get("expires_at")
-    if isinstance(exp, (int, float)) and exp > 0 and time.time() >= exp:
-        return None
+    if isinstance(exp, (int, float)) and exp > 0:
+        grace = 300  # seconds of client/server clock-skew tolerance
+        if time.time() >= exp + grace:
+            return None
     return token

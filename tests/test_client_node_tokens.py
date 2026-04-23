@@ -81,6 +81,39 @@ class TestSaveAndLoad:
         mode = stat.S_IMODE(path.stat().st_mode)
         assert mode == 0o600, f"expected 0600, got {oct(mode)}"
 
+    def test_file_mode_0600_even_under_lax_umask(
+        self, fresh_home: Path, monkeypatch,
+    ) -> None:
+        """Regression for codex P2: under umask 022, plain open('w')
+        creates 0644 and the bearer is world-readable for the window
+        between write and chmod. os.open(..., 0o600) closes that hole.
+        """
+        old = os.umask(0o002)  # ugo-w allowed, i.e. default-ish
+        try:
+            path = nt.save_token(
+                "dmp.example.com", token="dmp_v1_Y", subject="a@b.co",
+            )
+            mode = stat.S_IMODE(path.stat().st_mode)
+            assert mode == 0o600, (
+                f"under lax umask, saved token has mode {oct(mode)} (want 0o600)"
+            )
+        finally:
+            os.umask(old)
+
+    def test_save_cleans_leftover_tmp(self, fresh_home: Path) -> None:
+        """A crashed prior write might leave <name>.json.tmp behind.
+        save_token must not refuse to rewrite the target because of it."""
+        fresh_home.mkdir(parents=True, exist_ok=True)
+        (fresh_home / "dmp.example.com.json.tmp").write_text("stale")
+        # Must not raise (previously O_EXCL would).
+        nt.save_token(
+            "dmp.example.com", token="dmp_v1_Z", subject="a@b.co",
+        )
+        body = nt.load_token("dmp.example.com")
+        assert body["token"] == "dmp_v1_Z"
+        # The tmp file must not linger.
+        assert not (fresh_home / "dmp.example.com.json.tmp").exists()
+
     def test_parent_dir_mode_0700(self, fresh_home: Path) -> None:
         nt.save_token("dmp.example.com", token="x", subject="a@b.co")
         mode = stat.S_IMODE(fresh_home.stat().st_mode)
@@ -121,13 +154,29 @@ class TestBearerForEndpoint:
         assert nt.bearer_for_endpoint("https://other.example.com") is None
 
     def test_returns_none_for_expired_token(self, fresh_home: Path) -> None:
+        # Past the 5-minute clock-skew grace window — hard-rejected.
         nt.save_token(
             "dmp.example.com",
             token="dmp_v1_expired",
             subject="a@b.co",
-            expires_at=int(time.time()) - 1,
+            expires_at=int(time.time()) - 600,
         )
         assert nt.bearer_for_endpoint("https://dmp.example.com") is None
+
+    def test_clock_skew_grace_tolerates_slightly_expired(
+        self, fresh_home: Path
+    ) -> None:
+        """Regression for codex P3: a client whose clock is a few
+        seconds fast vs the server must not false-negative. Within
+        the 5-minute grace window, bearer_for_endpoint returns the
+        token and lets the server be authoritative."""
+        nt.save_token(
+            "dmp.example.com",
+            token="dmp_v1_barely",
+            subject="a@b.co",
+            expires_at=int(time.time()) - 30,  # 30s past, well inside grace
+        )
+        assert nt.bearer_for_endpoint("https://dmp.example.com") == "dmp_v1_barely"
 
     def test_none_expires_at_is_treated_as_infinite(self, fresh_home: Path) -> None:
         nt.save_token(
