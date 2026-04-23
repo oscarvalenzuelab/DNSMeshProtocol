@@ -7,6 +7,74 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added (M5.5 — multi-tenant node auth) — SHIPPED (merge `01318569`)
+
+- `DMP_AUTH_MODE=open|legacy|multi-tenant` env switch. Back-compat:
+  unset derives to `open` / `legacy` from whether a token is
+  configured — pre-M5.5 deploys need no config change.
+- `DMP_OPERATOR_TOKEN` is the preferred name for the operator bearer;
+  `DMP_HTTP_TOKEN` kept as a no-op alias.
+- Per-user publish tokens in `multi-tenant` mode. `TokenStore`
+  (sqlite) holds `sha256(token)` only — token material never
+  persisted. Scope-enforced on every `/v1/records/*` write:
+  owner-exclusive for identity / rotation / prekey names (`dmp.<user>.<domain>`,
+  `rotate.dmp.<user>.<domain>`, `pk-*.<hash12>.<domain>`), shared-
+  pool for mailbox slots + chunks (any live token), operator-only
+  for cluster / bootstrap. Per-token rate limits stack with per-IP.
+- **Split-audit policy:** shared-pool writes log only `ts` +
+  `remote_addr` — no `subject`, no `token_hash`. An operator
+  handed the DB cannot reconstruct which user delivered to whom.
+- **Self-service registration.** `GET /v1/registration/challenge` +
+  `POST /v1/registration/confirm`. Ed25519-signed challenge bound
+  to the node's hostname. Gated by
+  `DMP_REGISTRATION_ENABLED=1`, per-IP rate limit (5/hour default),
+  optional `DMP_REGISTRATION_ALLOWLIST`. Anti-takeover: a live
+  self-service token locks the subject to its `registered_spk`.
+  Signature verified BEFORE policy to prevent 403/409 oracle.
+  Atomic revoke-then-issue on rotation.
+- **Full Ed25519 low-order pubkey block** on registration — closes
+  the identity-point forgery (`A=01 00..00`, `sig = A || 0^32`
+  verifies every message under permissive RFC 8032 verify).
+- New CLI: `dmp register --node <hostname> [--subject ...]`,
+  `dmp token list/forget`. Auto-attach from `~/.dmp/tokens/<host>.json`
+  (mode 0600 via `os.open(O_EXCL, 0o600)`).
+- New operator CLI: `dmp-node-admin token issue/list/revoke/rotate`
+  + `audit tail`.
+- 104 new tests (token store, admin CLI, HTTP multi-tenant,
+  registration, client token store, low-order-point regression).
+  Total suite 1053 across 3 Python versions.
+- Docs: `docs/guide/registration.md`, `docs/deployment/multi-tenant.md`,
+  `docs/design/multi-tenant-auth.md`, How It Works trust-model rewrite.
+
+### Added (M5.4 — key rotation + revocation) — SHIPPED (merge `fdd455f`)
+
+- `RotationRecord` (`v=dmp1;t=rotation;`) and `RevocationRecord`
+  (`v=dmp1;t=revocation;`) wire types in `dmp.core.rotation`.
+  Co-signed by old and new key (rotation) / self-signed by revoked
+  key (revocation). Subject types: user_identity (1),
+  cluster_operator (2, reserved), bootstrap_signer (3, reserved).
+- `dmp identity rotate --experimental` CLI: publishes RotationRecord
+  + fresh IdentityRecord. `--reason compromise|lost_key` also
+  publishes a RevocationRecord; `--reason routine` (default) doesn't.
+  `--yes` does an atomic on-disk swap (`kdf_salt` preserved; only
+  the passphrase source rotates).
+- `dmp.client.rotation_chain.RotationChain.resolve_current_spk` —
+  chain-walker with max_hops=4, ambiguous-fork detection, seq
+  monotonicity, revocation cross-check. Returns `None` to signal
+  "don't trust any path from this key" (revocation or malformed).
+- `DMPClient(rotation_chain_enabled=True)` opt-in: when a pinned
+  `sender_spk` fails manifest verification, walk forward; also
+  reject incoming manifests whose sender_spk matches a revoked
+  key on the current RRset.
+- Wire format is DRAFT — flagged in docstrings + spec registry;
+  v0.3.0 may introduce a breaking `v=dmp2;t=rotation;` post-audit.
+- Golden test vectors at `docs/protocol/vectors/rotation_record.json`.
+- Fuzz harness: `tests/fuzz/test_fuzz_{rotation,revocation}_record.py`.
+- Docker e2e coverage: `tests/test_docker_integration.py::test_container_rotation_*`.
+- SDK demos: `examples/docker_e2e_demo.py` (single-node) and
+  `examples/cluster_e2e_demo.py` (3-node federated).
+- Docs: `docs/protocol/rotation.md`.
+
 ### Added (M1 — resolver resilience, partial)
 
 - `ResolverPool.discover(candidates, timeout=2.0)` classmethod: probes

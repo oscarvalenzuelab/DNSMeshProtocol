@@ -10,11 +10,14 @@ Two tracks live on this roadmap:
    traffic-analysis research. Post-beta by design: each piece is
    work we intend to do, not a gap we failed to close.
 
-**Status (2026-04-21):** `v0.1.0-alpha`. M1, M2 (full, incl.
+**Status (2026-04-23):** `v0.1.0-alpha`. M1, M2 (full, incl.
 node-side anti-entropy + compose cluster), M3 (full, incl. bootstrap
-discovery + cluster manifest gossip), and M4.1 (formal protocol
-spec) are shipped. The certification backlog (M4.2–M6) lands after
-the `v0.2.0-beta` tag. See per-milestone status below.
+discovery + cluster manifest gossip), M4.1 (formal protocol spec),
+M5.4 (key rotation + revocation), and M5.5 (multi-tenant node auth
+with per-user publish tokens + self-service registration) are
+shipped. The certification backlog (M4.2–M4.4 audit, M5.1–M5.3 /
+M5.6 / M5.7 reach, M6 traffic-analysis) lands after the
+`v0.2.0-beta` tag. See per-milestone status below.
 
 Atomic tasks for the current sprint live in [`TASKS.md`](TASKS.md);
 long-horizon items stay here until they get lifted into a sprint.
@@ -164,37 +167,48 @@ acted on. This is what earns the `v1.0` tag.
       (3–5 weeks: schema + verifier plumbing + at least 3 adapter
       platforms + CLI UX for publish / verify.)
 
-### M5.5 — Multi-tenant node auth (new, post-M5.4)
+### M5.5 — Multi-tenant node auth — SHIPPED (PR #4, merge `01318569`)
 
-Today the node's HTTP publish API has a single shared bearer token
-(`DMP_HTTP_TOKEN`). Fine for teams / small communities, wrong for
-a community node where strangers co-tenant. Per-user tokens turn
-the node from "one trust zone" into proper multi-tenant
-infrastructure.
+Per-user publish tokens with scope enforcement + self-service
+registration. Closes the "one-shared-bearer" trust model:
+community nodes where strangers co-tenant are now viable.
+See `docs/design/multi-tenant-auth.md` for the full design,
+`docs/deployment/multi-tenant.md` for the operator guide, and
+`docs/guide/registration.md` for the end-user flow.
 
-- [ ] **M5.5.1** Token schema: sqlite table
-      `tokens(hash, subject, scope, rate_limit, expires_at)` with
-      audit-logged issuance / revocation.
-- [ ] **M5.5.2** Scoped authorization: publish requests must target
+- [x] **M5.5.1** Token schema: sqlite table
+      `tokens(hash, subject, scope, rate_limit, expires_at,
+      registered_spk)` with audit-logged issuance / revocation.
+      Split-audit policy: shared-pool writes log no `subject` /
+      `token_hash`, so an operator handed the DB cannot
+      reconstruct who-delivered-to-whom.
+- [x] **M5.5.2** Scoped authorization: publish requests must target
       a record namespace that matches the token's `subject`
       (e.g. `alice@example.com` can only write under
       `dmp.alice.example.com` and her mailbox / chunk namespaces).
-      Leaking Alice's token must not let anyone publish as Bob.
-- [ ] **M5.5.3** Self-service registration endpoint
-      (`POST /v1/tokens/register`) that accepts an Ed25519-signed
-      challenge proving control of the subject; node mints a token
-      bound to that subject. Gated by per-IP rate limits + optional
-      operator allowlist.
-- [ ] **M5.5.4** Operator CLI (`dmp-node admin token {issue,revoke,list}`)
-      for environments that prefer issuing tokens out-of-band.
-- [ ] **M5.5.5** Per-token rate limits that stack with the existing
-      per-IP limiters.
+      Leaking Alice's token does not let anyone publish as Bob.
+- [x] **M5.5.3** Self-service registration endpoints
+      (`GET /v1/registration/challenge`, `POST /v1/registration/confirm`).
+      Accepts an Ed25519-signed challenge proving control of the
+      subject; node mints a token bound to that subject. Gated by
+      per-IP rate limits + optional operator allowlist. Signature-
+      first ordering (closes 403/409 oracle), atomic
+      revoke-then-issue (one live self-service token per subject),
+      full low-order Ed25519 public-key block (closes identity-
+      point forgery). Client CLI: `dmp register`.
+- [x] **M5.5.4** Operator CLI (`dmp-node-admin token
+      {issue,list,revoke,rotate}` + `audit tail`) for environments
+      that prefer issuing tokens out-of-band.
+- [x] **M5.5.5** Per-token rate limits that stack with the existing
+      per-IP limiters. Enforced in `TokenStore.authorize_write`
+      before returning success; 429 on throttle.
 - [ ] **M5.5.6** Token rotation + expiry with overlap windows so
-      clients can rotate without an offline window.
+      clients can rotate without an offline window. (Today's
+      rotation is atomic revoke-then-issue — one-second gap.
+      Overlap requires a small wire change.)
 
-(Undecided: self-service first or operator-issued first. Operator-
-issued is ~half the work and sufficient for "team/org" deployments;
-self-service is the real mesh story.)
+Self-service and operator-issued both shipped; they're orthogonal
+and the operator can run either or both.
 
 ### M6 — Traffic-analysis resistance (certification backlog, research track)
 

@@ -217,7 +217,9 @@ python docker/cluster/generate-cluster-manifest.py \
     --node node-d,http://dmp-node-d:8053
 
 # 2. Push to ONE node via the HTTP publish API. The bearer token is
-#    the node's DMP_HTTP_TOKEN, not DMP_SYNC_PEER_TOKEN.
+#    the node's DMP_OPERATOR_TOKEN (alias DMP_HTTP_TOKEN), not
+#    DMP_SYNC_PEER_TOKEN — cluster-manifest publish is operator-
+#    scoped in multi-tenant mode, so end-user tokens are rejected.
 curl -X POST \
     -H "Authorization: Bearer $NODE_A_HTTP_TOKEN" \
     -H "Content-Type: application/json" \

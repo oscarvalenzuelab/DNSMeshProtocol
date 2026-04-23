@@ -29,7 +29,8 @@ The HTTP API publishes records (signed, but not confidential) and
 serves `/metrics` (operational metadata) and `/v1/sync/*` (cluster-
 internal state dumps). Plain-HTTP deployments leak:
 
-- The bearer token (`DMP_HTTP_TOKEN`) on every publish.
+- The bearer token (`DMP_OPERATOR_TOKEN` or a per-user token under
+  `DMP_AUTH_MODE=multi-tenant`) on every publish.
 - Every publish payload — an attacker on path sees who is publishing
   what to which slot.
 - The entire `/metrics` body on every scrape.
@@ -54,10 +55,22 @@ Docker bridge network or a private interface, never a public one.
 
 ## 2. Token hygiene
 
-Two separate tokens:
+Three token classes as of M5.5:
 
-- `DMP_HTTP_TOKEN` — gates `POST /v1/records/*`, `DELETE /v1/records/*`,
-  AND `GET /metrics`. Clients who publish need this.
+- `DMP_OPERATOR_TOKEN` (alias: `DMP_HTTP_TOKEN`) — operator-scoped
+  bearer. In `DMP_AUTH_MODE=legacy` (the default when a token is
+  set but no mode is configured), it gates every write to
+  `/v1/records/*` plus `GET /metrics`. In `DMP_AUTH_MODE=multi-tenant`,
+  it still gates `/metrics` and operator-reserved namespaces (cluster
+  manifests, bootstrap records) but end-user writes are handled by
+  per-user tokens instead.
+- **Per-user tokens (M5.5, multi-tenant mode only).** Minted via
+  `dmp-node-admin token issue` or self-service
+  `POST /v1/registration/confirm`. Each is scope-bound to a subject
+  (`alice@example.com` can only write under her namespace). Never
+  persisted to disk on the node — only `sha256(token)` in
+  `tokens.db`. Leaking one user's token does not expose other
+  users' records.
 - `DMP_SYNC_PEER_TOKEN` — gates `/v1/sync/digest`, `/v1/sync/pull`,
   `/v1/sync/cluster-manifest`. Only sibling cluster nodes need this.
 
@@ -143,7 +156,7 @@ the node's writes will fail silently (or worse, succeed as root).
 
 ## 6. Metrics and logs
 
-- **`/metrics` behind `DMP_HTTP_TOKEN`.** The server refuses
+- **`/metrics` behind `DMP_OPERATOR_TOKEN`.** The server refuses
   unauthenticated metrics scrapes when a token is configured (see
   the sec-hardening bundle). If you deploy without a token, the
   server logs `metrics endpoint unauthenticated` at startup — that

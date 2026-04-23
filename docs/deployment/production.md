@@ -96,18 +96,20 @@ sees the real source, not the Caddy container's internal address.
 |---|---|
 | `DMP_HTTP_HOST` | `0.0.0.0` |
 | `DMP_HTTP_PORT` | `8053` |
-| `DMP_HTTP_TOKEN` | *(none)* — set to require bearer auth on publish AND metrics |
+| `DMP_OPERATOR_TOKEN` | *(none)* — bearer auth for operator-reserved writes + `/metrics`. Alias: `DMP_HTTP_TOKEN` (pre-M5.5 name, still honored). |
+| `DMP_AUTH_MODE` | *(auto)* — `open` / `legacy` / `multi-tenant`. Auto-derives to `open` when no token is set, `legacy` otherwise. Set explicitly to `multi-tenant` to enable per-user publish tokens. |
 | `DMP_HTTP_RATE` | `10` (requests/sec per source IP) |
 | `DMP_HTTP_BURST` | `100` |
 | `DMP_HTTP_MAX_CONCURRENCY` | `64` (handler threads) |
 
-**`DMP_HTTP_TOKEN` gates both `/v1/records/*` and `/metrics`.** Metrics
-leak operational metadata — publish rate, rate-limit hits, per-operation
-error counters — which is an activity indicator for a privacy-oriented
-protocol. When the token is unset (dev / local mode), the server logs
-a startup WARNING saying `metrics endpoint unauthenticated` and
-`/metrics` remains open. Do NOT ship a node to the public internet with
-the token unset. Generate one with:
+**`DMP_OPERATOR_TOKEN` gates `/v1/records/*` (in `legacy` mode) and
+`/metrics` (always).** Metrics leak operational metadata — publish
+rate, rate-limit hits, per-operation error counters — which is an
+activity indicator for a privacy-oriented protocol. When the token
+is unset (dev / local mode), the server logs a startup WARNING saying
+`metrics endpoint unauthenticated` and `/metrics` remains open. Do
+NOT ship a node to the public internet with the token unset.
+Generate one with:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(32))"
@@ -123,8 +125,9 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 ## Metrics scraping
 
-Point Prometheus at `GET /metrics`. If `DMP_HTTP_TOKEN` is set, the
-scrape must carry the same bearer token as the publish side:
+Point Prometheus at `GET /metrics`. If `DMP_OPERATOR_TOKEN` (or
+`DMP_HTTP_TOKEN` alias) is set, the scrape must carry the same
+bearer token as the publish side:
 
 ```yaml
 scrape_configs:
@@ -151,7 +154,9 @@ Useful alerts:
 
 - [ ] TLS termination in front of the HTTP API (Caddy overlay or
       your own).
-- [ ] `DMP_HTTP_TOKEN` set if you don't want open publish.
+- [ ] `DMP_OPERATOR_TOKEN` set if you don't want open publish. For
+      per-user isolation on a multi-tenant node, also set
+      `DMP_AUTH_MODE=multi-tenant` — see [Multi-tenant node]({{ site.baseurl }}/deployment/multi-tenant).
 - [ ] Persistent volume for `/var/lib/dmp`.
 - [ ] `/health` wired to your orchestrator's liveness probe.
 - [ ] `/metrics` scraped and alerted on.

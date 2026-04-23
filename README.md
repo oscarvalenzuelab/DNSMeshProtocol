@@ -10,10 +10,11 @@ internet already runs on.**
 
 > **Status: alpha, pre-external-audit.** Full federation (client
 > fan-out + union reader + node-side anti-entropy + manifest gossip),
-> bootstrap discovery, and the formal protocol spec are shipped. The
-> remaining path to `v1.0` is a certification backlog: external
-> cryptographic audit, mobile/web clients, key rotation records,
-> traffic-analysis hardening.
+> bootstrap discovery, key rotation + revocation (M5.4), multi-tenant
+> node auth with per-user publish tokens (M5.5), and the formal
+> protocol spec are shipped. The remaining path to `v1.0` is a
+> certification backlog: external cryptographic audit, mobile/web
+> clients, standalone CLI binaries, traffic-analysis hardening.
 >
 > **Don't route secrets through DMP until the external cryptographic
 > audit is done.** The codebase has had ~40+ rounds of automated
@@ -87,6 +88,23 @@ Full walk-through with two users:
   rejoins. A 3-node `docker-compose.cluster.yml` is a checked-in
   operator starting point; see
   [Clustered deployment](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/cluster).
+- **Key rotation + revocation.** `dmp identity rotate --experimental`
+  publishes a co-signed `RotationRecord` (new key ← old key) plus an
+  optional self-signed `RevocationRecord` when `--reason compromise`
+  or `--reason lost_key` is set. Rotation-aware contacts chain-walk
+  from their pinned key to the current head automatically; a
+  revocation aborts trust on any path that touches the revoked
+  key. See
+  [`docs/protocol/rotation.md`](https://oscarvalenzuelab.github.io/DNSMeshProtocol/protocol/rotation).
+- **Multi-tenant node auth (M5.5).** `DMP_AUTH_MODE=multi-tenant`
+  enables per-user publish tokens: every write to `/v1/records/*`
+  is scope-checked against the token's subject, and `dmp register`
+  + `/v1/registration/{challenge,confirm}` give users a self-service
+  path to mint their own tokens via an Ed25519-signed challenge.
+  Shared-pool writes (mailbox + chunks) don't log subject or
+  token hash, so an operator handed the DB cannot reconstruct
+  who-delivered-to-whom. See
+  [Multi-tenant deployment](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/multi-tenant).
 - **Zero-config onboarding via bootstrap discovery.** Given just
   `alice@example.com`, `dmp bootstrap discover me@my-domain --auto-pin`
   resolves the cluster, verifies the two-hop trust chain (bootstrap
@@ -134,7 +152,7 @@ dmp/
 
 docs/          Jekyll docs site (Just the Docs theme, GitHub Pages)
                Includes docs/protocol/ — the formal wire spec
-tests/         800+ unit, integration, fuzz, and docker-in-the-loop tests
+tests/         1050+ unit, integration, fuzz, and docker-in-the-loop tests
                Includes tests/fuzz/ (hypothesis property tests) and
                tests/test_vectors.py (golden interop test vectors).
 Dockerfile, docker-compose.yml, docker-compose.prod.yml, Caddyfile
@@ -144,10 +162,12 @@ Dockerfile, docker-compose.yml, docker-compose.prod.yml, Caddyfile
 
 ```bash
 pip install -e ".[dev]"
-pytest                                         # ~805 tests (incl. fuzz)
+pytest                                         # ~1050 tests (incl. fuzz)
 docker build -t dmp-node:latest .
-pytest tests/test_docker_integration.py        # 4 docker tests
+pytest tests/test_docker_integration.py        # 6 docker tests (incl. M5.4 rotation)
 pytest tests/test_compose_cluster.py           # 3 compose-cluster tests
+python examples/docker_e2e_demo.py             # single-node send/receive + rotation demo
+python examples/cluster_e2e_demo.py            # 3-node federated e2e demo
 ```
 
 Production installs use the hashed lockfile:

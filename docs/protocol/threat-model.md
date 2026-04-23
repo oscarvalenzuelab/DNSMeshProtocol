@@ -241,10 +241,17 @@ a user's Ed25519 signing key + long-term X25519 key + prekey `sk`s
 decrypts every past message those keys touch AND allows forgery of
 new messages until the keys are rotated.
 
-Rotation is manual: there is no in-band key-rotation primitive today.
-A user rotating their identity MUST republish their
-[identity record](routing.md#identity-records) and redistribute the
-new fingerprint out-of-band.
+Rotation IS in-band as of M5.4 (`dmp identity rotate --experimental`).
+The CLI publishes a co-signed `RotationRecord` (new key ← old) plus
+a fresh `IdentityRecord` signed by the new key; with `--reason
+compromise` or `--reason lost_key` it also publishes a self-signed
+`RevocationRecord` of the compromised key. Rotation-aware contacts
+(`rotation_chain_enabled=True`) walk the chain from their pinned key
+to the current head automatically; a revocation aborts trust on any
+path that touches the revoked key. Contacts running pre-M5.4
+clients still need out-of-band re-pin. Wire format details +
+limits are in [`rotation.md`](rotation.md); wire is DRAFT and may
+be bumped to `v=dmp2;t=rotation;` after the external audit.
 
 ### Traffic analysis of who-talks-to-whom-and-when
 

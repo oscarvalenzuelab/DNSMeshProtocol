@@ -95,9 +95,19 @@ The protocol assumes:
 
 ## What is NOT protected
 
-- **Post-compromise sender authentication.** If the sender's Ed25519
-  signing key leaks, an attacker can sign arbitrary future manifests
-  as that sender. There is no key rotation or revocation channel.
+- **Post-compromise sender authentication (partial — M5.4).** If the
+  sender's Ed25519 signing key leaks, an attacker can sign arbitrary
+  messages as that sender *until the sender rotates*. M5.4 ships
+  `dmp identity rotate --experimental --reason compromise`, which
+  publishes a co-signed `RotationRecord` (new key ← old) plus a
+  self-signed `RevocationRecord` of the leaked key. Rotation-aware
+  contacts chain-walk from the pinned old key to the new head
+  automatically; the revocation aborts trust on any path that
+  touches the revoked key. Caveats: the rotation wire format is
+  draft (post-audit revision may bump it to `v=dmp2;t=rotation;`),
+  and contacts running pre-M5.4 clients still need an out-of-band
+  notification to re-pin. See [docs/protocol/rotation.md](docs/protocol/rotation.md)
+  for the threat model.
 - **Traffic analysis.** Message timing, approximate size (chunk
   count), and the existence of a `(sender, recipient)` relationship
   are all visible to anyone who watches the mesh domain's DNS.
@@ -133,14 +143,22 @@ match the address (so a zone owner can't publish
    (atomic rename) but a crash mid-purge will keep an expired entry one
    cycle longer than intended. The persisted cache is sized-bounded only
    by the message TTL, not by an explicit cap.
-2. **Slot DoS surface narrowed but not eliminated.** Mailbox slots now
-   have append (RRset) semantics, so an attacker can *add* manifests
-   but cannot *evict* legitimate ones. Signed manifests ensure forged
-   entries fail verification. What remains: a volumetric attacker can
-   still fill the sqlite store with valid-but-irrelevant manifests until
-   disk is full. HTTP rate limiting and a per-name RRset size cap are
-   future work; for now, operators should run the HTTP API with a
-   bearer token (`DMP_HTTP_TOKEN`) and a reverse proxy rate limit.
+2. **Slot DoS surface narrowed.** Mailbox slots now have append
+   (RRset) semantics, so an attacker can *add* manifests but cannot
+   *evict* legitimate ones. Signed manifests ensure forged entries
+   fail verification. A per-name RRset cardinality cap
+   (`DMP_MAX_VALUES_PER_NAME`, default 64) and per-IP token-bucket
+   rate limits on the HTTP + DNS surfaces are shipped. M5.5 adds
+   per-token rate limits on top (`DMP_AUTH_MODE=multi-tenant`) so a
+   single user can't burn the shared per-IP budget for everyone
+   behind the same NAT. Remaining volumetric surface: a well-funded
+   attacker across many source IPs can still fill the store with
+   valid-but-irrelevant manifests — operators facing that threat
+   should front the publish API with a reverse proxy
+   (Caddy / nginx / Cloudflare) that imposes its own limits, and set
+   `DMP_OPERATOR_TOKEN` (fka `DMP_HTTP_TOKEN`, alias preserved) or
+   enable multi-tenant auth with `DMP_REGISTRATION_ALLOWLIST` so
+   only approved domains can self-register.
 3. **Erasure decode happens in-process**. Cross-chunk erasure coding
    landed (k-of-n via zfec); any k of n chunks reconstruct, default
    ~30% redundancy. The decoder trusts well-formed zfec share blocks —
@@ -155,22 +173,35 @@ match the address (so a zone owner can't publish
 5. **`DMPMessage.signature` field is vestigial.** The real sender
    signature lives in the slot manifest. The legacy 32-byte field on
    `DMPMessage` is unused and should be considered untrusted.
-6. **No formal key-rotation story.** Identities are long-term Ed25519 +
-   X25519 pairs derived from a passphrase. Rotation requires republishing
-   identity and reaching contacts out of band.
+6. **Key-rotation story (M5.4, draft wire format).** Identities are
+   long-term Ed25519 + X25519 pairs derived from a passphrase.
+   `dmp identity rotate --experimental` publishes a co-signed
+   `RotationRecord` + fresh `IdentityRecord`; rotation-aware
+   contacts (`rotation_chain_enabled=True`) chain-walk to the new
+   key without re-pinning. Pre-M5.4 contacts still need out-of-band
+   re-pin. The wire format is DRAFT — subject to revision in
+   v0.3.0 after the external audit; a breaking
+   `v=dmp2;t=rotation;` shape is on the table.
 7. **No transport-level authentication for the node's HTTP API**
-   beyond an optional bearer token. No TLS in the container; operators
-   must front with nginx/caddy or run inside a trusted network.
+   beyond bearer tokens. The node supports three auth modes
+   (`DMP_AUTH_MODE=open|legacy|multi-tenant`): `open` is
+   unauthenticated (dev only); `legacy` is the pre-M5.5 single
+   shared `DMP_OPERATOR_TOKEN` (alias `DMP_HTTP_TOKEN` for
+   back-compat); `multi-tenant` enables per-user tokens with scope
+   enforcement. There is no TLS in the container; operators must
+   front with nginx/caddy or run inside a trusted network.
 8. **`InMemoryDNSStore` is process-local.** It's a mock for tests; do not
    use it for anything exposed to real users.
-9. **Unbounded per-request threading.** Both the HTTP API and the UDP DNS
-   server use `ThreadingMixIn` and spawn a thread per request with no
-   concurrency ceiling. A socket flood can exhaust threads and memory
-   before the token-bucket rate limiter kicks in. Operators running a
-   public node should front it with a reverse proxy that imposes its
-   own connection cap (nginx `worker_connections`, Caddy defaults, a
-   dedicated DNS frontend for UDP). Moving to bounded worker pools or
-   async I/O is on the roadmap.
+9. **Bounded per-request threading.** Both the HTTP API and UDP DNS
+   server use `ThreadingMixIn` with an explicit concurrency ceiling
+   via a `threading.Semaphore` (`DMP_HTTP_MAX_CONCURRENCY`, default
+   64; `DMP_DNS_MAX_CONCURRENCY`, default 128). Once saturated, new
+   connections/packets are dropped rather than spawning unbounded
+   threads. Operators running a public node should still front it
+   with a reverse proxy that imposes connection caps (nginx
+   `worker_connections`, Caddy defaults) for defense in depth;
+   async I/O remains an option on the roadmap if single-node
+   throughput becomes a bottleneck.
 
 ## Cryptographic primitives
 
