@@ -98,9 +98,7 @@ def canonicalize_subject(raw: str) -> str:
             f"subject must be ASCII; got non-ASCII character at position {exc.start}"
         ) from exc
     if not _SUBJECT_ASCII_RE.match(norm):
-        raise ValueError(
-            f"subject does not match <local>@<fqdn> shape: {raw!r}"
-        )
+        raise ValueError(f"subject does not match <local>@<fqdn> shape: {raw!r}")
     return norm
 
 
@@ -203,18 +201,10 @@ _IDENTITY_RE = re.compile(
 _ROTATION_ZONE_RE = re.compile(
     rf"^rotate\.dmp\.(?P<user>{_LABEL})\.(?P<domain>{_LABEL}(?:\.{_LABEL})+)$"
 )
-_ROTATION_HASH_RE = re.compile(
-    rf"^rotate\.dmp\.id-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$"
-)
-_PREKEY_RE = re.compile(
-    rf"^pk-[0-9]+\.(?P<hash12>{_HASH12})\.{_LABEL}(?:\.{_LABEL})+$"
-)
-_MAILBOX_RE = re.compile(
-    rf"^slot-[0-9]+\.mb-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$"
-)
-_CHUNK_RE = re.compile(
-    rf"^chunk-[0-9]+-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$"
-)
+_ROTATION_HASH_RE = re.compile(rf"^rotate\.dmp\.id-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$")
+_PREKEY_RE = re.compile(rf"^pk-[0-9]+\.(?P<hash12>{_HASH12})\.{_LABEL}(?:\.{_LABEL})+$")
+_MAILBOX_RE = re.compile(rf"^slot-[0-9]+\.mb-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$")
+_CHUNK_RE = re.compile(rf"^chunk-[0-9]+-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$")
 
 
 def classify_name(name: str) -> ScopeClass:
@@ -446,7 +436,9 @@ class _PerTokenBucket:
         # Simpler than OrderedDict housekeeping and the bucket cap is
         # a memory guard, not a correctness guarantee.
         if len(self._buckets) > self._max_tracked:
-            for k in list(self._buckets.keys())[: len(self._buckets) - self._max_tracked]:
+            for k in list(self._buckets.keys())[
+                : len(self._buckets) - self._max_tracked
+            ]:
                 self._buckets.pop(k, None)
 
 
@@ -591,10 +583,18 @@ class TokenStore:
                    expires_at, revoked_at, issuer, note, registered_spk)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    row.token_hash, row.subject, row.subject_type,
-                    row.subject_hash12, row.rate_per_sec, row.rate_burst,
-                    row.issued_at, row.expires_at, None,
-                    row.issuer, row.note, row.registered_spk,
+                    row.token_hash,
+                    row.subject,
+                    row.subject_type,
+                    row.subject_hash12,
+                    row.rate_per_sec,
+                    row.rate_burst,
+                    row.issued_at,
+                    row.expires_at,
+                    None,
+                    row.issuer,
+                    row.note,
+                    row.registered_spk,
                 ),
             )
             self._audit(
@@ -623,7 +623,8 @@ class TokenStore:
             if updated:
                 # Fetch subject for the audit row.
                 r = self._conn.execute(
-                    "SELECT subject FROM tokens WHERE token_hash=?", (token_hash,),
+                    "SELECT subject FROM tokens WHERE token_hash=?",
+                    (token_hash,),
                 ).fetchone()
                 subj = r[0] if r else None
                 self._audit(
@@ -690,7 +691,8 @@ class TokenStore:
         with self._lock:
             # Snapshot current live self-service rows for this subject.
             rows = [
-                TokenRow(*r) for r in self._conn.execute(
+                TokenRow(*r)
+                for r in self._conn.execute(
                     f"""SELECT {self._SELECT_COLS} FROM tokens
                         WHERE subject=? AND revoked_at IS NULL
                           AND registered_spk IS NOT NULL""",
@@ -734,9 +736,18 @@ class TokenStore:
                    expires_at, revoked_at, issuer, note, registered_spk)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    token_hash, subject, SUBJECT_TYPE_USER_IDENTITY,
-                    None, rate_per_sec, rate_burst, now,
-                    expires_at, None, "self-service", "", registered_spk,
+                    token_hash,
+                    subject,
+                    SUBJECT_TYPE_USER_IDENTITY,
+                    None,
+                    rate_per_sec,
+                    rate_burst,
+                    now,
+                    expires_at,
+                    None,
+                    "self-service",
+                    "",
+                    registered_spk,
                 ),
             )
             self._audit(
@@ -856,40 +867,50 @@ class TokenStore:
             row = self._row_by_hash(token_hash)
             if row is None:
                 self._audit(
-                    "rejected", remote_addr=remote_addr,
+                    "rejected",
+                    remote_addr=remote_addr,
                     detail="no such token",
                 )
                 self._conn.commit()
                 return AuthResult(False, scope=scope, reason="unknown token")
             if not row.is_live():
                 self._audit(
-                    "rejected", remote_addr=remote_addr,
+                    "rejected",
+                    remote_addr=remote_addr,
                     detail="token expired or revoked",
                 )
                 self._conn.commit()
                 return AuthResult(
-                    False, row=row, scope=scope,
+                    False,
+                    row=row,
+                    scope=scope,
                     reason="token revoked or expired",
                 )
 
             if scope.kind == ScopeClass.OPERATOR_ONLY:
                 self._audit(
-                    "rejected", remote_addr=remote_addr,
+                    "rejected",
+                    remote_addr=remote_addr,
                     detail=f"operator-only scope: {scope.reason}",
                 )
                 self._conn.commit()
                 return AuthResult(
-                    False, row=row, scope=scope,
+                    False,
+                    row=row,
+                    scope=scope,
                     reason="operator-only record namespace",
                 )
             if scope.kind == ScopeClass.UNKNOWN:
                 self._audit(
-                    "rejected", remote_addr=remote_addr,
+                    "rejected",
+                    remote_addr=remote_addr,
                     detail=f"unknown scope: {scope.reason}",
                 )
                 self._conn.commit()
                 return AuthResult(
-                    False, row=row, scope=scope,
+                    False,
+                    row=row,
+                    scope=scope,
                     reason="unclassified record name",
                 )
 
@@ -900,13 +921,16 @@ class TokenStore:
                     if not row.subject_hash12 or row.subject_hash12 != expected[1:]:
                         self._audit(
                             "rejected",
-                            token_hash=token_hash, subject=row.subject,
+                            token_hash=token_hash,
+                            subject=row.subject,
                             remote_addr=remote_addr,
                             detail=f"subject_hash12 mismatch: want {expected}",
                         )
                         self._conn.commit()
                         return AuthResult(
-                            False, row=row, scope=scope,
+                            False,
+                            row=row,
+                            scope=scope,
                             reason="subject hash does not match record namespace",
                         )
                 else:
@@ -919,13 +943,16 @@ class TokenStore:
                     if row.subject != expected:
                         self._audit(
                             "rejected",
-                            token_hash=token_hash, subject=row.subject,
+                            token_hash=token_hash,
+                            subject=row.subject,
                             remote_addr=remote_addr,
                             detail=f"subject mismatch: want {expected}",
                         )
                         self._conn.commit()
                         return AuthResult(
-                            False, row=row, scope=scope,
+                            False,
+                            row=row,
+                            scope=scope,
                             reason="subject does not match record owner",
                         )
 
@@ -940,20 +967,25 @@ class TokenStore:
                     if log_use:
                         self._audit(
                             "throttled",
-                            token_hash=token_hash, subject=row.subject,
+                            token_hash=token_hash,
+                            subject=row.subject,
                             remote_addr=remote_addr,
                             detail="owner-exclusive",
                         )
                         self._conn.commit()
                     return AuthResult(
-                        False, throttled=True, row=row, scope=scope,
+                        False,
+                        throttled=True,
+                        row=row,
+                        scope=scope,
                         reason="per-token rate limit exceeded",
                     )
 
                 if log_use:
                     self._audit(
                         "used",
-                        token_hash=token_hash, subject=row.subject,
+                        token_hash=token_hash,
+                        subject=row.subject,
                         remote_addr=remote_addr,
                         detail="owner-exclusive",
                     )
@@ -978,12 +1010,17 @@ class TokenStore:
                     )
                     self._conn.commit()
                 return AuthResult(
-                    False, throttled=True, row=row, scope=scope,
+                    False,
+                    throttled=True,
+                    row=row,
+                    scope=scope,
                     reason="per-token rate limit exceeded",
                 )
             if log_use:
                 self._audit(
-                    "used", remote_addr=remote_addr, detail="shared-pool",
+                    "used",
+                    remote_addr=remote_addr,
+                    detail="shared-pool",
                 )
                 self._conn.commit()
             return AuthResult(True, row=row, scope=scope)

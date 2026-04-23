@@ -41,7 +41,6 @@ from dmp.server.tokens import (
     subject_hash12_for_x25519,
 )
 
-
 # ---------------------------------------------------------------------------
 # DB resolution
 # ---------------------------------------------------------------------------
@@ -138,14 +137,18 @@ def _print_row_table(rows: list) -> None:
     print("  ".join(f"{h:<20}" for h in header))
     for r in rows:
         status = "live" if r.is_live() else "inactive"
-        print("  ".join([
-            f"{r.token_hash[:16]:<20}",
-            f"{r.subject:<20}",
-            f"{_fmt_ts(r.issued_at):<20}",
-            f"{_fmt_ts(r.expires_at):<20}",
-            f"{_fmt_ts(r.revoked_at):<20}",
-            f"{status:<20}",
-        ]))
+        print(
+            "  ".join(
+                [
+                    f"{r.token_hash[:16]:<20}",
+                    f"{r.subject:<20}",
+                    f"{_fmt_ts(r.issued_at):<20}",
+                    f"{_fmt_ts(r.expires_at):<20}",
+                    f"{_fmt_ts(r.revoked_at):<20}",
+                    f"{status:<20}",
+                ]
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -194,14 +197,19 @@ def cmd_token_issue(args: argparse.Namespace, store: TokenStore) -> int:
     )
 
     if args.json:
-        print(json.dumps({
-            "token": token,
-            "subject": row.subject,
-            "subject_hash12": row.subject_hash12,
-            "expires_at": row.expires_at,
-            "rate_per_sec": row.rate_per_sec,
-            "rate_burst": row.rate_burst,
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "token": token,
+                    "subject": row.subject,
+                    "subject_hash12": row.subject_hash12,
+                    "expires_at": row.expires_at,
+                    "rate_per_sec": row.rate_per_sec,
+                    "rate_burst": row.rate_burst,
+                },
+                indent=2,
+            )
+        )
     else:
         print(f"  subject:    {row.subject}")
         if row.subject_hash12:
@@ -238,12 +246,15 @@ def cmd_token_revoke(args: argparse.Namespace, store: TokenStore) -> int:
         return 0
     # Otherwise treat target as a token-hash prefix; require unambiguous match.
     matches = [
-        r for r in store.list(include_revoked=False)
+        r
+        for r in store.list(include_revoked=False)
         if r.token_hash.startswith(target.lower())
     ]
     if not matches:
-        print(f"no live token found for subject or hash-prefix {target!r}",
-              file=sys.stderr)
+        print(
+            f"no live token found for subject or hash-prefix {target!r}",
+            file=sys.stderr,
+        )
         return 1
     if len(matches) > 1:
         print(
@@ -254,8 +265,10 @@ def cmd_token_revoke(args: argparse.Namespace, store: TokenStore) -> int:
         return 2
     ok = store.revoke(matches[0].token_hash)
     if ok:
-        print(f"revoked token {matches[0].token_hash[:16]}… "
-              f"(subject {matches[0].subject})")
+        print(
+            f"revoked token {matches[0].token_hash[:16]}… "
+            f"(subject {matches[0].subject})"
+        )
         return 0
     print("revoke failed (race?)", file=sys.stderr)
     return 1
@@ -270,7 +283,8 @@ def cmd_token_rotate(args: argparse.Namespace, store: TokenStore) -> int:
     revoked = store.revoke_by_subject(args.subject)
     token, row = store.issue(
         args.subject,
-        rate_per_sec=args.rate, rate_burst=args.burst,
+        rate_per_sec=args.rate,
+        rate_burst=args.burst,
         expires_in_seconds=parse_duration(args.expires) if args.expires else None,
         issuer=f"admin:{os.environ.get('USER', 'unknown')}:rotate",
         note="rotation",
@@ -286,8 +300,12 @@ def cmd_audit_tail(args: argparse.Namespace, store: TokenStore) -> int:
     if args.json:
         out = [
             {
-                "ts": ts, "event": ev, "token_hash": th, "subject": sj,
-                "remote_addr": ra, "detail": de,
+                "ts": ts,
+                "event": ev,
+                "token_hash": th,
+                "subject": sj,
+                "remote_addr": ra,
+                "detail": de,
             }
             for (ts, ev, th, sj, ra, de) in rows
         ]
@@ -319,7 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--db",
         default=None,
         help="Path to the token sqlite DB "
-             "(default: $DMP_TOKEN_DB_PATH or /var/lib/dmp/tokens.db)",
+        "(default: $DMP_TOKEN_DB_PATH or /var/lib/dmp/tokens.db)",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -329,32 +347,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_issue = p_tok_sub.add_parser("issue", help="mint a new token for a subject")
     p_issue.add_argument("subject", help="e.g. alice@example.com")
-    p_issue.add_argument("--expires", help="duration like 90d, 12h, 300s; default: no expiry")
-    p_issue.add_argument("--rate", type=float, default=DEFAULT_RATE_PER_SEC,
-                         help=f"req/s (default: {DEFAULT_RATE_PER_SEC})")
-    p_issue.add_argument("--burst", type=int, default=DEFAULT_RATE_BURST,
-                         help=f"burst budget (default: {DEFAULT_RATE_BURST})")
+    p_issue.add_argument(
+        "--expires", help="duration like 90d, 12h, 300s; default: no expiry"
+    )
+    p_issue.add_argument(
+        "--rate",
+        type=float,
+        default=DEFAULT_RATE_PER_SEC,
+        help=f"req/s (default: {DEFAULT_RATE_PER_SEC})",
+    )
+    p_issue.add_argument(
+        "--burst",
+        type=int,
+        default=DEFAULT_RATE_BURST,
+        help=f"burst budget (default: {DEFAULT_RATE_BURST})",
+    )
     p_issue.add_argument("--note", help="free-form operator annotation")
     p_issue.add_argument(
         "--with-prekey-scope",
         metavar="X25519_HEX",
         help="32-byte hex X25519 pubkey — binds the token's prekey scope "
-             "(pk-*.<hash12>.*) to that key's hash. Required for the user "
-             "to publish their own prekeys.",
+        "(pk-*.<hash12>.*) to that key's hash. Required for the user "
+        "to publish their own prekeys.",
     )
-    p_issue.add_argument("--json", action="store_true",
-                         help="emit JSON instead of the human-readable banner")
+    p_issue.add_argument(
+        "--json",
+        action="store_true",
+        help="emit JSON instead of the human-readable banner",
+    )
     p_issue.set_defaults(func=cmd_token_issue)
 
     p_list = p_tok_sub.add_parser("list", help="list tokens")
     p_list.add_argument("--subject", help="filter to one subject")
-    p_list.add_argument("--include-revoked", action="store_true",
-                        help="include revoked tokens in the output")
+    p_list.add_argument(
+        "--include-revoked",
+        action="store_true",
+        help="include revoked tokens in the output",
+    )
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_token_list)
 
-    p_rev = p_tok_sub.add_parser("revoke",
-                                  help="revoke by exact subject OR by token-hash prefix")
+    p_rev = p_tok_sub.add_parser(
+        "revoke", help="revoke by exact subject OR by token-hash prefix"
+    )
     p_rev.add_argument("target", help="subject (e.g. alice@example.com) or hash prefix")
     p_rev.set_defaults(func=cmd_token_revoke)
 
@@ -372,8 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit = sub.add_parser("audit", help="inspect the audit log")
     p_audit_sub = p_audit.add_subparsers(dest="audit_cmd", required=True)
     p_tail = p_audit_sub.add_parser("tail", help="tail recent audit rows")
-    p_tail.add_argument("--event",
-                        help="filter: issued|revoked|used|rejected")
+    p_tail.add_argument("--event", help="filter: issued|revoked|used|rejected")
     p_tail.add_argument("--limit", type=int, default=50)
     p_tail.add_argument("--json", action="store_true")
     p_tail.set_defaults(func=cmd_audit_tail)

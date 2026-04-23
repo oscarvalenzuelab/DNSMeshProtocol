@@ -99,6 +99,7 @@ def _default_token_db_path(record_db_path: str) -> str:
     main loop depending on an admin module.
     """
     from pathlib import Path as _Path
+
     p = _Path(record_db_path)
     return str(p.with_name(p.stem + "_tokens" + p.suffix))
 

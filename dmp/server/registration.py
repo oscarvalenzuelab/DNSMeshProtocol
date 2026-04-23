@@ -215,7 +215,8 @@ def _parse_hex(value: str, expected_bytes: int, field: str) -> bytes:
         raw = binascii.unhexlify(value)
     except binascii.Error as exc:
         raise RegistrationError(
-            f"{field}: not valid hex", http_status=400,
+            f"{field}: not valid hex",
+            http_status=400,
         ) from exc
     if len(raw) != expected_bytes:
         raise RegistrationError(
@@ -226,7 +227,9 @@ def _parse_hex(value: str, expected_bytes: int, field: str) -> bytes:
 
 
 def _build_signing_payload(
-    challenge_hex: str, subject: str, node: str,
+    challenge_hex: str,
+    subject: str,
+    node: str,
 ) -> bytes:
     """Return the bytes the client must sign on /confirm.
 
@@ -286,14 +289,15 @@ class RegistrationConfig:
     @classmethod
     def from_env(cls) -> "RegistrationConfig":
         enabled = os.environ.get("DMP_REGISTRATION_ENABLED", "").strip() in (
-            "1", "true", "yes", "on",
+            "1",
+            "true",
+            "yes",
+            "on",
         )
         hostname = os.environ.get("DMP_NODE_HOSTNAME", "").strip()
         allow_raw = os.environ.get("DMP_REGISTRATION_ALLOWLIST", "")
         allowlist = tuple(
-            a.strip().lower().rstrip(".")
-            for a in allow_raw.split(",")
-            if a.strip()
+            a.strip().lower().rstrip(".") for a in allow_raw.split(",") if a.strip()
         )
         expiry = int(
             os.environ.get(
