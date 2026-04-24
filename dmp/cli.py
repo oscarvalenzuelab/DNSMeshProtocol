@@ -2821,6 +2821,72 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_peers(args: argparse.Namespace) -> int:
+    """Show the heartbeat-discovery view a node exposes at /v1/nodes/seen.
+
+    No config required: hits any node's public discovery endpoint and
+    formats the result. Useful for "I just spun up a node, what does
+    its directory look like?" and for surveying a peer before pinning
+    it. ``--json`` returns the raw payload for piping into jq.
+    """
+    import json as _json
+    import time as _time
+
+    import requests
+
+    endpoint = args.endpoint.rstrip("/")
+    url = f"{endpoint}/v1/nodes/seen"
+    timeout = float(args.timeout)
+    try:
+        r = requests.get(url, timeout=timeout)
+    except requests.RequestException as e:
+        _die(2, f"GET {url} failed: {e}")
+    if r.status_code == 404:
+        _die(
+            1,
+            f"{endpoint} does not expose a discovery feed. The operator "
+            "has not enabled the heartbeat layer (DMP_HEARTBEAT_ENABLED=1).",
+        )
+    if r.status_code != 200:
+        _die(2, f"{url} returned {r.status_code}: {r.text[:200]}")
+
+    payload = r.json()
+    if args.json:
+        print(_json.dumps(payload, indent=2))
+        return 0
+
+    # Human-readable table.
+    self_block = payload.get("self") or {}
+    seen = payload.get("seen") or []
+    print(f"node:    {endpoint}")
+    print(f"  self endpoint: {self_block.get('endpoint', '?')}")
+    print(f"  operator spk:  {self_block.get('operator_spk_hex', '?')}")
+    print(f"  heartbeat:     {'on' if self_block.get('enabled') else 'off'}")
+    print()
+    if not seen:
+        print("(no peers seen yet)")
+        return 0
+
+    now = int(_time.time())
+    print(f"peers ({len(seen)}):")
+    for entry in seen:
+        ep = entry.get("endpoint", "?")
+        spk = entry.get("operator_spk_hex", "")
+        spk_short = (spk[:8] + "..." + spk[-4:]) if len(spk) > 16 else spk
+        ts = int(entry.get("ts", 0))
+        age = max(0, now - ts)
+        if age < 60:
+            age_str = f"{age}s ago"
+        elif age < 3600:
+            age_str = f"{age // 60}m ago"
+        else:
+            age_str = f"{age // 3600}h ago"
+        version = entry.get("version") or "-"
+        print(f"  {ep}")
+        print(f"    spk={spk_short}  version={version}  last heard {age_str}")
+    return 0
+
+
 def cmd_node(args: argparse.Namespace) -> int:
     """Convenience: launch a dnsmesh-node in the foreground."""
     from dmp.server.node import DMPNode, DMPNodeConfig
@@ -3193,6 +3259,28 @@ def build_parser() -> argparse.ArgumentParser:
         "mode. All-or-nothing: on any failure the config is left untouched.",
     )
     p_bs_discover.set_defaults(func=cmd_bootstrap_discover)
+
+    # peers (discovery feed of a single node)
+    p_peers = sub.add_parser(
+        "peers",
+        help="show the heartbeat directory a node exposes at /v1/nodes/seen",
+    )
+    p_peers.add_argument(
+        "endpoint",
+        help="HTTP base URL of the node to query (e.g. https://dmp.example.com)",
+    )
+    p_peers.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the raw JSON payload instead of a human-readable table",
+    )
+    p_peers.add_argument(
+        "--timeout",
+        type=float,
+        default=5.0,
+        help="HTTP timeout in seconds (default: 5)",
+    )
+    p_peers.set_defaults(func=cmd_peers)
 
     # node (convenience launcher)
     p_n = sub.add_parser("node", help="run a dnsmesh node in the foreground")
