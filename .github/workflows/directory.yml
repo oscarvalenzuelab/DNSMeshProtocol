@@ -88,9 +88,14 @@ jobs:
           # 'Generated' (the cosmetic timestamp) — both feed.json's
           # `generated_at` and index.html's <small>Generated …</small>
           # share that token.
+          # All three greps need -E: the {3} quantifier is an extended-
+          # regex feature, and `grep -v` (basic-regex by default) treats
+          # `{3}` as literal characters. Without -E, the file-header
+          # lines (--- / +++) survive and trip the cosmetic-only-skip
+          # check, so every cron tick produced a no-op commit.
           if git diff --staged --no-color | grep -E '^[+-]' \
-              | grep -v '^[+-]{3}' \
-              | grep -v 'Generated\|generated_at' \
+              | grep -vE '^[+-]{3}' \
+              | grep -vE 'Generated|generated_at' \
               | grep -q .; then
             # Deliberately NOT marking [skip ci]: GitHub Actions honors
             # that token, and the next pages.yml run is exactly what we
