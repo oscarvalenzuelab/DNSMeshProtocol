@@ -1,0 +1,23 @@
+# Public seed list for the canonical DMP directory aggregator.
+#
+# One node HTTP base URL per line. Lines starting with '#' and blank
+# lines are ignored. Each URL must respond to GET /v1/nodes/seen with
+# a verified heartbeat feed.
+#
+# To add your node:
+#   1. Stand it up with the heartbeat layer enabled. See
+#      https://ovalenzuela.com/DNSMeshProtocol/deployment/heartbeat
+#   2. Open a PR adding your node's HTTPS URL below.
+#   3. The next scheduled run of the directory workflow rebuilds
+#      https://ovalenzuela.com/DNSMeshProtocol/directory/ with your
+#      node included. From there, anti-entropy gossip across nodes
+#      (each node /v1/nodes/seen lists the peers IT has heard) lets
+#      the aggregator find every node reachable from a seed without
+#      having to enumerate them all here.
+#
+# This file is intentionally federated, not authoritative: anyone can
+# run their own aggregator off any subset of seeds. The version under
+# this repo just gives the project a public "first directory" so a
+# fresh operator has somewhere to look immediately.
+
+# (no canonical seeds yet; PRs welcome)

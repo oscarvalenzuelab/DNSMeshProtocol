@@ -33,6 +33,8 @@ an item here is the most common way a DMP node gets owned.
   opt-in peer-to-peer discovery layer (M5.8): each node pings peers
   with signed heartbeats, aggregators render a public directory
   off the resulting signed feed. No central trust anchor required.
+  Project-canonical render at [`/directory/`]({{ site.baseurl }}/directory/),
+  refreshed every 30 min from `directory/seeds.txt`.
 - [Hardening]({{ site.baseurl }}/deployment/hardening) — mandatory
   operator checklist before production.
 
