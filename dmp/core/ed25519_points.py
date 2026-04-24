@@ -19,7 +19,6 @@ needs to update one file.
 
 from __future__ import annotations
 
-
 LOW_ORDER_ED25519_PUBKEYS: frozenset = frozenset(
     bytes.fromhex(h)
     for h in (

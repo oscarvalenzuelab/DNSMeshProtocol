@@ -112,9 +112,7 @@ class TestSignatureVerification:
         bad_wire = RECORD_PREFIX + base64.b64encode(tampered).decode("ascii")
         assert HeartbeatRecord.parse_and_verify(bad_wire, now=now) is None
 
-    def test_sign_rejects_mismatched_crypto(
-        self, signer: DMPCrypto, now: int
-    ) -> None:
+    def test_sign_rejects_mismatched_crypto(self, signer: DMPCrypto, now: int) -> None:
         other = DMPCrypto.from_passphrase("other", salt=b"B" * 32)
         hb = _build(signer, now=now)  # declares signer's spk
         with pytest.raises(ValueError, match="does not match declared operator_spk"):
@@ -162,9 +160,7 @@ class TestLowOrderPubkey:
                 + struct.pack(">Q", now)
                 + struct.pack(">Q", now + 86400)
             )
-            wire = RECORD_PREFIX + base64.b64encode(body + b"\x00" * 64).decode(
-                "ascii"
-            )
+            wire = RECORD_PREFIX + base64.b64encode(body + b"\x00" * 64).decode("ascii")
             assert HeartbeatRecord.parse_and_verify(wire, now=now) is None
 
 
@@ -174,16 +170,12 @@ class TestLowOrderPubkey:
 
 
 class TestFreshness:
-    def test_future_ts_beyond_skew_rejected(
-        self, signer: DMPCrypto, now: int
-    ) -> None:
+    def test_future_ts_beyond_skew_rejected(self, signer: DMPCrypto, now: int) -> None:
         hb = _build(signer, now=now + 3600, exp=now + 3600 + 86400)
         wire = hb.sign(signer)
         assert HeartbeatRecord.parse_and_verify(wire, now=now) is None
 
-    def test_past_ts_beyond_skew_rejected(
-        self, signer: DMPCrypto, now: int
-    ) -> None:
+    def test_past_ts_beyond_skew_rejected(self, signer: DMPCrypto, now: int) -> None:
         hb = _build(signer, now=now - 3600, exp=now - 3600 + 86400)
         wire = hb.sign(signer)
         assert HeartbeatRecord.parse_and_verify(wire, now=now) is None
@@ -395,6 +387,7 @@ class TestMalformedWire:
         # We bypass the endpoint validator at construction by constructing
         # with a legal endpoint, then swapping via dataclasses.replace.
         from dataclasses import replace
+
         hb = _build(signer, now=now)
         # Pack so the wire is near MAX_ENDPOINT_LEN; plus other fields
         # still stays under MAX_WIRE_LEN — we already tested the max

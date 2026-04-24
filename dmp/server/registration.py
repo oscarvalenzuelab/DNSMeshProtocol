@@ -49,7 +49,9 @@ from dmp.server.tokens import (
 # Low-order Ed25519 block list — shared source of truth at
 # dmp.core.ed25519_points so registration, heartbeat, and any future
 # signed-record consumer all stay in sync.
-from dmp.core.ed25519_points import LOW_ORDER_ED25519_PUBKEYS as _LOW_ORDER_ED25519_PUBKEYS  # noqa: E402,F401
+from dmp.core.ed25519_points import (
+    LOW_ORDER_ED25519_PUBKEYS as _LOW_ORDER_ED25519_PUBKEYS,
+)  # noqa: E402,F401
 
 # Version byte embedded in the signed message. Bump if we change the
 # signing-payload layout so old and new signatures can't collide.

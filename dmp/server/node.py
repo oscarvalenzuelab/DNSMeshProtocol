@@ -118,7 +118,7 @@ class _HeartbeatBundle:
     heartbeat layer is opt-in-enabled. None when disabled."""
 
     store: object  # SeenStore; typed loose to avoid the import at
-                   # module load time for disabled deployments
+    # module load time for disabled deployments
     worker: object  # HeartbeatWorker
     submit_rate_limit: "RateLimit"
     seen_rate_limit: "RateLimit"
@@ -206,13 +206,10 @@ def _load_heartbeat_from_env(record_db_path: str):
     # SeenStore alongside the record DB (override via env).
     from dmp.server.heartbeat_store import SeenStore
 
-    seen_db = (
-        os.environ.get("DMP_HEARTBEAT_DB_PATH", "").strip()
-        or _default_heartbeat_db_path(record_db_path)
-    )
-    retention_hours = int(
-        os.environ.get("DMP_HEARTBEAT_RETENTION_HOURS", "72")
-    )
+    seen_db = os.environ.get(
+        "DMP_HEARTBEAT_DB_PATH", ""
+    ).strip() or _default_heartbeat_db_path(record_db_path)
+    retention_hours = int(os.environ.get("DMP_HEARTBEAT_RETENTION_HOURS", "72"))
     max_rows = int(os.environ.get("DMP_HEARTBEAT_SEEN_MAX_ROWS", "10000"))
     store = SeenStore(
         seen_db,
@@ -227,14 +224,8 @@ def _load_heartbeat_from_env(record_db_path: str):
     )
 
     seed_peers_raw = os.environ.get("DMP_HEARTBEAT_SEEDS", "")
-    seed_peers = tuple(
-        s.strip()
-        for s in seed_peers_raw.split(",")
-        if s.strip()
-    )
-    interval = int(
-        os.environ.get("DMP_HEARTBEAT_INTERVAL_SECONDS", "300")
-    )
+    seed_peers = tuple(s.strip() for s in seed_peers_raw.split(",") if s.strip())
+    interval = int(os.environ.get("DMP_HEARTBEAT_INTERVAL_SECONDS", "300"))
     ttl = int(os.environ.get("DMP_HEARTBEAT_TTL_SECONDS", "86400"))
     max_peers = int(os.environ.get("DMP_HEARTBEAT_MAX_PEERS", "25"))
     version = os.environ.get("DMP_HEARTBEAT_VERSION", "").strip() or "dev"
@@ -672,9 +663,7 @@ class DMPNode:
                 heartbeat_bundle.self_spk_hex if heartbeat_bundle else None
             ),
         )
-        self.heartbeat_worker = (
-            heartbeat_bundle.worker if heartbeat_bundle else None
-        )
+        self.heartbeat_worker = heartbeat_bundle.worker if heartbeat_bundle else None
         self.cleanup = CleanupWorker(
             self.store.cleanup_expired,
             interval_seconds=self.config.cleanup_interval,

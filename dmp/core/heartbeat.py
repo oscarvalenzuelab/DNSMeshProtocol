@@ -329,9 +329,7 @@ class HeartbeatRecord:
         — a mismatch catches a common footgun where a caller signs a
         heartbeat with the wrong key and confuses verifiers downstream.
         """
-        if (
-            operator_crypto.get_signing_public_key_bytes() != bytes(self.operator_spk)
-        ):
+        if operator_crypto.get_signing_public_key_bytes() != bytes(self.operator_spk):
             raise ValueError(
                 "operator_crypto signing key does not match declared operator_spk"
             )

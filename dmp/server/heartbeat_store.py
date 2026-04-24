@@ -136,9 +136,7 @@ class SeenStore:
             # rows. Otherwise a pile of unswept expired rows would
             # cause a fresh legitimate accept to evict another live
             # node. Codex phase-2 P2 fix.
-            self._conn.execute(
-                "DELETE FROM heartbeats_seen WHERE exp <= ?", (now_i,)
-            )
+            self._conn.execute("DELETE FROM heartbeats_seen WHERE exp <= ?", (now_i,))
             self._conn.execute(
                 """INSERT INTO heartbeats_seen
                    (operator_spk_hex, endpoint, wire, ts, exp, version,

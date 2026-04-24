@@ -67,9 +67,7 @@ class _StubPoster:
 
 
 class TestTickBasics:
-    def test_solo_node_no_seeds_no_calls(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_solo_node_no_seeds_no_calls(self, store: SeenStore, now: int) -> None:
         """A freshly-started node with no seeds and no cluster peers
         has nothing to ping. tick_once returns 0 and does not raise."""
         cfg = HeartbeatWorkerConfig(
@@ -102,9 +100,7 @@ class TestTickBasics:
             "https://seed2.example.com/v1/heartbeat",
         ]
 
-    def test_gossip_response_written_to_store(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_gossip_response_written_to_store(self, store: SeenStore, now: int) -> None:
         """A seed responds with {"seen": [wire1, wire2]} — those
         wires get verified and stored."""
         cfg = HeartbeatWorkerConfig(
@@ -182,9 +178,7 @@ class TestPeerList:
         urls = [c[0] for c in poster.calls]
         assert urls == ["https://real-seed.example.com/v1/heartbeat"]
 
-    def test_gossip_learned_peers_expand_set(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_gossip_learned_peers_expand_set(self, store: SeenStore, now: int) -> None:
         """Seeding the store with known peers should cause them to
         appear in the ping list on the next tick."""
         # Pre-seed the store with two known peers.
@@ -214,9 +208,7 @@ class TestPeerList:
             "https://b.example.com/v1/heartbeat",
         ]
 
-    def test_max_peers_cap_applies(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_max_peers_cap_applies(self, store: SeenStore, now: int) -> None:
         """max_peers caps the outbound fan-out per tick."""
         seeds = tuple(f"https://s{i}.example.com" for i in range(10))
         cfg = HeartbeatWorkerConfig(
@@ -287,9 +279,7 @@ class TestCooldown:
         worker.tick_once(now=now + 180)
         assert len(poster.calls) == 2  # retried
 
-    def test_successful_peer_clears_cooldown(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_successful_peer_clears_cooldown(self, store: SeenStore, now: int) -> None:
         """A peer transitions from failing to working — cooldown clears."""
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
@@ -318,9 +308,7 @@ class TestCooldown:
 
 
 class TestOwnHeartbeatShape:
-    def test_own_wire_is_valid_heartbeat(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_own_wire_is_valid_heartbeat(self, store: SeenStore, now: int) -> None:
         """The wire the worker posts to peers must parse + verify
         cleanly on the receiving side."""
         cfg = HeartbeatWorkerConfig(
@@ -336,7 +324,7 @@ class TestOwnHeartbeatShape:
         )
         worker = HeartbeatWorker(cfg, signer, store, http_poster=poster)
         worker.tick_once(now=now)
-        (url, body, _) = poster.calls[0]
+        url, body, _ = poster.calls[0]
         wire = body["wire"]
         parsed = HeartbeatRecord.parse_and_verify(wire, now=now)
         assert parsed is not None
@@ -355,9 +343,7 @@ class TestFreshnessPerPeer:
     refreshes ``now`` + re-signs.
     """
 
-    def test_clock_refreshed_per_peer(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_clock_refreshed_per_peer(self, store: SeenStore, now: int) -> None:
         """Inject a poster that captures the `ts` field in each
         posted wire; assert ts increases across consecutive peers."""
         cfg = HeartbeatWorkerConfig(
@@ -425,9 +411,7 @@ class TestFreshnessPerPeer:
 class TestGossipIngestBounded:
     """Codex phase-4 P2: cap on per-response gossip ingest."""
 
-    def test_oversized_gossip_is_truncated(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_oversized_gossip_is_truncated(self, store: SeenStore, now: int) -> None:
         """A hostile seed returns `seen` with far more wires than
         the configured cap. The worker must only process up to
         max_gossip_per_response of them.
@@ -483,9 +467,7 @@ class TestSelfFilterCanonicalization:
         urls = [c[0] for c in poster.calls]
         assert urls == ["https://other.example.com/v1/heartbeat"]
 
-    def test_uppercase_scheme_filtered(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_uppercase_scheme_filtered(self, store: SeenStore, now: int) -> None:
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
@@ -507,9 +489,7 @@ class TestSelfFilterCanonicalization:
         urls = [c[0] for c in poster.calls]
         assert urls == ["https://other.example.com/v1/heartbeat"]
 
-    def test_default_port_filtered(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_default_port_filtered(self, store: SeenStore, now: int) -> None:
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",

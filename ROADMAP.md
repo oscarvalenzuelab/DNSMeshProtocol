@@ -13,11 +13,12 @@ Two tracks live on this roadmap:
 **Status (2026-04-23):** `v0.1.0-alpha`. M1, M2 (full, incl.
 node-side anti-entropy + compose cluster), M3 (full, incl. bootstrap
 discovery + cluster manifest gossip), M4.1 (formal protocol spec),
-M5.4 (key rotation + revocation), and M5.5 (multi-tenant node auth
-with per-user publish tokens + self-service registration) are
-shipped. The certification backlog (M4.2–M4.4 audit, M5.1–M5.3 /
-M5.6 / M5.7 reach, M6 traffic-analysis) lands after the
-`v0.2.0-beta` tag. See per-milestone status below.
+M5.4 (key rotation + revocation), M5.5 (multi-tenant node auth
+with per-user publish tokens + self-service registration), and
+M5.8 (node heartbeat + discovery directory) are shipped. The
+certification backlog (M4.2–M4.4 audit, M5.1–M5.3 / M5.6 / M5.7
+reach, M6 traffic-analysis) lands after the `v0.2.0-beta` tag.
+See per-milestone status below.
 
 Atomic tasks for the current sprint live in [`TASKS.md`](TASKS.md);
 long-horizon items stay here until they get lifted into a sprint.
@@ -209,6 +210,50 @@ See `docs/design/multi-tenant-auth.md` for the full design,
 
 Self-service and operator-issued both shipped; they're orthogonal
 and the operator can run either or both.
+
+### M5.8 — Node heartbeat + discovery directory — SHIPPED
+
+Opt-in peer-to-peer heartbeat layer so a newcomer can discover
+which DMP nodes exist and which are healthy without out-of-band
+coordination. Each node emits a signed ``HeartbeatRecord``
+periodically, pushes to seeds + cluster peers + gossip-learned
+peers, and stores received heartbeats in a local sqlite. The
+snapshot is served at ``GET /v1/nodes/seen``; any aggregator can
+union multiple nodes' exports to render a directory website
+deterministically. Design doc: ``docs/design/heartbeat-directory.md``.
+
+- [x] **M5.8.1** ``HeartbeatRecord`` wire type
+      (``v=dmp1;t=heartbeat;``) with strict endpoint validator
+      (no userinfo, no private / loopback / link-local IPs, no
+      localhost aliases) and the shared Ed25519 low-order pubkey
+      block list extracted to ``dmp/core/ed25519_points.py``.
+- [x] **M5.8.2** SeenStore — sqlite-backed, upsert keyed by
+      (operator_spk, endpoint), 72h sliding retention, 10k row
+      cap with oldest-received-first eviction over LIVE rows
+      (stale rows pruned first). ``accept(wire)`` verifies
+      internally — no "comment-only" trust boundary.
+- [x] **M5.8.3** HTTP endpoints ``POST /v1/heartbeat`` +
+      ``GET /v1/nodes/seen`` with split per-IP rate buckets
+      (heavy ``/nodes/seen`` scraper traffic does not steal the
+      submit budget). POST response uses ``{"seen": [...]}``
+      field matching the GET shape.
+- [x] **M5.8.4** HeartbeatWorker daemon — self-signing + gossip
+      ingest. Clock + wire refreshed per-peer (tail peer doesn't
+      get a stale wire). Incoming gossip capped at
+      ``max_gossip_per_response`` (default 20) so a hostile seed
+      can't force unbounded sig-verify work. Self-filter uses
+      URL canonicalization (scheme / host case, default-port
+      elision).
+- [x] **M5.8.5** DMPNode env-driven wiring:
+      ``DMP_HEARTBEAT_ENABLED=1`` + ``DMP_HEARTBEAT_SELF_ENDPOINT``
+      + ``DMP_HEARTBEAT_OPERATOR_KEY_PATH``. Plus the standalone
+      ``OperatorSigner`` so operators can reuse the same 32-byte
+      Ed25519 seed ``generate-cluster-manifest.py`` emits.
+- [x] **M5.8.6** Reference aggregator at
+      ``examples/directory_aggregator.py`` — fetches seed nodes'
+      ``/v1/nodes/seen``, re-verifies every entry, writes
+      deterministic ``feed.json`` + static ``index.html``. Anyone
+      can run one off the same signed P2P data.
 
 ### M6 — Traffic-analysis resistance (certification backlog, research track)
 

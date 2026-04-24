@@ -42,9 +42,10 @@ class TestConstruction:
         # A trailing newline from a file-read must not break the loader.
         seed_hex = "aa" * 32
         s = OperatorSigner.from_hex(seed_hex + "\n")
-        assert s.get_signing_public_key_bytes() == OperatorSigner.from_hex(
-            seed_hex
-        ).get_signing_public_key_bytes()
+        assert (
+            s.get_signing_public_key_bytes()
+            == OperatorSigner.from_hex(seed_hex).get_signing_public_key_bytes()
+        )
 
 
 class TestSign:

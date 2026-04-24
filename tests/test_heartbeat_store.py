@@ -72,18 +72,14 @@ class TestAcceptAndList:
         assert rows[0].ts == now
         assert rows[0].remote_addr == "10.0.0.1"
 
-    def test_accept_rejects_unverified_wire(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_accept_rejects_unverified_wire(self, store: SeenStore, now: int) -> None:
         """Codex phase-2 P3: accept verifies internally. Garbage
         wire must short-circuit to None and NOT touch the DB."""
         result = store.accept("not-a-valid-wire", now=now)
         assert result is None
         assert store.count() == 0
 
-    def test_accept_rejects_tampered_wire(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_accept_rejects_tampered_wire(self, store: SeenStore, now: int) -> None:
         """A wire whose body has been mutated must fail the embedded
         signature verification and be refused."""
         signer = _signer()
@@ -108,9 +104,7 @@ class TestAcceptAndList:
         assert rows[0].ts == now + 60
         assert rows[0].wire == wire_b
 
-    def test_older_ts_does_not_clobber_newer(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_older_ts_does_not_clobber_newer(self, store: SeenStore, now: int) -> None:
         """Race: if an out-of-order older heartbeat arrives after a
         newer one, it must NOT overwrite the newer row."""
         signer = _signer()
@@ -124,9 +118,7 @@ class TestAcceptAndList:
         assert rows[0].ts == now + 120
         assert rows[0].wire == wire_new
 
-    def test_distinct_nodes_both_stored(
-        self, store: SeenStore, now: int
-    ) -> None:
+    def test_distinct_nodes_both_stored(self, store: SeenStore, now: int) -> None:
         s1 = _signer("a", b"A" * 32)
         s2 = _signer("b", b"B" * 32)
         w1 = _build_and_sign(s1, ts=now)
@@ -182,9 +174,7 @@ class TestListRecentFilters:
 
 
 class TestRetention:
-    def test_sweep_drops_well_past_exp(
-        self, tmp_path: Path, now: int
-    ) -> None:
+    def test_sweep_drops_well_past_exp(self, tmp_path: Path, now: int) -> None:
         # Short retention so we don't need a 72h jump.
         store = SeenStore(str(tmp_path / "hb.db"), retention_seconds=60)
         try:
@@ -198,9 +188,7 @@ class TestRetention:
         finally:
             store.close()
 
-    def test_sweep_keeps_rows_within_retention(
-        self, tmp_path: Path, now: int
-    ) -> None:
+    def test_sweep_keeps_rows_within_retention(self, tmp_path: Path, now: int) -> None:
         store = SeenStore(str(tmp_path / "hb.db"), retention_seconds=3600)
         try:
             signer = _signer()
@@ -215,17 +203,13 @@ class TestRetention:
 
 
 class TestRowCountCap:
-    def test_insert_past_cap_evicts_oldest(
-        self, tmp_path: Path, now: int
-    ) -> None:
+    def test_insert_past_cap_evicts_oldest(self, tmp_path: Path, now: int) -> None:
         store = SeenStore(str(tmp_path / "hb.db"), max_rows=3)
         try:
             # Insert 5 distinct rows with increasing received_at order.
             for i in range(5):
                 signer = _signer(str(i), bytes([i + 1]) * 32)
-                wire = _build_and_sign(
-                    signer, f"https://n{i}.example.com", ts=now + i
-                )
+                wire = _build_and_sign(signer, f"https://n{i}.example.com", ts=now + i)
                 store.accept(wire, now=now + i)
 
             # At most 3 rows remain, and the two oldest (i=0,1) are gone.

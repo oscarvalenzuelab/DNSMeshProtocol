@@ -54,9 +54,7 @@ class OperatorSigner:
             raise ValueError("seed_hex must be a string")
         cleaned = seed_hex.strip()
         if len(cleaned) != 64:
-            raise ValueError(
-                f"seed_hex must be 64 hex chars, got {len(cleaned)}"
-            )
+            raise ValueError(f"seed_hex must be 64 hex chars, got {len(cleaned)}")
         try:
             seed = bytes.fromhex(cleaned)
         except ValueError as exc:

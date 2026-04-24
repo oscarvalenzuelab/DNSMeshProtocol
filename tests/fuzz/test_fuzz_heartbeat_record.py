@@ -18,7 +18,6 @@ from hypothesis import given, strategies as st
 
 from dmp.core.heartbeat import RECORD_PREFIX, HeartbeatRecord
 
-
 hypothesis.settings.register_profile("ci", max_examples=5000, deadline=None)
 hypothesis.settings.register_profile("default", max_examples=500, deadline=None)
 hypothesis.settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "default"))

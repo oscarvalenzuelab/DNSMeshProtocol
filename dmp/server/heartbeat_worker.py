@@ -231,9 +231,7 @@ class HeartbeatWorker:
             # Refresh clock + re-sign per peer (P2 fix). Uses `now`
             # override when the test passed one; otherwise wall
             # clock so late peers get an ~up-to-the-second wire.
-            per_peer_now = (
-                int(now) if now is not None else int(time.time())
-            )
+            per_peer_now = int(now) if now is not None else int(time.time())
             try:
                 own_wire = self._build_own_wire(per_peer_now)
             except ValueError:
@@ -342,9 +340,7 @@ class HeartbeatWorker:
 # ---------------------------------------------------------------------------
 
 
-def _default_http_poster(
-    url: str, body: dict, timeout: float
-) -> Optional[dict]:
+def _default_http_poster(url: str, body: dict, timeout: float) -> Optional[dict]:
     """Default HTTP POST. Returns decoded JSON on 200, None otherwise.
 
     Deferred requests import so importing this module in a minimal

@@ -46,7 +46,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dmp.core.heartbeat import HeartbeatRecord  # noqa: E402
 
-
 log = logging.getLogger("dmp-directory-aggregator")
 
 
@@ -241,9 +240,7 @@ def emit_html(nodes: List[AggregatedNode], out: Path, *, now: int) -> None:
         age_str = (
             f"{age}s ago"
             if age < 60
-            else f"{age // 60}m ago"
-            if age < 3600
-            else f"{age // 3600}h ago"
+            else f"{age // 60}m ago" if age < 3600 else f"{age // 3600}h ago"
         )
         spk_short = n.operator_spk_hex[:8] + "…" + n.operator_spk_hex[-4:]
         return (

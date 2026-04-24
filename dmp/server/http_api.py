@@ -564,9 +564,7 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             )
             return 400
 
-        gossip_limit = int(
-            getattr(self.server, "heartbeat_gossip_limit", 10)
-        )
+        gossip_limit = int(getattr(self.server, "heartbeat_gossip_limit", 10))
         # Gossip-on-ping response: recent heartbeats from OTHER
         # operators. Exclude the submitter's own spk so A never tells
         # B about A's own heartbeat; also excludes any other wire

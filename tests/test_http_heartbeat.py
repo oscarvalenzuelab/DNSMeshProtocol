@@ -143,13 +143,14 @@ class TestSubmit:
         api, store = hb_api
         signer = _signer()
         wire = _heartbeat(signer)
-        r = requests.post(
-            f"{_base(api)}/v1/heartbeat", json={"wire": wire}, timeout=2
-        )
+        r = requests.post(f"{_base(api)}/v1/heartbeat", json={"wire": wire}, timeout=2)
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["ok"] is True
-        assert body["accepted_operator_spk_hex"] == signer.get_signing_public_key_bytes().hex()
+        assert (
+            body["accepted_operator_spk_hex"]
+            == signer.get_signing_public_key_bytes().hex()
+        )
         # Store now has one row.
         assert store.count() == 1
 
@@ -158,9 +159,7 @@ class TestSubmit:
         signer = _signer()
         wire = _heartbeat(signer)
         bad = wire[:-4] + ("A" if wire[-4] != "A" else "B") + wire[-3:]
-        r = requests.post(
-            f"{_base(api)}/v1/heartbeat", json={"wire": bad}, timeout=2
-        )
+        r = requests.post(f"{_base(api)}/v1/heartbeat", json={"wire": bad}, timeout=2)
         assert r.status_code == 400
         assert store.count() == 0
 
@@ -191,14 +190,12 @@ class TestGossipResponse:
         api, _ = hb_api
         signer = _signer()
         wire = _heartbeat(signer)
-        r = requests.post(
-            f"{_base(api)}/v1/heartbeat", json={"wire": wire}, timeout=2
-        )
+        r = requests.post(f"{_base(api)}/v1/heartbeat", json={"wire": wire}, timeout=2)
         body = r.json()
         assert "seen" in body, f"expected 'seen' field in {body}"
-        assert "gossip" not in body, (
-            "response must NOT use 'gossip' — field is 'seen' per design doc"
-        )
+        assert (
+            "gossip" not in body
+        ), "response must NOT use 'gossip' — field is 'seen' per design doc"
 
     def test_submit_returns_other_nodes_as_seen(self, hb_api) -> None:
         api, store = hb_api
@@ -210,9 +207,7 @@ class TestGossipResponse:
         # Now a fourth node submits its own heartbeat.
         fourth = _signer("fourth", b"F" * 32)
         wire = _heartbeat(fourth, endpoint="https://fourth.example.com")
-        r = requests.post(
-            f"{_base(api)}/v1/heartbeat", json={"wire": wire}, timeout=2
-        )
+        r = requests.post(f"{_base(api)}/v1/heartbeat", json={"wire": wire}, timeout=2)
         assert r.status_code == 200
         body = r.json()
         # Seen list should contain the 3 other nodes' wires, not the
@@ -295,9 +290,7 @@ class TestNodesSeen:
 class TestDisabled:
     def test_post_heartbeat_returns_404(self, hb_api_disabled) -> None:
         api = hb_api_disabled
-        r = requests.post(
-            f"{_base(api)}/v1/heartbeat", json={"wire": "x"}, timeout=2
-        )
+        r = requests.post(f"{_base(api)}/v1/heartbeat", json={"wire": "x"}, timeout=2)
         assert r.status_code == 404
 
     def test_get_nodes_seen_returns_404(self, hb_api_disabled) -> None:
@@ -317,12 +310,8 @@ class TestRateLimit:
         signer = _signer()
         w1 = _heartbeat(signer, endpoint="https://a.example.com")
         w2 = _heartbeat(signer, endpoint="https://b.example.com")
-        r1 = requests.post(
-            f"{_base(api)}/v1/heartbeat", json={"wire": w1}, timeout=2
-        )
-        r2 = requests.post(
-            f"{_base(api)}/v1/heartbeat", json={"wire": w2}, timeout=2
-        )
+        r1 = requests.post(f"{_base(api)}/v1/heartbeat", json={"wire": w1}, timeout=2)
+        r2 = requests.post(f"{_base(api)}/v1/heartbeat", json={"wire": w2}, timeout=2)
         # Rate limiter burst=1 → first passes (200 or 400 depending
         # on verify), second hits 429.
         assert r1.status_code in (200, 400)
