@@ -4,14 +4,21 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="dmp",
+    # PyPI distribution name; `dmp` is already taken on PyPI by an
+    # unrelated package, so we publish under the product brand instead.
+    # The import path stays `import dmp` — distribution name and
+    # import name intentionally differ (same pattern as pyyaml → yaml).
+    name="dnsmesh",
     version="0.1.0",
     author="Oscar Valenzuela B",
     author_email="oscar.valenzuela.b@gmail.com",
     description="A federated end-to-end encrypted messaging protocol delivered over DNS",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    packages=find_packages(),
+    # Ship only the `dmp` package tree; bare `find_packages()` otherwise
+    # pulls `tests/` into site-packages and collides with every other
+    # project that also has a top-level `tests` module.
+    packages=find_packages(include=("dmp", "dmp.*")),
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",

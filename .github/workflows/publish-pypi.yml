@@ -1,6 +1,8 @@
 name: publish-pypi
 
-# Builds sdist + wheel and publishes the `dmp` package to PyPI.
+# Builds sdist + wheel and publishes the `dnsmesh` package to PyPI.
+# (Distribution name is `dnsmesh` because `dmp` is already squatted on
+# PyPI. Import path stays `import dmp` — see setup.py for the rationale.)
 #
 # Triggers:
 #   - push of an sdk-v* tag: canonical release path
@@ -10,11 +12,12 @@ name: publish-pypi
 # One-time setup on PyPI (required — no API token is used, the whole
 # point of OIDC trusted publishing is avoiding a long-lived secret):
 #
-#   pypi.org → Your projects → dmp → Publishing → Add a pending publisher
-#     Owner:          oscarvalenzuelab
-#     Repository:     DNSMeshProtocol
-#     Workflow name:  publish-pypi.yml
-#     Environment:    pypi
+#   pypi.org → Your account → Publishing → Add a pending publisher
+#     PyPI project name: dnsmesh
+#     Owner:             oscarvalenzuelab
+#     Repository:        DNSMeshProtocol
+#     Workflow name:     publish-pypi.yml
+#     Environment:       pypi
 #
 # The `environment: pypi` line below has to stay in sync with whatever
 # environment name you configure on PyPI.
