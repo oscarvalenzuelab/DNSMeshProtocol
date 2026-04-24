@@ -894,7 +894,9 @@ def cmd_identity_publish(args: argparse.Namespace) -> int:
             # resistance comes from the DNS zone's access control, not
             # from a hash.
             name = zone_anchored_identity_name(cfg.identity_domain)
-            resolve_hint = f"dnsmesh identity fetch {cfg.username}@{cfg.identity_domain}"
+            resolve_hint = (
+                f"dnsmesh identity fetch {cfg.username}@{cfg.identity_domain}"
+            )
         else:
             name = identity_domain(cfg.username, _effective_domain(cfg))
             resolve_hint = f"dnsmesh identity fetch {cfg.username}"
