@@ -76,6 +76,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Thread the commit SHA + resolved version + build timestamp
+          # into the Dockerfile ARGs so the OCI image labels on the
+          # published image point back at the exact source revision.
+          build-args: |
+            DMP_VERSION=${{ steps.meta.outputs.version }}
+            DMP_REVISION=${{ github.sha }}
+            DMP_CREATED=${{ steps.meta.outputs.json && fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] || '' }}
           # Build cache via GHA's registry-level cache — much faster than
           # rebuilding from scratch on every push while keeping the
           # pushed image layers untouched.
