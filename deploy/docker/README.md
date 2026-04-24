@@ -1,6 +1,6 @@
 # Running `dnsmesh-node` as a Docker image
 
-Published image: **`oscarvalenzuelab/dnsmesh-node`** on Docker Hub (tags:
+Published image: **`ovalenzuela/dnsmesh-node`** on Docker Hub (tags:
 `latest`, `main`, and `<semver>` for tagged releases).
 
 This bundle is the reference recipe for a production-style *single-node*
@@ -60,7 +60,7 @@ docker run -d --name dnsmesh-node \
   -p 8053:8053/tcp \
   -e DMP_HTTP_TOKEN=$(openssl rand -hex 32) \
   -v dnsmesh-data:/var/lib/dmp \
-  oscarvalenzuelab/dnsmesh-node:latest
+  ovalenzuela/dnsmesh-node:latest
 ```
 
 With this shape, the HTTP publish API is exposed directly on TCP 8053

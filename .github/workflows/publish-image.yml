@@ -96,3 +96,15 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: true
           sbom: true
+
+      - name: Sync Docker Hub repo description
+        # Keeps the Docker Hub repo page in sync with deploy/docker/README.md
+        # (operator-focused) and a one-line short description. Uses the same
+        # DOCKERHUB_TOKEN as the push step — no extra secret needed.
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/dnsmesh-node
+          short-description: "Node for DNS Mesh Protocol — federated end-to-end encrypted messaging over DNS."
+          readme-filepath: ./deploy/docker/README.md

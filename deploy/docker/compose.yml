@@ -2,7 +2,7 @@
 #
 # Pulls the published image from Docker Hub (no local build required).
 # Pin to a specific tag in prod — the `latest` default is fine for first-
-# run, but you want reproducibility: `oscarvalenzuelab/dnsmesh-node:v0.2.0`.
+# run, but you want reproducibility: `ovalenzuela/dnsmesh-node:v0.2.0`.
 #
 # Why standalone (and not an overlay on docker-compose.yml /
 # docker-compose.prod.yml): compose merges `ports` lists additively, so
@@ -20,7 +20,7 @@
 
 services:
   dnsmesh-node:
-    image: oscarvalenzuelab/dnsmesh-node:${DMP_IMAGE_TAG:-latest}
+    image: ovalenzuela/dnsmesh-node:${DMP_IMAGE_TAG:-latest}
     container_name: dnsmesh-node
     restart: unless-stopped
 
