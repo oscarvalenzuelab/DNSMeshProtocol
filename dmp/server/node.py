@@ -104,6 +104,158 @@ def _default_token_db_path(record_db_path: str) -> str:
     return str(p.with_name(p.stem + "_tokens" + p.suffix))
 
 
+def _default_heartbeat_db_path(record_db_path: str) -> str:
+    """``dmp.db`` -> ``dmp_heartbeats.db`` alongside the record DB."""
+    from pathlib import Path as _Path
+
+    p = _Path(record_db_path)
+    return str(p.with_name(p.stem + "_heartbeats" + p.suffix))
+
+
+@dataclass
+class _HeartbeatBundle:
+    """Everything DMPNode hands to the HTTP API + worker when the
+    heartbeat layer is opt-in-enabled. None when disabled."""
+
+    store: object  # SeenStore; typed loose to avoid the import at
+    # module load time for disabled deployments
+    worker: object  # HeartbeatWorker
+    submit_rate_limit: "RateLimit"
+    seen_rate_limit: "RateLimit"
+    self_endpoint: str
+    self_spk_hex: str
+
+
+def _load_heartbeat_from_env(record_db_path: str):
+    """Return a ``_HeartbeatBundle`` if opt-in-enabled, else None.
+
+    Prerequisites when enabled:
+      - ``DMP_HEARTBEAT_ENABLED`` is truthy.
+      - ``DMP_HEARTBEAT_SELF_ENDPOINT`` (fully-qualified HTTPS URL
+        of this node, matching the hostname that peers reach).
+      - ``DMP_HEARTBEAT_OPERATOR_KEY_PATH`` (file containing the
+        node operator's Ed25519 private seed, 64-hex-char or
+        32-byte binary).
+
+    Misconfigured state (enabled but prerequisites missing) logs an
+    ERROR and returns None rather than silently disabling — the
+    operator asked for the feature, they should see the reason.
+    """
+    if os.environ.get("DMP_HEARTBEAT_ENABLED", "").strip() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None
+
+    self_endpoint = os.environ.get("DMP_HEARTBEAT_SELF_ENDPOINT", "").strip()
+    key_path = os.environ.get("DMP_HEARTBEAT_OPERATOR_KEY_PATH", "").strip()
+    if not self_endpoint:
+        log.error(
+            "DMP_HEARTBEAT_ENABLED but DMP_HEARTBEAT_SELF_ENDPOINT unset; "
+            "heartbeat layer disabled."
+        )
+        return None
+    if not key_path:
+        log.error(
+            "DMP_HEARTBEAT_ENABLED but DMP_HEARTBEAT_OPERATOR_KEY_PATH unset; "
+            "heartbeat layer disabled."
+        )
+        return None
+
+    # Load the Ed25519 private seed. Accept either hex-encoded text
+    # (64 chars) or raw 32-byte binary. Any other shape -> fail.
+    try:
+        from pathlib import Path as _Path
+
+        raw = _Path(key_path).expanduser().read_bytes().strip()
+    except OSError as exc:
+        log.error("heartbeat operator key unreadable: %s", exc)
+        return None
+
+    seed: Optional[bytes] = None
+    if len(raw) == 32:
+        seed = raw
+    else:
+        try:
+            text = raw.decode("ascii").strip()
+        except UnicodeDecodeError:
+            text = ""
+        if len(text) == 64:
+            try:
+                seed = bytes.fromhex(text)
+            except ValueError:
+                seed = None
+    if seed is None or len(seed) != 32:
+        log.error(
+            "heartbeat operator key at %s is neither 32 raw bytes nor 64-hex",
+            key_path,
+        )
+        return None
+
+    # Build an OperatorSigner from the seed. DMPCrypto derives its
+    # Ed25519 key from the X25519 private bytes; the heartbeat path
+    # wants to use the operator's standalone Ed25519 key (same
+    # artifact `generate-cluster-manifest.py` emits), so we use the
+    # lightweight wrapper instead.
+    from dmp.core.operator_signer import OperatorSigner
+
+    crypto = OperatorSigner(seed)
+
+    # SeenStore alongside the record DB (override via env).
+    from dmp.server.heartbeat_store import SeenStore
+
+    seen_db = os.environ.get(
+        "DMP_HEARTBEAT_DB_PATH", ""
+    ).strip() or _default_heartbeat_db_path(record_db_path)
+    retention_hours = int(os.environ.get("DMP_HEARTBEAT_RETENTION_HOURS", "72"))
+    max_rows = int(os.environ.get("DMP_HEARTBEAT_SEEN_MAX_ROWS", "10000"))
+    store = SeenStore(
+        seen_db,
+        retention_seconds=retention_hours * 3600,
+        max_rows=max_rows,
+    )
+
+    # Worker config.
+    from dmp.server.heartbeat_worker import (
+        HeartbeatWorker,
+        HeartbeatWorkerConfig,
+    )
+
+    seed_peers_raw = os.environ.get("DMP_HEARTBEAT_SEEDS", "")
+    seed_peers = tuple(s.strip() for s in seed_peers_raw.split(",") if s.strip())
+    interval = int(os.environ.get("DMP_HEARTBEAT_INTERVAL_SECONDS", "300"))
+    ttl = int(os.environ.get("DMP_HEARTBEAT_TTL_SECONDS", "86400"))
+    max_peers = int(os.environ.get("DMP_HEARTBEAT_MAX_PEERS", "25"))
+    version = os.environ.get("DMP_HEARTBEAT_VERSION", "").strip() or "dev"
+    cfg = HeartbeatWorkerConfig(
+        self_endpoint=self_endpoint,
+        version=version,
+        seed_peers=seed_peers,
+        interval_seconds=interval,
+        ttl_seconds=ttl,
+        max_peers=max_peers,
+    )
+    worker = HeartbeatWorker(cfg, crypto, store)
+
+    # Rate limits on the HTTP endpoints — independent submit / seen
+    # buckets per codex phase-3 P2.
+    submit_rate = float(os.environ.get("DMP_HEARTBEAT_SUBMIT_RATE_PER_SEC", "1.0"))
+    submit_burst = float(os.environ.get("DMP_HEARTBEAT_SUBMIT_BURST", "30"))
+    seen_rate = float(os.environ.get("DMP_HEARTBEAT_SEEN_RATE_PER_SEC", "5.0"))
+    seen_burst = float(os.environ.get("DMP_HEARTBEAT_SEEN_BURST", "60"))
+
+    return _HeartbeatBundle(
+        store=store,
+        worker=worker,
+        submit_rate_limit=RateLimit(rate_per_second=submit_rate, burst=submit_burst),
+        seen_rate_limit=RateLimit(rate_per_second=seen_rate, burst=seen_burst),
+        self_endpoint=self_endpoint,
+        self_spk_hex=crypto.get_signing_public_key_bytes().hex(),
+    )
+
+
 def _peer_id_from_url(url: str) -> str:
     """Derive a short stable peer id from an HTTP URL.
 
@@ -472,6 +624,12 @@ class DMPNode:
 
         registration_config = RegistrationConfig.from_env()
 
+        # M5.8 heartbeat — opt-in discovery directory. Wired only
+        # when DMP_HEARTBEAT_ENABLED=1 AND the operator has provided
+        # the signing-key material + public hostname. Solo-node
+        # deployments and pre-M5.8 configs see no wiring at all.
+        heartbeat_bundle = _load_heartbeat_from_env(self.config.db_path)
+
         self.http = DMPHttpApi(
             self.store,
             host=self.config.http_host,
@@ -491,7 +649,21 @@ class DMPNode:
             auth_mode=self.config.auth_mode,
             token_store=token_store,
             registration_config=registration_config,
+            heartbeat_store=heartbeat_bundle.store if heartbeat_bundle else None,
+            heartbeat_submit_rate_limit=(
+                heartbeat_bundle.submit_rate_limit if heartbeat_bundle else None
+            ),
+            heartbeat_seen_rate_limit=(
+                heartbeat_bundle.seen_rate_limit if heartbeat_bundle else None
+            ),
+            heartbeat_self_endpoint=(
+                heartbeat_bundle.self_endpoint if heartbeat_bundle else None
+            ),
+            heartbeat_self_spk_hex=(
+                heartbeat_bundle.self_spk_hex if heartbeat_bundle else None
+            ),
         )
+        self.heartbeat_worker = heartbeat_bundle.worker if heartbeat_bundle else None
         self.cleanup = CleanupWorker(
             self.store.cleanup_expired,
             interval_seconds=self.config.cleanup_interval,
@@ -506,6 +678,8 @@ class DMPNode:
         self.dns.start()
         self.http.start()
         self.cleanup.start()
+        if self.heartbeat_worker is not None:
+            self.heartbeat_worker.start()
         if self.anti_entropy is not None:
             self.anti_entropy.start()
         log.info(

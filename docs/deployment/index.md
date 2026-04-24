@@ -26,6 +26,10 @@ an item here is the most common way a DMP node gets owned.
 - [Multi-tenant node]({{ site.baseurl }}/deployment/multi-tenant) —
   per-user publish tokens (M5.5): self-service registration, operator
   CLI, scope rules, split audit / anonymity property.
+- [Node heartbeat + directory]({{ site.baseurl }}/deployment/heartbeat) —
+  opt-in peer-to-peer discovery layer (M5.8): each node pings peers
+  with signed heartbeats, aggregators render a public directory
+  off the resulting signed feed. No central trust anchor required.
 - [Hardening]({{ site.baseurl }}/deployment/hardening) — mandatory
   operator checklist before production.
 
