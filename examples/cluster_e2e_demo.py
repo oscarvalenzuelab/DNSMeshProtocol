@@ -75,20 +75,23 @@ SYNC_GRACE_SECONDS = 4.0
 class HttpWriter:
     def __init__(self, http_port: int) -> None:
         import requests
+
         self._requests = requests
         self._base = f"http://127.0.0.1:{http_port}"
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
         r = self._requests.post(
             f"{self._base}/v1/records/{name}",
-            json={"value": value, "ttl": ttl}, timeout=5,
+            json={"value": value, "ttl": ttl},
+            timeout=5,
         )
         return r.status_code == 201
 
     def delete_txt_record(self, name: str, value: Optional[str] = None) -> bool:
         r = self._requests.delete(
             f"{self._base}/v1/records/{name}",
-            json={"value": value} if value else None, timeout=5,
+            json={"value": value} if value else None,
+            timeout=5,
         )
         return r.status_code == 204
 
@@ -127,10 +130,14 @@ def ensure_manifest() -> None:
     print("Generating cluster manifest (first run)…")
     subprocess.run(
         [
-            sys.executable, str(GENERATE_SCRIPT),
-            "--cluster-name", DOMAIN,
-            "--manifest-out", str(MANIFEST_PATH),
-            "--operator-key-out", str(OPERATOR_KEY_PATH),
+            sys.executable,
+            str(GENERATE_SCRIPT),
+            "--cluster-name",
+            DOMAIN,
+            "--manifest-out",
+            str(MANIFEST_PATH),
+            "--operator-key-out",
+            str(OPERATOR_KEY_PATH),
         ],
         check=True,
     )
@@ -140,7 +147,8 @@ def compose_up() -> None:
     print(f"Bringing up 3-node cluster ({COMPOSE_FILE.name})…")
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     import requests
 
@@ -149,9 +157,13 @@ def compose_up() -> None:
     while pending and time.time() < deadline:
         for nid in list(pending):
             try:
-                if requests.get(
-                    f"http://127.0.0.1:{NODES[nid]['http']}/health", timeout=1,
-                ).status_code == 200:
+                if (
+                    requests.get(
+                        f"http://127.0.0.1:{NODES[nid]['http']}/health",
+                        timeout=1,
+                    ).status_code
+                    == 200
+                ):
                     pending.discard(nid)
             except Exception:
                 pass
@@ -169,7 +181,8 @@ def compose_down() -> None:
     print(f"\nTearing down cluster ({COMPOSE_FILE.name})…")
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "down", "-v"],
-        capture_output=True, timeout=30,
+        capture_output=True,
+        timeout=30,
     )
 
 
@@ -217,7 +230,8 @@ def rotate_identity(
             subject_type=SUBJECT_TYPE_USER_IDENTITY,
             subject=subject,
             revoked_spk=old_crypto.get_signing_public_key_bytes(),
-            reason_code=revoke_reason, ts=ts,
+            reason_code=revoke_reason,
+            ts=ts,
         )
         assert old_client.writer.publish_txt_record(
             rrset, revocation.sign(old_crypto), ttl=ttl
@@ -226,13 +240,17 @@ def rotate_identity(
     identity_rrset = identity_domain(old_client.username, old_client.domain)
     new_identity = make_record(new_crypto, old_client.username)
     assert old_client.writer.publish_txt_record(
-        identity_rrset, new_identity.sign(new_crypto), ttl=ttl,
+        identity_rrset,
+        new_identity.sign(new_crypto),
+        ttl=ttl,
     ), "new IdentityRecord publish failed"
 
     return DMPClient(
-        old_client.username, new_passphrase,
+        old_client.username,
+        new_passphrase,
         domain=old_client.domain,
-        writer=old_client.writer, reader=old_client.reader,
+        writer=old_client.writer,
+        reader=old_client.reader,
         kdf_salt=kdf_salt,
         rotation_chain_enabled=old_client.rotation_chain_enabled,
     )
@@ -268,21 +286,30 @@ def main() -> int:
         alice_salt = os.urandom(32)
         bob_salt = os.urandom(32)
         alice = DMPClient(
-            "alice", "alice-pass-v1",
-            domain=DOMAIN, writer=alice_writer, reader=alice_reader,
+            "alice",
+            "alice-pass-v1",
+            domain=DOMAIN,
+            writer=alice_writer,
+            reader=alice_reader,
             kdf_salt=alice_salt,
         )
         bob = DMPClient(
-            "bob", "bob-pass",
-            domain=DOMAIN, writer=bob_writer, reader=bob_reader,
-            kdf_salt=bob_salt, rotation_chain_enabled=True,
+            "bob",
+            "bob-pass",
+            domain=DOMAIN,
+            writer=bob_writer,
+            reader=bob_reader,
+            kdf_salt=bob_salt,
+            rotation_chain_enabled=True,
         )
         alice.add_contact(
-            "bob", bob.get_public_key_hex(),
+            "bob",
+            bob.get_public_key_hex(),
             signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex(),
         )
         bob.add_contact(
-            "alice", alice.get_public_key_hex(),
+            "alice",
+            alice.get_public_key_hex(),
             signing_key_hex=alice.crypto.get_signing_public_key_bytes().hex(),
         )
 
@@ -290,7 +317,9 @@ def main() -> int:
         # Alice publishes identity + sends on node-a.
         rrset = identity_domain("alice", DOMAIN)
         assert alice_writer.publish_txt_record(
-            rrset, make_record(alice.crypto, "alice").sign(alice.crypto), ttl=300,
+            rrset,
+            make_record(alice.crypto, "alice").sign(alice.crypto),
+            ttl=300,
         )
         assert alice.send_message("bob", "hello across the federation")
         wait_for_federation("chunks + manifest → node-b")
@@ -303,17 +332,21 @@ def main() -> int:
         wait_for_federation("rotation RRset → node-b")
         resolved = bob._rotation_chain.resolve_current_spk(
             alice.crypto.get_signing_public_key_bytes(),
-            f"alice@{DOMAIN}", SUBJECT_TYPE_USER_IDENTITY,
+            f"alice@{DOMAIN}",
+            SUBJECT_TYPE_USER_IDENTITY,
         )
-        assert resolved == alice_v2.crypto.get_signing_public_key_bytes(), (
-            f"chain walk via node-b failed; got {resolved!r}"
-        )
+        assert (
+            resolved == alice_v2.crypto.get_signing_public_key_bytes()
+        ), f"chain walk via node-b failed; got {resolved!r}"
         print("  node-b chain walk → new key ✓")
 
         # Re-pin + deliver under the rotated key.
-        bob.add_contact("alice", alice_v2.get_public_key_hex(), signing_key_hex=resolved.hex())
+        bob.add_contact(
+            "alice", alice_v2.get_public_key_hex(), signing_key_hex=resolved.hex()
+        )
         alice_v2.add_contact(
-            "bob", bob.get_public_key_hex(),
+            "bob",
+            bob.get_public_key_hex(),
             signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex(),
         )
         assert alice_v2.send_message("bob", "hello under v2 key")
@@ -324,17 +357,20 @@ def main() -> int:
 
         step(4, "Compromise rotation: revocation federates too")
         rotate_identity(
-            alice_v2, "alice-pass-v3", alice_salt,
+            alice_v2,
+            "alice-pass-v3",
+            alice_salt,
             revoke_reason=REASON_COMPROMISE,
         )
         wait_for_federation("revocation RRset → node-b")
         resolved = bob._rotation_chain.resolve_current_spk(
             alice_v2.crypto.get_signing_public_key_bytes(),
-            f"alice@{DOMAIN}", SUBJECT_TYPE_USER_IDENTITY,
+            f"alice@{DOMAIN}",
+            SUBJECT_TYPE_USER_IDENTITY,
         )
-        assert resolved is None, (
-            f"chain walker must refuse revoked path; got {resolved!r}"
-        )
+        assert (
+            resolved is None
+        ), f"chain walker must refuse revoked path; got {resolved!r}"
         print("  node-b: chain from v2 → None (revoked) ✓")
 
         print("\nAll federated steps passed.")

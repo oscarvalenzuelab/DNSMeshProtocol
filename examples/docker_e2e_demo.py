@@ -133,10 +133,18 @@ def start_node() -> dict:
 
     subprocess.run(
         [
-            "docker", "run", "--rm", "-d", "--name", name,
-            "-p", f"127.0.0.1:{dns_port}:5353/udp",
-            "-p", f"127.0.0.1:{http_port}:8053/tcp",
-            "-e", "DMP_LOG_LEVEL=WARNING",
+            "docker",
+            "run",
+            "--rm",
+            "-d",
+            "--name",
+            name,
+            "-p",
+            f"127.0.0.1:{dns_port}:5353/udp",
+            "-p",
+            f"127.0.0.1:{http_port}:8053/tcp",
+            "-e",
+            "DMP_LOG_LEVEL=WARNING",
             IMAGE,
         ],
         check=True,
@@ -146,13 +154,20 @@ def start_node() -> dict:
     deadline = time.time() + 15.0
     while time.time() < deadline:
         try:
-            if requests.get(f"http://127.0.0.1:{http_port}/health", timeout=1).status_code == 200:
+            if (
+                requests.get(
+                    f"http://127.0.0.1:{http_port}/health", timeout=1
+                ).status_code
+                == 200
+            ):
                 break
         except Exception:
             pass
         time.sleep(0.2)
     else:
-        logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True).stdout
+        logs = subprocess.run(
+            ["docker", "logs", name], capture_output=True, text=True
+        ).stdout
         subprocess.run(["docker", "stop", name], capture_output=True)
         raise RuntimeError(f"container failed health check; logs:\n{logs}")
 
@@ -203,7 +218,10 @@ def rotate_identity(
     old_crypto = old_client.crypto
     new_crypto = DMPCrypto.from_passphrase(new_passphrase, salt=kdf_salt)
 
-    if new_crypto.get_signing_public_key_bytes() == old_crypto.get_signing_public_key_bytes():
+    if (
+        new_crypto.get_signing_public_key_bytes()
+        == old_crypto.get_signing_public_key_bytes()
+    ):
         raise ValueError("new passphrase derives the same key as the old one")
 
     subject = f"{old_client.username}@{old_client.domain}"
@@ -234,7 +252,9 @@ def rotate_identity(
             reason_code=revoke_reason,
             ts=ts,
         )
-        if not old_client.writer.publish_txt_record(rrset, revocation.sign(old_crypto), ttl=ttl):
+        if not old_client.writer.publish_txt_record(
+            rrset, revocation.sign(old_crypto), ttl=ttl
+        ):
             raise RuntimeError(f"publish of RevocationRecord to {rrset} failed")
 
     # New IdentityRecord for the new key — non-rotation-aware peers
@@ -271,7 +291,9 @@ def step(n: int, title: str) -> None:
 def main() -> int:
     print("Starting dmp-node container…")
     node = start_node()
-    print(f"  name={node['name']}  http=127.0.0.1:{node['http_port']}  dns=127.0.0.1:{node['dns_port']}")
+    print(
+        f"  name={node['name']}  http=127.0.0.1:{node['http_port']}  dns=127.0.0.1:{node['dns_port']}"
+    )
     try:
         writer = HttpWriter(f"http://127.0.0.1:{node['http_port']}")
         reader = DnsReader("127.0.0.1", node["dns_port"])
@@ -283,21 +305,33 @@ def main() -> int:
         alice_salt = os.urandom(32)
         bob_salt = os.urandom(32)
         alice = DMPClient(
-            "alice", "alice-pass-v1",
-            domain=DOMAIN, writer=writer, reader=reader,
+            "alice",
+            "alice-pass-v1",
+            domain=DOMAIN,
+            writer=writer,
+            reader=reader,
             kdf_salt=alice_salt,
         )
         # Bob is rotation-aware so he'll chain-walk Alice's key in step 3.
         bob = DMPClient(
-            "bob", "bob-pass-v1",
-            domain=DOMAIN, writer=writer, reader=reader,
+            "bob",
+            "bob-pass-v1",
+            domain=DOMAIN,
+            writer=writer,
+            reader=reader,
             kdf_salt=bob_salt,
             rotation_chain_enabled=True,
         )
-        alice.add_contact("bob", bob.get_public_key_hex(),
-                          signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex())
-        bob.add_contact("alice", alice.get_public_key_hex(),
-                        signing_key_hex=alice.crypto.get_signing_public_key_bytes().hex())
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex(),
+        )
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.crypto.get_signing_public_key_bytes().hex(),
+        )
         print(f"  alice spk = {alice.crypto.get_signing_public_key_bytes().hex()}")
         print(f"  bob   spk = {bob.crypto.get_signing_public_key_bytes().hex()}")
 
@@ -305,50 +339,65 @@ def main() -> int:
         assert publish_identity(alice), "alice identity publish failed"
         assert alice.send_message("bob", "hello from alice, key v1"), "send failed"
         inbox = bob.receive_messages()
-        assert len(inbox) == 1 and inbox[0].plaintext == b"hello from alice, key v1", inbox
+        assert (
+            len(inbox) == 1 and inbox[0].plaintext == b"hello from alice, key v1"
+        ), inbox
         print(f"  bob received: {inbox[0].plaintext!r}")
 
         step(3, "Routine rotation: Alice → new key, Bob chain-walks")
         alice_v2 = rotate_identity(alice, "alice-pass-v2", alice_salt)  # no revocation
-        print(f"  new alice spk = {alice_v2.crypto.get_signing_public_key_bytes().hex()}")
+        print(
+            f"  new alice spk = {alice_v2.crypto.get_signing_public_key_bytes().hex()}"
+        )
 
         # Bob's pinned contact still has Alice's OLD spk. A rotation-aware
         # client uses resolve_current_spk to walk forward to the new head.
         from dmp.core.rotation import SUBJECT_TYPE_USER_IDENTITY as _SUBJ
+
         resolved = bob._rotation_chain.resolve_current_spk(
             alice.crypto.get_signing_public_key_bytes(),
             f"alice@{DOMAIN}",
             _SUBJ,
         )
-        assert resolved == alice_v2.crypto.get_signing_public_key_bytes(), (
-            f"chain-walk didn't reach new key; got {resolved!r}"
-        )
+        assert (
+            resolved == alice_v2.crypto.get_signing_public_key_bytes()
+        ), f"chain-walk didn't reach new key; got {resolved!r}"
         print("  rotation chain walk → new key ✓")
 
         # Re-pin with the resolved key so send/receive uses it.
         bob.add_contact(
-            "alice", alice_v2.get_public_key_hex(),
+            "alice",
+            alice_v2.get_public_key_hex(),
             signing_key_hex=resolved.hex(),
         )
         # Alice must re-pin Bob too (her client is new).
         alice_v2.add_contact(
-            "bob", bob.get_public_key_hex(),
+            "bob",
+            bob.get_public_key_hex(),
             signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex(),
         )
 
-        assert alice_v2.send_message("bob", "hello from alice, key v2"), "v2 send failed"
+        assert alice_v2.send_message(
+            "bob", "hello from alice, key v2"
+        ), "v2 send failed"
         inbox = bob.receive_messages()
         # Bob's inbox accumulates; find the new message.
         new_msgs = [m for m in inbox if m.plaintext == b"hello from alice, key v2"]
-        assert new_msgs, f"v2 message not delivered; inbox={[m.plaintext for m in inbox]}"
+        assert (
+            new_msgs
+        ), f"v2 message not delivered; inbox={[m.plaintext for m in inbox]}"
         print(f"  bob received under rotated key: {new_msgs[0].plaintext!r}")
 
         step(4, "Compromise rotation: Alice → new key + revoke old")
         alice_v3 = rotate_identity(
-            alice_v2, "alice-pass-v3", alice_salt,
+            alice_v2,
+            "alice-pass-v3",
+            alice_salt,
             revoke_reason=REASON_COMPROMISE,
         )
-        print(f"  new alice spk = {alice_v3.crypto.get_signing_public_key_bytes().hex()}")
+        print(
+            f"  new alice spk = {alice_v3.crypto.get_signing_public_key_bytes().hex()}"
+        )
         print("  revocation of v2 key published")
 
         # The chain walker refuses ANY path from a revoked key, so a Bob
@@ -359,22 +408,26 @@ def main() -> int:
             f"alice@{DOMAIN}",
             _SUBJ,
         )
-        assert resolved is None, (
-            f"chain-walker must refuse a revoked path; got {resolved!r}"
-        )
+        assert (
+            resolved is None
+        ), f"chain-walker must refuse a revoked path; got {resolved!r}"
         print("  chain walk from v2 → None (revoked) ✓")
 
         # Out-of-band re-pin is required after compromise. Bob re-pins v3
         # directly (how a real contact would: fetch + human verify).
         bob.add_contact(
-            "alice", alice_v3.get_public_key_hex(),
+            "alice",
+            alice_v3.get_public_key_hex(),
             signing_key_hex=alice_v3.crypto.get_signing_public_key_bytes().hex(),
         )
         alice_v3.add_contact(
-            "bob", bob.get_public_key_hex(),
+            "bob",
+            bob.get_public_key_hex(),
             signing_key_hex=bob.crypto.get_signing_public_key_bytes().hex(),
         )
-        assert alice_v3.send_message("bob", "hello from alice, key v3"), "v3 send failed"
+        assert alice_v3.send_message(
+            "bob", "hello from alice, key v3"
+        ), "v3 send failed"
         inbox = bob.receive_messages()
         assert any(m.plaintext == b"hello from alice, key v3" for m in inbox), inbox
         print("  bob received under re-pinned v3 key ✓")
