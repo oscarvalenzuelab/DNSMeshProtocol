@@ -1,0 +1,97 @@
+name: publish-binaries
+
+# Builds single-file `dmp` binaries via PyInstaller for Linux / macOS /
+# Windows and attaches them to a GitHub Release named after the tag.
+#
+# Triggers:
+#   - push of a cli-v* tag: canonical release path
+#   - manual workflow_dispatch: only useful for dry runs
+#
+# No external secrets — softprops/action-gh-release uses the workflow's
+# GITHUB_TOKEN (permissions: contents: write) to attach assets.
+
+on:
+  push:
+    tags: ["cli-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # write the release + upload assets
+
+jobs:
+  build:
+    name: build dmp (${{ matrix.asset }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: dmp-linux-x86_64
+          - os: macos-latest
+            asset: dmp-macos-arm64
+          - os: windows-latest
+            # PyInstaller on Windows appends .exe itself; the upload
+            # glob below picks up both the bare name and the .exe.
+            asset: dmp-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag version matches dmp/__init__.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF##*/}"
+          TAG_VERSION="${TAG#cli-v}"
+          SRC_VERSION=$(sed -nE 's/^__version__ = "([^"]+)"$/\1/p' dmp/__init__.py | head -n1)
+          if [[ "$TAG_VERSION" != "$SRC_VERSION" ]]; then
+            echo "tag $TAG implies $TAG_VERSION but dmp/__init__.py is $SRC_VERSION"
+            exit 1
+          fi
+
+      - name: Install deps + PyInstaller
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install "pyinstaller>=6.0"
+
+      - name: Build single-file binary
+        shell: bash
+        # --collect-submodules and --collect-data walk the whole `dmp`
+        # package so dynamically-imported submodules + any data files
+        # end up in the one-file bundle. cryptography + argon2-cffi
+        # pull in their own C extensions; PyInstaller's default hooks
+        # already know how to bundle them, but if this build starts
+        # missing a module at runtime, add it here with
+        # `--hidden-import <name>` and re-tag.
+        run: |
+          pyinstaller \
+            --onefile \
+            --name "${{ matrix.asset }}" \
+            --collect-submodules dmp \
+            --collect-data dmp \
+            dmp/cli.py
+
+      - name: Smoke-test the binary
+        shell: bash
+        run: |
+          # Windows output has .exe appended; look for either form.
+          if [[ -x "./dist/${{ matrix.asset }}" ]]; then
+            ./dist/${{ matrix.asset }} --help > /dev/null
+          else
+            ./dist/${{ matrix.asset }}.exe --help > /dev/null
+          fi
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}*
+          fail_on_unmatched_files: true
+          # Release name + tag default to the ref that triggered this
+          # workflow (cli-vX.Y.Z); each matrix job uploads into the
+          # same release so all three binaries end up on one page.

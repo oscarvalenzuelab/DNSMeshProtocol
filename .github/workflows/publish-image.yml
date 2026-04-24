@@ -3,9 +3,12 @@ name: publish-image
 # Builds and pushes the dmp-node image to Docker Hub.
 #
 # Triggers:
-#   - push to main: tagged as :latest and :main
-#   - push of a v* tag: tagged as the full version + major-only alias
+#   - push to main:        tagged as :latest and :main (tracking channel)
+#   - push of image-v* tag: tagged as the full version + major-only alias
 #   - manual workflow_dispatch: for ad-hoc rebuilds
+#
+# Tag scheme is one prefix per artifact so SDK / CLI / image releases
+# can be cut independently. See scripts/release/tag.sh.
 #
 # Does NOT run on PRs — we build-and-test the image in the `docker`
 # job of ci.yml on every PR; this workflow is strictly for publishing.
@@ -19,7 +22,7 @@ name: publish-image
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ["image-v*"]
   workflow_dispatch:
 
 permissions:
@@ -53,18 +56,21 @@ jobs:
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/dmp-node
           # Tag strategy:
-          #   main   -> :latest, :main, :sha-<short>
-          #   vX.Y.Z -> :X.Y.Z, :X.Y, :X, :latest, :sha-<short>
-          # The `latest` alias is attached to the HEAD of main AND to
-          # the most recent semver — both can clobber each other but
-          # the last-run workflow wins, which is fine for a single-
-          # maintainer project.
+          #   main         -> :latest, :main, :sha-<short>
+          #   image-vX.Y.Z -> :X.Y.Z, :X.Y, :X, :latest, :sha-<short>
+          # `type=match` extracts the semver out of the "image-v..."
+          # prefix we chose so each artifact kind has its own tag
+          # namespace. The `latest` alias is attached to the HEAD of
+          # main AND to the most recent release — both can clobber
+          # each other but the last-run workflow wins, which is fine
+          # for a single-maintainer project.
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=match,pattern=image-v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=image-v(\d+\.\d+),group=1
+            type=match,pattern=image-v(\d+),group=1
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/image-v') }}
             type=sha,prefix=sha-,format=short
 
       - name: Build + push (multi-arch)
