@@ -1,5 +1,9 @@
 # Running `dnsmesh-node` as a Docker image
 
+- **Source:** [github.com/oscarvalenzuelab/DNSMeshProtocol](https://github.com/oscarvalenzuelab/DNSMeshProtocol)
+- **Python client CLI:** [`pip install dnsmesh`](https://pypi.org/project/dnsmesh/)
+- **Documentation:** [ovalenzuela.com/DNSMeshProtocol](https://ovalenzuela.com/DNSMeshProtocol/)
+
 Published image: **`ovalenzuela/dnsmesh-node`** on Docker Hub (tags:
 `latest`, `main`, and `<semver>` for tagged releases).
 
@@ -105,9 +109,3 @@ DMP's anti-entropy sync uses the same `DMP_HTTP_PORT` (default
 each other on that port — typically on a private network, gated by
 `DMP_SYNC_PEER_TOKEN`. See `docs/deployment/cluster.md`.
 
-## Publishing the image (maintainer notes)
-
-Pushes to `main` and pushes of `v*` tags trigger
-`.github/workflows/publish-image.yml`, which builds multi-arch
-(`linux/amd64`, `linux/arm64`) and pushes to Docker Hub. Repo
-secrets required: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`.
