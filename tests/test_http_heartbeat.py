@@ -87,15 +87,39 @@ def hb_api_disabled(tmp_path: Path):
 
 @pytest.fixture
 def hb_api_rate_limited(tmp_path: Path):
-    """API with a TIGHT heartbeat rate limit (1 req/sec, burst 1)
-    so tests can demonstrate 429."""
+    """API with tight heartbeat rate limits on BOTH endpoints so
+    the basic rate-limit tests can demonstrate 429 on each."""
     store = SeenStore(str(tmp_path / "hb.db"))
     api = DMPHttpApi(
         InMemoryDNSStore(),
         host="127.0.0.1",
         port=_free_port(),
         heartbeat_store=store,
-        heartbeat_rate_limit=RateLimit(rate_per_second=0.001, burst=1.0),
+        heartbeat_submit_rate_limit=RateLimit(rate_per_second=0.001, burst=1.0),
+        heartbeat_seen_rate_limit=RateLimit(rate_per_second=0.001, burst=1.0),
+    )
+    api.start()
+    try:
+        yield api, store
+    finally:
+        api.stop()
+        store.close()
+
+
+@pytest.fixture
+def hb_api_split_buckets(tmp_path: Path):
+    """API where the SEEN bucket is tight (burst=1) but the SUBMIT
+    bucket is generous. Proves the two limiters are independent —
+    hammering /v1/nodes/seen until 429 must NOT affect
+    /v1/heartbeat's bucket."""
+    store = SeenStore(str(tmp_path / "hb.db"))
+    api = DMPHttpApi(
+        InMemoryDNSStore(),
+        host="127.0.0.1",
+        port=_free_port(),
+        heartbeat_store=store,
+        heartbeat_submit_rate_limit=RateLimit(rate_per_second=100.0, burst=100.0),
+        heartbeat_seen_rate_limit=RateLimit(rate_per_second=0.001, burst=1.0),
     )
     api.start()
     try:
@@ -159,15 +183,29 @@ class TestSubmit:
 
 
 class TestGossipResponse:
-    def test_submit_returns_other_nodes_as_gossip(self, hb_api) -> None:
+    def test_response_shape_matches_design_doc(self, hb_api) -> None:
+        """Codex phase-3 P2 regression: design doc specifies the
+        gossip field on POST /v1/heartbeat is named `seen`
+        (matching the GET /v1/nodes/seen shape). Ensure the POST
+        response uses `seen` and does NOT use `gossip`."""
+        api, _ = hb_api
+        signer = _signer()
+        wire = _heartbeat(signer)
+        r = requests.post(
+            f"{_base(api)}/v1/heartbeat", json={"wire": wire}, timeout=2
+        )
+        body = r.json()
+        assert "seen" in body, f"expected 'seen' field in {body}"
+        assert "gossip" not in body, (
+            "response must NOT use 'gossip' — field is 'seen' per design doc"
+        )
+
+    def test_submit_returns_other_nodes_as_seen(self, hb_api) -> None:
         api, store = hb_api
         # Pre-populate the store with a few distinct nodes.
-        pre_populate = []
         for i in range(3):
             s = _signer(f"n{i}", bytes([i + 1]) * 32)
-            w = _heartbeat(s, endpoint=f"https://n{i}.example.com")
-            pre_populate.append(s)
-            store.accept(w)
+            store.accept(_heartbeat(s, endpoint=f"https://n{i}.example.com"))
 
         # Now a fourth node submits its own heartbeat.
         fourth = _signer("fourth", b"F" * 32)
@@ -177,17 +215,17 @@ class TestGossipResponse:
         )
         assert r.status_code == 200
         body = r.json()
-        # Gossip should contain the 3 other nodes' wires, not the
+        # Seen list should contain the 3 other nodes' wires, not the
         # submitter's own.
-        gossip = body["gossip"]
-        gossip_spks = set()
-        for w in gossip:
+        seen_wires = body["seen"]
+        seen_spks = set()
+        for w in seen_wires:
             parsed = HeartbeatRecord.parse_and_verify(w)
             assert parsed is not None
-            gossip_spks.add(bytes(parsed.operator_spk).hex())
-        assert fourth.get_signing_public_key_bytes().hex() not in gossip_spks
+            seen_spks.add(bytes(parsed.operator_spk).hex())
+        assert fourth.get_signing_public_key_bytes().hex() not in seen_spks
         # All 3 pre-populated nodes should appear.
-        assert len(gossip_spks) == 3
+        assert len(seen_spks) == 3
 
     def test_gossip_respects_limit(self, tmp_path: Path) -> None:
         store = SeenStore(str(tmp_path / "hb.db"))
@@ -212,7 +250,7 @@ class TestGossipResponse:
                 timeout=2,
             )
             assert r.status_code == 200
-            assert len(r.json()["gossip"]) == 2
+            assert len(r.json()["seen"]) == 2
         finally:
             api.stop()
             store.close()
@@ -296,3 +334,26 @@ class TestRateLimit:
         r2 = requests.get(f"{_base(api)}/v1/nodes/seen", timeout=2)
         assert r1.status_code == 200
         assert r2.status_code == 429
+
+    def test_submit_and_seen_buckets_are_independent(
+        self, hb_api_split_buckets
+    ) -> None:
+        """Codex phase-3 P2 regression: hammering /v1/nodes/seen
+        until 429 must NOT steal from the /v1/heartbeat submit
+        budget on the same IP. The two buckets are separate."""
+        api, _ = hb_api_split_buckets
+        # Burn the seen bucket (burst=1).
+        r1 = requests.get(f"{_base(api)}/v1/nodes/seen", timeout=2)
+        r2 = requests.get(f"{_base(api)}/v1/nodes/seen", timeout=2)
+        assert r1.status_code == 200
+        assert r2.status_code == 429
+
+        # A submit against the same IP must still pass — the submit
+        # limiter has its own generous bucket.
+        signer = _signer()
+        r3 = requests.post(
+            f"{_base(api)}/v1/heartbeat",
+            json={"wire": _heartbeat(signer)},
+            timeout=2,
+        )
+        assert r3.status_code == 200, r3.text

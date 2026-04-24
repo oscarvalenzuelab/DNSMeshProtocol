@@ -497,14 +497,25 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         layer. Disabled = both endpoints 404."""
         return bool(getattr(self.server, "heartbeat_store", None))
 
-    def _heartbeat_rate_ok(self) -> bool:
-        """Per-IP rate limiter for /v1/heartbeat + /v1/nodes/seen.
+    def _heartbeat_rate_ok(self, *, endpoint: str) -> bool:
+        """Per-IP rate limiter for heartbeat endpoints.
 
-        Separate from the publish-side limiter because the budgets
-        differ: a busy aggregator scraping /v1/nodes/seen every few
-        minutes is normal, while a spike on the publish API is not.
+        Two separate buckets, keyed by endpoint role:
+
+          - ``submit``  — gates ``POST /v1/heartbeat``. Peers write
+            one heartbeat per tick (~5 min); budget is tight and
+            per-IP limits discourage runaway submitters.
+          - ``seen``    — gates ``GET /v1/nodes/seen``. An aggregator
+            scraping every 30-60s is legitimate; budget is generous.
+
+        Splitting the buckets means heavy read traffic from a
+        scraper on a shared NAT / reverse-proxy IP does not burn
+        the submit budget for legitimate peer ingestion.
         """
-        limiter = getattr(self.server, "heartbeat_rate_limiter", None)
+        if endpoint == "submit":
+            limiter = getattr(self.server, "heartbeat_submit_rate_limiter", None)
+        else:
+            limiter = getattr(self.server, "heartbeat_seen_rate_limiter", None)
         if limiter is None:
             return True
         key = self.client_address[0] if self.client_address else "?"
@@ -514,15 +525,19 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         """POST /v1/heartbeat: peer pushes a signed heartbeat.
 
         Verifies + stores via SeenStore.accept(). Responds with
-        ``{"ok": true, "gossip": [<wire>, ...]}`` — up to N of the
+        ``{"ok": true, "seen": [<wire>, ...]}`` — up to N of the
         most-recently-seen OTHER heartbeats, which the caller adds
         to its own ping list. Gossip-on-ping is how the mesh
         bootstraps without a centralized peer registry.
+
+        The response field is ``seen`` (not ``gossip``) to match the
+        design doc and the GET /v1/nodes/seen schema — a client that
+        consumes both endpoints parses the same key name in both.
         """
         if not self._heartbeat_enabled():
             self._send_json(404, {"error": "not found"})
             return 404
-        if not self._heartbeat_rate_ok():
+        if not self._heartbeat_rate_ok(endpoint="submit"):
             self._send_json(429, {"error": "heartbeat rate limit exceeded"})
             return 429
         body = self._read_json_body()
@@ -552,12 +567,14 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         gossip_limit = int(
             getattr(self.server, "heartbeat_gossip_limit", 10)
         )
-        # Gossip response: recent heartbeats from OTHER operators.
-        # Excluding the submitter's own spk prevents an obvious echo
-        # loop where A tells B about A's own heartbeat.
+        # Gossip-on-ping response: recent heartbeats from OTHER
+        # operators. Exclude the submitter's own spk so A never tells
+        # B about A's own heartbeat; also excludes any other wire
+        # under the same operator key (same-operator concurrent
+        # submits don't echo each other).
         own_spk_hex = bytes(record.operator_spk).hex()
         rows = store.list_recent(now=None, limit=gossip_limit + 1)
-        gossip = [r.wire for r in rows if r.operator_spk_hex != own_spk_hex][
+        seen = [r.wire for r in rows if r.operator_spk_hex != own_spk_hex][
             :gossip_limit
         ]
         self._send_json(
@@ -565,7 +582,7 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "accepted_operator_spk_hex": own_spk_hex,
-                "gossip": gossip,
+                "seen": seen,
             },
         )
         return 200
@@ -576,7 +593,7 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         if not self._heartbeat_enabled():
             self._send_json(404, {"error": "not found"})
             return 404
-        if not self._heartbeat_rate_ok():
+        if not self._heartbeat_rate_ok(endpoint="seen"):
             self._send_json(429, {"error": "heartbeat rate limit exceeded"})
             return 429
         store = self.server.heartbeat_store
@@ -1073,7 +1090,8 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         challenge_store=None,
         registration_rate_limiter=None,
         heartbeat_store=None,
-        heartbeat_rate_limiter=None,
+        heartbeat_submit_rate_limiter=None,
+        heartbeat_seen_rate_limiter=None,
         heartbeat_self_endpoint=None,
         heartbeat_self_spk_hex=None,
         heartbeat_gossip_limit: int = 10,
@@ -1103,9 +1121,13 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.challenge_store = challenge_store
         self.registration_rate_limiter = registration_rate_limiter
         # M5.8 heartbeat plumbing. All None when disabled — handlers
-        # 404 on _heartbeat_enabled()==False.
+        # 404 on _heartbeat_enabled()==False. Submit + seen buckets
+        # are separate per codex phase-3 P2: heavy scraper traffic on
+        # /v1/nodes/seen must NOT burn the ingestion budget for
+        # POST /v1/heartbeat.
         self.heartbeat_store = heartbeat_store
-        self.heartbeat_rate_limiter = heartbeat_rate_limiter
+        self.heartbeat_submit_rate_limiter = heartbeat_submit_rate_limiter
+        self.heartbeat_seen_rate_limiter = heartbeat_seen_rate_limiter
         self.heartbeat_self_endpoint = heartbeat_self_endpoint
         self.heartbeat_self_spk_hex = heartbeat_self_spk_hex
         self.heartbeat_gossip_limit = int(heartbeat_gossip_limit)
@@ -1162,7 +1184,8 @@ class DMPHttpApi:
         token_store=None,
         registration_config=None,
         heartbeat_store=None,
-        heartbeat_rate_limit: Optional[RateLimit] = None,
+        heartbeat_submit_rate_limit: Optional[RateLimit] = None,
+        heartbeat_seen_rate_limit: Optional[RateLimit] = None,
         heartbeat_self_endpoint: Optional[str] = None,
         heartbeat_self_spk_hex: Optional[str] = None,
         heartbeat_gossip_limit: int = 10,
@@ -1202,9 +1225,14 @@ class DMPHttpApi:
         # the caller didn't pass one, the endpoints 404. Self-identity
         # (endpoint + spk hex) is surfaced on GET /v1/nodes/seen so
         # aggregators know who to attribute THIS node's listing to.
+        # Two independent rate limits: submit + seen. Splitting them
+        # keeps heavy scraper traffic on /v1/nodes/seen from burning
+        # the budget for legitimate peer POSTs to /v1/heartbeat.
         self.heartbeat_store = heartbeat_store
-        self.heartbeat_rate_limit = heartbeat_rate_limit
-        self.heartbeat_rate_limiter = None  # materialized in start()
+        self.heartbeat_submit_rate_limit = heartbeat_submit_rate_limit
+        self.heartbeat_seen_rate_limit = heartbeat_seen_rate_limit
+        self.heartbeat_submit_rate_limiter = None  # materialized in start()
+        self.heartbeat_seen_rate_limiter = None
         self.heartbeat_self_endpoint = heartbeat_self_endpoint
         self.heartbeat_self_spk_hex = heartbeat_self_spk_hex
         self.heartbeat_gossip_limit = int(heartbeat_gossip_limit)
@@ -1241,12 +1269,24 @@ class DMPHttpApi:
                 )
             )
 
-        # M5.8 heartbeat rate limiter — only materialized when the
-        # operator wired a heartbeat_store in.
-        if self.heartbeat_store is not None and self.heartbeat_rate_limit is not None:
-            if self.heartbeat_rate_limit.enabled:
-                self.heartbeat_rate_limiter = TokenBucketLimiter(
-                    self.heartbeat_rate_limit
+        # M5.8 heartbeat rate limiters — materialized only when the
+        # operator wired a heartbeat_store in AND supplied a
+        # RateLimit for the corresponding endpoint. Submit + seen
+        # are independent per codex phase-3 P2.
+        if self.heartbeat_store is not None:
+            if (
+                self.heartbeat_submit_rate_limit is not None
+                and self.heartbeat_submit_rate_limit.enabled
+            ):
+                self.heartbeat_submit_rate_limiter = TokenBucketLimiter(
+                    self.heartbeat_submit_rate_limit
+                )
+            if (
+                self.heartbeat_seen_rate_limit is not None
+                and self.heartbeat_seen_rate_limit.enabled
+            ):
+                self.heartbeat_seen_rate_limiter = TokenBucketLimiter(
+                    self.heartbeat_seen_rate_limit
                 )
 
         self._server = _DMPHttpServer(
@@ -1268,7 +1308,8 @@ class DMPHttpApi:
             challenge_store=self.challenge_store,
             registration_rate_limiter=self.registration_rate_limiter,
             heartbeat_store=self.heartbeat_store,
-            heartbeat_rate_limiter=self.heartbeat_rate_limiter,
+            heartbeat_submit_rate_limiter=self.heartbeat_submit_rate_limiter,
+            heartbeat_seen_rate_limiter=self.heartbeat_seen_rate_limiter,
             heartbeat_self_endpoint=self.heartbeat_self_endpoint,
             heartbeat_self_spk_hex=self.heartbeat_self_spk_hex,
             heartbeat_gossip_limit=self.heartbeat_gossip_limit,
