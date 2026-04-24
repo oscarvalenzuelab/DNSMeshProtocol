@@ -1,4 +1,4 @@
-"""`dmp` command-line interface.
+"""`dnsmesh` command-line interface.
 
 A thin wrapper around DMPClient for identity, contact, and message operations
 against a DMP node. Pairs well with `python -m dmp.server` on the node side.
@@ -7,13 +7,13 @@ Config lives at $DMP_CONFIG_HOME/config.yaml (default: ~/.dmp/config.yaml).
 Passphrases are never written to config — either set DMP_PASSPHRASE in the
 environment or point `passphrase_file` at a file readable only by you.
 
-    dmp init alice --domain mesh.example.com --endpoint http://node:8053
-    dmp identity show
-    dmp contacts add bob 3f...a9
-    dmp contacts list
-    dmp send bob "hello bob"
-    dmp recv
-    dmp node            # convenience: launch a dmp-node in the foreground
+    dnsmesh init alice --domain mesh.example.com --endpoint http://node:8053
+    dnsmesh identity show
+    dnsmesh contacts add bob 3f...a9
+    dnsmesh contacts list
+    dnsmesh send bob "hello bob"
+    dnsmesh recv
+    dnsmesh node        # convenience: launch a dnsmesh-node in the foreground
 
 Exit codes: 0 success, 1 user/config error, 2 network/backend error.
 """
@@ -61,12 +61,12 @@ class CLIConfig:
     # ("8.8.8.8", "2001:4860:4860::8888") or `host:port` (IPv4) /
     # `[host]:port` (IPv6). When non-empty, the CLI builds a
     # `ResolverPool` over these and `dns_host` / `dns_port` are ignored
-    # for reads. Populated by `dmp init --dns-resolvers` or
-    # `dmp resolvers discover --save`. Empty list preserves the legacy
+    # for reads. Populated by `dnsmesh init --dns-resolvers` or
+    # `dnsmesh resolvers discover --save`. Empty list preserves the legacy
     # single-host behavior.
     dns_resolvers: List[str] = field(default_factory=list)
     passphrase_file: Optional[str] = None  # alternative to DMP_PASSPHRASE
-    # 32 random bytes generated at `dmp init`, stored as hex. Combined with
+    # 32 random bytes generated at `dnsmesh init`, stored as hex. Combined with
     # the passphrase under Argon2id to derive the X25519 seed. Two users who
     # happen to share a passphrase still get independent identities; an
     # attacker who captures the public identity has to do a per-user
@@ -74,7 +74,7 @@ class CLIConfig:
     kdf_salt: str = ""
     # Optional DNS zone under which the user publishes / queries identity
     # records. When set, identity publish writes `dmp.<identity_domain>`
-    # and `dmp identity fetch <user>@<host>` resolves addresses in this
+    # and `dnsmesh identity fetch <user>@<host>` resolves addresses in this
     # shape. Leaving this empty falls back to the hash-based name under
     # the shared mesh `domain` (squat-prone, TOFU only).
     identity_domain: str = ""
@@ -98,15 +98,15 @@ class CLIConfig:
     cluster_node_token: str = ""
     # Explicit cluster-mode activation switch. Decouples "I pinned the
     # anchors" from "I want every networked command to go through the
-    # cluster path". Flipped True by `dmp cluster enable` only after a
-    # live manifest fetch succeeds; `dmp cluster pin` leaves it False
+    # cluster path". Flipped True by `dnsmesh cluster enable` only after a
+    # live manifest fetch succeeds; `dnsmesh cluster pin` leaves it False
     # so operators can `cluster fetch` to verify before cutting over.
     # Back-compat: older configs load as False even when both anchors
-    # are pinned — upgrading requires a one-time `dmp cluster enable`.
+    # are pinned — upgrading requires a one-time `dnsmesh cluster enable`.
     cluster_enabled: bool = False
     # Bootstrap-discovery anchors (M3.2-wire). When pinned via
-    # `dmp bootstrap pin <user_domain> <signer_spk_hex>`, subsequent
-    # `dmp bootstrap fetch / discover` and `dmp identity fetch
+    # `dnsmesh bootstrap pin <user_domain> <signer_spk_hex>`, subsequent
+    # `dnsmesh bootstrap fetch / discover` and `dnsmesh identity fetch
     # alice@<host> --via-bootstrap` commands translate a user domain
     # into the cluster handling its mailboxes. This is a SEPARATE
     # trust domain from `cluster_*`: the zone operator signing
@@ -125,7 +125,7 @@ class CLIConfig:
     # (and for the `contacts add` shortcut that doesn't require a signing
     # key). Pinned `spk` is what gates incoming manifests from that sender.
     # `domain` holds the remote host for a contact added via
-    # `dmp identity fetch user@host --add`; it's consulted by the
+    # `dnsmesh identity fetch user@host --add`; it's consulted by the
     # rotation fallback so chain walks resolve against the remote zone
     # (not the operator's local effective domain). Legacy configs predating
     # this field leave it empty and fall back to the local effective
@@ -136,7 +136,7 @@ class CLIConfig:
     def load(cls, path: Path) -> "CLIConfig":
         if not path.exists():
             raise FileNotFoundError(
-                f"no config at {path} — run `dmp init <username>` first"
+                f"no config at {path} — run `dnsmesh init <username>` first"
             )
         data = yaml.safe_load(path.read_text()) or {}
         raw_contacts = data.get("contacts", {}) or {}
@@ -179,7 +179,7 @@ class CLIConfig:
             # Back-compat: an older config (pinned anchors, no
             # cluster_enabled key) must NOT silently enter cluster mode
             # on upgrade. Default to False; the operator must run
-            # `dmp cluster enable` once to cut over.
+            # `dnsmesh cluster enable` once to cut over.
             cluster_enabled=bool(data.get("cluster_enabled", False)),
             # Bootstrap-discovery anchors (M3.2-wire). Load as empty on
             # pre-M3.2 configs; no auto-activation. Persisted alongside
@@ -225,7 +225,7 @@ class _HttpWriter(DNSRecordWriter):
 
     M5.5 auto-attach: if ``token`` is None, fall back to a saved
     per-node bearer at ``~/.dmp/tokens/<host>.json`` (written by
-    ``dmp register``). An explicit ``token`` wins — operators who
+    ``dnsmesh register``). An explicit ``token`` wins — operators who
     hand out a shared ``DMP_OPERATOR_TOKEN`` keep using that path.
     """
 
@@ -424,7 +424,7 @@ def _cluster_mode_enabled(config: CLIConfig) -> bool:
     The `cluster_enabled` flag separates "I pinned the anchors" (setup)
     from "I want every networked command to use the cluster path"
     (activation). This lets operators pin + verify via
-    `dmp cluster fetch` before cutting over with `dmp cluster enable`.
+    `dnsmesh cluster fetch` before cutting over with `dnsmesh cluster enable`.
     """
     return bool(
         config.cluster_base_domain
@@ -578,7 +578,7 @@ def _make_cluster_reader_factory(
 class _OfflineWriter(DNSRecordWriter):
     """Placeholder writer used by local-only CLI commands in cluster mode.
 
-    `dmp identity show` and similar commands only read the local identity
+    `dnsmesh identity show` and similar commands only read the local identity
     state — no writer needed. But the legacy code path hands every client
     a real `_HttpWriter`; when cluster mode is enabled we'd otherwise try
     to fetch the cluster manifest at startup, which fails with exit 2 any
@@ -632,7 +632,7 @@ def _make_client(
     legacy single-endpoint path.
 
     `requires_network=False` is an escape hatch for commands that only
-    need local state (e.g. `dmp identity show`, which just prints
+    need local state (e.g. `dnsmesh identity show`, which just prints
     username + derived keys). In that mode we skip the cluster manifest
     fetch entirely and hand the client offline placeholder writer/reader
     objects that raise on use. This keeps offline CLI use working (no
@@ -648,7 +648,7 @@ def _make_client(
             _die(
                 1,
                 "cluster_operator_spk is not valid hex; run "
-                "`dmp cluster pin <hex> <base_domain>` to fix",
+                "`dnsmesh cluster pin <hex> <base_domain>` to fix",
             )
         if len(operator_spk) != 32:
             _die(
@@ -690,7 +690,7 @@ def _make_client(
                 refresh_interval=refresh_interval,
             )
             writer = cluster_client.writer
-            # Cross-domain reads (e.g. `dmp identity fetch
+            # Cross-domain reads (e.g. `dnsmesh identity fetch
             # alice@other-domain.com`) would NXDOMAIN through the
             # cluster's authoritative nodes because those nodes have
             # no delegation for the external zone. Wrap the union
@@ -706,20 +706,20 @@ def _make_client(
         if not config.endpoint:
             if not requires_network:
                 # Legacy mode with no endpoint: still usable for local
-                # commands. Hand back placeholders so `dmp identity show`
+                # commands. Hand back placeholders so `dnsmesh identity show`
                 # works on a bare config that never got an --endpoint.
                 writer = _OfflineWriter()
                 reader = _OfflineReader()
             else:
                 _die(
                     1,
-                    "no endpoint configured — run `dmp init` with --endpoint, or edit "
+                    "no endpoint configured — run `dnsmesh init` with --endpoint, or edit "
                     f"{_config_path()}",
                 )
         else:
             writer = _HttpWriter(config.endpoint, config.http_token)
             reader = _make_reader(config)
-    # Persist the replay cache next to the config so repeated `dmp recv` calls
+    # Persist the replay cache next to the config so repeated `dnsmesh recv` calls
     # across separate CLI processes don't re-deliver the same message.
     replay_path = str(_config_path().parent / "replay_cache.json")
     # Prekey store sits in the same config dir; forward-secrecy property
@@ -755,7 +755,7 @@ def _make_client(
     # while refresh_prekeys publishes under the cluster base, silently
     # disabling forward secrecy on every send.
     #
-    # For CROSS-ZONE contacts (pinned via `dmp identity fetch
+    # For CROSS-ZONE contacts (pinned via `dnsmesh identity fetch
     # alice@other-zone.example --add`), we persist the remote host as
     # `entry.domain`. Using that here lets the rotation-chain walker
     # resolve against the remote zone's `rotate.dmp.<remote-host>`
@@ -791,7 +791,7 @@ def _close_client(client: DMPClient) -> None:
 
 
 def _die(code: int, msg: str) -> None:
-    print(f"dmp: {msg}", file=sys.stderr)
+    print(f"dnsmesh: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -839,7 +839,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     cfg.save(path)
     print(f"wrote config to {path}")
     print(
-        "Next: set DMP_PASSPHRASE or create a passphrase file, then `dmp identity show`."
+        "Next: set DMP_PASSPHRASE or create a passphrase file, then `dnsmesh identity show`."
     )
     print(
         "Keep this config file. If you lose the kdf_salt you cannot "
@@ -894,10 +894,10 @@ def cmd_identity_publish(args: argparse.Namespace) -> int:
             # resistance comes from the DNS zone's access control, not
             # from a hash.
             name = zone_anchored_identity_name(cfg.identity_domain)
-            resolve_hint = f"dmp identity fetch {cfg.username}@{cfg.identity_domain}"
+            resolve_hint = f"dnsmesh identity fetch {cfg.username}@{cfg.identity_domain}"
         else:
             name = identity_domain(cfg.username, _effective_domain(cfg))
-            resolve_hint = f"dmp identity fetch {cfg.username}"
+            resolve_hint = f"dnsmesh identity fetch {cfg.username}"
 
         ok = client.writer.publish_txt_record(name, wire, ttl=args.ttl)
         if not ok:
@@ -1107,7 +1107,7 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
     # the old key entirely (correct — it's no longer safe to follow
     # ANY chain starting from the compromised key; holders of the old
     # key must re-pin out-of-band). Non-rotation-aware contacts
-    # running `dmp identity fetch` will filter the old identity
+    # running `dnsmesh identity fetch` will filter the old identity
     # record out of the mailbox-name RRset and see only the new one.
     #
     # routine: do NOT publish a revocation. A routine rotation is a
@@ -1168,7 +1168,7 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
                 print(
                     f"warning: RotationRecord published, but RevocationRecord "
                     f"of the old key FAILED to publish at {rrset_name} — "
-                    f"non-rotation-aware `dmp identity fetch` will see BOTH "
+                    f"non-rotation-aware `dnsmesh identity fetch` will see BOTH "
                     f"the old and new IdentityRecords and exit ambiguous. "
                     f"Re-publish the revocation manually.",
                     file=sys.stderr,
@@ -1186,7 +1186,7 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
 
         # Also publish a fresh IdentityRecord for the NEW key so that
         # non-rotation-aware contacts still see the new key pinned
-        # correctly on a plain `dmp identity fetch`.
+        # correctly on a plain `dnsmesh identity fetch`.
         new_identity = make_record(new_crypto, cfg.username)
         ok = client.writer.publish_txt_record(
             identity_rrset, new_identity.sign(new_crypto), ttl=int(args.ttl)
@@ -1195,7 +1195,7 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
             print(
                 f"warning: RotationRecord published, but IdentityRecord "
                 f"for the new key FAILED to publish at {identity_rrset} — "
-                f"re-run `dmp identity publish` after updating the local "
+                f"re-run `dnsmesh identity publish` after updating the local "
                 f"config to the new passphrase.",
                 file=sys.stderr,
             )
@@ -1279,12 +1279,12 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
     )
     print(
         "  2. Other contacts must manually re-pin: "
-        "`dmp identity fetch <user>@<host> --add` against the new key."
+        "`dnsmesh identity fetch <user>@<host> --add` against the new key."
     )
     if swapped_locally:
         print(
             "  3. The local identity has already been swapped atomically; "
-            "`dmp identity show` will report the new pubkey. `dmp identity "
+            "`dnsmesh identity show` will report the new pubkey. `dnsmesh identity "
             "publish` will re-publish the new IdentityRecord under the "
             "rotated key."
         )
@@ -1293,7 +1293,7 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
             "  3. Point your passphrase source at the new passphrase "
             "(edit `passphrase_file` in config.yaml, or set DMP_PASSPHRASE). "
             "Do NOT regenerate kdf_salt — the current salt + new passphrase "
-            "derives the rotated keypair. Re-running `dmp init --force` "
+            "derives the rotated keypair. Re-running `dnsmesh init --force` "
             "would break local adoption."
         )
     # Non-zero exit when the env-passphrase mismatch was detected so a
@@ -1366,7 +1366,7 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
             _die(
                 1,
                 f"--via-bootstrap: no bootstrap signer pinned for {host!r}; "
-                f"run `dmp bootstrap pin {host} <signer_spk_hex>` first",
+                f"run `dnsmesh bootstrap pin {host} <signer_spk_hex>` first",
             )
         signer_spk = _decode_signer_spk(
             cfg.bootstrap_signer_spk, field_name="bootstrap_signer_spk"
@@ -1440,7 +1440,7 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
             reader_factory=_make_cluster_reader_factory(cfg, bootstrap_reader),
             refresh_interval=None,  # one-shot; no background thread.
         )
-        # Identity fetch is the cross-domain workflow — `dmp identity
+        # Identity fetch is the cross-domain workflow — `dnsmesh identity
         # fetch alice@other-domain.com` queries a zone the pinned
         # cluster doesn't own. Without the composite split, those
         # queries NXDOMAIN through the authoritative cluster nodes.
@@ -1701,9 +1701,9 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
         else:
             # Persist the remote host so the rotation fallback can walk
             # chains against the right zone. Two shapes can supply it:
-            #   1) `dmp identity fetch alice@other.example --add`
+            #   1) `dnsmesh identity fetch alice@other.example --add`
             #      → parsed_addr = (alice, other.example)
-            #   2) `dmp identity fetch alice --domain other.example --add`
+            #   2) `dnsmesh identity fetch alice --domain other.example --add`
             #      → parsed_addr is None, args.domain carries the host
             # Both must persist `domain` so _make_client doesn't later
             # overwrite with the local effective_domain and break
@@ -1745,10 +1745,10 @@ def cmd_contacts_add(args: argparse.Namespace) -> int:
             _die(1, "signing key must be 32 bytes (64 hex characters)")
         spk_hex = args.signing_key.lower()
 
-    # `domain` empty here: `dmp contacts add` takes no remote host, so
+    # `domain` empty here: `dnsmesh contacts add` takes no remote host, so
     # cross-zone rotation-chain resolution isn't available via this
     # path — the client falls back to the local effective domain.
-    # Use `dmp identity fetch user@host --add` to persist the remote
+    # Use `dnsmesh identity fetch user@host --add` to persist the remote
     # host and enable chain walks against the remote zone.
     cfg.contacts[args.name] = {
         "pub": args.pubkey.lower(),
@@ -1762,11 +1762,11 @@ def cmd_contacts_add(args: argparse.Namespace) -> int:
         print(
             f"added contact {args.name}\n"
             f"  WARNING: no Ed25519 signing key pinned. Until at least one\n"
-            f"  contact has a pinned signing key, `dmp recv` runs in\n"
+            f"  contact has a pinned signing key, `dnsmesh recv` runs in\n"
             f"  trust-on-first-use mode — any signature-valid manifest\n"
             f"  addressed to you will be delivered, including from senders\n"
             f"  you never added. Re-run with --signing-key <64-hex>, or\n"
-            f"  bootstrap via `dmp identity fetch <user> --add` which\n"
+            f"  bootstrap via `dnsmesh identity fetch <user> --add` which\n"
             f"  pins both keys.",
             file=sys.stderr,
         )
@@ -1777,7 +1777,7 @@ def cmd_contacts_list(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
     if not cfg.contacts:
         print(
-            "(no contacts yet — `dmp contacts add <name> <pubkey_hex>` or `dmp identity fetch <user> --add`)"
+            "(no contacts yet — `dnsmesh contacts add <name> <pubkey_hex>` or `dnsmesh identity fetch <user> --add`)"
         )
         return 0
     width = max(len(n) for n in cfg.contacts)
@@ -1792,7 +1792,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     if args.recipient not in cfg.contacts:
         _die(
             1,
-            f"unknown contact `{args.recipient}` — add it first with `dmp contacts add`",
+            f"unknown contact `{args.recipient}` — add it first with `dnsmesh contacts add`",
         )
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
@@ -1859,8 +1859,8 @@ def cmd_register(args: argparse.Namespace) -> int:
          IdentityRecords — no new keypair needed).
       3. POST /v1/registration/confirm.
       4. Save the returned token to ``~/.dmp/tokens/<node>.json``.
-         Every subsequent ``dmp identity publish`` / ``dmp send`` /
-         ``dmp identity refresh-prekeys`` to this node will auto-
+         Every subsequent ``dnsmesh identity publish`` / ``dnsmesh send`` /
+         ``dnsmesh identity refresh-prekeys`` to this node will auto-
          attach it as a Bearer header.
 
     Subject defaults to ``<username>@<effective-domain>`` from the
@@ -1875,7 +1875,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     if not cfg.username:
         _die(
             1,
-            "no local config — run `dmp init <username>` before `dmp register`",
+            "no local config — run `dnsmesh init <username>` before `dnsmesh register`",
         )
 
     subject = args.subject or f"{cfg.username}@{_effective_domain(cfg)}"
@@ -1959,7 +1959,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             f"subject {subject!r} is already held by a different key (409). "
             "If you previously registered on another machine, use that same "
             "passphrase here, or ask the operator to revoke the prior "
-            "token via `dmp-node-admin token revoke <subject>`.",
+            "token via `dnsmesh-node-admin token revoke <subject>`.",
         )
     if r2.status_code != 200:
         _die(2, f"confirm failed: HTTP {r2.status_code}: {r2.text}")
@@ -1984,7 +1984,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(body["expires_at"])))
         print(f"  expires at {ts}")
     print(
-        "  subsequent `dmp identity publish` / `dmp send` to this node "
+        "  subsequent `dnsmesh identity publish` / `dnsmesh send` to this node "
         "will use this token automatically."
     )
     return 0
@@ -1997,7 +1997,7 @@ def cmd_token_list(args: argparse.Namespace) -> int:
 
     rows = list(list_tokens())
     if args.json:
-        # Strip the raw token material — `dmp token list --json` is
+        # Strip the raw token material — `dnsmesh token list --json` is
         # for scripting / inventory, not for dumping credentials to
         # stdout. Show prefix + length so the operator can confirm
         # "the right token" without ever printing the full value.
@@ -2049,7 +2049,7 @@ def cmd_resolvers_discover(args: argparse.Namespace) -> int:
     Without `--save`, this is a read-only diagnostic — useful on a
     captive network to sanity-check which upstreams are reachable
     before committing to them. With `--save`, the working list is
-    written to config as `dns_resolvers`; a subsequent `dmp resolvers
+    written to config as `dns_resolvers`; a subsequent `dnsmesh resolvers
     list` (and, once M1.2 lands, the normal client read path) will
     pick it up.
 
@@ -2068,7 +2068,7 @@ def cmd_resolvers_discover(args: argparse.Namespace) -> int:
         print(f"  {host}")
 
     if args.save:
-        # `dmp init` may not have run yet on a fresh machine; in that
+        # `dnsmesh init` may not have run yet on a fresh machine; in that
         # case there's no config to update and the user should init
         # first. If the config does exist, we just set the new field
         # (creating it if absent) and persist.
@@ -2076,8 +2076,8 @@ def cmd_resolvers_discover(args: argparse.Namespace) -> int:
         if not path.exists():
             _die(
                 1,
-                f"no config at {path} — run `dmp init <username>` before "
-                f"`dmp resolvers discover --save`",
+                f"no config at {path} — run `dnsmesh init <username>` before "
+                f"`dnsmesh resolvers discover --save`",
             )
         cfg = CLIConfig.load(path)
         cfg.dns_resolvers = working
@@ -2091,17 +2091,17 @@ def cmd_resolvers_list(args: argparse.Namespace) -> int:
 
     On a fresh install with no `config.yaml`, this used to raise
     `FileNotFoundError` from `CLIConfig.load` and dump a traceback —
-    unfriendly for `dmp resolvers list` as a diagnostic command.
+    unfriendly for `dnsmesh resolvers list` as a diagnostic command.
     Check for the config up front and surface a clean exit-1 with the
-    same "run `dmp init` first" hint other commands use via `_die`.
+    same "run `dnsmesh init` first" hint other commands use via `_die`.
     """
     path = _config_path()
     if not path.exists():
-        _die(1, f"no config at {path} — run `dmp init <username>` first")
+        _die(1, f"no config at {path} — run `dnsmesh init <username>` first")
     cfg = CLIConfig.load(path)
     if not cfg.dns_resolvers:
         print(
-            "(no dns_resolvers configured — run `dmp resolvers discover "
+            "(no dns_resolvers configured — run `dnsmesh resolvers discover "
             "--save` to populate)"
         )
         return 0
@@ -2115,19 +2115,19 @@ def cmd_cluster_pin(args: argparse.Namespace) -> int:
 
     Writes anchors to config; does NOT fetch and does NOT activate
     cluster mode. Activation is a separate step: the operator first
-    runs `dmp cluster fetch` to confirm the manifest resolves and
-    verifies, then `dmp cluster enable` to flip `cluster_enabled=True`
+    runs `dnsmesh cluster fetch` to confirm the manifest resolves and
+    verifies, then `dnsmesh cluster enable` to flip `cluster_enabled=True`
     so subsequent networked commands route through the cluster path.
 
     This decoupling means pinning an operator who hasn't published
-    their manifest yet is safe — it won't wedge every `dmp send` /
-    `dmp recv` on a failed bootstrap. It also gives operators a
-    reversible activation: `dmp cluster disable` drops back to the
+    their manifest yet is safe — it won't wedge every `dnsmesh send` /
+    `dnsmesh recv` on a failed bootstrap. It also gives operators a
+    reversible activation: `dnsmesh cluster disable` drops back to the
     legacy endpoint without clearing the pinned anchors.
     """
     path = _config_path()
     if not path.exists():
-        _die(1, f"no config at {path} — run `dmp init <username>` first")
+        _die(1, f"no config at {path} — run `dnsmesh init <username>` first")
     cfg = CLIConfig.load(path)
     try:
         raw = bytes.fromhex(args.operator_spk)
@@ -2155,15 +2155,15 @@ def cmd_cluster_pin(args: argparse.Namespace) -> int:
     cfg.save(path)
     print(f"pinned cluster operator key and base domain {args.base_domain}")
     print("next:")
-    print("  1. `dmp cluster fetch` to verify the manifest resolves")
-    print("  2. `dmp cluster enable` to cut over from the legacy endpoint")
+    print("  1. `dnsmesh cluster fetch` to verify the manifest resolves")
+    print("  2. `dnsmesh cluster enable` to cut over from the legacy endpoint")
     return 0
 
 
 def cmd_cluster_enable(args: argparse.Namespace) -> int:
     """Activate cluster mode after a live manifest-fetch sanity check.
 
-    Requires both anchors pinned (`dmp cluster pin` beforehand). Runs a
+    Requires both anchors pinned (`dnsmesh cluster pin` beforehand). Runs a
     `fetch_cluster_manifest` against the pinned base domain; if the
     fetch fails (nothing published, signature mismatch, expired),
     leaves `cluster_enabled=False` and exits 2 so the operator can
@@ -2176,12 +2176,12 @@ def cmd_cluster_enable(args: argparse.Namespace) -> int:
     """
     path = _config_path()
     if not path.exists():
-        _die(1, f"no config at {path} — run `dmp init <username>` first")
+        _die(1, f"no config at {path} — run `dnsmesh init <username>` first")
     cfg = CLIConfig.load(path)
     if not _cluster_anchors_pinned(cfg):
         _die(
             1,
-            "cluster anchors not pinned — run `dmp cluster pin "
+            "cluster anchors not pinned — run `dnsmesh cluster pin "
             "<operator_spk_hex> <base_domain>` first",
         )
     try:
@@ -2200,9 +2200,9 @@ def cmd_cluster_enable(args: argparse.Namespace) -> int:
         # do NOT flip True on a failed fetch. The operator needs to
         # fix whatever broke the bootstrap before activating.
         print(
-            f"dmp: cluster manifest fetch failed for {cfg.cluster_base_domain} — "
+            f"dnsmesh: cluster manifest fetch failed for {cfg.cluster_base_domain} — "
             "nothing at `cluster.<base>` TXT verified under the pinned operator key. "
-            "Cluster mode NOT enabled. Run `dmp cluster fetch` for diagnostics.",
+            "Cluster mode NOT enabled. Run `dnsmesh cluster fetch` for diagnostics.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -2235,7 +2235,7 @@ def cmd_cluster_disable(args: argparse.Namespace) -> int:
     """
     path = _config_path()
     if not path.exists():
-        _die(1, f"no config at {path} — run `dmp init <username>` first")
+        _die(1, f"no config at {path} — run `dnsmesh init <username>` first")
     cfg = CLIConfig.load(path)
     was_enabled = cfg.cluster_enabled
     cfg.cluster_enabled = False
@@ -2262,12 +2262,12 @@ def cmd_cluster_fetch(args: argparse.Namespace) -> int:
     """
     path = _config_path()
     if not path.exists():
-        _die(1, f"no config at {path} — run `dmp init <username>` first")
+        _die(1, f"no config at {path} — run `dnsmesh init <username>` first")
     cfg = CLIConfig.load(path)
     if not _cluster_anchors_pinned(cfg):
         _die(
             1,
-            "cluster not configured — run `dmp cluster pin <operator_spk_hex> "
+            "cluster not configured — run `dnsmesh cluster pin <operator_spk_hex> "
             "<base_domain>` first",
         )
     try:
@@ -2333,7 +2333,7 @@ def cmd_cluster_fetch(args: argparse.Namespace) -> int:
 def cmd_cluster_status(args: argparse.Namespace) -> int:
     """Build the cluster client and print health snapshots.
 
-    Unlike `dmp cluster fetch`, this actually spins up the full
+    Unlike `dnsmesh cluster fetch`, this actually spins up the full
     ClusterClient (including per-node writers/readers) so the
     fanout/union health snapshots have data to report. We shut it
     down immediately after printing — no background refresh thread
@@ -2341,12 +2341,12 @@ def cmd_cluster_status(args: argparse.Namespace) -> int:
     """
     path = _config_path()
     if not path.exists():
-        _die(1, f"no config at {path} — run `dmp init <username>` first")
+        _die(1, f"no config at {path} — run `dnsmesh init <username>` first")
     cfg = CLIConfig.load(path)
     if not _cluster_anchors_pinned(cfg):
         _die(
             1,
-            "cluster not configured — run `dmp cluster pin <operator_spk_hex> "
+            "cluster not configured — run `dnsmesh cluster pin <operator_spk_hex> "
             "<base_domain>` first",
         )
     try:
@@ -2419,7 +2419,7 @@ def cmd_bootstrap_pin(args: argparse.Namespace) -> int:
     Writes `bootstrap_user_domain` + `bootstrap_signer_spk` to config.
     Does NOT fetch — pinning is cheap and reversible, while a failing
     fetch during pin would wedge every subsequent command on DNS
-    availability. Mirrors the `dmp cluster pin` ergonomics.
+    availability. Mirrors the `dnsmesh cluster pin` ergonomics.
 
     Validation:
     - `user_domain` goes through `bootstrap_rrset_name` which runs the
@@ -2430,7 +2430,7 @@ def cmd_bootstrap_pin(args: argparse.Namespace) -> int:
     """
     path = _config_path()
     if not path.exists():
-        _die(1, f"no config at {path} — run `dmp init <username>` first")
+        _die(1, f"no config at {path} — run `dnsmesh init <username>` first")
     cfg = CLIConfig.load(path)
     # Validate the user domain the same way bootstrap_rrset_name will
     # — reject malformed names here so the error surfaces at pin time,
@@ -2446,11 +2446,11 @@ def cmd_bootstrap_pin(args: argparse.Namespace) -> int:
     print(f"pinned bootstrap signer for {cfg.bootstrap_user_domain}")
     print("next:")
     print(
-        f"  1. `dmp bootstrap fetch` to verify the record at "
+        f"  1. `dnsmesh bootstrap fetch` to verify the record at "
         f"_dmp.{cfg.bootstrap_user_domain} resolves"
     )
     print(
-        f"  2. `dmp bootstrap discover <user>@{cfg.bootstrap_user_domain}` "
+        f"  2. `dnsmesh bootstrap discover <user>@{cfg.bootstrap_user_domain}` "
         "to see which cluster(s) the domain points at"
     )
     return 0
@@ -2532,7 +2532,7 @@ def _resolve_bootstrap_anchors(
         _die(
             1,
             "no bootstrap anchors available — pass --user-domain + "
-            "--signer-spk, or pin with `dmp bootstrap pin <user_domain> "
+            "--signer-spk, or pin with `dnsmesh bootstrap pin <user_domain> "
             "<signer_spk_hex>` first",
         )
     # If CLI supplied only one side, complain rather than silently
@@ -2590,7 +2590,7 @@ def cmd_bootstrap_fetch(args: argparse.Namespace) -> int:
     """
     path = _config_path()
     if not path.exists():
-        _die(1, f"no config at {path} — run `dmp init <username>` first")
+        _die(1, f"no config at {path} — run `dnsmesh init <username>` first")
     cfg = CLIConfig.load(path)
     user_domain, signer_spk = _resolve_bootstrap_anchors(
         cfg,
@@ -2629,8 +2629,8 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
        `bootstrap pin`) OR explicit `--signer-spk`.
     3. Fetch + verify the bootstrap record for `host`.
     4. Pick `best_entry()` (lowest priority — SMTP MX semantics).
-    5. Without `--auto-pin`: print the `dmp cluster pin` /
-       `dmp cluster enable` steps the operator would run. Do NOT
+    5. Without `--auto-pin`: print the `dnsmesh cluster pin` /
+       `dnsmesh cluster enable` steps the operator would run. Do NOT
        write anything to config — this is a diagnostic that bridges
        discovery to cluster handoff so the operator approves.
     6. With `--auto-pin`: ALSO fetch + verify the cluster manifest
@@ -2644,7 +2644,7 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
 
     path = _config_path()
     if not path.exists():
-        _die(1, f"no config at {path} — run `dmp init <username>` first")
+        _die(1, f"no config at {path} — run `dnsmesh init <username>` first")
     cfg = CLIConfig.load(path)
 
     parsed = parse_address(args.address)
@@ -2660,7 +2660,7 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
             _die(
                 1,
                 f"no bootstrap signer pinned for {host!r} — run "
-                f"`dmp bootstrap pin {host} <signer_spk_hex>` first, or "
+                f"`dnsmesh bootstrap pin {host} <signer_spk_hex>` first, or "
                 "pass --signer-spk <hex> on this call",
             )
         signer_hex = cfg.bootstrap_signer_spk
@@ -2668,7 +2668,7 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
             _die(
                 1,
                 f"no bootstrap signer pinned for {host!r} — run "
-                f"`dmp bootstrap pin {host} <signer_spk_hex>` first",
+                f"`dnsmesh bootstrap pin {host} <signer_spk_hex>` first",
             )
     signer_spk = _decode_signer_spk(signer_hex, field_name="signer_spk")
 
@@ -2717,26 +2717,26 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
         print()
         print("to pin this cluster manually, run:")
         print(
-            f"  dmp cluster pin {shown.operator_spk.hex()} {shown.cluster_base_domain}"
+            f"  dnsmesh cluster pin {shown.operator_spk.hex()} {shown.cluster_base_domain}"
         )
-        print("  dmp cluster fetch  # verify manifest")
-        print("  dmp cluster enable # activate cluster mode")
+        print("  dnsmesh cluster fetch  # verify manifest")
+        print("  dnsmesh cluster enable # activate cluster mode")
         print()
         print("or re-run with --auto-pin to do all of the above atomically.")
         return 0
 
     # --auto-pin mutates the caller's own global cluster_* config and
     # flips cluster_enabled=True, which rehomes every subsequent
-    # `dmp send` / `dmp recv` / `identity publish` onto the discovered
+    # `dnsmesh send` / `dnsmesh recv` / `identity publish` onto the discovered
     # cluster. Running it against ANY address (e.g. to look at a
     # recipient alice@example.com) would rehome the operator's local
     # mailbox state to someone else's cluster — a silent hijack.
     #
     # Guard: require the discovered host to match bootstrap_user_domain
     # pinned in config. That makes auto-pin an explicit two-step flow:
-    #   1. `dmp bootstrap pin <my-domain> <my-signer-spk>`  — acknowledge
+    #   1. `dnsmesh bootstrap pin <my-domain> <my-signer-spk>`  — acknowledge
     #      trust anchor for the zone you actually live on
-    #   2. `dmp bootstrap discover me@my-domain --auto-pin`
+    #   2. `dnsmesh bootstrap discover me@my-domain --auto-pin`
     # Inspecting a recipient's cluster is still possible without
     # --auto-pin (diagnostic mode) or via --via-bootstrap on
     # identity fetch.
@@ -2748,10 +2748,10 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
             f"--auto-pin refuses to rehome config onto {host!r}: it is "
             f"not the bootstrap_user_domain pinned in config "
             f"({cfg.bootstrap_user_domain!r}). Pin your own home domain "
-            f"first with `dmp bootstrap pin {host} <signer_spk_hex>`, "
+            f"first with `dnsmesh bootstrap pin {host} <signer_spk_hex>`, "
             f"then re-run --auto-pin. For one-off discovery of a "
             f"recipient's cluster, omit --auto-pin (diagnostic mode) "
-            f"or use `dmp identity fetch alice@host --via-bootstrap`.",
+            f"or use `dnsmesh identity fetch alice@host --via-bootstrap`.",
         )
 
     # Verify the cluster manifest at the returned anchor BEFORE writing
@@ -2762,7 +2762,7 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     #    (below, via fetch_cluster_manifest).
     # Only after BOTH succeed do we persist. A half-written config
     # (bootstrap pinned but no cluster) is worse than none at all —
-    # `dmp send` would wedge on cluster-mode enabled with no manifest.
+    # `dnsmesh send` would wedge on cluster-mode enabled with no manifest.
     #
     # Walk entries in priority order. Accept only an entry whose
     # cluster manifest verifies AND whose per-node factories can
@@ -2784,15 +2784,15 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
     # Both records verified: commit both to config atomically.
     # Pin the bootstrap anchor on the caller's behalf so future
     # discover/fetch calls don't need --signer-spk. Pin the cluster
-    # anchors and set cluster_enabled=True so the next `dmp send` /
-    # `dmp recv` routes through the federation path.
+    # anchors and set cluster_enabled=True so the next `dnsmesh send` /
+    # `dnsmesh recv` routes through the federation path.
     #
     # Clear cluster_node_token AND http_token: both were scoped to the
     # previous operator. _build_cluster_writer_factory falls back from
     # cluster_node_token to http_token, so clearing only the former
     # would still send the legacy token to the newly discovered cluster
     # — a cross-trust-domain credential leak. The operator can
-    # repopulate either via `dmp config set` or by editing the config
+    # repopulate either via `dnsmesh config set` or by editing the config
     # file if the new cluster requires auth.
     cfg.bootstrap_user_domain = host.rstrip(".")
     cfg.bootstrap_signer_spk = signer_hex.lower()
@@ -2820,7 +2820,7 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
 
 
 def cmd_node(args: argparse.Namespace) -> int:
-    """Convenience: launch a dmp-node in the foreground."""
+    """Convenience: launch a dnsmesh-node in the foreground."""
     from dmp.server.node import DMPNode, DMPNodeConfig
 
     overrides = {}
@@ -2841,7 +2841,7 @@ def cmd_node(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="dmp", description="DNS Mesh Protocol CLI")
+    p = argparse.ArgumentParser(prog="dnsmesh", description="DNS Mesh Protocol CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # init
@@ -2988,7 +2988,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="discover the cluster serving the address's right-hand host "
         "via the pinned bootstrap signer, then route the lookup through "
-        "a one-shot ClusterClient. Requires `dmp bootstrap pin <host> "
+        "a one-shot ClusterClient. Requires `dnsmesh bootstrap pin <host> "
         "<signer_spk_hex>` first. No config is written.",
     )
     p_id_fetch.set_defaults(func=cmd_identity_fetch)
@@ -3181,7 +3181,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--signer-spk",
         default=None,
         help="bootstrap signer_spk (hex) for this host; required when the "
-        "host has not been pinned via `dmp bootstrap pin`",
+        "host has not been pinned via `dnsmesh bootstrap pin`",
     )
     p_bs_discover.add_argument(
         "--auto-pin",
@@ -3193,7 +3193,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bs_discover.set_defaults(func=cmd_bootstrap_discover)
 
     # node (convenience launcher)
-    p_n = sub.add_parser("node", help="run a dmp node in the foreground")
+    p_n = sub.add_parser("node", help="run a dnsmesh node in the foreground")
     p_n.add_argument("--db-path")
     p_n.add_argument("--dns-port", type=int)
     p_n.add_argument("--http-port", type=int)

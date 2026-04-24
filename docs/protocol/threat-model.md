@@ -29,16 +29,16 @@ keys:
 
 1. **Bootstrap signer** (zone operator). Authority over
    `_dmp.<user_domain>` TXT. Pinned via
-   `dmp bootstrap pin <user_domain> <fingerprint>`. Compromise → an
+   `dnsmesh bootstrap pin <user_domain> <fingerprint>`. Compromise → an
    attacker can redirect a user domain to a hostile cluster.
 2. **Cluster operator**. Authority over
    `cluster.<cluster_base_domain>` TXT. Pinned out-of-band, or
    discovered via a verified bootstrap record and then pinned via
-   `dmp cluster pin` / `--auto-pin`. Compromise → an attacker can
+   `dnsmesh cluster pin` / `--auto-pin`. Compromise → an attacker can
    serve forged records inside that cluster.
 3. **User signing identity** (Ed25519 identity key). Signs slot
    manifests, identity records, and prekeys. Pinned out-of-band by
-   contacts (`dmp contacts add --signing-key <hex>`) or first-use.
+   contacts (`dnsmesh contacts add --signing-key <hex>`) or first-use.
    Compromise → an attacker can forge messages as that user.
 
 The three trust anchors are **independent**: compromise of one does
@@ -241,7 +241,7 @@ a user's Ed25519 signing key + long-term X25519 key + prekey `sk`s
 decrypts every past message those keys touch AND allows forgery of
 new messages until the keys are rotated.
 
-Rotation IS in-band as of M5.4 (`dmp identity rotate --experimental`).
+Rotation IS in-band as of M5.4 (`dnsmesh identity rotate --experimental`).
 The CLI publishes a co-signed `RotationRecord` (new key ← old) plus
 a fresh `IdentityRecord` signed by the new key; with `--reason
 compromise` or `--reason lost_key` it also publishes a self-signed

@@ -601,7 +601,7 @@ class RevocationRecord:
         age gate entirely.
 
         The historical 1-year cap introduced a silent regression: once
-        the cap expired, `dmp identity fetch` could no longer filter
+        the cap expired, `dnsmesh identity fetch` could no longer filter
         the old IdentityRecord out of the mailbox RRset (append
         semantics lets the old record stay live if re-published), and
         the fetch path saw BOTH old and new identities as valid —

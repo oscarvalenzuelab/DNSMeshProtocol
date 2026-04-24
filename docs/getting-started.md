@@ -26,17 +26,17 @@ pip install -e .
 Verify:
 
 ```bash
-dmp --help
+dnsmesh --help
 ```
 
 ## Run a node (local)
 
 ```bash
-docker build -t dmp-node:latest .
-docker run -d --name dmp-node \
+docker build -t dnsmesh-node:latest .
+docker run -d --name dnsmesh-node \
   -p 5353:5353/udp -p 8053:8053/tcp \
-  -v dmp-data:/var/lib/dmp \
-  dmp-node:latest
+  -v dnsmesh-data:/var/lib/dmp \
+  dnsmesh-node:latest
 
 # Health check
 curl http://127.0.0.1:8053/health
@@ -58,10 +58,10 @@ machines, but separate `DMP_CONFIG_HOME` directories work fine on one box.
 ```bash
 export DMP_CONFIG_HOME=/tmp/alice-home
 export DMP_PASSPHRASE=alice-pass
-dmp init alice --domain mesh.local \
+dnsmesh init alice --domain mesh.local \
                --endpoint http://127.0.0.1:8053 \
                --dns-host 127.0.0.1 --dns-port 5353
-dmp identity publish
+dnsmesh identity publish
 ```
 
 **Terminal 2 — Bob**
@@ -69,19 +69,19 @@ dmp identity publish
 ```bash
 export DMP_CONFIG_HOME=/tmp/bob-home
 export DMP_PASSPHRASE=bob-pass
-dmp init bob --domain mesh.local \
+dnsmesh init bob --domain mesh.local \
              --endpoint http://127.0.0.1:8053 \
              --dns-host 127.0.0.1 --dns-port 5353
 
 # Publish bob's identity + a pool of one-time prekeys for forward secrecy.
-dmp identity publish
-dmp identity refresh-prekeys
+dnsmesh identity publish
+dnsmesh identity refresh-prekeys
 
 # Resolve alice's identity from DNS and pin her.
-dmp identity fetch alice --add
+dnsmesh identity fetch alice --add
 
 # Send.
-dmp send alice "hello alice"
+dnsmesh send alice "hello alice"
 ```
 
 **Terminal 1 — Alice reads**
@@ -89,9 +89,9 @@ dmp send alice "hello alice"
 ```bash
 # Resolve bob too so his signing key is pinned — receive then accepts
 # only manifests from pinned signers, not TOFU.
-dmp identity fetch bob --add
+dnsmesh identity fetch bob --add
 
-dmp recv
+dnsmesh recv
 ```
 
 You should see:
@@ -103,7 +103,7 @@ from ef44bf…
 ```
 
 {: .tip }
-Running `dmp recv` a second time in the same config home doesn't
+Running `dnsmesh recv` a second time in the same config home doesn't
 re-deliver the same message — the replay cache persists to
 `$DMP_CONFIG_HOME/replay_cache.json`.
 
@@ -115,7 +115,7 @@ re-deliver the same message — the replay cache persists to
    records under the mesh domain.
 3. A signed manifest naming alice's Ed25519 key + the prekey_id + total
    chunks went into one of bob's 10 mailbox slots.
-4. Bob's `dmp recv` polled the slots, verified alice's signature (pinned
+4. Bob's `dnsmesh recv` polled the slots, verified alice's signature (pinned
    contact), checked the replay cache, fetched chunks, ran erasure
    decode, and decrypted with the prekey's secret half.
 5. The prekey's secret half was then **deleted** locally and from DNS —
@@ -132,10 +132,10 @@ and fans every write to a majority of nodes while unioning every read.
 
 ```bash
 # Pin the operator key + base domain once.
-dmp cluster pin 3c6a...the32byteoperatorpubkeyinhex mesh.example.com
+dnsmesh cluster pin 3c6a...the32byteoperatorpubkeyinhex mesh.example.com
 
 # Sanity-check that the signed manifest is published and verifiable.
-dmp cluster fetch
+dnsmesh cluster fetch
 # cluster: mesh.example.com
 #   seq:   7
 #   exp:   1816000000
@@ -143,7 +143,7 @@ dmp cluster fetch
 #     n01  http=https://n1.mesh.example.com:8053  dns=203.0.113.10:53
 #     ...
 
-# From here on every `dmp send` / `dmp recv` / `dmp identity publish`
+# From here on every `dnsmesh send` / `dnsmesh recv` / `dnsmesh identity publish`
 # fans writes across ceil(N/2) nodes and unions reads across all N.
 # Manifests refresh in the background on `cluster_refresh_interval`
 # (default 3600 seconds).
@@ -152,7 +152,7 @@ dmp cluster fetch
 When either `cluster_operator_spk` or `cluster_base_domain` is unset
 the CLI falls back to the legacy single-endpoint mode, so existing
 configs keep working unchanged. See
-[User Guide → CLI reference → `dmp cluster`]({{ site.baseurl }}/guide/cli)
+[User Guide → CLI reference → `dnsmesh cluster`]({{ site.baseurl }}/guide/cli)
 for the full subcommand list.
 
 ## Next

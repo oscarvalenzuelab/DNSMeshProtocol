@@ -239,7 +239,7 @@ shipped with M5.5:
 ## Operator-issued flow
 
 ```bash
-dmp-node admin token issue alice@example.com \
+dnsmesh-node admin token issue alice@example.com \
     --rate-per-sec 20 \
     --expires 90d \
     --note "onboarded via Telegram DM"
@@ -249,12 +249,12 @@ dmp-node admin token issue alice@example.com \
 #   expires_at: 2026-07-22T00:00:00Z
 # Operator shares the token with Alice out-of-band.
 
-dmp-node admin token list
-dmp-node admin token revoke <token-prefix-or-subject>
-dmp-node admin token rotate <subject>  # issues a new one, revokes the old after grace window
+dnsmesh-node admin token list
+dnsmesh-node admin token revoke <token-prefix-or-subject>
+dnsmesh-node admin token rotate <subject>  # issues a new one, revokes the old after grace window
 ```
 
-The admin CLI is a subcommand of the node binary (not the `dmp`
+The admin CLI is a subcommand of the node binary (not the `dnsmesh`
 client CLI) because it needs direct access to the token database.
 In the Docker deploy, operators run it via `docker exec`.
 
@@ -262,14 +262,14 @@ In the Docker deploy, operators run it via `docker exec`.
 
 ```bash
 # Self-service path:
-dmp register --node dmp.example.com
+dnsmesh register --node dmp.example.com
 # Prompts for subject (defaults to <username>@<domain> from config),
 # generates keys if not present, does the 2-step dance, writes the
-# returned token to ~/.dmp/tokens/<node-hostname>. `dmp identity
+# returned token to ~/.dmp/tokens/<node-hostname>. `dnsmesh identity
 # publish` etc. auto-read that file.
 
 # Operator-issued path:
-dmp token add dmp.example.com <token-from-operator>
+dnsmesh token add dmp.example.com <token-from-operator>
 ```
 
 Tokens live at `~/.dmp/tokens/<node-hostname>` (mode 0600, one
@@ -305,8 +305,8 @@ A node can be configured in one of three modes via
    writes gated by "any active token". Unit tests + fuzz.
 3. **Self-service registration** — `/v1/registration/challenge` +
    `/confirm` endpoints. Per-IP rate limits. Allowlist support.
-4. **Client CLI** — `dmp register`, `dmp token add/list/rotate`.
-   Updates to `dmp identity publish` / `dmp send` to auto-attach
+4. **Client CLI** — `dnsmesh register`, `dnsmesh token add/list/rotate`.
+   Updates to `dnsmesh identity publish` / `dnsmesh send` to auto-attach
    bearer headers from `~/.dmp/tokens/`.
 5. **Docs** — user guide section, operator deployment doc, How It
    Works update to reflect new trust model.

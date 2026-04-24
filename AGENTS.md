@@ -158,7 +158,7 @@ black --check dmp tests
 mypy --ignore-missing-imports dmp || true    # permissive for now
 
 # Docker integration (only if you touched server/ or client/ code):
-docker build -t dmp-node:latest .
+docker build -t dnsmesh-node:latest .
 pytest tests/test_docker_integration.py -v
 ```
 

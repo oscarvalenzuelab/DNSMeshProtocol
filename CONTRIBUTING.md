@@ -33,7 +33,7 @@ pytest -v
 For the full docker integration tests:
 
 ```bash
-docker build -t dmp-node:latest .
+docker build -t dnsmesh-node:latest .
 pytest tests/test_docker_integration.py -v
 ```
 

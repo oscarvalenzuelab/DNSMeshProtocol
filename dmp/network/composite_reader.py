@@ -16,7 +16,7 @@ DMP in cluster mode runs in two overlapping DNS namespaces:
    resolver that already knows how to walk public DNS.
 
 Without a split between the two, a user who pins a cluster breaks
-every cross-domain workflow the moment they do so: ``dmp identity
+every cross-domain workflow the moment they do so: ``dnsmesh identity
 fetch alice@other-domain.com`` stops resolving because the union
 reader hits all-NXDOMAIN from the pinned cluster nodes.
 

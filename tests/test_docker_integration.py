@@ -1,7 +1,7 @@
-"""End-to-end integration test: boot the dmp-node container, run a real client.
+"""End-to-end integration test: boot the dnsmesh-node container, run a real client.
 
-Skipped unless Docker is available and the dmp-node:latest image is present.
-Build the image first with `docker build -t dmp-node:latest .`.
+Skipped unless Docker is available and the dnsmesh-node:latest image is present.
+Build the image first with `docker build -t dnsmesh-node:latest .`.
 
 The test spins up a fresh container on ephemeral host ports, drives a pair of
 DMPClients through the container's SqliteMailboxStore via the HTTP API, and
@@ -60,18 +60,18 @@ def _free_port(kind=socket.SOCK_STREAM) -> int:
 pytestmark = [
     pytest.mark.skipif(not _docker_available(), reason="docker not available"),
     pytest.mark.skipif(
-        not _image_exists("dmp-node:latest"),
-        reason="dmp-node:latest image missing; run `docker build -t dmp-node:latest .`",
+        not _image_exists("dnsmesh-node:latest"),
+        reason="dnsmesh-node:latest image missing; run `docker build -t dnsmesh-node:latest .`",
     ),
 ]
 
 
 @pytest.fixture
 def node_container():
-    """Run a fresh dmp-node container bound to ephemeral host ports."""
+    """Run a fresh dnsmesh-node container bound to ephemeral host ports."""
     import requests  # deferred — avoid import at collection if dep missing
 
-    name = f"dmp-node-test-{uuid.uuid4().hex[:8]}"
+    name = f"dnsmesh-node-test-{uuid.uuid4().hex[:8]}"
     http_port = _free_port(socket.SOCK_STREAM)
     dns_port = _free_port(socket.SOCK_DGRAM)
 
@@ -89,7 +89,7 @@ def node_container():
             f"127.0.0.1:{http_port}:8053/tcp",
             "-e",
             "DMP_LOG_LEVEL=WARNING",
-            "dmp-node:latest",
+            "dnsmesh-node:latest",
         ],
         check=True,
         capture_output=True,
@@ -339,7 +339,7 @@ def test_container_zone_anchored_identity(node_container):
     Alice publishes her identity at `dmp.alice.example.com` (a zone she
     "controls" in this test — the node accepts any writer on port 8053).
     Bob fetches via `alice@alice.example.com` and stores her as a pinned
-    contact. This exercises `dmp identity publish` + `dmp identity fetch`
+    contact. This exercises `dnsmesh identity publish` + `dnsmesh identity fetch`
     logic inside the client against a real UDP DNS server, not the
     in-memory store.
     """
@@ -595,7 +595,7 @@ def test_container_rotation_compromise_revokes_old_key(node_container):
 
 @pytest.fixture
 def heartbeat_node_container(tmp_path):
-    """Run a dmp-node container with the heartbeat layer opted in."""
+    """Run a dnsmesh-node container with the heartbeat layer opted in."""
     import requests
 
     seed = os.urandom(32)
@@ -603,7 +603,7 @@ def heartbeat_node_container(tmp_path):
     key_path.write_text(seed.hex())
     key_path.chmod(0o400)
 
-    name = f"dmp-node-hb-{uuid.uuid4().hex[:8]}"
+    name = f"dnsmesh-node-hb-{uuid.uuid4().hex[:8]}"
     http_port = _free_port(socket.SOCK_STREAM)
     dns_port = _free_port(socket.SOCK_DGRAM)
 
@@ -636,7 +636,7 @@ def heartbeat_node_container(tmp_path):
             "DMP_HEARTBEAT_INTERVAL_SECONDS=3600",
             "-v",
             f"{key_path}:/etc/dmp/operator.hex:ro",
-            "dmp-node:latest",
+            "dnsmesh-node:latest",
         ],
         check=True,
         capture_output=True,

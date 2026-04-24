@@ -9,8 +9,8 @@ Usage:
 
 Generates a fresh Ed25519 operator keypair (hex-encoded) and writes the
 signed cluster manifest alongside. The manifest lists the three nodes
-that ``docker-compose.cluster.yml`` stands up (``dmp-node-a``,
-``dmp-node-b``, ``dmp-node-c``) with their in-docker-network HTTP + DNS
+that ``docker-compose.cluster.yml`` stands up (``dnsmesh-node-a``,
+``dnsmesh-node-b``, ``dnsmesh-node-c``) with their in-docker-network HTTP + DNS
 endpoints.
 
 IMPORTANT: this key is for dev/test only. Do NOT reuse the emitted
@@ -45,15 +45,15 @@ def _build_manifest(
     """Three nodes addressed by their compose container names.
 
     The dns_endpoint points at the node's DNS listener inside the
-    dmp-cluster docker network; clients outside that network see the
+    dnsmesh-cluster docker network; clients outside that network see the
     ports mapped by ``docker-compose.cluster.yml`` (5301/5302/5303 on
     127.0.0.1 by default).
     """
     nodes = [
         ClusterNode(
             node_id=f"node-{letter}",
-            http_endpoint=f"http://dmp-node-{letter}:8053",
-            dns_endpoint=f"dmp-node-{letter}:5353",
+            http_endpoint=f"http://dnsmesh-node-{letter}:8053",
+            dns_endpoint=f"dnsmesh-node-{letter}:5353",
         )
         for letter in ("a", "b", "c")
     ]

@@ -1,6 +1,6 @@
 name: publish-binaries
 
-# Builds single-file `dmp` binaries via PyInstaller for Linux / macOS /
+# Builds single-file `dnsmesh` binaries via PyInstaller for Linux / macOS /
 # Windows and attaches them to a GitHub Release named after the tag.
 #
 # Triggers:
@@ -20,19 +20,19 @@ permissions:
 
 jobs:
   build:
-    name: build dmp (${{ matrix.asset }})
+    name: build dnsmesh (${{ matrix.asset }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            asset: dmp-linux-x86_64
+            asset: dnsmesh-linux-x86_64
           - os: macos-latest
-            asset: dmp-macos-arm64
+            asset: dnsmesh-macos-arm64
           - os: windows-latest
             # PyInstaller on Windows appends .exe itself; the upload
             # glob below picks up both the bare name and the .exe.
-            asset: dmp-windows-x86_64
+            asset: dnsmesh-windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

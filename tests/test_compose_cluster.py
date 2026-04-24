@@ -2,10 +2,10 @@
 
 Skipped unless:
 - Docker is available AND
-- The ``dmp-node:latest`` image exists AND
+- The ``dnsmesh-node:latest`` image exists AND
 - ``docker compose`` is available.
 
-Build the image first with ``docker build -t dmp-node:latest .`` and
+Build the image first with ``docker build -t dnsmesh-node:latest .`` and
 the test will spin up ``docker-compose.cluster.yml`` with a freshly
 generated (dev-only) cluster manifest, exercise the anti-entropy
 convergence story across the three nodes, and tear everything down.
@@ -90,8 +90,8 @@ def _image_exists(tag: str) -> bool:
 pytestmark = [
     pytest.mark.skipif(not _compose_available(), reason="docker compose not available"),
     pytest.mark.skipif(
-        not _image_exists("dmp-node:latest"),
-        reason="dmp-node:latest missing; run `docker build -t dmp-node:latest .`",
+        not _image_exists("dnsmesh-node:latest"),
+        reason="dnsmesh-node:latest missing; run `docker build -t dnsmesh-node:latest .`",
     ),
     pytest.mark.skipif(
         not _COMPOSE_FILE.exists(),

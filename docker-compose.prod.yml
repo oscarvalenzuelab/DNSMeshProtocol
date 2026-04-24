@@ -1,4 +1,4 @@
-# Overlay for production deployments: puts Caddy in front of dmp-node with
+# Overlay for production deployments: puts Caddy in front of dnsmesh-node with
 # automatic Let's Encrypt certificates, and drops the raw 8053 port from the
 # host. Use with:
 #
@@ -9,11 +9,11 @@
 # server before Caddy's ACME challenge will succeed.
 
 services:
-  dmp-node:
+  dnsmesh-node:
     # Don't expose HTTP publicly in prod; Caddy handles it over TLS.
     ports:
       - "5353:5353/udp"
-    # dmp-node:8053 is still reachable from within the compose network.
+    # dnsmesh-node:8053 is still reachable from within the compose network.
 
   caddy:
     image: caddy:2
@@ -29,7 +29,7 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     depends_on:
-      - dmp-node
+      - dnsmesh-node
 
 volumes:
   caddy-data:

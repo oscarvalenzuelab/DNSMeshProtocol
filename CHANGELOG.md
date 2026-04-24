@@ -35,10 +35,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Full Ed25519 low-order pubkey block** on registration — closes
   the identity-point forgery (`A=01 00..00`, `sig = A || 0^32`
   verifies every message under permissive RFC 8032 verify).
-- New CLI: `dmp register --node <hostname> [--subject ...]`,
-  `dmp token list/forget`. Auto-attach from `~/.dmp/tokens/<host>.json`
+- New CLI: `dnsmesh register --node <hostname> [--subject ...]`,
+  `dnsmesh token list/forget`. Auto-attach from `~/.dmp/tokens/<host>.json`
   (mode 0600 via `os.open(O_EXCL, 0o600)`).
-- New operator CLI: `dmp-node-admin token issue/list/revoke/rotate`
+- New operator CLI: `dnsmesh-node-admin token issue/list/revoke/rotate`
   + `audit tail`.
 - 104 new tests (token store, admin CLI, HTTP multi-tenant,
   registration, client token store, low-order-point regression).
@@ -53,7 +53,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Co-signed by old and new key (rotation) / self-signed by revoked
   key (revocation). Subject types: user_identity (1),
   cluster_operator (2, reserved), bootstrap_signer (3, reserved).
-- `dmp identity rotate --experimental` CLI: publishes RotationRecord
+- `dnsmesh identity rotate --experimental` CLI: publishes RotationRecord
   + fresh IdentityRecord. `--reason compromise|lost_key` also
   publishes a RevocationRecord; `--reason routine` (default) doesn't.
   `--yes` does an atomic on-disk swap (`kdf_salt` preserved; only
@@ -90,14 +90,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   public resolvers across four operators (Google, Cloudflare, Quad9,
   OpenDNS). Operator diversity is the point — a single provider outage
   or blocklist doesn't take the pool down.
-- `dmp resolvers discover [--save] [--timeout S]` CLI subcommand: runs
+- `dnsmesh resolvers discover [--save] [--timeout S]` CLI subcommand: runs
   `ResolverPool.discover(WELL_KNOWN_RESOLVERS)` and prints the working
   list. With `--save`, writes the result to config as `dns_resolvers`
   (creating the field if absent, so the command works even before
   M1.2's `--dns-resolvers` init flag lands).
-- `dmp resolvers list`: prints the currently configured `dns_resolvers`.
+- `dnsmesh resolvers list`: prints the currently configured `dns_resolvers`.
 - `CLIConfig.dns_resolvers`: optional list field on the config, default
-  empty. Written by `dmp resolvers discover --save`; will be consumed
+  empty. Written by `dnsmesh resolvers discover --save`; will be consumed
   by M1.2's multi-resolver `_make_client` wiring when that lands.
 - `dmp.network.resolver_pool.ResolverPool`: a `DNSRecordReader` that wraps
   multiple upstream resolvers (IP literals only) with per-host health
@@ -131,9 +131,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   by the identity's Ed25519 key; fits a single 255-byte DNS TXT string.
   Published at `id-{sha256(username)[:16]}.{domain}` so DNS labels
   don't expose the plaintext username.
-- `dmp identity publish` — pushes the current identity record to the
+- `dnsmesh identity publish` — pushes the current identity record to the
   node's store. Default TTL is 86400 s; override with `--ttl`.
-- `dmp identity fetch <username>` — resolves, verifies, and displays a
+- `dnsmesh identity fetch <username>` — resolves, verifies, and displays a
   remote identity record. `--add` saves it as a local contact after
   signature verification. `--domain` overrides the mesh domain. `--json`
   machine-readable output.
@@ -169,20 +169,20 @@ smaller issues introduced while fixing the first audit. All now fixed:
   rather than spawning unbounded threads. Env vars
   `DMP_HTTP_MAX_CONCURRENCY` and `DMP_DNS_MAX_CONCURRENCY` override.
 - README's "sender authentication pinned to contacts" bullet
-  replaced with honest "pinned-or-TOFU" language. `dmp contacts add`
+  replaced with honest "pinned-or-TOFU" language. `dnsmesh contacts add`
   without `--signing-key` now prints a multi-line stderr warning
   making the TOFU fallback explicit.
 - Default rate limits raised: HTTP 10/s burst 100 (was 5/s burst 20).
-  `dmp identity refresh-prekeys --count` default lowered from 50 to
+  `dnsmesh identity refresh-prekeys --count` default lowered from 50 to
   25 so a full pool fits in a single burst window.
 
 ### Added (zone-anchored identity)
 
-- `CLIConfig.identity_domain` + `dmp init --identity-domain <zone>`:
-  users who own a DNS zone can anchor identity there. `dmp identity
+- `CLIConfig.identity_domain` + `dnsmesh init --identity-domain <zone>`:
+  users who own a DNS zone can anchor identity there. `dnsmesh identity
   publish` writes `dmp.<identity_domain>` instead of the hash-based
   shared-mesh name, and resolvers see a stable well-known name.
-- Address parsing: `dmp identity fetch alice@alice.example.com`
+- Address parsing: `dnsmesh identity fetch alice@alice.example.com`
   resolves `dmp.alice.example.com` and verifies the record's internal
   `username` matches the address's left half — so the zone owner
   can't publish a record for a different name and have it stored as
@@ -191,7 +191,7 @@ smaller issues introduced while fixing the first audit. All now fixed:
   `dmp.core.identity.parse_address` encode the convention; new tests
   in `test_identity.py` and `test_cli.py` exercise the publish/fetch
   round-trip and the username-mismatch rejection.
-- Plain-username `dmp identity fetch alice` still uses the legacy
+- Plain-username `dnsmesh identity fetch alice` still uses the legacy
   hash-based name under the shared mesh domain for TOFU onboarding.
 - SECURITY.md now calls zone-anchored identity out as the
   recommended posture for real deployments; shared-mesh identity
@@ -223,7 +223,7 @@ smaller issues introduced while fixing the first audit. All now fixed:
 - `DMPCrypto.decrypt_message` and `MessageEncryption.decrypt_with_header`
   accept a `private_key=` override so the receive path can route
   ECDH through a prekey sk instead of the instance's long-term key.
-- CLI: `dmp identity refresh-prekeys [--count 50] [--ttl 86400]`.
+- CLI: `dnsmesh identity refresh-prekeys [--count 50] [--ttl 86400]`.
 - Prekey store path wired into the CLI via `_make_client` at
   `$DMP_CONFIG_HOME/prekeys.db`, 0o600 perms. Library callers pass
   `prekey_store_path=` to `DMPClient.__init__`; the default is
@@ -282,7 +282,7 @@ smaller issues introduced while fixing the first audit. All now fixed:
 
 ### Added
 
-- `dmp.cli` — `dmp` command: `init`, `identity show`, `contacts add/list`,
+- `dmp.cli` — `dnsmesh` command: `init`, `identity show`, `contacts add/list`,
   `send`, `recv`, `node`. Config in `~/.dmp/config.yaml`; passphrase via
   `DMP_PASSPHRASE` env var or `passphrase_file`. Never stored in config.
 - `dmp.storage.SqliteMailboxStore` — persistent TTL-aware `DNSRecordStore`.
@@ -310,7 +310,7 @@ smaller issues introduced while fixing the first audit. All now fixed:
   via `persist_path`: writes are atomic (tmp + rename), expired entries
   drop on load, and corrupt files are ignored (start from empty state).
   The CLI wires this to `$DMP_CONFIG_HOME/replay_cache.json` by default
-  so `dmp recv` doesn't re-deliver already-seen messages across calls.
+  so `dnsmesh recv` doesn't re-deliver already-seen messages across calls.
 - Dockerfile (multi-stage, non-root runtime user, healthcheck) and
   `docker-compose.yml`.
 - GitHub Actions CI: pytest matrix over 3.10/3.11/3.12, `black --check`,
@@ -330,7 +330,7 @@ smaller issues introduced while fixing the first audit. All now fixed:
 
 - Switched passphrase → X25519 seed from PBKDF2-HMAC-SHA256 (100k iters,
   fixed salt) to Argon2id (memory-hard, 32 MiB, t=2, p=2). The CLI now
-  generates a 32-byte random salt at `dmp init` and stores it in the
+  generates a 32-byte random salt at `dnsmesh init` and stores it in the
   config file; two users who pick the same passphrase get independent
   keys, and an offline attacker has to repeat the memory-hard
   derivation per guess. The library API falls back to a fixed sentinel

@@ -1,8 +1,8 @@
-# Production single-node dmp-node deploy, runnable anywhere docker is.
+# Production single-node dnsmesh-node deploy, runnable anywhere docker is.
 #
 # Pulls the published image from Docker Hub (no local build required).
 # Pin to a specific tag in prod — the `latest` default is fine for first-
-# run, but you want reproducibility: `oscarvalenzuelab/dmp-node:v0.2.0`.
+# run, but you want reproducibility: `oscarvalenzuelab/dnsmesh-node:v0.2.0`.
 #
 # Why standalone (and not an overlay on docker-compose.yml /
 # docker-compose.prod.yml): compose merges `ports` lists additively, so
@@ -19,9 +19,9 @@
 # a repo checkout. Path is resolved relative to the compose file.
 
 services:
-  dmp-node:
-    image: oscarvalenzuelab/dmp-node:${DMP_IMAGE_TAG:-latest}
-    container_name: dmp-node
+  dnsmesh-node:
+    image: oscarvalenzuelab/dnsmesh-node:${DMP_IMAGE_TAG:-latest}
+    container_name: dnsmesh-node
     restart: unless-stopped
 
     ports:
@@ -31,7 +31,7 @@ services:
       # `systemctl disable --now systemd-resolved`) or dnsmasq.
       - "53:5353/udp"
       # HTTP API stays INTERNAL — Caddy terminates TLS on 443 and reverse-
-      # proxies to dmp-node:8053 on the compose network. No `8053:8053`
+      # proxies to dnsmesh-node:8053 on the compose network. No `8053:8053`
       # host mapping here on purpose.
 
     environment:
@@ -47,7 +47,7 @@ services:
       DMP_LOG_FORMAT: json
 
     volumes:
-      - dmp-data:/var/lib/dmp
+      - dnsmesh-data:/var/lib/dmp
 
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8053/health"]
@@ -58,7 +58,7 @@ services:
 
   caddy:
     image: caddy:2
-    container_name: dmp-caddy
+    container_name: dnsmesh-caddy
     restart: unless-stopped
 
     ports:
@@ -78,10 +78,10 @@ services:
       - caddy-config:/config
 
     depends_on:
-      dmp-node:
+      dnsmesh-node:
         condition: service_healthy
 
 volumes:
-  dmp-data:
+  dnsmesh-data:
   caddy-data:
   caddy-config:

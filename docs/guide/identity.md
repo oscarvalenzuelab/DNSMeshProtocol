@@ -19,7 +19,7 @@ plus a per-identity 32-byte random salt stored in the CLI config.
 ## Publishing your identity
 
 ```bash
-dmp identity publish
+dnsmesh identity publish
 ```
 
 This writes a signed `IdentityRecord` (108 signed bytes plus a 64-byte
@@ -28,7 +28,7 @@ configured a zone you control:
 
 ### Shared mesh domain (TOFU)
 
-Without `--identity-domain` at `dmp init`, the record goes to
+Without `--identity-domain` at `dnsmesh init`, the record goes to
 `id-{sha256(username)[:16]}.<mesh_domain>`. Anyone can publish at any
 username — the hash is only a name-to-label mapping, not a trust root.
 Squatting is possible and mitigated only at fetch time by the
@@ -39,9 +39,9 @@ Squatting is possible and mitigated only at fetch time by the
 Initialize with a DNS zone you control:
 
 ```bash
-dmp init alice --identity-domain alice.example.com \
+dnsmesh init alice --identity-domain alice.example.com \
                --domain mesh.local --endpoint ...
-dmp identity publish
+dnsmesh identity publish
 ```
 
 The record now goes to `dmp.alice.example.com`. Squatting requires
@@ -59,10 +59,10 @@ You can use both together.
 
 ```bash
 # Legacy hash-based (TOFU) resolve
-dmp identity fetch alice --add
+dnsmesh identity fetch alice --add
 
 # Zone-anchored resolve
-dmp identity fetch alice@alice.example.com --add
+dnsmesh identity fetch alice@alice.example.com --add
 ```
 
 Fetch verifies the Ed25519 signature on the record. `--add` saves the
@@ -84,7 +84,7 @@ so the guardrail rarely fires there.
 
 ## Pinned vs unpinned contacts
 
-`dmp contacts list` labels each contact:
+`dnsmesh contacts list` labels each contact:
 
 ```
 alice   3f…            (pinned)
@@ -102,7 +102,7 @@ actively messaging.
 
 {: .warning }
 Always re-add contacts with `--signing-key` (or bootstrap via
-`dmp identity fetch <user> --add`) before treating delivered messages
+`dnsmesh identity fetch <user> --add`) before treating delivered messages
 as authenticated. The unpinned path is documented in
 [SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md)
 as an explicit TOFU exception.
@@ -111,10 +111,10 @@ as an explicit TOFU exception.
 
 There is no automatic rotation. If a key leaks:
 
-1. Generate a new identity with a fresh config (`dmp init --force` or
+1. Generate a new identity with a fresh config (`dnsmesh init --force` or
    a new `$DMP_CONFIG_HOME`).
 2. Publish the new identity.
-3. Contact everyone out of band, tell them to re-`dmp identity fetch`.
+3. Contact everyone out of band, tell them to re-`dnsmesh identity fetch`.
 
 Proper key-rotation records are on the roadmap but not shipping in
 the current alpha.

@@ -27,7 +27,7 @@ long-horizon items stay here until they get lifted into a sprint.
 
 ### M1 — Resolver resilience — SHIPPED
 
-Client-side resolver pool with multi-upstream failover. `dmp` keeps
+Client-side resolver pool with multi-upstream failover. `dnsmesh` keeps
 working when the primary configured resolver starts returning NXDOMAIN
 or SERVFAIL for DMP-shaped names.
 
@@ -35,8 +35,8 @@ or SERVFAIL for DMP-shaped names.
       demotion, cooldown-as-preference fallback — commits `7cb8d7f..12376a4`.
 - [x] **M1.2** CLI `--dns-resolvers 8.8.8.8,1.1.1.1,9.9.9.9`, falls
       back to legacy single-host — commit `3096eb0`.
-- [x] **M1.3** Dynamic resolver discovery (`dmp resolvers discover
-      [--save]` / `dmp resolvers list`) — commit `d39cb56`.
+- [x] **M1.3** Dynamic resolver discovery (`dnsmesh resolvers discover
+      [--save]` / `dnsmesh resolvers list`) — commit `d39cb56`.
 - [x] **M1.4** Integration tests: two local UDP DNS stubs, one serving
       correctly, one NXDOMAIN'ing; client survives — commits `29c5c44`,
       `6108c66`.
@@ -60,7 +60,7 @@ convergence, kill-and-rejoin backfill, and peer-auth enforcement.
       `9c71332..b55c93b`.
 - [x] **M2.3** `UnionReader`: query every node concurrently, union
       dedup'd TXT answers — commits `7a0340e..f5e3776`.
-- [x] **M2.wire** CLI + client integration (`dmp cluster pin/fetch/
+- [x] **M2.wire** CLI + client integration (`dnsmesh cluster pin/fetch/
       enable/disable/status`, cluster-mode in `_make_client`) — commits
       `94964d9..31eba4e`; plus polish (`M2.wire-polish`) +
       `cluster-composite-reader` (cross-domain reads) +
@@ -93,7 +93,7 @@ cluster operator) verifies before any config is written.
 - [x] **M3.1** `BootstrapRecord` at `_dmp.<user_domain>` — signed pointer
       from a user domain to one or more clusters with priority-ordered
       fallback — commits `cd2f383..5c33cd5`, plus `81f1dd7`.
-- [x] **M3.2-wire** `dmp bootstrap pin/fetch/discover [--auto-pin]` +
+- [x] **M3.2-wire** `dnsmesh bootstrap pin/fetch/discover [--auto-pin]` +
       `identity fetch --via-bootstrap` — commits `20a83fe..d21c305`.
 - [x] **M3.3** Node-to-node gossip of the signed cluster manifest.
       Operator pushes a seq++ manifest to ONE node (disk, HTTP POST, or
@@ -144,7 +144,7 @@ acted on. This is what earns the `v1.0` tag.
       `tests/test_docker_integration.py` and the two demos under
       `examples/`. Wire format is draft — may be bumped to
       `v=dmp2;t=rotation;` after the M4 external audit.
-- [ ] **M5.6** Standalone binaries for the `dmp` CLI: PyInstaller-
+- [ ] **M5.6** Standalone binaries for the `dnsmesh` CLI: PyInstaller-
       built single-file executables for Windows (`.exe`), macOS (Intel
       + Apple Silicon), and Linux (x86_64 + arm64). Ships alongside
       the PyPI release in M5.1 for users who don't want a Python
@@ -196,8 +196,8 @@ See `docs/design/multi-tenant-auth.md` for the full design,
       first ordering (closes 403/409 oracle), atomic
       revoke-then-issue (one live self-service token per subject),
       full low-order Ed25519 public-key block (closes identity-
-      point forgery). Client CLI: `dmp register`.
-- [x] **M5.5.4** Operator CLI (`dmp-node-admin token
+      point forgery). Client CLI: `dnsmesh register`.
+- [x] **M5.5.4** Operator CLI (`dnsmesh-node-admin token
       {issue,list,revoke,rotate}` + `audit tail`) for environments
       that prefer issuing tokens out-of-band.
 - [x] **M5.5.5** Per-token rate limits that stack with the existing

@@ -34,7 +34,7 @@ DMP_NODE_HOSTNAME=dmp.example.com        # required for registration
 ```
 
 Plus, to enable self-service registration (users running
-`dmp register` instead of you handing out tokens):
+`dnsmesh register` instead of you handing out tokens):
 
 ```bash
 DMP_REGISTRATION_ENABLED=1
@@ -46,11 +46,11 @@ Override the path via `DMP_TOKEN_DB_PATH`.
 
 ## Admin CLI cheatsheet
 
-Every `dmp-node-admin` command runs directly against the token
+Every `dnsmesh-node-admin` command runs directly against the token
 sqlite DB. On a docker deploy, run it via `docker exec`:
 
 ```bash
-docker exec dmp-node dmp-node-admin token issue alice@example.com \
+docker exec dnsmesh-node dnsmesh-node-admin token issue alice@example.com \
     --expires 90d --note "onboarded via Signal"
 ```
 
@@ -67,7 +67,7 @@ when the server is wedged.
 
 ## Opting into self-service registration
 
-Self-service (`dmp register`) lets users mint their own tokens
+Self-service (`dnsmesh register`) lets users mint their own tokens
 without the operator. The flow is signature-gated: the user proves
 control of an Ed25519 key over a one-shot challenge bound to *this*
 node's hostname. Exactly one live self-service token per subject
@@ -109,7 +109,7 @@ out of the box:
 DMP_AUTH_MODE=multi-tenant
 DMP_OPERATOR_TOKEN=<secret>
 DMP_NODE_HOSTNAME=dmp.example.com
-# No DMP_REGISTRATION_ENABLED. Only dmp-node-admin issues tokens.
+# No DMP_REGISTRATION_ENABLED. Only dnsmesh-node-admin issues tokens.
 ```
 
 ### "Open community node, my domain only"
@@ -201,7 +201,7 @@ Three stacked limiters, deliberately:
    time. Catches a user who publishes too aggressively without
    affecting others.
 
-Legitimate `dmp identity publish` + `dmp identity refresh-prekeys
+Legitimate `dnsmesh identity publish` + `dnsmesh identity refresh-prekeys
 --count 50` + a typical send fits under the defaults comfortably.
 
 ## Migration path from legacy
@@ -217,10 +217,10 @@ Rollout order we suggest:
    value you already had>`. Publish API behaves as before:
    operator token writes anywhere.
 2. Issue tokens to your existing users one at a time via
-   `dmp-node-admin token issue`. Hand them out through a trusted
+   `dnsmesh-node-admin token issue`. Hand them out through a trusted
    channel.
 3. Users switch their `DMP_HTTP_TOKEN` env to their per-user token,
-   OR run `dmp register` once and let `~/.dmp/tokens/<node>.json`
+   OR run `dnsmesh register` once and let `~/.dmp/tokens/<node>.json`
    take over.
 4. Once everyone's migrated, you can tighten the operator token —
    or rotate it, since it's no longer in every user's shell.

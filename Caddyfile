@@ -2,7 +2,7 @@
 #
 # Set DMP_NODE_HOSTNAME to the fully-qualified name that points at this server.
 # Caddy will obtain a Let's Encrypt certificate automatically and reverse-proxy
-# to the dmp-node container on its internal :8053 port.
+# to the dnsmesh-node container on its internal :8053 port.
 #
 # For a dev setup without a real hostname, swap the first line for:
 #   :8443
@@ -11,8 +11,8 @@
 {$DMP_NODE_HOSTNAME} {
     encode gzip zstd
 
-    # Preserve client IP so dmp-node's rate limiter sees the real source.
-    reverse_proxy dmp-node:8053 {
+    # Preserve client IP so dnsmesh-node's rate limiter sees the real source.
+    reverse_proxy dnsmesh-node:8053 {
         header_up X-Forwarded-For {remote_host}
         header_up X-Real-IP {remote_host}
     }

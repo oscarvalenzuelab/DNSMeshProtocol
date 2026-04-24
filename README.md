@@ -52,16 +52,16 @@ cd DNSMeshProtocol
 pip install -e .
 
 # Build and run the node
-docker build -t dmp-node:latest .
+docker build -t dnsmesh-node:latest .
 docker run -d -p 5353:5353/udp -p 8053:8053/tcp \
-  -v dmp-data:/var/lib/dmp dmp-node:latest
+  -v dnsmesh-data:/var/lib/dmp dnsmesh-node:latest
 
 # Set up an identity and send your first message
 export DMP_PASSPHRASE=a-strong-passphrase
-dmp init alice --domain mesh.local \
+dnsmesh init alice --domain mesh.local \
                --endpoint http://127.0.0.1:8053 \
                --dns-host 127.0.0.1 --dns-port 5353
-dmp identity publish
+dnsmesh identity publish
 ```
 
 Full walk-through with two users:
@@ -80,7 +80,7 @@ Full walk-through with two users:
   reconstructs the message.
 - **Resolver resilience.** `ResolverPool` fans queries across multiple
   upstream resolvers with oracle-based demotion on lying resolvers.
-  `dmp resolvers discover` auto-builds the pool from public resolvers.
+  `dnsmesh resolvers discover` auto-builds the pool from public resolvers.
 - **Multi-node federation** (client AND node side). `FanoutWriter`
   publishes to every cluster node (quorum = `ceil(N/2)`); `UnionReader`
   reads the union with dedup. Nodes run pull-based anti-entropy
@@ -88,7 +88,7 @@ Full walk-through with two users:
   rejoins. A 3-node `docker-compose.cluster.yml` is a checked-in
   operator starting point; see
   [Clustered deployment](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/cluster).
-- **Key rotation + revocation.** `dmp identity rotate --experimental`
+- **Key rotation + revocation.** `dnsmesh identity rotate --experimental`
   publishes a co-signed `RotationRecord` (new key ← old key) plus an
   optional self-signed `RevocationRecord` when `--reason compromise`
   or `--reason lost_key` is set. Rotation-aware contacts chain-walk
@@ -98,7 +98,7 @@ Full walk-through with two users:
   [`docs/protocol/rotation.md`](https://oscarvalenzuelab.github.io/DNSMeshProtocol/protocol/rotation).
 - **Multi-tenant node auth (M5.5).** `DMP_AUTH_MODE=multi-tenant`
   enables per-user publish tokens: every write to `/v1/records/*`
-  is scope-checked against the token's subject, and `dmp register`
+  is scope-checked against the token's subject, and `dnsmesh register`
   + `/v1/registration/{challenge,confirm}` give users a self-service
   path to mint their own tokens via an Ed25519-signed challenge.
   Shared-pool writes (mailbox + chunks) don't log subject or
@@ -106,7 +106,7 @@ Full walk-through with two users:
   who-delivered-to-whom. See
   [Multi-tenant deployment](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/multi-tenant).
 - **Zero-config onboarding via bootstrap discovery.** Given just
-  `alice@example.com`, `dmp bootstrap discover me@my-domain --auto-pin`
+  `alice@example.com`, `dnsmesh bootstrap discover me@my-domain --auto-pin`
   resolves the cluster, verifies the two-hop trust chain (bootstrap
   signer → cluster operator), and cuts over atomically.
 - **Persistent, size-bounded node.** sqlite storage, TTL cleanup,
@@ -148,7 +148,7 @@ dmp/
 ├── server/     DMPNode: UDP DNS server, HTTP API, cleanup worker,
 │               metrics, rate limiting, structured logging
 ├── client/     DMPClient — send / receive / identity / prekeys
-└── cli.py      `dmp` command-line interface
+└── cli.py      `dnsmesh` command-line interface
 
 docs/          Jekyll docs site (Just the Docs theme, GitHub Pages)
                Includes docs/protocol/ — the formal wire spec
@@ -163,7 +163,7 @@ Dockerfile, docker-compose.yml, docker-compose.prod.yml, Caddyfile
 ```bash
 pip install -e ".[dev]"
 pytest                                         # ~1050 tests (incl. fuzz)
-docker build -t dmp-node:latest .
+docker build -t dnsmesh-node:latest .
 pytest tests/test_docker_integration.py        # 6 docker tests (incl. M5.4 rotation)
 pytest tests/test_compose_cluster.py           # 3 compose-cluster tests
 python examples/docker_e2e_demo.py             # single-node send/receive + rotation demo

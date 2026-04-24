@@ -33,7 +33,7 @@ Environment variables (all optional, sensible defaults for dev):
     DMP_CLUSTER_MANIFEST_PATH  alias for DMP_CLUSTER_FILE (operator-facing name)
     DMP_NODE_ID                this node's id in the cluster        default: none (skip self-filter)
     DMP_SYNC_PEERS             comma-separated HTTP peer URLs       default: none (falls back to cluster file)
-                               e.g. "http://dmp-node-b:8053,http://dmp-node-c:8053".
+                               e.g. "http://dnsmesh-node-b:8053,http://dnsmesh-node-c:8053".
                                Takes precedence over DMP_CLUSTER_FILE when set.
     DMP_SYNC_PEER_TOKEN        shared token for /v1/sync/*          default: none (endpoints 403)
     DMP_SYNC_INTERVAL          seconds between sync ticks           default: 10
@@ -48,13 +48,13 @@ Environment variables (all optional, sensible defaults for dev):
                                If unset, derived from the on-disk
                                cluster manifest.                     default: none
     DMP_SYNC_SELF_ENDPOINT     this node's HTTP URL on the peer
-                               network (e.g. "http://dmp-node-a:8053")
+                               network (e.g. "http://dnsmesh-node-a:8053")
                                used to filter self out of a gossiped
                                manifest so a node never syncs with
                                itself.                               default: none
 
 Peer URLs from DMP_SYNC_PEERS point at the OTHER nodes' HTTP base (e.g.
-``http://dmp-node-b:8053``). The worker appends ``/v1/sync/digest`` and
+``http://dnsmesh-node-b:8053``). The worker appends ``/v1/sync/digest`` and
 ``/v1/sync/pull`` itself; callers should not include those suffixes.
 
 Port 53 is privileged on Linux. In a container, publish with
@@ -94,7 +94,7 @@ log = logging.getLogger(__name__)
 def _default_token_db_path(record_db_path: str) -> str:
     """Resolve a token-DB path that sits alongside the record DB.
 
-    Matches the default used by ``dmp-node-admin --db ...``. Kept in
+    Matches the default used by ``dnsmesh-node-admin --db ...``. Kept in
     two places rather than imported from admin.py to avoid the server
     main loop depending on an admin module.
     """
@@ -368,7 +368,7 @@ class DMPNodeConfig:
     # Path to the sqlite token store. Defaults to sibling of db_path.
     token_db_path: Optional[str] = None
     # Bursts are sized for legitimate bulk publishes: a fresh
-    # `dmp identity refresh-prekeys --count 50` + a manifest and half a
+    # `dnsmesh identity refresh-prekeys --count 50` + a manifest and half a
     # dozen chunks lands under the burst, while a sustained flood is
     # still throttled to http_rate per second.
     http_rate: float = 10.0

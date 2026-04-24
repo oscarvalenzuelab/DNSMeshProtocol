@@ -20,7 +20,7 @@ secrets through it before then.
 
 The repo ships a production overlay for docker-compose that puts
 Caddy in front of the HTTP API. Caddy obtains a Let's Encrypt cert
-automatically and reverse-proxies `:443 → dmp-node:8053` over
+automatically and reverse-proxies `:443 → dnsmesh-node:8053` over
 HTTPS + HTTP/3.
 
 ### Prerequisites
@@ -54,7 +54,7 @@ The shipped `Caddyfile` is minimal:
 ```
 {$DMP_NODE_HOSTNAME} {
     encode gzip zstd
-    reverse_proxy dmp-node:8053 {
+    reverse_proxy dnsmesh-node:8053 {
         header_up X-Forwarded-For {remote_host}
         header_up X-Real-IP {remote_host}
     }
@@ -131,14 +131,14 @@ bearer token as the publish side:
 
 ```yaml
 scrape_configs:
-  - job_name: dmp-node
+  - job_name: dnsmesh-node
     metrics_path: /metrics
     static_configs:
       - targets: ["dmp.example.com"]
     scheme: https
     authorization:
       type: Bearer
-      credentials_file: /etc/prometheus/dmp-token
+      credentials_file: /etc/prometheus/dnsmesh-token
 ```
 
 Useful alerts:

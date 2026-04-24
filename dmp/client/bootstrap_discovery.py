@@ -22,7 +22,7 @@ statements:
 
 1. The **zone operator** controls ``_dmp.<user_domain>`` TXT and signs
    the :class:`BootstrapRecord` with ``signer_spk``. This is the trust
-   anchor a client must have out-of-band (e.g. via ``dmp bootstrap
+   anchor a client must have out-of-band (e.g. via ``dnsmesh bootstrap
    pin`` on a fingerprint published by the user's home domain).
 2. The **cluster operator** controls ``cluster.<cluster_base_domain>``
    TXT and signs the :class:`ClusterManifest` with a separate

@@ -689,7 +689,7 @@ class TestDMPClientRotationChainIntegration:
         rotation.
 
         This test asserts that when a contact carries a remote domain
-        (persisted by ``dmp identity fetch user@host --add``), the
+        (persisted by ``dnsmesh identity fetch user@host --add``), the
         chain walker queries the remote zone's rrset and resolves the
         rotation.
         """

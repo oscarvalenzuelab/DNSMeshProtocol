@@ -207,7 +207,7 @@ Source: `dmp/cli.py:1055-1100` (`cmd_identity_fetch`) plus the
    - **Zero verifying records** → fetch failure.
    - **Multiple verifying records with differing keys** → ambiguous;
      surface all fingerprints and require the user to resolve (e.g.
-     `dmp identity fetch --accept-fingerprint <hex>`).
+     `dnsmesh identity fetch --accept-fingerprint <hex>`).
 
 ## Cluster discovery
 
@@ -216,7 +216,7 @@ Source: `dmp/client/bootstrap_discovery.py`,
 
 Pre-condition: the user has pinned the **bootstrap signer**
 (zone operator's Ed25519 public key) out-of-band via
-`dmp bootstrap pin <user_domain> <fingerprint>`. See
+`dnsmesh bootstrap pin <user_domain> <fingerprint>`. See
 [bootstrap §Threat model](bootstrap.md#threat-model).
 
 1. **Fetch the bootstrap record**. Given address

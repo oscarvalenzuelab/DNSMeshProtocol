@@ -14,7 +14,7 @@ Scenarios:
      chain walker (still reading node-b) correctly returns None.
 
 Prerequisites:
-  docker build -t dmp-node:latest .
+  docker build -t dnsmesh-node:latest .
 
 Usage:
   python examples/cluster_e2e_demo.py

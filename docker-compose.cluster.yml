@@ -6,8 +6,8 @@
 #   * shares the same signed cluster manifest (docker/cluster/cluster-manifest.wire)
 #     so a rolled operator key stays consistent across all three
 #   * points at the OTHER two nodes as anti-entropy peers via the
-#     internal docker-compose network (DNS names: dmp-node-a,
-#     dmp-node-b, dmp-node-c)
+#     internal docker-compose network (DNS names: dnsmesh-node-a,
+#     dnsmesh-node-b, dnsmesh-node-c)
 #   * exposes its DNS + HTTP to the LOCAL HOST ONLY on 127.0.0.1 —
 #     public-facing deployments should pair this compose with a real
 #     reverse proxy (see docker-compose.prod.yml) and never publish the
@@ -37,18 +37,18 @@ version: "3.8"
 services:
   node-a:
     build: .
-    image: dmp-node:latest
-    container_name: dmp-node-a
+    image: dnsmesh-node:latest
+    container_name: dnsmesh-node-a
     env_file: docker/cluster/node-a.env
     volumes:
-      - dmp-data-a:/var/lib/dmp
+      - dnsmesh-data-a:/var/lib/dmp
       - ./docker/cluster/cluster-manifest.wire:/etc/dmp/cluster-manifest.wire:ro
     ports:
       # 127.0.0.1 bind keeps these off the public interface. Operators
       # who want remote access should front the HTTP port with TLS.
       - "127.0.0.1:5301:5353/udp"
       - "127.0.0.1:8101:8053/tcp"
-    networks: [dmp-cluster]
+    networks: [dnsmesh-cluster]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8053/health"]
       interval: 10s
@@ -58,16 +58,16 @@ services:
 
   node-b:
     build: .
-    image: dmp-node:latest
-    container_name: dmp-node-b
+    image: dnsmesh-node:latest
+    container_name: dnsmesh-node-b
     env_file: docker/cluster/node-b.env
     volumes:
-      - dmp-data-b:/var/lib/dmp
+      - dnsmesh-data-b:/var/lib/dmp
       - ./docker/cluster/cluster-manifest.wire:/etc/dmp/cluster-manifest.wire:ro
     ports:
       - "127.0.0.1:5302:5353/udp"
       - "127.0.0.1:8102:8053/tcp"
-    networks: [dmp-cluster]
+    networks: [dnsmesh-cluster]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8053/health"]
       interval: 10s
@@ -77,16 +77,16 @@ services:
 
   node-c:
     build: .
-    image: dmp-node:latest
-    container_name: dmp-node-c
+    image: dnsmesh-node:latest
+    container_name: dnsmesh-node-c
     env_file: docker/cluster/node-c.env
     volumes:
-      - dmp-data-c:/var/lib/dmp
+      - dnsmesh-data-c:/var/lib/dmp
       - ./docker/cluster/cluster-manifest.wire:/etc/dmp/cluster-manifest.wire:ro
     ports:
       - "127.0.0.1:5303:5353/udp"
       - "127.0.0.1:8103:8053/tcp"
-    networks: [dmp-cluster]
+    networks: [dnsmesh-cluster]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8053/health"]
       interval: 10s
@@ -95,10 +95,10 @@ services:
       retries: 3
 
 networks:
-  dmp-cluster:
+  dnsmesh-cluster:
     driver: bridge
 
 volumes:
-  dmp-data-a:
-  dmp-data-b:
-  dmp-data-c:
+  dnsmesh-data-a:
+  dnsmesh-data-b:
+  dnsmesh-data-c:

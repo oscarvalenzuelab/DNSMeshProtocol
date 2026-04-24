@@ -20,11 +20,11 @@ shared secret, you're not on a multi-tenant node; just export
 `DMP_OPERATOR_TOKEN=<value>` (or `DMP_HTTP_TOKEN` on an older
 deploy) and use the CLI normally.
 
-## Self-service (`dmp register`)
+## Self-service (`dnsmesh register`)
 
 Prerequisites:
 
-- You've run `dmp init <username>` — your local Ed25519 signing key
+- You've run `dnsmesh init <username>` — your local Ed25519 signing key
   is what the node will verify against.
 - The operator has given you the node hostname.
 - The operator has enabled registration on the node
@@ -33,7 +33,7 @@ Prerequisites:
 ```bash
 # One command, signs a challenge with your local key, saves the
 # resulting token under ~/.dmp/tokens/dmp.example.com.json.
-dmp register --node dmp.example.com
+dnsmesh register --node dmp.example.com
 ```
 
 Subject defaults to `<username>@<effective-domain>` from your
@@ -46,12 +46,12 @@ On success, the CLI prints:
 registered alice@example.com on dmp.example.com
   token saved to /Users/alice/.dmp/tokens/dmp.example.com.json (mode 0600)
   expires at 2026-07-22T00:00:00Z
-  subsequent `dmp identity publish` / `dmp send` to this node will
+  subsequent `dnsmesh identity publish` / `dnsmesh send` to this node will
   use this token automatically.
 ```
 
-Every subsequent `dmp identity publish`, `dmp send`, and
-`dmp identity refresh-prekeys` to that node auto-attaches the token
+Every subsequent `dnsmesh identity publish`, `dnsmesh send`, and
+`dnsmesh identity refresh-prekeys` to that node auto-attaches the token
 as the `Authorization: Bearer …` header. No env var to export, no
 flags to remember.
 
@@ -62,19 +62,19 @@ flags to remember.
 | `cannot reach <node>` | Network / TLS / hostname problem. | `curl -v https://<node>/v1/registration/challenge` to narrow down. |
 | `did not accept the challenge request (404)` | Node doesn't have registration on, or isn't in multi-tenant mode. | Ask the operator to set `DMP_REGISTRATION_ENABLED=1` + `DMP_AUTH_MODE=multi-tenant`. |
 | `rate-limited (429)` | You hit the per-IP registration throttle (default 5 / hour). | Wait an hour, or ask the operator to loosen `DMP_REGISTRATION_ENDPOINT_RATE_PER_SEC`. |
-| `node rejected the signature (401)` | Your local Ed25519 key doesn't match what you claimed. Usually a wrong passphrase. | `dmp identity show` — the `signing_pk` should match what you expected. |
+| `node rejected the signature (401)` | Your local Ed25519 key doesn't match what you claimed. Usually a wrong passphrase. | `dnsmesh identity show` — the `signing_pk` should match what you expected. |
 | `subject not in allowlist (403)` | The operator restricted self-service to specific domains, and yours isn't on the list. | Use `--subject alice@<allowed-domain>`, or ask the operator. |
-| `subject already held by a different key (409)` | Someone else registered that subject first, OR you registered previously on a different machine and this one has a different key. | Re-run on the machine that has the original passphrase, or ask the operator to revoke: `dmp-node-admin token revoke <subject>`. |
+| `subject already held by a different key (409)` | Someone else registered that subject first, OR you registered previously on a different machine and this one has a different key. | Re-run on the machine that has the original passphrase, or ask the operator to revoke: `dnsmesh-node-admin token revoke <subject>`. |
 
 ## Rotating your token
 
-`dmp register` is idempotent. Re-running it on the same machine
+`dnsmesh register` is idempotent. Re-running it on the same machine
 with the same key rotates the token: the old one is revoked at the
 node and a fresh one is saved locally in one atomic DB transaction
 (no window where both are live, no window where neither is).
 
 ```bash
-dmp register --node dmp.example.com
+dnsmesh register --node dmp.example.com
 # output: registered alice@example.com on dmp.example.com
 #         (old token for the same subject was revoked)
 ```
@@ -82,7 +82,7 @@ dmp register --node dmp.example.com
 ## Inspecting what you have
 
 ```bash
-dmp token list
+dnsmesh token list
 # NODE                            SUBJECT                        EXPIRES
 # dmp.example.com                 alice@example.com              2026-07-22T00:00:00Z
 # node-b.other.org                alice@other.org                -
@@ -93,18 +93,18 @@ subject, and expiry. `--json` adds a truncated prefix + length for
 scripting, still never the full token.
 
 ```bash
-dmp token forget <node>
+dnsmesh token forget <node>
 # removes ~/.dmp/tokens/<node>.json. Handy if the operator has
-# revoked your token and you want to start fresh with `dmp register`.
+# revoked your token and you want to start fresh with `dnsmesh register`.
 ```
 
-## Operator-issued path (no `dmp register`)
+## Operator-issued path (no `dnsmesh register`)
 
 If the operator prefers to hand out tokens directly:
 
 ```bash
 # They'll run on the node:
-dmp-node-admin token issue alice@example.com \
+dnsmesh-node-admin token issue alice@example.com \
     --expires 90d --note "alice onboarded via Signal"
 
 # Output (shown to the operator once):
@@ -126,7 +126,7 @@ echo '{
 chmod 0600 ~/.dmp/tokens/dmp.example.com.json
 ```
 
-A CLI sugar command `dmp token add` for this step is a future nice-
+A CLI sugar command `dnsmesh token add` for this step is a future nice-
 to-have; the manual version is fine for now because the file format
 is stable.
 

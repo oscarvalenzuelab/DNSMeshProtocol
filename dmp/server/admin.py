@@ -3,7 +3,7 @@
 Runs directly against the node's sqlite token DB. Intended to be
 invoked from the host (or via ``docker exec``) by the node operator.
 
-Entry point: ``dmp-node-admin`` (see setup.py console_scripts).
+Entry point: ``dnsmesh-node-admin`` (see setup.py console_scripts).
 
 Commands:
 
@@ -330,8 +330,8 @@ def cmd_audit_tail(args: argparse.Namespace, store: TokenStore) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="dmp-node-admin",
-        description="Operator CLI for the dmp-node multi-tenant token store.",
+        prog="dnsmesh-node-admin",
+        description="Operator CLI for the dnsmesh-node multi-tenant token store.",
     )
     p.add_argument(
         "--db",
