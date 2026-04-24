@@ -248,6 +248,8 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             return self._handle_registration_challenge()
         if self.path == "/v1/nodes/seen":
             return self._handle_nodes_seen()
+        if self.path == "/nodes":
+            return self._handle_nodes_html()
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/sync/digest":
             return self._handle_sync_digest(parsed.query)
@@ -583,6 +585,79 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
                 "seen": seen,
             },
         )
+        return 200
+
+    def _handle_nodes_html(self) -> int:
+        """GET /nodes: human-readable HTML view of this node's heartbeat
+        directory. Same data as /v1/nodes/seen but rendered for a
+        browser, so an operator can point a teammate at the URL without
+        having to explain JSON parsing.
+
+        Returns 404 when the heartbeat layer is disabled — the route
+        only makes sense when the node is opted into discovery.
+        """
+        if not self._heartbeat_enabled():
+            self._send_json(404, {"error": "discovery disabled on this node"})
+            return 404
+        if not self._heartbeat_rate_ok(endpoint="seen"):
+            self._send_json(429, {"error": "heartbeat rate limit exceeded"})
+            return 429
+
+        from dmp.core.heartbeat import HeartbeatRecord
+        from dmp.server.heartbeat_html import DirectoryRow, render
+
+        store = self.server.heartbeat_store
+        limit = int(getattr(self.server, "heartbeat_seen_limit", 500))
+        rows = store.list_recent(limit=limit)
+        directory_rows = []
+        for r in rows:
+            try:
+                rec = HeartbeatRecord.parse_and_verify(r.wire)
+            except Exception:
+                # Malformed/expired records are skipped silently — the
+                # store accepted them at write-time, so a verify failure
+                # here means clock drift or an in-flight rotation. Don't
+                # take down the directory page over it.
+                continue
+            if rec is None:
+                continue
+            directory_rows.append(
+                DirectoryRow(
+                    endpoint=rec.endpoint,
+                    operator_spk_hex=rec.operator_spk.hex(),
+                    version=rec.version,
+                    ts=int(rec.ts),
+                    sources=1,
+                )
+            )
+
+        self_endpoint = getattr(self.server, "heartbeat_self_endpoint", None) or ""
+        self_spk_hex = getattr(self.server, "heartbeat_self_spk_hex", None) or ""
+
+        import html as _html
+
+        header = (
+            '<div class="self-block">'
+            f"<strong>This node:</strong> "
+            f'<a href="{_html.escape(self_endpoint, quote=True)}">'
+            f"{_html.escape(self_endpoint)}</a><br>"
+            f"<small>operator pubkey: <code>{_html.escape(self_spk_hex)}</code></small>"
+            f"<br><small>{len(directory_rows)} peers in the last 72h · "
+            f'<a href="/v1/nodes/seen">raw JSON feed</a></small>'
+            "</div>"
+        )
+        body = render(
+            directory_rows,
+            title="DMP node directory",
+            header_html=header,
+        )
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=30")
+        self.end_headers()
+        self.wfile.write(data)
         return 200
 
     def _handle_nodes_seen(self) -> int:

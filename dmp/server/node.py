@@ -692,6 +692,32 @@ class DMPNode:
             len(self.anti_entropy.peers) if self.anti_entropy else 0,
         )
 
+        # Discovery / directory surface (M5.8). Operators don't always
+        # remember whether they enabled the heartbeat layer or where the
+        # public-facing views live, so the node says it explicitly on
+        # startup. The bundle is None when DMP_HEARTBEAT_ENABLED is unset
+        # or any prerequisite is missing — see _load_heartbeat_from_env.
+        if heartbeat_bundle is not None:
+            log.info(
+                "discovery: heartbeat enabled, self=%s",
+                heartbeat_bundle.self_endpoint,
+            )
+            log.info(
+                "discovery: peer list (JSON) at %s/v1/nodes/seen",
+                heartbeat_bundle.self_endpoint.rstrip("/"),
+            )
+            log.info(
+                "discovery: peer list (HTML) at %s/nodes",
+                heartbeat_bundle.self_endpoint.rstrip("/"),
+            )
+        else:
+            log.info(
+                "discovery: heartbeat disabled (this node is private). "
+                "Set DMP_HEARTBEAT_ENABLED=1 + "
+                "DMP_HEARTBEAT_SELF_ENDPOINT + "
+                "DMP_HEARTBEAT_OPERATOR_KEY_PATH to be discoverable."
+            )
+
     def _publish_cluster_manifest_from_file(self) -> None:
         """If a signed cluster manifest is mounted at ``cluster_file``
         AND it parses as a ClusterManifest wire blob, publish it under
