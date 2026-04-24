@@ -7,6 +7,34 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed — CLI rename (breaking for source installs)
+
+- **CLI command renamed** from `dmp` to `dnsmesh`. The distribution on
+  PyPI is `dnsmesh` (the `dmp` slug is squatted), so for brand
+  consistency the binary and the admin CLI follow suit: `dmp` →
+  `dnsmesh`, `dmp-node-admin` → `dnsmesh-node-admin`.
+- **Docker image renamed** from `dmp-node` to `dnsmesh-node` (Docker
+  Hub repo, Dockerfile label, all compose samples, cluster peer env
+  files). The `python -m dmp.server` entrypoint and the `/var/lib/dmp`
+  volume are unchanged, so in-container behavior is identical.
+- **Migration:** `pip uninstall dmp` (if you had an editable install
+  under the old name), then `pip install -e .` again. The shell
+  commands become `dnsmesh ...` / `dnsmesh-node-admin ...`. For
+  Docker, pull `<user>/dnsmesh-node:latest` instead of
+  `<user>/dmp-node:latest` and update your compose file's
+  `image:` / `container_name:` / volume name.
+
+### Unchanged (deliberately)
+
+- **Python import path** stays `import dmp` — same split as
+  pyyaml → yaml. Scripts using the library do not need to change.
+- **Wire protocol** (`v=dmp1;...`), **DNS subdomain conventions**
+  (`dmp.<user>.<host>`, `_dmp-cluster.<name>`, `rotate.dmp.<host>`),
+  **`DMP_*` environment variables**, **`~/.dmp/config.yaml` path**,
+  **`dmp_*` Prometheus metric names**, and the in-container **`dmp`
+  Unix user** are untouched. Existing operator configs and signed
+  records keep working.
+
 ### Added (M5.5 — multi-tenant node auth) — SHIPPED (merge `01318569`)
 
 - `DMP_AUTH_MODE=open|legacy|multi-tenant` env switch. Back-compat:
