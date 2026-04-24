@@ -58,7 +58,12 @@ jobs:
       - name: Audit installed environment
         # Final drift check: confirms the audited lockfile is what's
         # actually resolvable in a fresh environment.
-        run: pip-audit --strict
+        #
+        # CVE-2026-3219 is in pip itself on the GitHub runner toolchain;
+        # no fix version has been published and pip is not in our lockfile,
+        # so the environment audit flags it on every run. Revisit when
+        # upstream ships a patched pip.
+        run: pip-audit --strict --ignore-vuln CVE-2026-3219
 
   fuzz-wire-parsers:
     name: hypothesis fuzz (wire parsers)

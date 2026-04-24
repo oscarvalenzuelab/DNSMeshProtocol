@@ -601,7 +601,14 @@ def heartbeat_node_container(tmp_path):
     seed = os.urandom(32)
     key_path = tmp_path / "operator-ed25519.hex"
     key_path.write_text(seed.hex())
-    key_path.chmod(0o400)
+    # World-readable so the container's non-root `dmp` user can read the
+    # bind-mounted file. 0o400 only works when the host UID matches the
+    # container UID (as it does on Docker Desktop for Mac via user-namespace
+    # translation); on Linux CI runners the UIDs diverge and the container
+    # silently fails to load the operator key → heartbeat routes never
+    # register → tests get 404. The key is per-test random bytes, not
+    # sensitive material worth protecting with mode 0o400 here.
+    key_path.chmod(0o444)
 
     name = f"dnsmesh-node-hb-{uuid.uuid4().hex[:8]}"
     http_port = _free_port(socket.SOCK_STREAM)
