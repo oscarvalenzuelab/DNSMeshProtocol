@@ -128,7 +128,7 @@ docker run -d --name dnsmesh-node \
   -p 8053:8053/tcp \
   -e DMP_OPERATOR_TOKEN=$(openssl rand -hex 32) \
   -v dnsmesh-data:/var/lib/dmp \
-  oscarvalenzuelab/dnsmesh-node:latest
+  ovalenzuela/dnsmesh-node:latest
 ```
 
 Point a DNS A record at the VPS's public IP. Front the HTTP port with

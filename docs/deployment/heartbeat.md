@@ -58,7 +58,7 @@ docker run -d --name dnsmesh-node \
   -v $(pwd)/operator-ed25519.hex:/etc/dmp/operator.hex:ro \
   -v dnsmesh-data:/var/lib/dmp \
   -p 53:5353/udp -p 8053:8053/tcp \
-  oscarvalenzuelab/dnsmesh-node:latest
+  ovalenzuela/dnsmesh-node:latest
 ```
 
 ## Env reference
