@@ -34,10 +34,12 @@ unchanged.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import struct
 import time
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit
 
 from dmp.core.crypto import DMPCrypto
 from dmp.core.ed25519_points import is_low_order as _is_low_order
@@ -72,23 +74,44 @@ _DEFAULT_TS_SKEW_SECONDS = 300
 # Intentionally strict: an attacker inserting file://, javascript:,
 # or unicode spoofs in a heartbeat is an obvious red flag, and
 # accepting one into the seen-store lets a crawling aggregator hit
-# it.
-_ALLOWED_URL_SCHEMES = ("https://", "http://")
+# it. SSRF vectors (userinfo host-confusion, IP literals in private
+# ranges, localhost aliases) are rejected here — an aggregator can
+# re-check at connect time but the defense-in-depth starts in the
+# wire parser.
+_ALLOWED_URL_SCHEMES = ("https", "http")
+
+# Hostnames that resolve to the host itself. Block all case-
+# variants at the wire layer because even though 'localhost' is
+# just a hostname, every reasonable resolver maps it to 127.0.0.1 /
+# ::1 and therefore it is an SSRF vector on the crawler side.
+_LOCALHOST_ALIASES = {"localhost", "localhost.localdomain", "ip6-localhost"}
 
 
 def _validate_endpoint(endpoint: str) -> None:
     """Shape-check ``endpoint``. Raise ValueError on malformed input.
 
-    Rules:
-      - Non-empty, UTF-8 encodable.
-      - Length <= MAX_ENDPOINT_LEN.
-      - Starts with https:// or http:// (dev-mode http permitted but
-        the operator guide flags it as only appropriate for trusted
-        LANs).
-      - No embedded path / query / fragment (the endpoint is the
-        publish-API base; clients append paths themselves).
-      - No embedded whitespace, control chars, or non-ASCII (URL
-        hostnames are IDNA-encoded into ASCII upstream of this layer).
+    Rules (in order of check):
+
+      1. Non-empty string, <= MAX_ENDPOINT_LEN, ASCII-only, no
+         whitespace / control chars.
+      2. Parses under urllib.parse.urlsplit with an allowed scheme
+         (``https`` or ``http``).
+      3. No userinfo (rejects ``https://public@127.0.0.1`` style
+         host-confusion: `requests` connects to the parsed host,
+         not the label left of ``@``).
+      4. Non-empty hostname.
+      5. No path / query / fragment (endpoint is the publish-API
+         base; clients append ``/v1/...`` themselves).
+      6. If the hostname is an IP literal, reject any loopback /
+         private / link-local / multicast / reserved / unspecified
+         address (blocks direct SSRF vectors). Covers both v4 and
+         bracketed v6 literals.
+      7. Reject case-insensitive ``localhost`` and its aliases.
+
+    Hostnames that resolve via DNS to private IPs at crawl time
+    are the *aggregator*'s responsibility to refuse at connect
+    time — a wire parser can't see the future resolution. This
+    function is the first line of defense, not the only one.
     """
     if not isinstance(endpoint, str) or not endpoint:
         raise ValueError("endpoint must be a non-empty string")
@@ -96,28 +119,68 @@ def _validate_endpoint(endpoint: str) -> None:
         raise ValueError(
             f"endpoint length {len(endpoint)} > MAX_ENDPOINT_LEN {MAX_ENDPOINT_LEN}"
         )
-    if not any(endpoint.startswith(s) for s in _ALLOWED_URL_SCHEMES):
-        raise ValueError(
-            f"endpoint must start with one of {_ALLOWED_URL_SCHEMES}"
-        )
-    # No trailing path / query / fragment past the authority.
-    after_scheme = endpoint.split("://", 1)[1]
-    if any(c in after_scheme for c in ("/", "?", "#")):
-        raise ValueError(
-            "endpoint must be <scheme>://<host>[:port], no path / query / fragment"
-        )
-    if not after_scheme:
-        raise ValueError("endpoint must include a host")
-    # ASCII-only. No unicode homoglyphs in a public directory listing.
     try:
         endpoint.encode("ascii")
     except UnicodeEncodeError as exc:
         raise ValueError(
             f"endpoint must be ASCII; non-ASCII at position {exc.start}"
         ) from exc
-    # No whitespace or control chars.
     if any(ord(c) < 0x21 or ord(c) == 0x7F for c in endpoint):
         raise ValueError("endpoint contains whitespace or control characters")
+
+    # urlsplit handles bracketed IPv6, userinfo, port, path, query,
+    # fragment correctly — defer to it rather than hand-rolling the
+    # parser. urlsplit itself never raises; missing fields come back
+    # as ''.
+    parts = urlsplit(endpoint)
+    if parts.scheme.lower() not in _ALLOWED_URL_SCHEMES:
+        raise ValueError(
+            f"endpoint scheme must be one of {_ALLOWED_URL_SCHEMES}; "
+            f"got {parts.scheme!r}"
+        )
+    if parts.username is not None or parts.password is not None:
+        # `https://user@dmp.example.com` is the canonical SSRF-via-
+        # userinfo vector: a reader skimming the URL thinks the host
+        # is "dmp.example.com" but requests connects to whatever's
+        # after the @. Refuse outright.
+        raise ValueError("endpoint must not carry userinfo (user:pass@...)")
+    host = parts.hostname or ""
+    if not host:
+        raise ValueError("endpoint must include a host")
+    # urlsplit preserves path/query/fragment. None must be present
+    # (the endpoint is the authority-only base).
+    if parts.path or parts.query or parts.fragment:
+        raise ValueError(
+            "endpoint must be <scheme>://<host>[:port], no path / query / fragment"
+        )
+
+    # Localhost and its aliases resolve to loopback on every
+    # reasonable system — block them at the wire layer.
+    if host.lower() in _LOCALHOST_ALIASES:
+        raise ValueError(f"endpoint host {host!r} is a localhost alias")
+
+    # If the host is an IP literal, refuse any non-public range.
+    # ipaddress.ip_address raises on non-literals (hostnames); we
+    # fall through in that case — hostname resolution is the
+    # aggregator's SSRF defense, not ours.
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"endpoint host {host!r} is a {type(ip).__name__} in a "
+                "non-public range (loopback / private / link-local / "
+                "multicast / reserved / unspecified)"
+            )
 
 
 def _validate_version(version: str) -> None:

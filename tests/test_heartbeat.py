@@ -230,31 +230,91 @@ class TestFreshness:
 
 
 class TestEndpointShape:
-    @pytest.mark.parametrize("good", [
-        "https://dmp.example.com",
-        "https://dmp.example.com:8053",
-        "http://127.0.0.1:8053",  # dev-only
-    ])
+    @pytest.mark.parametrize(
+        "good",
+        [
+            "https://dmp.example.com",
+            "https://dmp.example.com:8053",
+            "https://dmp.example.com:443",
+            "http://dmp.example.com",  # http permitted for dev hostnames
+            "https://[2606:4700:4700::1111]:443",  # public IPv6 (Cloudflare)
+        ],
+    )
     def test_accepted(self, good: str) -> None:
         _validate_endpoint(good)
 
-    @pytest.mark.parametrize("bad", [
-        "",
-        "dmp.example.com",  # no scheme
-        "ftp://dmp.example.com",  # wrong scheme
-        "javascript:alert(1)",
-        "file:///etc/passwd",
-        "https://",  # no host
-        "https://dmp.example.com/",  # trailing path
-        "https://dmp.example.com/v1/records",
-        "https://dmp.example.com?x=1",
-        "https://dmp.example.com#frag",
-        "https://dmp.éxample.com",  # non-ASCII
-        "https://dmp .example.com",  # space
-        "https://dmp.example.com\n",  # control char
-    ])
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "",
+            "dmp.example.com",  # no scheme
+            "ftp://dmp.example.com",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "https://",
+            "https://dmp.example.com/",  # trailing path
+            "https://dmp.example.com/v1/records",
+            "https://dmp.example.com?x=1",
+            "https://dmp.example.com#frag",
+            "https://dmp.éxample.com",  # non-ASCII
+            "https://dmp .example.com",  # space
+            "https://dmp.example.com\n",  # control char
+        ],
+    )
     def test_rejected(self, bad: str) -> None:
         with pytest.raises(ValueError):
+            _validate_endpoint(bad)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            # codex P1 — userinfo host-confusion (SSRF bypass).
+            "https://public.example.com@127.0.0.1:8443",
+            "https://user:pass@dmp.example.com",
+            "https://user@127.0.0.1",
+        ],
+    )
+    def test_userinfo_rejected(self, bad: str) -> None:
+        with pytest.raises(ValueError, match="userinfo"):
+            _validate_endpoint(bad)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            # IPv4 loopback / private / link-local / multicast / reserved.
+            "https://127.0.0.1",
+            "https://127.0.0.1:8443",
+            "https://10.0.0.1",
+            "https://192.168.1.1",
+            "https://172.16.0.1",
+            "https://169.254.169.254",  # EC2 / GCP metadata
+            "https://224.0.0.1",  # multicast
+            "https://0.0.0.0",  # unspecified
+            # IPv6 loopback / link-local / unique-local.
+            "https://[::1]:443",
+            "https://[::1]",
+            "https://[fe80::1]:443",  # link-local
+            "https://[fc00::1]",  # unique-local
+            "https://[::]",  # unspecified
+        ],
+    )
+    def test_private_ip_literal_rejected(self, bad: str) -> None:
+        with pytest.raises(ValueError, match="non-public"):
+            _validate_endpoint(bad)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "https://localhost",
+            "https://localhost:8053",
+            "https://LOCALHOST",
+            "https://Localhost",
+            "https://localhost.localdomain",
+            "https://ip6-localhost",
+        ],
+    )
+    def test_localhost_alias_rejected(self, bad: str) -> None:
+        with pytest.raises(ValueError, match="localhost"):
             _validate_endpoint(bad)
 
     def test_too_long_rejected(self) -> None:

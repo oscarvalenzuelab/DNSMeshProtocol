@@ -67,8 +67,11 @@ Binary layout (all integers big-endian):
                                        max ≈ 410 bytes
 ```
 
-Wire prefix: `v=dmp1;t=heartbeat;` followed by base64url of the
-binary, no padding. Fits comfortably in a single DNS TXT record.
+Wire prefix: `v=dmp1;t=heartbeat;` followed by standard base64 of
+the binary (same encoding the other signed DMP record types —
+`ClusterManifest`, `RotationRecord`, `BootstrapRecord` — use for
+consistency across the wire surface). Fits comfortably in a single
+DNS TXT record.
 
 ### What `endpoint` is
 
