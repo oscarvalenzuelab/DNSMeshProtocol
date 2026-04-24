@@ -21,6 +21,10 @@ an item here is the most common way a DMP node gets owned.
 - [DigitalOcean]({{ site.baseurl }}/deployment/digitalocean) — one-shot
   bootstrap script for a single Droplet (works on any UDP-capable VPS).
   The fastest way to a real node on the public internet.
+- [Native Ubuntu]({{ site.baseurl }}/deployment/native-ubuntu) — install
+  directly via apt + pip + systemd, no Docker. ~50 MB idle RAM
+  footprint vs ~150 MB for the Docker recipe. Fronted by Caddy for
+  auto-TLS.
 - [Production]({{ site.baseurl }}/deployment/production) — TLS via Caddy,
   rate limiting, per-name RRset caps, metrics scraping, env-var reference.
 - [Clustered deployment]({{ site.baseurl }}/deployment/cluster) — 3-node
