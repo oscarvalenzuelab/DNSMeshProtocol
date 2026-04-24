@@ -268,9 +268,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument(
         "--seed",
         action="append",
-        required=True,
+        default=[],
         help="seed node HTTPS URL (repeatable). Each seed's "
         "/v1/nodes/seen is fetched; results are unioned and verified.",
+    )
+    p.add_argument(
+        "--seeds-file",
+        type=Path,
+        help="text file with one seed URL per line. Lines starting with "
+        "'#' and blank lines are ignored. Stacks with --seed.",
     )
     p.add_argument(
         "--out-dir",
@@ -291,12 +297,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
+    seeds = list(args.seed)
+    if args.seeds_file:
+        for line in args.seeds_file.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            seeds.append(stripped)
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
     now = int(time.time())
-    nodes = aggregate(args.seed, now=now)
+    nodes = aggregate(seeds, now=now) if seeds else []
     emit_json(nodes, args.out_dir / "feed.json", now=now)
     emit_html(nodes, args.out_dir / "index.html", now=now)
-    log.info("wrote %d nodes to %s", len(nodes), args.out_dir)
+    log.info(
+        "wrote %d nodes from %d seeds to %s", len(nodes), len(seeds), args.out_dir
+    )
     return 0
 
 
