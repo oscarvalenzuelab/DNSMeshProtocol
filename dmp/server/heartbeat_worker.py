@@ -25,6 +25,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Set
+from urllib.parse import urlsplit, urlunsplit
 
 from dmp.core.crypto import DMPCrypto
 from dmp.core.heartbeat import HeartbeatRecord
@@ -41,6 +42,49 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 # Cooldown applied to a peer that fails a single tick. Next tick we
 # skip it. Counter resets on successful contact.
 DEFAULT_FAILURE_COOLDOWN_TICKS = 1
+# Cap on how many gossip wires the worker will ingest from ONE peer
+# per POST. A hostile seed can answer with an unbounded `seen` list;
+# without a cap, the worker burns signature-verify + sqlite cycles
+# processing the flood. Design doc said "up to N recent heartbeats";
+# this is the enforcement.
+DEFAULT_MAX_GOSSIP_PER_RESPONSE = 20
+# Schemes whose default ports should be elided when canonicalizing
+# URLs for self-identity comparison. Anything not in this map keeps
+# its port literal.
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _canonicalize_url(url: str) -> str:
+    """Return a canonical form suitable for self-identity comparison.
+
+    Rules:
+      - lowercase scheme
+      - lowercase hostname (ASCII; IDN hostnames arrive punycoded
+        upstream so case-folding their label here is safe)
+      - elide the port if it matches the scheme default
+      - strip trailing slash
+      - drop path/query/fragment (endpoints have none by contract)
+
+    An empty / malformed URL returns the empty string so it can't
+    accidentally match the node's real endpoint.
+    """
+    if not isinstance(url, str) or not url:
+        return ""
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return ""
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if not scheme or not host:
+        return ""
+    port = parts.port
+    default = _DEFAULT_PORTS.get(scheme)
+    if port is None or port == default:
+        netloc = host
+    else:
+        netloc = f"{host}:{port}"
+    return urlunsplit((scheme, netloc, "", "", "")).rstrip("/")
 
 
 @dataclass(frozen=True)
@@ -59,6 +103,11 @@ class HeartbeatWorkerConfig:
     max_peers: int = DEFAULT_MAX_PEERS
     http_timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS
     failure_cooldown_ticks: int = DEFAULT_FAILURE_COOLDOWN_TICKS
+    # Upper bound on the number of gossip wires ingested from ONE
+    # peer response. See codex phase-4 P2: otherwise a hostile peer
+    # can force O(N) sig-verify + sqlite work by returning a
+    # very-long `seen` array.
+    max_gossip_per_response: int = DEFAULT_MAX_GOSSIP_PER_RESPONSE
 
 
 class HeartbeatWorker:
@@ -146,20 +195,25 @@ class HeartbeatWorker:
 
     def tick_once(self, *, now: Optional[int] = None) -> int:
         """Run one tick synchronously. Returns count of successful
-        POSTs. Exposed for tests."""
-        now_i = int(now) if now is not None else int(time.time())
-        # Build + sign own heartbeat. Worker is in-process, so any
-        # sign error is a config bug worth surfacing; we log and
-        # skip the tick rather than crash the daemon.
-        try:
-            own_wire = self._build_own_wire(now_i)
-        except ValueError:
-            log.exception("heartbeat self-wire build failed; skipping tick")
-            return 0
+        POSTs. Exposed for tests.
 
-        # Assemble the ping list: seeds + gossip-learned + cluster
-        # peers. De-dup preserving order; cap at max_peers.
-        peers = self._build_peer_list(now_i)
+        Clock handling: the peer list is assembled once at tick
+        start (uses ``now`` for the freshness filter on
+        ``SeenStore.list_for_ping``), but the heartbeat wire is
+        RE-SIGNED with a fresh ``now`` immediately before each POST,
+        and ``SeenStore.accept`` receives a fresh ``now`` too.
+        Sequential POSTs at ~10s timeout each can span a few minutes
+        — freezing ``now`` at tick start would put a late-POSTed
+        wire dangerously close to the receiver's 5-min ts-skew
+        guard, and would evaluate late gossip against an early
+        clock. Codex phase-4 P2 fix.
+        """
+        tick_start = int(now) if now is not None else int(time.time())
+
+        # Assemble the ping list once using the tick-start `now`
+        # for the gossip-learned filter. Peer set doesn't change
+        # mid-tick even if the clock advances.
+        peers = self._build_peer_list(tick_start)
         if not peers:
             # Solo node with no seeds — still valid, just nothing
             # to send yet. A peer pushing to us will populate the
@@ -173,6 +227,22 @@ class HeartbeatWorker:
             if cd > 0:
                 self._cooldown[peer] = cd - 1
                 continue
+
+            # Refresh clock + re-sign per peer (P2 fix). Uses `now`
+            # override when the test passed one; otherwise wall
+            # clock so late peers get an ~up-to-the-second wire.
+            per_peer_now = (
+                int(now) if now is not None else int(time.time())
+            )
+            try:
+                own_wire = self._build_own_wire(per_peer_now)
+            except ValueError:
+                log.exception(
+                    "heartbeat self-wire build failed mid-tick; "
+                    "skipping remaining peers"
+                )
+                return successes
+
             response = self._http_poster(
                 peer + "/v1/heartbeat",
                 {"wire": own_wire},
@@ -187,10 +257,17 @@ class HeartbeatWorker:
             successes += 1
             seen_wires = response.get("seen") or []
             if isinstance(seen_wires, list):
-                for w in seen_wires:
+                # Bound per-response work — a hostile peer cannot
+                # force unbounded signature verification + sqlite
+                # writes by handing us an oversized `seen` array.
+                # Truncate at max_gossip_per_response. Codex
+                # phase-4 P2 fix.
+                for w in seen_wires[: self._cfg.max_gossip_per_response]:
                     if isinstance(w, str):
                         self._store.accept(
-                            w, remote_addr=peer, now=now_i
+                            w,
+                            remote_addr=peer,
+                            now=per_peer_now,
                         )
         return successes
 
@@ -216,21 +293,29 @@ class HeartbeatWorker:
         gossip-learned from the seen store. De-duped preserving
         order, cap at max_peers. The node's own endpoint is filtered
         out so we never ping ourselves.
+
+        URLs are canonicalized for self-compare + dedup:
+        scheme/host lowercased, default ports elided, trailing
+        slash stripped. This closes the codex phase-4 P2 where
+        ``HTTPS://self.example.com`` or ``https://self.example.com:443``
+        would bypass the self-filter.
         """
-        self_ep = self._cfg.self_endpoint.rstrip("/")
+        self_canon = _canonicalize_url(self._cfg.self_endpoint)
         seen: Set[str] = set()
         out: List[str] = []
 
         def _add(url: str) -> None:
             if not isinstance(url, str):
                 return
-            norm = url.rstrip("/")
-            if not norm or norm == self_ep:
+            canon = _canonicalize_url(url)
+            if not canon or canon == self_canon:
                 return
-            if norm in seen:
+            if canon in seen:
                 return
-            seen.add(norm)
-            out.append(norm)
+            seen.add(canon)
+            # Append the canonical form, not the raw input, so
+            # downstream HTTP posts use a predictable URL.
+            out.append(canon)
 
         for u in self._cfg.seed_peers:
             _add(u)

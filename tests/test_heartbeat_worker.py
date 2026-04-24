@@ -345,6 +345,193 @@ class TestOwnHeartbeatShape:
         assert parsed.operator_spk == signer.get_signing_public_key_bytes()
 
 
+class TestFreshnessPerPeer:
+    """Codex phase-4 P2: frozen-clock regression.
+
+    The old worker signed ``own_wire`` ONCE at tick start and used
+    the same ``now`` across every POST. With max_peers=25 ×
+    http_timeout=10s the tail peer could receive a 250s-old wire,
+    eating into the receiver's 5-min ts-skew budget. Now each POST
+    refreshes ``now`` + re-signs.
+    """
+
+    def test_clock_refreshed_per_peer(
+        self, store: SeenStore, now: int
+    ) -> None:
+        """Inject a poster that captures the `ts` field in each
+        posted wire; assert ts increases across consecutive peers."""
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            seed_peers=(
+                "https://a.example.com",
+                "https://b.example.com",
+                "https://c.example.com",
+            ),
+        )
+
+        captured_ts = []
+        call_count = [0]
+
+        def _stub(url, body, timeout):
+            # Advance the virtual clock by 60 seconds per call so a
+            # second-resolution per-peer ts MUST differ.
+            parsed = HeartbeatRecord.parse_and_verify(
+                body["wire"], now=now + call_count[0] * 60 + 1
+            )
+            assert parsed is not None
+            captured_ts.append(parsed.ts)
+            call_count[0] += 1
+            return {"ok": True, "seen": []}
+
+        class _ClockingWorker(HeartbeatWorker):
+            """Subclass that advances clock 60s per POST to simulate
+            a slow network where each peer takes a minute to respond."""
+
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self._fake_now = now
+
+            def _current_time(self) -> int:
+                t = self._fake_now
+                self._fake_now += 60
+                return t
+
+        # Instead of a subclass we override time.time indirectly by
+        # passing explicit `now` to tick_once — but tick_once's
+        # per-peer refresh only fires when `now is None`. So the
+        # simpler test: don't pass `now`, and monkeypatch time.time
+        # to a counter.
+        import dmp.server.heartbeat_worker as hb_mod
+
+        orig_time = hb_mod.time.time
+        counter = [now]
+
+        def _fake_time():
+            counter[0] += 60
+            return counter[0]
+
+        hb_mod.time.time = _fake_time
+        try:
+            worker = HeartbeatWorker(cfg, _signer(), store, http_poster=_stub)
+            worker.tick_once()  # no `now`, so each peer uses live time
+            assert len(captured_ts) == 3
+            # ts values strictly increase per POST (60s apart).
+            assert captured_ts[0] < captured_ts[1] < captured_ts[2]
+        finally:
+            hb_mod.time.time = orig_time
+
+
+class TestGossipIngestBounded:
+    """Codex phase-4 P2: cap on per-response gossip ingest."""
+
+    def test_oversized_gossip_is_truncated(
+        self, store: SeenStore, now: int
+    ) -> None:
+        """A hostile seed returns `seen` with far more wires than
+        the configured cap. The worker must only process up to
+        max_gossip_per_response of them.
+        """
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            seed_peers=("https://hostile.example.com",),
+            max_gossip_per_response=3,
+        )
+        # Build 10 valid heartbeats from distinct signers.
+        many = []
+        for i in range(10):
+            s = _signer(f"peer{i}", bytes([i + 10]) * 32)
+            many.append(_heartbeat(s, f"https://p{i}.example.com", ts=now))
+
+        poster = _StubPoster(
+            responses={
+                "https://hostile.example.com/v1/heartbeat": {
+                    "ok": True,
+                    "seen": many,
+                }
+            }
+        )
+        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
+        worker.tick_once(now=now)
+        # Only the first 3 of the 10 wires should have been accepted.
+        assert store.count() == 3
+
+
+class TestSelfFilterCanonicalization:
+    """Codex phase-4 P2: self-filter must canonicalize URLs."""
+
+    def test_uppercase_host_filtered(self, store: SeenStore, now: int) -> None:
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            seed_peers=(
+                "https://SELF.example.com",
+                "https://other.example.com",
+            ),
+        )
+        poster = _StubPoster(
+            responses={
+                "https://other.example.com/v1/heartbeat": {
+                    "ok": True,
+                    "seen": [],
+                }
+            }
+        )
+        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
+        worker.tick_once(now=now)
+        urls = [c[0] for c in poster.calls]
+        assert urls == ["https://other.example.com/v1/heartbeat"]
+
+    def test_uppercase_scheme_filtered(
+        self, store: SeenStore, now: int
+    ) -> None:
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            seed_peers=(
+                "HTTPS://self.example.com",
+                "https://other.example.com",
+            ),
+        )
+        poster = _StubPoster(
+            responses={
+                "https://other.example.com/v1/heartbeat": {
+                    "ok": True,
+                    "seen": [],
+                }
+            }
+        )
+        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
+        worker.tick_once(now=now)
+        urls = [c[0] for c in poster.calls]
+        assert urls == ["https://other.example.com/v1/heartbeat"]
+
+    def test_default_port_filtered(
+        self, store: SeenStore, now: int
+    ) -> None:
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            seed_peers=(
+                "https://self.example.com:443",  # default-port variant
+                "https://other.example.com",
+            ),
+        )
+        poster = _StubPoster(
+            responses={
+                "https://other.example.com/v1/heartbeat": {
+                    "ok": True,
+                    "seen": [],
+                }
+            }
+        )
+        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
+        worker.tick_once(now=now)
+        urls = [c[0] for c in poster.calls]
+        assert urls == ["https://other.example.com/v1/heartbeat"]
+
+
 class TestLifecycle:
     def test_start_stop(self, store: SeenStore) -> None:
         """Daemon thread lifecycle: start -> stop returns cleanly even
