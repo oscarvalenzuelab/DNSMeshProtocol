@@ -1,0 +1,58 @@
+[Unit]
+Description=dnsmesh-node (DNS Mesh Protocol authoritative + publish API)
+Documentation=https://ovalenzuela.com/DNSMeshProtocol/deployment/native-ubuntu
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dnsmesh
+Group=dnsmesh
+
+# Operator config + secrets. EnvironmentFile is read by systemd before
+# fork, so the file's permissions (0640 root:dnsmesh) gate access to
+# DMP_OPERATOR_TOKEN even if the dnsmesh user account is later
+# compromised.
+EnvironmentFile=/etc/dnsmesh/node.env
+
+ExecStart=/opt/dnsmesh/venv/bin/python -m dmp.server
+
+# Restart only on actual crashes; a clean SIGTERM (e.g. systemctl stop)
+# leaves the unit in a stopped state instead of looping.
+Restart=on-failure
+RestartSec=5
+
+# UDP 53 is privileged. AmbientCapabilities lets the dnsmesh user
+# bind it without running the whole process as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- Hardening (systemd sandboxing) ---------------------------------
+# These mirror what `docker run` gives you for free. Each line removes
+# a kernel-side capability or filesystem path the dmp.server module
+# does not need. If you ever extend the server to write somewhere new,
+# add the path to ReadWritePaths or remove the relevant directive.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+
+# Logs: journald, picked up by `journalctl -u dnsmesh-node`. The
+# server's own structured logger writes to stdout/stderr, which
+# systemd captures.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
