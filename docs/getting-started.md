@@ -12,18 +12,44 @@ nav_order: 3
 
 ## Prerequisites
 
-- Python 3.10 or newer
-- Docker (for running the node; optional for library-only use)
+- Python 3.10 or newer (for the PyPI install or source install)
+- Docker (for running a node locally; not needed if you only use the
+  CLI against someone else's node)
 
 ## Install the CLI
+
+Pick one. The PyPI wheel is the fastest path; source install is for
+contributors and people pinning to an unreleased commit.
+
+### From PyPI (recommended)
+
+```bash
+pip install dnsmesh
+```
+
+### Standalone binary (no Python required)
+
+Single-file executables are attached to every release on GitHub. Pick
+the asset for your platform from the latest
+[`cli-vX.Y.Z` release](https://github.com/oscarvalenzuelab/DNSMeshProtocol/releases).
+Available for Linux x86_64, macOS arm64, and Windows x86_64.
+
+```bash
+# example: macOS arm64
+curl -fsSL -o ~/.local/bin/dnsmesh \
+    https://github.com/oscarvalenzuelab/DNSMeshProtocol/releases/latest/download/dnsmesh-macos-arm64
+chmod +x ~/.local/bin/dnsmesh
+```
+
+### From source (contributors)
 
 ```bash
 git clone https://github.com/oscarvalenzuelab/DNSMeshProtocol.git
 cd DNSMeshProtocol
-pip install -e .
+pip install -e ".[dev]"
 ```
 
-Verify:
+Verify any of the above:
 
 ```bash
 dnsmesh --help
@@ -31,15 +57,32 @@ dnsmesh --help
 
 ## Run a node (local)
 
+The pre-built image on Docker Hub is the easiest way:
+
+```bash
+docker run -d --name dnsmesh-node \
+  -p 5353:5353/udp -p 8053:8053/tcp \
+  -v dnsmesh-data:/var/lib/dmp \
+  ovalenzuela/dnsmesh-node:latest
+
+# Health check
+curl http://127.0.0.1:8053/health
+```
+
+To put a node on the public internet (with auto TLS, hardening, etc.),
+follow [Deployment → DigitalOcean]({{ site.baseurl }}/deployment/digitalocean)
+or any of the other deployment guides — the same Docker recipe runs
+on any UDP-capable VPS.
+
+If you'd rather build from source instead of pulling the published
+image:
+
 ```bash
 docker build -t dnsmesh-node:latest .
 docker run -d --name dnsmesh-node \
   -p 5353:5353/udp -p 8053:8053/tcp \
   -v dnsmesh-data:/var/lib/dmp \
   dnsmesh-node:latest
-
-# Health check
-curl http://127.0.0.1:8053/health
 ```
 
 Ports:
