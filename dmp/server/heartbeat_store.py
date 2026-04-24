@@ -98,25 +98,47 @@ class SeenStore:
 
     def accept(
         self,
-        record: HeartbeatRecord,
         wire: str,
         *,
         remote_addr: str = "",
         now: Optional[int] = None,
-    ) -> None:
-        """Store a verified heartbeat. Upserts on (operator_spk, endpoint).
+        ts_skew_seconds: Optional[int] = None,
+    ) -> Optional[HeartbeatRecord]:
+        """Verify + store a heartbeat wire. Returns the record on success.
 
-        No signature re-check here — the caller is responsible for
-        running ``HeartbeatRecord.parse_and_verify`` first. Accepting
-        the wire string verbatim (rather than re-serializing from the
-        record's fields) is deliberate: it preserves the operator's
-        exact signature bytes so a downstream verifier sees what the
-        signer emitted. Re-serializing would force every consumer to
-        trust our serialization to produce byte-identical output.
+        Signature / freshness / low-order-pubkey checks happen
+        INSIDE this call via ``HeartbeatRecord.parse_and_verify``.
+        A caller cannot accidentally persist an unverified wire —
+        the API takes the wire string only, and any verification
+        failure short-circuits to ``None`` without touching the DB.
+
+        The wire string is stored verbatim (not re-serialized from
+        the parsed record) so a downstream consumer of
+        ``GET /v1/nodes/seen`` sees the operator's exact signature
+        bytes, not our best-guess reconstruction.
+
+        Returns:
+            The parsed ``HeartbeatRecord`` on accept, ``None`` when
+            parse_and_verify rejected the wire.
         """
         now_i = int(now) if now is not None else int(time.time())
+        kwargs = {"now": now_i}
+        if ts_skew_seconds is not None:
+            kwargs["ts_skew_seconds"] = int(ts_skew_seconds)
+        record = HeartbeatRecord.parse_and_verify(wire, **kwargs)
+        if record is None:
+            return None
+
         spk_hex = bytes(record.operator_spk).hex()
         with self._lock:
+            # Row-count cap enforcement: before counting, drop stale
+            # rows so the cap is over LIVE rows, not "ever-received"
+            # rows. Otherwise a pile of unswept expired rows would
+            # cause a fresh legitimate accept to evict another live
+            # node. Codex phase-2 P2 fix.
+            self._conn.execute(
+                "DELETE FROM heartbeats_seen WHERE exp <= ?", (now_i,)
+            )
             self._conn.execute(
                 """INSERT INTO heartbeats_seen
                    (operator_spk_hex, endpoint, wire, ts, exp, version,
@@ -141,9 +163,8 @@ class SeenStore:
                     remote_addr or None,
                 ),
             )
-            # Enforce the row-count cap opportunistically on insert.
-            # Oldest-received-first eviction. Only evict when we're
-            # over cap AND at least one row qualifies.
+            # Now cap is checked over live rows only (stale already
+            # pruned above). Oldest-received-first eviction.
             count_row = self._conn.execute(
                 "SELECT COUNT(*) FROM heartbeats_seen"
             ).fetchone()
@@ -160,6 +181,7 @@ class SeenStore:
                     (over,),
                 )
             self._conn.commit()
+        return record
 
     def sweep_expired(self, now: Optional[int] = None) -> int:
         """Delete rows whose `exp` is older than `now - retention`.

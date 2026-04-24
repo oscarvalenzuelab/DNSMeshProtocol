@@ -28,7 +28,10 @@ def _build_and_sign(
     version: str = "0.1.0",
     ts: int,
     exp_delta: int = 86400,
-) -> tuple:
+) -> str:
+    """Returns the wire string. Tests that need both the record and
+    the wire can parse_and_verify the wire themselves — keeps the
+    store's API as the single point of trust."""
     hb = HeartbeatRecord(
         endpoint=endpoint,
         operator_spk=signer.get_signing_public_key_bytes(),
@@ -36,7 +39,7 @@ def _build_and_sign(
         ts=ts,
         exp=ts + exp_delta,
     )
-    return hb, hb.sign(signer)
+    return hb.sign(signer)
 
 
 @pytest.fixture
@@ -59,30 +62,49 @@ def store(tmp_path: Path) -> SeenStore:
 class TestAcceptAndList:
     def test_round_trip(self, store: SeenStore, now: int) -> None:
         signer = _signer()
-        hb, wire = _build_and_sign(signer, ts=now)
-        store.accept(hb, wire, remote_addr="10.0.0.1", now=now)
+        wire = _build_and_sign(signer, ts=now)
+        assert store.accept(wire, remote_addr="10.0.0.1", now=now) is not None
 
         rows = store.list_recent(now=now)
         assert len(rows) == 1
         assert rows[0].wire == wire
-        assert rows[0].endpoint == hb.endpoint
+        assert rows[0].endpoint == "https://dmp.example.com"
         assert rows[0].ts == now
         assert rows[0].remote_addr == "10.0.0.1"
 
-    def test_upsert_on_repeat_pair(self, store: SeenStore, now: int) -> None:
-        """Same (operator_spk, endpoint) pair → overwrite the older row
-        rather than accumulate duplicates."""
+    def test_accept_rejects_unverified_wire(
+        self, store: SeenStore, now: int
+    ) -> None:
+        """Codex phase-2 P3: accept verifies internally. Garbage
+        wire must short-circuit to None and NOT touch the DB."""
+        result = store.accept("not-a-valid-wire", now=now)
+        assert result is None
+        assert store.count() == 0
+
+    def test_accept_rejects_tampered_wire(
+        self, store: SeenStore, now: int
+    ) -> None:
+        """A wire whose body has been mutated must fail the embedded
+        signature verification and be refused."""
         signer = _signer()
-        _, wire_a = _build_and_sign(signer, ts=now)
-        _, wire_b = _build_and_sign(signer, ts=now + 60)
-        hb_a = HeartbeatRecord.parse_and_verify(wire_a, now=now)
-        hb_b = HeartbeatRecord.parse_and_verify(wire_b, now=now + 60)
-        store.accept(hb_a, wire_a, now=now)
-        store.accept(hb_b, wire_b, now=now + 60)
+        wire = _build_and_sign(signer, ts=now)
+        # Flip one middle byte of the base64 payload to corrupt body.
+        prefix, payload = wire.split(";", 2)[:2], wire.split(";", 2)[2]
+        # Any-one-byte flip; keep it within the base64 alphabet.
+        mutated = wire[:-4] + ("A" if wire[-4] != "A" else "B") + wire[-3:]
+        assert store.accept(mutated, now=now) is None
+        assert store.count() == 0
+
+    def test_upsert_on_repeat_pair(self, store: SeenStore, now: int) -> None:
+        """Same (operator_spk, endpoint) pair → overwrite the older row."""
+        signer = _signer()
+        wire_a = _build_and_sign(signer, ts=now)
+        wire_b = _build_and_sign(signer, ts=now + 60)
+        store.accept(wire_a, now=now)
+        store.accept(wire_b, now=now + 60)
 
         rows = store.list_recent(now=now + 60)
         assert len(rows) == 1
-        # Newer ts wins.
         assert rows[0].ts == now + 60
         assert rows[0].wire == wire_b
 
@@ -90,18 +112,12 @@ class TestAcceptAndList:
         self, store: SeenStore, now: int
     ) -> None:
         """Race: if an out-of-order older heartbeat arrives after a
-        newer one, it must NOT overwrite the newer row.
-
-        ON CONFLICT ... WHERE excluded.ts >= stored.ts handles this
-        at the sqlite level.
-        """
+        newer one, it must NOT overwrite the newer row."""
         signer = _signer()
-        _, wire_new = _build_and_sign(signer, ts=now + 120)
-        _, wire_old = _build_and_sign(signer, ts=now)
-        hb_new = HeartbeatRecord.parse_and_verify(wire_new, now=now + 120)
-        hb_old = HeartbeatRecord.parse_and_verify(wire_old, now=now)
-        store.accept(hb_new, wire_new, now=now + 120)
-        store.accept(hb_old, wire_old, now=now + 120)
+        wire_new = _build_and_sign(signer, ts=now + 120)
+        wire_old = _build_and_sign(signer, ts=now)
+        store.accept(wire_new, now=now + 120)
+        store.accept(wire_old, now=now + 120)
 
         rows = store.list_recent(now=now + 120)
         assert len(rows) == 1
@@ -113,10 +129,10 @@ class TestAcceptAndList:
     ) -> None:
         s1 = _signer("a", b"A" * 32)
         s2 = _signer("b", b"B" * 32)
-        hb1, w1 = _build_and_sign(s1, ts=now)
-        hb2, w2 = _build_and_sign(s2, "https://other.example.com", ts=now)
-        store.accept(hb1, w1, now=now)
-        store.accept(hb2, w2, now=now)
+        w1 = _build_and_sign(s1, ts=now)
+        w2 = _build_and_sign(s2, "https://other.example.com", ts=now)
+        store.accept(w1, now=now)
+        store.accept(w2, now=now)
 
         rows = store.list_recent(now=now)
         assert len(rows) == 2
@@ -125,10 +141,10 @@ class TestAcceptAndList:
         self, store: SeenStore, now: int
     ) -> None:
         signer = _signer()
-        hb1, w1 = _build_and_sign(signer, "https://a.example.com", ts=now)
-        hb2, w2 = _build_and_sign(signer, "https://b.example.com", ts=now)
-        store.accept(hb1, w1, now=now)
-        store.accept(hb2, w2, now=now)
+        w1 = _build_and_sign(signer, "https://a.example.com", ts=now)
+        w2 = _build_and_sign(signer, "https://b.example.com", ts=now)
+        store.accept(w1, now=now)
+        store.accept(w2, now=now)
 
         rows = store.list_recent(now=now)
         assert len(rows) == 2
@@ -139,21 +155,19 @@ class TestListRecentFilters:
         """A row whose `exp` is <= now should NOT appear in list_recent
         even if sweep_expired hasn't run yet."""
         signer = _signer()
-        hb, wire = _build_and_sign(signer, ts=now - 86400 - 1, exp_delta=1)
-        # Write the row directly (bypassing the freshness check we
-        # normally rely on upstream).
-        store.accept(hb, wire, now=now - 86400 - 1)
+        # Accept at the original time (when the wire is fresh); then
+        # query at a later time after exp has passed.
+        wire = _build_and_sign(signer, ts=now - 86400 - 1, exp_delta=60)
+        store.accept(wire, now=now - 86400 - 1)
 
         rows = store.list_recent(now=now)
         assert rows == []
 
     def test_list_respects_limit(self, store: SeenStore, now: int) -> None:
         for i in range(5):
-            signer = _signer(str(i), bytes([i]) * 32)
-            hb, wire = _build_and_sign(
-                signer, f"https://n{i}.example.com", ts=now + i
-            )
-            store.accept(hb, wire, now=now + i)
+            signer = _signer(str(i), bytes([i + 1]) * 32)
+            wire = _build_and_sign(signer, f"https://n{i}.example.com", ts=now + i)
+            store.accept(wire, now=now + i)
 
         rows = store.list_recent(now=now + 5, limit=2)
         assert len(rows) == 2
@@ -175,8 +189,8 @@ class TestRetention:
         store = SeenStore(str(tmp_path / "hb.db"), retention_seconds=60)
         try:
             signer = _signer()
-            hb, wire = _build_and_sign(signer, ts=now - 1000, exp_delta=60)
-            store.accept(hb, wire, now=now - 1000)
+            wire = _build_and_sign(signer, ts=now - 1000, exp_delta=60)
+            store.accept(wire, now=now - 1000)
             # At `now`, exp = now - 940; retention = 60s; so exp < now - 60.
             deleted = store.sweep_expired(now=now)
             assert deleted == 1
@@ -190,8 +204,8 @@ class TestRetention:
         store = SeenStore(str(tmp_path / "hb.db"), retention_seconds=3600)
         try:
             signer = _signer()
-            hb, wire = _build_and_sign(signer, ts=now, exp_delta=86400)
-            store.accept(hb, wire, now=now)
+            wire = _build_and_sign(signer, ts=now, exp_delta=86400)
+            store.accept(wire, now=now)
             # exp is in the future — sweep must not drop it.
             deleted = store.sweep_expired(now=now + 60)
             assert deleted == 0
@@ -206,14 +220,13 @@ class TestRowCountCap:
     ) -> None:
         store = SeenStore(str(tmp_path / "hb.db"), max_rows=3)
         try:
-            # Insert 5 distinct rows with increasing received_at
-            # order (via the `now` parameter).
+            # Insert 5 distinct rows with increasing received_at order.
             for i in range(5):
                 signer = _signer(str(i), bytes([i + 1]) * 32)
-                hb, wire = _build_and_sign(
+                wire = _build_and_sign(
                     signer, f"https://n{i}.example.com", ts=now + i
                 )
-                store.accept(hb, wire, now=now + i)
+                store.accept(wire, now=now + i)
 
             # At most 3 rows remain, and the two oldest (i=0,1) are gone.
             assert store.count() == 3
@@ -227,6 +240,99 @@ class TestRowCountCap:
         finally:
             store.close()
 
+    def test_cap_does_not_evict_live_because_of_stale(
+        self, tmp_path: Path, now: int
+    ) -> None:
+        """Codex phase-2 P2: cap must be enforced against LIVE rows
+        only. If the DB holds a mix of stale + live, a fresh accept
+        that hits the cap should evict stale rows before ever
+        considering a live row.
+        """
+        store = SeenStore(
+            str(tmp_path / "hb.db"),
+            max_rows=2,
+            retention_seconds=100 * 86400,
+        )
+        try:
+            # Seed with a stale row (exp well in the past at list time).
+            stale_signer = _signer("stale", b"S" * 32)
+            stale_wire = _build_and_sign(
+                stale_signer,
+                "https://stale.example.com",
+                ts=now - 86400,
+                exp_delta=60,
+            )
+            store.accept(stale_wire, now=now - 86400)
+
+            # Two live rows fill the cap.
+            for i in range(2):
+                signer = _signer(f"live{i}", bytes([i + 1]) * 32)
+                wire = _build_and_sign(
+                    signer, f"https://live{i}.example.com", ts=now + i
+                )
+                store.accept(wire, now=now + i)
+
+            # Accept one more live row — this is over cap IF stale
+            # counts. Pre-fix: stale stays, one of live0/live1 evicted.
+            # Post-fix: stale pruned first, all 3 live rows kept + cap
+            # still over-by-one-live so oldest-live evicted.
+            new_signer = _signer("live-new", b"N" * 32)
+            new_wire = _build_and_sign(
+                new_signer, "https://live-new.example.com", ts=now + 10
+            )
+            store.accept(new_wire, now=now + 10)
+
+            # The stale row must be gone. The live rows must fill
+            # exactly the cap (2).
+            live_rows = store.list_recent(now=now + 10)
+            endpoints = sorted(r.endpoint for r in live_rows)
+            assert "https://stale.example.com" not in endpoints
+            # With cap=2 and 3 live rows inserted, oldest-live evicted.
+            assert len(live_rows) == 2
+            assert "https://live-new.example.com" in endpoints
+        finally:
+            store.close()
+
+
+class TestCrossProcessSharedDb:
+    def test_two_store_instances_same_db_newer_ts_wins(
+        self, tmp_path: Path, now: int
+    ) -> None:
+        """Codex phase-2 P3: two SeenStore instances over the same
+        SQLite file must still respect the "newer ts wins" invariant
+        under the ON CONFLICT clause.
+
+        This simulates two node processes each with its own SeenStore
+        pointing at a shared DB (unusual but possible deploy). The
+        in-process lock doesn't cross processes; the SQLite-level
+        constraint does.
+        """
+        db = str(tmp_path / "shared.db")
+        store_a = SeenStore(db)
+        store_b = SeenStore(db)
+        try:
+            signer = _signer()
+            wire_old = _build_and_sign(signer, ts=now)
+            wire_new = _build_and_sign(signer, ts=now + 120)
+
+            # Instance A accepts the NEWER wire first.
+            store_a.accept(wire_new, now=now + 120)
+            # Instance B accepts the older wire.
+            store_b.accept(wire_old, now=now + 120)
+
+            # Either instance, reading, must see the newer wire.
+            rows_a = store_a.list_recent(now=now + 120)
+            rows_b = store_b.list_recent(now=now + 120)
+            assert len(rows_a) == 1
+            assert len(rows_b) == 1
+            assert rows_a[0].ts == now + 120
+            assert rows_b[0].ts == now + 120
+            assert rows_a[0].wire == wire_new
+            assert rows_b[0].wire == wire_new
+        finally:
+            store_a.close()
+            store_b.close()
+
 
 # ---------------------------------------------------------------------------
 # Ping-list exposure
@@ -239,10 +345,8 @@ class TestPingList:
     ) -> None:
         for i in range(3):
             signer = _signer(str(i), bytes([i + 1]) * 32)
-            hb, wire = _build_and_sign(
-                signer, f"https://n{i}.example.com", ts=now + i
-            )
-            store.accept(hb, wire, now=now + i)
+            wire = _build_and_sign(signer, f"https://n{i}.example.com", ts=now + i)
+            store.accept(wire, now=now + i)
         urls = store.list_for_ping(limit=2, now=now + 5)
         assert urls == ["https://n2.example.com", "https://n1.example.com"]
 
@@ -258,18 +362,17 @@ class TestPingList:
 class TestForget:
     def test_forget_removes_row(self, store: SeenStore, now: int) -> None:
         signer = _signer()
-        hb, wire = _build_and_sign(signer, ts=now)
-        store.accept(hb, wire, now=now)
+        wire = _build_and_sign(signer, ts=now)
+        store.accept(wire, now=now)
         spk_hex = signer.get_signing_public_key_bytes().hex()
 
-        assert store.forget(spk_hex, hb.endpoint) is True
+        assert store.forget(spk_hex, "https://dmp.example.com") is True
         assert store.list_recent(now=now) == []
 
     def test_forget_idempotent(self, store: SeenStore, now: int) -> None:
         signer = _signer()
-        hb, wire = _build_and_sign(signer, ts=now)
-        store.accept(hb, wire, now=now)
+        wire = _build_and_sign(signer, ts=now)
+        store.accept(wire, now=now)
         spk_hex = signer.get_signing_public_key_bytes().hex()
-        store.forget(spk_hex, hb.endpoint)
-        # Second call returns False; store is unchanged.
-        assert store.forget(spk_hex, hb.endpoint) is False
+        store.forget(spk_hex, "https://dmp.example.com")
+        assert store.forget(spk_hex, "https://dmp.example.com") is False
