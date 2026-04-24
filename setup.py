@@ -65,8 +65,12 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "dmp = dmp.cli:main",
-            "dmp-node-admin = dmp.server.admin:main",
+            # Distribution is `dnsmesh` on PyPI; import path stays `dmp`
+            # (same split as pyyaml → yaml). The `dmp` command name was
+            # avoided because an unrelated `dmp` package on PyPI ships a
+            # binary of that name and the two would collide on $PATH.
+            "dnsmesh = dmp.cli:main",
+            "dnsmesh-node-admin = dmp.server.admin:main",
         ],
     },
 )

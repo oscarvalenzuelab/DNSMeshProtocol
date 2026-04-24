@@ -158,7 +158,7 @@ experimental for confidentiality-critical traffic.
 
 Actively shipping:
 
-- Command-line client (`dmp`, source install; PyPI release pending
+- Command-line client (`dnsmesh`, source install; PyPI release pending
   the beta gate).
 - Dockerized node with sqlite storage, metrics, rate limiting.
 - Forward-secret messaging via one-time prekeys (prekey-consumed
@@ -169,14 +169,14 @@ Actively shipping:
 - **Resolver resilience** — a `ResolverPool` with oracle-based
   demotion survives a subset of upstream DNS resolvers lying about
   DMP-shaped names.
-- **Multi-node federation** (client AND node side) — `dmp cluster
+- **Multi-node federation** (client AND node side) — `dnsmesh cluster
   pin / enable` switches the client onto a signed `ClusterManifest`;
   writes quorum across the node set, reads union with dedup, refresh
   is atomic across reader + writer. Nodes run pull-based anti-entropy
   against their peers so records propagate across the cluster even
   after a node restart. `docker-compose.cluster.yml` is a
   checked-in 3-node operator starting point.
-- **Bootstrap discovery** — `dmp bootstrap discover me@my-domain
+- **Bootstrap discovery** — `dnsmesh bootstrap discover me@my-domain
   --auto-pin` resolves the cluster from a user domain via a signed
   `_dmp.<user_domain>` TXT record, verifies the two-hop trust chain
   (bootstrap signer → cluster operator), and cuts over atomically.

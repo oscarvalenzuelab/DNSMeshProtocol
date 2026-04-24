@@ -63,7 +63,7 @@ CHALLENGE_TTL_SECONDS = 60
 
 # Default token lifetime issued via self-service. 90 days — rotate or
 # re-register before expiry. Admins who want a different default can
-# mint via dmp-node-admin which accepts --expires.
+# mint via dnsmesh-node-admin which accepts --expires.
 DEFAULT_SELF_SERVICE_EXPIRY_SECONDS = 90 * 86400
 
 

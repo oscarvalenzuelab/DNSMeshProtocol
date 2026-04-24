@@ -97,7 +97,7 @@ class TestInitAndIdentity:
     def test_init_generates_unique_salts_per_identity(
         self, config_home, tmp_path, monkeypatch
     ):
-        """Two independent `dmp init` runs must produce distinct salts."""
+        """Two independent `dnsmesh init` runs must produce distinct salts."""
         cli.main(["init", "alice", "--endpoint", "http://x"])
         first = yaml.safe_load((config_home / "config.yaml").read_text())["kdf_salt"]
 
@@ -1058,8 +1058,8 @@ class TestLoadWithoutConfig:
             cli.main(["resolvers", "list"])
         assert exc.value.code == 1
         err = capsys.readouterr().err
-        # The hint should mention `dmp init` so users know what to do.
-        assert "dmp init" in err
+        # The hint should mention `dnsmesh init` so users know what to do.
+        assert "dnsmesh init" in err
 
 
 class TestDnsResolvers:
@@ -2756,8 +2756,8 @@ class TestBootstrapCommand:
         out = capsys.readouterr().out
         assert "alice@example.com" in out
         assert "mesh.example.com" in out
-        assert "dmp cluster pin" in out
-        assert "dmp cluster enable" in out
+        assert "dnsmesh cluster pin" in out
+        assert "dnsmesh cluster enable" in out
         assert "--auto-pin" in out
 
         # No config mutation: cluster_* fields remain empty.

@@ -50,15 +50,15 @@ Mount the key file read-only. The node only needs read access and
 never modifies it.
 
 ```bash
-docker run -d --name dmp-node \
+docker run -d --name dnsmesh-node \
   -e DMP_HEARTBEAT_ENABLED=1 \
   -e DMP_HEARTBEAT_SELF_ENDPOINT=https://dmp.example.com \
   -e DMP_HEARTBEAT_OPERATOR_KEY_PATH=/etc/dmp/operator.hex \
   -e DMP_HEARTBEAT_SEEDS=https://seed1.example.com,https://seed2.example.com \
   -v $(pwd)/operator-ed25519.hex:/etc/dmp/operator.hex:ro \
-  -v dmp-data:/var/lib/dmp \
+  -v dnsmesh-data:/var/lib/dmp \
   -p 53:5353/udp -p 8053:8053/tcp \
-  oscarvalenzuelab/dmp-node:latest
+  oscarvalenzuelab/dnsmesh-node:latest
 ```
 
 ## Env reference
@@ -164,10 +164,10 @@ Typical cron:
 */5 * * * * /usr/local/bin/python /opt/dmp/examples/directory_aggregator.py \
     --seed https://dmp.example.com \
     --seed https://dmp.otherop.org \
-    --out-dir /var/www/dmp-directory
+    --out-dir /var/www/dnsmesh-directory
 ```
 
-Serve `/var/www/dmp-directory/` with nginx / Caddy / GitHub Pages /
+Serve `/var/www/dnsmesh-directory/` with nginx / Caddy / GitHub Pages /
 wherever. `feed.json` is re-verifiable by any downstream consumer
 without re-fetching the seeds — it just carries the original
 signed wires.

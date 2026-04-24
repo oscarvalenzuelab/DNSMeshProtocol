@@ -9,7 +9,7 @@
 #
 # To refresh: `docker buildx imagetools inspect python:3.11-slim` and
 # copy the top-level `Digest:` value (the multi-arch index). Verify the
-# image still builds with `docker build -t dmp-node:latest .` before
+# image still builds with `docker build -t dnsmesh-node:latest .` before
 # landing the bump.
 FROM python:3.11-slim@sha256:233de06753d30d120b1a3ce359d8d3be8bda78524cd8f520c99883bfe33964cf AS builder
 
@@ -55,7 +55,7 @@ FROM python:3.11-slim@sha256:233de06753d30d120b1a3ce359d8d3be8bda78524cd8f520c99
 ARG DMP_VERSION=dev
 ARG DMP_REVISION=unknown
 ARG DMP_CREATED=""
-LABEL org.opencontainers.image.title="dmp-node" \
+LABEL org.opencontainers.image.title="dnsmesh-node" \
       org.opencontainers.image.description="DNS Mesh Protocol node — federated end-to-end encrypted messaging over DNS." \
       org.opencontainers.image.source="https://github.com/oscarvalenzuelab/DNSMeshProtocol" \
       org.opencontainers.image.url="https://oscarvalenzuelab.github.io/DNSMeshProtocol/" \

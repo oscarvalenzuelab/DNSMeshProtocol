@@ -65,7 +65,7 @@ Three token classes as of M5.5:
   manifests, bootstrap records) but end-user writes are handled by
   per-user tokens instead.
 - **Per-user tokens (M5.5, multi-tenant mode only).** Minted via
-  `dmp-node-admin token issue` or self-service
+  `dnsmesh-node-admin token issue` or self-service
   `POST /v1/registration/confirm`. Each is scope-bound to a subject
   (`alice@example.com` can only write under her namespace). Never
   persisted to disk on the node — only `sha256(token)` in
@@ -211,7 +211,7 @@ The supply-chain / CVE story is only useful if someone acts on it.
   existing peers. Check `CHANGELOG.md` for any breaking change notes.
 - **Pin by digest in production.** The Dockerfile already pins the
   base image by sha256; your deployment YAML / Compose file should
-  pin the `dmp-node` image by digest too (not by `:latest`).
+  pin the `dnsmesh-node` image by digest too (not by `:latest`).
 
 ## Cross-references
 

@@ -345,7 +345,7 @@ Rationale: the alternative (an expiring cap, previously one year)
 created a silent rotation regression. `IdentityRecord` publishes
 have append semantics; nothing forbids a compromised keyholder from
 re-publishing the old IdentityRecord indefinitely. The matching
-`RevocationRecord` lets `dmp identity fetch` filter that old record
+`RevocationRecord` lets `dnsmesh identity fetch` filter that old record
 out. If the revocation filter silently drops stale revocations, then
 once the cap expires on a client it sees BOTH old + new
 IdentityRecords as valid and reports "ambiguous — re-pin
@@ -422,7 +422,7 @@ The external cryptographic audit is asked to review, at minimum:
 Only **user identity rotation** has a CLI subcommand in M5.4:
 
 ```
-dmp identity rotate --experimental [--new-passphrase-file <path>] [--yes]
+dnsmesh identity rotate --experimental [--new-passphrase-file <path>] [--yes]
 ```
 
 - Without `--experimental`, the command errors out with a clear
@@ -437,7 +437,7 @@ dmp identity rotate --experimental [--new-passphrase-file <path>] [--yes]
   deliberate: until all pinned contacts are known to have migrated
   (manually re-pinned or rotation-chain-enabled), the user still needs
   the old passphrase to send with the key their contacts trust. Manual
-  step: re-run `dmp init --force` with the new passphrase once the
+  step: re-run `dnsmesh init --force` with the new passphrase once the
   migration is complete.
 
 **Cluster operator and bootstrap-signer rotation** have a wire format

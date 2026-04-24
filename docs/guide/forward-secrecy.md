@@ -14,7 +14,7 @@ prekey pool.
 
 ## How it works
 
-1. Bob runs `dmp identity refresh-prekeys`. The client:
+1. Bob runs `dnsmesh identity refresh-prekeys`. The client:
    - Generates 25 one-time X25519 keypairs (count is configurable).
    - Signs each one with bob's Ed25519 identity key.
    - Publishes the signed public halves as a TXT RRset at
@@ -28,7 +28,7 @@ prekey pool.
    - Picks one random verified prekey.
    - Does ECDH(sender_ephemeral_sk, prekey_pub).
    - Writes `prekey_id` into the signed slot manifest.
-3. Bob's `dmp recv`:
+3. Bob's `dnsmesh recv`:
    - Parses the manifest, finds `prekey_id`.
    - Looks up the matching private key in his local store.
    - Does ECDH(prekey_sk, sender_ephemeral_pk) — same shared secret.
@@ -47,7 +47,7 @@ Senders pick randomly from the live RRset. If the pool drains to zero
 (everyone consumed everything and nobody refreshed), new senders fall
 back to bob's long-term key — which is *not* forward-secret.
 
-Run `dmp identity refresh-prekeys` periodically, or before you expect
+Run `dnsmesh identity refresh-prekeys` periodically, or before you expect
 a burst of traffic. The default of 25 stays under the node's default
 HTTP rate limit (burst 100) so one command publishes the whole pool.
 

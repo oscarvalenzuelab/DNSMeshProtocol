@@ -16,8 +16,8 @@ nav_order: 11
 
 There is no way today for a would-be user on the internet to discover
 which DMP nodes exist and which are healthy. Every DMP discovery
-primitive currently shipped (`dmp bootstrap discover <zone>`,
-`dmp cluster fetch`, cluster-manifest gossip in M3.3) resolves *a
+primitive currently shipped (`dnsmesh bootstrap discover <zone>`,
+`dnsmesh cluster fetch`, cluster-manifest gossip in M3.3) resolves *a
 specific operator's* nodes from a zone the user already knows.
 Bootstrapping from zero — "I want to try DMP, which nodes exist?" —
 requires out-of-band knowledge.

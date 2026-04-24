@@ -43,8 +43,8 @@ ciphertext to a node to publish as TXT records.
       ├─ username                      ├─ mailbox manifests            ├─ private keys
       └─ pinned contacts               └─ encrypted chunks             └─ received cache
 
-         dmp init                      [HTTP publish API]              dmp identity fetch
-         dmp send bob    ─── POST ──►  stores ciphertext   ◄─── DNS ───  dmp recv  (decrypts locally)
+         dnsmesh init                      [HTTP publish API]              dnsmesh identity fetch
+         dnsmesh send bob    ─── POST ──►  stores ciphertext   ◄─── DNS ───  dnsmesh recv  (decrypts locally)
 ```
 
 Everything on the wire is either **signed** (the node cannot forge it)
@@ -61,8 +61,8 @@ keep your secrets.
 
 | Role | What they run | Where |
 |---|---|---|
-| **User** | `dmp` CLI / library (eventually an app) | Their laptop or phone |
-| **Node operator** | `dmp-node` Docker container | A VPS, a Raspberry Pi, a Droplet — anywhere reachable on UDP 53 |
+| **User** | `dnsmesh` CLI / `dmp` Python library (eventually an app) | Their laptop or phone |
+| **Node operator** | `dnsmesh-node` Docker container | A VPS, a Raspberry Pi, a Droplet — anywhere reachable on UDP 53 |
 
 A user and a node operator *can* be the same person — they don't have
 to be.
@@ -106,11 +106,11 @@ For users who don't want to operate infrastructure.
 
 ```bash
 pip install dnsmeshprotocol     # (once published; today: pip install -e .)
-dmp init alice --domain dmp.yournode.com
-dmp identity publish
+dnsmesh init alice --domain dmp.yournode.com
+dnsmesh identity publish
 ```
 
-The `dmp` CLI reaches out to `dmp.yournode.com` over the HTTPS publish
+The `dnsmesh` CLI reaches out to `dmp.yournode.com` over the HTTPS publish
 API, hands it a signed `IdentityRecord`, and the node stores it as a
 TXT record. The user shares their address (`alice@dmp.yournode.com`)
 with contacts. Done.
@@ -123,12 +123,12 @@ enabled (recommended). That's the only secret they need.
 For operators who want a node for themselves, a team, or a community.
 
 ```bash
-docker run -d --name dmp-node \
+docker run -d --name dnsmesh-node \
   -p 53:5353/udp \
   -p 8053:8053/tcp \
   -e DMP_OPERATOR_TOKEN=$(openssl rand -hex 32) \
-  -v dmp-data:/var/lib/dmp \
-  oscarvalenzuelab/dmp-node:latest
+  -v dnsmesh-data:/var/lib/dmp \
+  oscarvalenzuelab/dnsmesh-node:latest
 ```
 
 Point a DNS A record at the VPS's public IP. Front the HTTP port with
@@ -174,24 +174,24 @@ Concrete flow, from scratch:
    stores the private halves in `~/.dmp/config.yaml`. The private keys
    **never leave the laptop**.
    ```bash
-   dmp init alice --domain example.com
+   dnsmesh init alice --domain example.com
    ```
 4. **Publish the public keys.** The CLI signs an `IdentityRecord`
    locally and POSTs it to the node. The node stores it as a TXT
    record that any DNS client can now resolve.
    ```bash
-   dmp identity publish
+   dnsmesh identity publish
    ```
 5. **Share the address.** Tell friends: *I'm `alice@example.com`.*
 6. **Friends fetch and pin.** Their client resolves the TXT record,
    verifies the Ed25519 signature, stores the public keys as a
    contact.
    ```bash
-   dmp identity fetch alice@example.com --add
+   dnsmesh identity fetch alice@example.com --add
    ```
-7. **Exchange messages.** `dmp send bob "hello"` on Alice's side →
+7. **Exchange messages.** `dnsmesh send bob "hello"` on Alice's side →
    encrypt locally, chunk, publish chunks as TXT records keyed by a
-   shared hash both sides can derive. `dmp recv` on Bob's side →
+   shared hash both sides can derive. `dnsmesh recv` on Bob's side →
    resolve the chunks, verify, decrypt locally.
 
 No account creation on the node side at any point. Users self-publish
@@ -204,7 +204,7 @@ picked via `DMP_AUTH_MODE`:
 
 - **`open`** (default when no token is configured). No auth, no
   TokenStore, no registration endpoints. Dev / trusted-LAN only.
-  `dmp identity publish` works unauthenticated. Suitable for
+  `dnsmesh identity publish` works unauthenticated. Suitable for
   running a single-user node on your own laptop.
 
 - **`legacy`** (implicit when `DMP_OPERATOR_TOKEN` / `DMP_HTTP_TOKEN`
@@ -216,8 +216,8 @@ picked via `DMP_AUTH_MODE`:
 
 - **`multi-tenant`** (opt-in via `DMP_AUTH_MODE=multi-tenant`).
   Per-user publish tokens. Each user has their own bearer, minted
-  either by the operator (`dmp-node-admin token issue`) or
-  self-service (the user runs `dmp register`, proves key control
+  either by the operator (`dnsmesh-node-admin token issue`) or
+  self-service (the user runs `dnsmesh register`, proves key control
   with a signed challenge, and the node mints a token bound to
   their subject). Publish requests are scope-checked:
     - Alice's token can POST `dmp.alice.example.com` — her identity

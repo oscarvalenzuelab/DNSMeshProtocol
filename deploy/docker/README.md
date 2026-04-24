@@ -1,10 +1,10 @@
-# Running `dmp-node` as a Docker image
+# Running `dnsmesh-node` as a Docker image
 
-Published image: **`oscarvalenzuelab/dmp-node`** on Docker Hub (tags:
+Published image: **`oscarvalenzuelab/dnsmesh-node`** on Docker Hub (tags:
 `latest`, `main`, and `<semver>` for tagged releases).
 
 This bundle is the reference recipe for a production-style *single-node*
-deploy of `dmp-node`. It is intentionally platform-agnostic: the image
+deploy of `dnsmesh-node`. It is intentionally platform-agnostic: the image
 runs anywhere docker does — DigitalOcean Droplets, AWS EC2 / Lightsail,
 Hetzner, bare-metal, your laptop — as long as the host can expose UDP
 on the DNS port. (Most serverless / PaaS tiers, including DigitalOcean
@@ -22,7 +22,7 @@ application needs to send and receive over DMP.
 export DMP_NODE_HOSTNAME=dmp.example.com
 export DMP_HTTP_TOKEN=$(openssl rand -hex 32)
 
-# Pull + start (the compose file pulls dmp-node:latest + caddy:2).
+# Pull + start (the compose file pulls dnsmesh-node:latest + caddy:2).
 curl -fsSL https://raw.githubusercontent.com/oscarvalenzuelab/DNSMeshProtocol/main/deploy/docker/compose.yml \
     -o compose.yml
 curl -fsSL https://raw.githubusercontent.com/oscarvalenzuelab/DNSMeshProtocol/main/Caddyfile \
@@ -32,7 +32,7 @@ docker compose up -d
 
 The stack:
 
-- **`dmp-node`**: UDP 53 (DMP authoritative DNS), internal 8053 for
+- **`dnsmesh-node`**: UDP 53 (DMP authoritative DNS), internal 8053 for
   the publish API (Caddy-proxied, not exposed to the host).
 - **`caddy`**: 80 (ACME HTTP-01) + 443/tcp + 443/udp (HTTPS + HTTP/3),
   auto-ACME with Let's Encrypt.
@@ -55,12 +55,12 @@ dig @$DMP_NODE_HOSTNAME hello.example TXT +short
 If you don't want Caddy or compose, the image runs standalone:
 
 ```bash
-docker run -d --name dmp-node \
+docker run -d --name dnsmesh-node \
   -p 53:5353/udp \
   -p 8053:8053/tcp \
   -e DMP_HTTP_TOKEN=$(openssl rand -hex 32) \
-  -v dmp-data:/var/lib/dmp \
-  oscarvalenzuelab/dmp-node:latest
+  -v dnsmesh-data:/var/lib/dmp \
+  oscarvalenzuelab/dnsmesh-node:latest
 ```
 
 With this shape, the HTTP publish API is exposed directly on TCP 8053

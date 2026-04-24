@@ -14,7 +14,7 @@ nav_order: 1
 ## Build the image
 
 ```bash
-docker build -t dmp-node:latest .
+docker build -t dnsmesh-node:latest .
 ```
 
 Multi-stage build on `python:3.11-slim`. Final image runs as a
@@ -24,15 +24,15 @@ non-root `dmp` user, exposes `5353/udp` and `8053/tcp`, and has a
 ## Run a single node
 
 ```bash
-docker run -d --name dmp-node \
+docker run -d --name dnsmesh-node \
   -p 5353:5353/udp -p 8053:8053/tcp \
-  -v dmp-data:/var/lib/dmp \
-  dmp-node:latest
+  -v dnsmesh-data:/var/lib/dmp \
+  dnsmesh-node:latest
 ```
 
 | Mount | Purpose |
 |---|---|
-| `-v dmp-data:/var/lib/dmp` | Persistent sqlite store (message RRsets, replay state) |
+| `-v dnsmesh-data:/var/lib/dmp` | Persistent sqlite store (message RRsets, replay state) |
 
 Check it's up:
 
@@ -47,13 +47,13 @@ curl http://127.0.0.1:8053/metrics   # Prometheus text
 
 ```yaml
 services:
-  dmp-node:
+  dnsmesh-node:
     build: .
     ports:
       - "5353:5353/udp"
       - "8053:8053/tcp"
     volumes:
-      - dmp-data:/var/lib/dmp
+      - dnsmesh-data:/var/lib/dmp
     environment:
       DMP_LOG_LEVEL: INFO
       # (commented-out knobs for rate limits, bearer token, log format)
@@ -62,14 +62,14 @@ services:
       interval: 30s
 
 volumes:
-  dmp-data:
+  dnsmesh-data:
 ```
 
 Bring it up:
 
 ```bash
 docker compose up -d
-docker compose logs -f dmp-node
+docker compose logs -f dnsmesh-node
 docker compose down     # stop; volume persists
 ```
 
@@ -113,8 +113,8 @@ echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf
 
 ```bash
 git pull
-docker build -t dmp-node:latest .
-docker compose up -d dmp-node
+docker build -t dnsmesh-node:latest .
+docker compose up -d dnsmesh-node
 ```
 
 The sqlite schema migrates itself on open — no manual step. Existing

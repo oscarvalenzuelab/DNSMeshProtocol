@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""End-to-end demo against a real dmp-node Docker container.
+"""End-to-end demo against a real dnsmesh-node Docker container.
 
 Drives two DMPClient instances (Alice, Bob) through a locally-running
-dmp-node container via the node's HTTP publish API + UDP DNS resolver.
+dnsmesh-node container via the node's HTTP publish API + UDP DNS resolver.
 Exercises three flows:
 
   1. Baseline send/receive (pre-rotation).
@@ -12,7 +12,7 @@ Exercises three flows:
      old key, and Bob's client refuses further messages signed with it.
 
 Prerequisites:
-  docker build -t dmp-node:latest .
+  docker build -t dnsmesh-node:latest .
 
 Usage:
   python examples/docker_e2e_demo.py
@@ -47,7 +47,7 @@ from dmp.core.rotation import (  # noqa: E402
 )
 
 DOMAIN = "mesh.demo"
-IMAGE = "dmp-node:latest"
+IMAGE = "dnsmesh-node:latest"
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +56,7 @@ IMAGE = "dmp-node:latest"
 
 
 class HttpWriter:
-    """Publishes TXT records to a dmp-node via its HTTP API."""
+    """Publishes TXT records to a dnsmesh-node via its HTTP API."""
 
     def __init__(self, base_url: str, token: Optional[str] = None) -> None:
         import requests
@@ -289,7 +289,7 @@ def step(n: int, title: str) -> None:
 
 
 def main() -> int:
-    print("Starting dmp-node container…")
+    print("Starting dnsmesh-node container…")
     node = start_node()
     print(
         f"  name={node['name']}  http=127.0.0.1:{node['http_port']}  dns=127.0.0.1:{node['dns_port']}"

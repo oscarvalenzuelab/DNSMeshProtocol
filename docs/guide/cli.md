@@ -28,7 +28,7 @@ identity even if you remember the passphrase.
 ### Config fields of note
 
 - `dns_host` / `dns_port`: legacy single-resolver config. Used by both
-  `_make_client` (for send/recv) and `dmp identity fetch` when
+  `_make_client` (for send/recv) and `dnsmesh identity fetch` when
   `dns_resolvers` is empty.
 - `dns_resolvers`: list of IP literals (optionally with port) that
   populates a `ResolverPool` across failover-eligible upstreams. When
@@ -46,18 +46,18 @@ identity even if you remember the passphrase.
   `FanoutWriter` + `UnionReader` across the named nodes. When False
   (the default on a fresh pin, and on any older config missing the
   field), the client uses the legacy single-endpoint path regardless
-  of pinned anchors. Flip this on via `dmp cluster enable` (runs a
+  of pinned anchors. Flip this on via `dnsmesh cluster enable` (runs a
   live manifest fetch sanity check first) and off via
-  `dmp cluster disable`.
+  `dnsmesh cluster disable`.
 - `cluster_refresh_interval`: seconds between background manifest
   refresh ticks. Default 3600 (once/hour). Set to 0 to disable the
-  refresh thread (a manual `dmp cluster fetch` / restart is then
+  refresh thread (a manual `dnsmesh cluster fetch` / restart is then
   needed to pick up node-set changes).
 - `cluster_node_token`: optional bearer token for the per-node HTTP
   publish writers. Falls back to `http_token` when empty.
 - `bootstrap_user_domain` + `bootstrap_signer_spk`: anchors for
   bootstrap discovery (M3.2-wire). Pinning these with
-  `dmp bootstrap pin <user_domain> <signer_spk_hex>` lets the client
+  `dnsmesh bootstrap pin <user_domain> <signer_spk_hex>` lets the client
   translate `alice@<user_domain>` addresses into concrete cluster
   anchors via a signed TXT record at `_dmp.<user_domain>`. See
   [Bootstrap discovery](#bootstrap-discovery). This is a **separate
@@ -68,12 +68,12 @@ identity even if you remember the passphrase.
 
 ## Subcommands
 
-### `dmp init`
+### `dnsmesh init`
 
 Create a fresh config.
 
 ```
-dmp init <username> [--domain D] [--endpoint URL] [--http-token T]
+dnsmesh init <username> [--domain D] [--endpoint URL] [--http-token T]
                     [--dns-host H] [--dns-port P]
                     [--dns-resolvers IP[:PORT],IP[:PORT],...]
                     [--identity-domain ZONE]
@@ -101,7 +101,7 @@ When `--dns-resolvers` is set, the CLI wires a `ResolverPool` with
 per-host health tracking and automatic failover; `--dns-host` /
 `--dns-port` are ignored for reads. When it is absent, the CLI falls
 back to the single-host reader for back-compat. Bad parses (non-IP
-literal, malformed `host:port`, port out of range) fail `dmp init`
+literal, malformed `host:port`, port out of range) fail `dnsmesh init`
 with exit code 1 before any config is written.
 
 Pool-port caveat: `ResolverPool` today takes a single port for every
@@ -109,16 +109,16 @@ upstream. If the parsed entries carry mixed ports, the first explicit
 port wins and the rest of the pool inherits it. Pools of same-port
 resolvers (all `:53`, or all default) are unaffected.
 
-### `dmp identity`
+### `dnsmesh identity`
 
 | Subcommand | Purpose |
 |---|---|
-| `dmp identity show [--json]` | Print this identity's public keys |
-| `dmp identity publish [--ttl N]` | Publish the signed identity record to DNS |
-| `dmp identity refresh-prekeys [--count N] [--ttl S]` | Generate and publish a one-time prekey pool |
-| `dmp identity fetch <user> [--domain D] [--add] [--accept-fingerprint F] [--via-bootstrap] [--json]` | Resolve someone else's identity |
+| `dnsmesh identity show [--json]` | Print this identity's public keys |
+| `dnsmesh identity publish [--ttl N]` | Publish the signed identity record to DNS |
+| `dnsmesh identity refresh-prekeys [--count N] [--ttl S]` | Generate and publish a one-time prekey pool |
+| `dnsmesh identity fetch <user> [--domain D] [--add] [--accept-fingerprint F] [--via-bootstrap] [--json]` | Resolve someone else's identity |
 
-`dmp identity fetch` accepts either a plain `<user>` (hash-based lookup
+`dnsmesh identity fetch` accepts either a plain `<user>` (hash-based lookup
 under the shared mesh domain — TOFU) or a zone-anchored
 `<user>@<zone>` (queries `dmp.<zone>` — anchored to that DNS zone's
 ownership).
@@ -129,28 +129,28 @@ refused and fingerprints are printed on stderr. Re-run with
 
 `--via-bootstrap` (M3.2-wire): when the address is in `<user>@<host>`
 form and a bootstrap signer is pinned for `<host>` via
-`dmp bootstrap pin`, the command discovers the cluster serving that
+`dnsmesh bootstrap pin`, the command discovers the cluster serving that
 host on-the-fly and routes the identity query through a one-shot
 cluster client. No config is written — this is a lookup convenience.
-For a permanent cluster pin, use `dmp bootstrap discover --auto-pin`
+For a permanent cluster pin, use `dnsmesh bootstrap discover --auto-pin`
 instead.
 
-### `dmp contacts`
+### `dnsmesh contacts`
 
 | Subcommand | Purpose |
 |---|---|
-| `dmp contacts add <name> <x25519_hex> [--signing-key <ed25519_hex>]` | Pin a contact |
-| `dmp contacts list` | Show pinned contacts; marks each pinned or UNPINNED |
+| `dnsmesh contacts add <name> <x25519_hex> [--signing-key <ed25519_hex>]` | Pin a contact |
+| `dnsmesh contacts list` | Show pinned contacts; marks each pinned or UNPINNED |
 
 Adding a contact **without** `--signing-key` prints a stderr warning
 and leaves the client in TOFU mode for incoming messages. Prefer
-`dmp identity fetch <user> --add`, which pins both keys automatically.
+`dnsmesh identity fetch <user> --add`, which pins both keys automatically.
 
-### `dmp send` / `dmp recv`
+### `dnsmesh send` / `dnsmesh recv`
 
 ```
-dmp send <recipient> <message>
-dmp recv
+dnsmesh send <recipient> <message>
+dnsmesh recv
 ```
 
 `send` auto-selects a forward-secret path when the contact has a
@@ -162,15 +162,15 @@ replay cache, fetches chunks, runs cross-chunk erasure decode, and
 decrypts. Messages that pass all checks are printed; everything else
 is silently dropped.
 
-### `dmp resolvers`
+### `dnsmesh resolvers`
 
 Manage the upstream DNS resolver list the client uses to read chunks,
 manifests, and identity records.
 
 | Subcommand | Purpose |
 |---|---|
-| `dmp resolvers discover [--save] [--timeout S]` | Probe well-known public resolvers (Google, Cloudflare, Quad9, OpenDNS — 8 IPv4 hosts total) and print the working set |
-| `dmp resolvers list` | Print the currently configured `dns_resolvers` |
+| `dnsmesh resolvers discover [--save] [--timeout S]` | Probe well-known public resolvers (Google, Cloudflare, Quad9, OpenDNS — 8 IPv4 hosts total) and print the working set |
+| `dnsmesh resolvers list` | Print the currently configured `dns_resolvers` |
 
 `discover` sends a cheap TXT query for a stable well-known name to
 each candidate with a `--timeout` (default 2.0 s) budget. Resolvers
@@ -183,20 +183,20 @@ captive or restricted network to sanity-check which upstreams are
 reachable. With `--save`, the working list is written to
 `config.yaml` as `dns_resolvers`. Once M1.2 lands, the normal read
 path wires a multi-resolver `ResolverPool` over that list instead of
-the single `--dns-host` upstream, so `dmp send` / `dmp recv` benefit
+the single `--dns-host` upstream, so `dnsmesh send` / `dnsmesh recv` benefit
 automatically.
 
 Example:
 
 ```
-$ dmp resolvers discover
+$ dnsmesh resolvers discover
 discovered 4 working resolver(s):
   1.1.1.1
   8.8.8.8
   9.9.9.9
   208.67.222.222
 
-$ dmp resolvers discover --save
+$ dnsmesh resolvers discover --save
 discovered 4 working resolver(s):
   1.1.1.1
   8.8.8.8
@@ -204,14 +204,14 @@ discovered 4 working resolver(s):
   208.67.222.222
 saved 4 resolvers to /home/alice/.dmp/config.yaml
 
-$ dmp resolvers list
+$ dnsmesh resolvers list
 1.1.1.1
 8.8.8.8
 9.9.9.9
 208.67.222.222
 ```
 
-### `dmp cluster`
+### `dnsmesh cluster`
 
 Federation mode (M2.wire). A cluster is a set of nodes collectively
 serving the same mailbox data; a client that pins the operator's
@@ -221,22 +221,22 @@ nodes can go down without the client caring.
 
 | Subcommand | Purpose |
 |---|---|
-| `dmp cluster pin <operator_spk_hex> <base_domain>` | Store trust anchors in config (does NOT activate cluster mode) |
-| `dmp cluster fetch [--save]` | One-shot fetch + verify of the cluster manifest; print summary |
-| `dmp cluster enable` | Activate cluster mode after a successful manifest fetch (flips `cluster_enabled=True`) |
-| `dmp cluster disable` | Deactivate cluster mode without clearing the pinned anchors (flips `cluster_enabled=False`) |
-| `dmp cluster status` | Build the cluster client; print per-node fan-out/union health + activation flag |
+| `dnsmesh cluster pin <operator_spk_hex> <base_domain>` | Store trust anchors in config (does NOT activate cluster mode) |
+| `dnsmesh cluster fetch [--save]` | One-shot fetch + verify of the cluster manifest; print summary |
+| `dnsmesh cluster enable` | Activate cluster mode after a successful manifest fetch (flips `cluster_enabled=True`) |
+| `dnsmesh cluster disable` | Deactivate cluster mode without clearing the pinned anchors (flips `cluster_enabled=False`) |
+| `dnsmesh cluster status` | Build the cluster client; print per-node fan-out/union health + activation flag |
 
 Activation is a two-step process so that pinning an operator whose
 manifest isn't yet published doesn't wedge every subsequent
 networked command. The flow is:
 
-1. `dmp cluster pin` — write the anchors. Leaves `cluster_enabled`
+1. `dnsmesh cluster pin` — write the anchors. Leaves `cluster_enabled`
    at its default (False).
-2. `dmp cluster fetch` — confirm the manifest is published, signed
+2. `dnsmesh cluster fetch` — confirm the manifest is published, signed
    by the pinned key, and not expired. Pure diagnostic; no state
    change.
-3. `dmp cluster enable` — re-runs the fetch as a sanity check and,
+3. `dnsmesh cluster enable` — re-runs the fetch as a sanity check and,
    on success, flips `cluster_enabled=True`. On failure, exits 2
    and leaves the flag unchanged, so a failed enable never locks
    the CLI out of its legacy endpoint.
@@ -267,7 +267,7 @@ a quick post-rollover health check.
 `disable` is also idempotent and leaves the pinned anchors alone.
 Running it is the fastest way back to the legacy single-endpoint
 path if cluster mode misbehaves; re-enabling later is a single
-`dmp cluster enable` call.
+`dnsmesh cluster enable` call.
 
 `status` builds a short-lived `ClusterClient` (no background
 refresh thread) and prints the activation flag (`cluster_enabled:
@@ -277,8 +277,8 @@ failure count, last error, and endpoint. Works regardless of
 `cluster_enabled`, so operators can inspect the cluster before
 cutting over.
 
-Mode switch: `_make_client` (called by `dmp send`, `dmp recv`,
-`dmp identity publish`, etc.) reads `cluster_base_domain`,
+Mode switch: `_make_client` (called by `dnsmesh send`, `dnsmesh recv`,
+`dnsmesh identity publish`, etc.) reads `cluster_base_domain`,
 `cluster_operator_spk`, AND `cluster_enabled` at every invocation.
 When all three are set it fetches + verifies the manifest on the
 spot and wires a cluster client into the DMPClient. When any is
@@ -294,13 +294,13 @@ reads and writes keep working against the last known node set.
 Example:
 
 ```
-$ dmp cluster pin 3c6a... mesh.example.com
+$ dnsmesh cluster pin 3c6a... mesh.example.com
 pinned cluster operator key and base domain mesh.example.com
 next:
-  1. `dmp cluster fetch` to verify the manifest resolves
-  2. `dmp cluster enable` to cut over from the legacy endpoint
+  1. `dnsmesh cluster fetch` to verify the manifest resolves
+  2. `dnsmesh cluster enable` to cut over from the legacy endpoint
 
-$ dmp cluster fetch
+$ dnsmesh cluster fetch
 cluster: mesh.example.com
   seq:   7
   exp:   1816000000
@@ -309,14 +309,14 @@ cluster: mesh.example.com
     n02  http=https://n2.mesh.example.com:8053  dns=203.0.113.11:53
     n03  http=https://n3.mesh.example.com:8053  dns=(via bootstrap reader)
 
-$ dmp cluster enable
+$ dnsmesh cluster enable
 cluster: mesh.example.com
   seq:   7
   exp:   1816000000
   nodes: 3
 cluster mode enabled.
 
-$ dmp cluster status
+$ dnsmesh cluster status
 cluster: mesh.example.com (seq=7, exp=1816000000)
 cluster_enabled: True
 fan-out writer snapshot:
@@ -328,7 +328,7 @@ union reader snapshot:
   n02  http=https://n2.mesh.example.com:8053  fails=0  err=None
   n03  http=https://n3.mesh.example.com:8053  fails=0  err=None
 
-$ dmp cluster disable
+$ dnsmesh cluster disable
 cluster mode disabled — next commands will use the legacy endpoint path.
 ```
 
@@ -340,10 +340,10 @@ Upgrading a config from that era does **not** silently activate
 cluster mode. The CLI loads such configs with `cluster_enabled=False`,
 which means:
 
-- `dmp send` / `dmp recv` / `dmp identity publish` keep using the
+- `dnsmesh send` / `dnsmesh recv` / `dnsmesh identity publish` keep using the
   legacy single-endpoint path (`config.endpoint`) even with both
   cluster anchors present.
-- The operator must run `dmp cluster enable` once to cut over. That
+- The operator must run `dnsmesh cluster enable` once to cut over. That
   call re-verifies the manifest against the pinned anchors; on
   success it flips `cluster_enabled=True` and persists, so the
   next networked command uses the cluster path.
@@ -358,7 +358,7 @@ The M3.2-wire `bootstrap_user_domain` / `bootstrap_signer_spk`
 fields are purely additive. An existing cluster-only config (both
 `cluster_*` anchors pinned, `cluster_enabled=True`) is unchanged by
 the upgrade — it continues to use the pinned cluster path. The
-bootstrap-discovery commands (`dmp bootstrap pin / fetch / discover`)
+bootstrap-discovery commands (`dnsmesh bootstrap pin / fetch / discover`)
 are opt-in; until you pin a bootstrap signer, the CLI behavior is
 identical to pre-M3.2.
 
@@ -374,7 +374,7 @@ unauthenticated). The per-node reader is a UDP DNS reader pointed at
 `dns_endpoint` fall back to the configured bootstrap reader (the
 same resolver pool used to fetch the manifest).
 
-### `dmp bootstrap`
+### `dnsmesh bootstrap`
 
 Bootstrap discovery (M3.2-wire). A bootstrap record is a signed TXT
 record at `_dmp.<user_domain>` that points the user domain at one or
@@ -387,9 +387,9 @@ operator's Ed25519 key, obtained out-of-band.
 
 | Subcommand | Purpose |
 |---|---|
-| `dmp bootstrap pin <user_domain> <signer_spk_hex>` | Store the zone operator's trust anchor in config |
-| `dmp bootstrap fetch [--user-domain X] [--signer-spk hex]` | One-shot fetch + verify; print the entry summary |
-| `dmp bootstrap discover <user@host> [--signer-spk hex] [--auto-pin]` | End-to-end discovery; print `cluster pin` guidance or auto-commit |
+| `dnsmesh bootstrap pin <user_domain> <signer_spk_hex>` | Store the zone operator's trust anchor in config |
+| `dnsmesh bootstrap fetch [--user-domain X] [--signer-spk hex]` | One-shot fetch + verify; print the entry summary |
+| `dnsmesh bootstrap discover <user@host> [--signer-spk hex] [--auto-pin]` | End-to-end discovery; print `cluster pin` guidance or auto-commit |
 
 #### Trust model
 
@@ -405,7 +405,7 @@ legitimate one, and a stolen cluster-operator key can tamper with
 mailbox data on that cluster but cannot rewrite which cluster a user
 domain points at.
 
-`dmp bootstrap discover --auto-pin` makes this two-hop verification
+`dnsmesh bootstrap discover --auto-pin` makes this two-hop verification
 visible: it first verifies the bootstrap record against the pinned
 `bootstrap_signer_spk`, THEN verifies the cluster manifest at the
 returned anchor against the entry's `operator_spk`. Only after
@@ -416,22 +416,22 @@ config (bootstrap pinned but no cluster) is worse than none.
 #### `pin`
 
 ```
-dmp bootstrap pin example.com 3c6a...
+dnsmesh bootstrap pin example.com 3c6a...
 pinned bootstrap signer for example.com
 next:
-  1. `dmp bootstrap fetch` to verify the record at _dmp.example.com resolves
-  2. `dmp bootstrap discover <user>@example.com` to see which cluster(s) the domain points at
+  1. `dnsmesh bootstrap fetch` to verify the record at _dmp.example.com resolves
+  2. `dnsmesh bootstrap discover <user>@example.com` to see which cluster(s) the domain points at
 ```
 
 Pin writes `bootstrap_user_domain` + `bootstrap_signer_spk` to
 config. Does **not** fetch — pinning an operator whose record isn't
 yet published is safe (the command never touches DNS, so it never
-wedges). The same decoupling `dmp cluster pin` uses.
+wedges). The same decoupling `dnsmesh cluster pin` uses.
 
 #### `fetch`
 
 ```
-dmp bootstrap fetch
+dnsmesh bootstrap fetch
 user_domain: example.com
 seq:         3
 expires:     1816000000
@@ -452,7 +452,7 @@ or no verifying record.
 #### `discover`
 
 ```
-dmp bootstrap discover alice@example.com
+dnsmesh bootstrap discover alice@example.com
 address:     alice@example.com
 user_domain: example.com  (seq=3, exp=1816000000)
 best entry:  priority=10
@@ -460,9 +460,9 @@ best entry:  priority=10
   operator_spk:        7f3b2a89b4e5c6d1...
 
 to pin this cluster manually, run:
-  dmp cluster pin 7f3b2a89b4e5c6d1... mesh.example.com
-  dmp cluster fetch  # verify manifest
-  dmp cluster enable # activate cluster mode
+  dnsmesh cluster pin 7f3b2a89b4e5c6d1... mesh.example.com
+  dnsmesh cluster fetch  # verify manifest
+  dnsmesh cluster enable # activate cluster mode
 
 or re-run with --auto-pin to do all of the above atomically.
 ```
@@ -477,13 +477,13 @@ cluster anchors and sets `cluster_enabled=True` in a single atomic
 step. If either verification fails, the command exits 2 and leaves
 the config untouched.
 
-### `dmp node`
+### `dnsmesh node`
 
 Convenience launcher for a foreground DMP node, reading config from
 env vars.
 
 ```
-dmp node [--db-path PATH] [--dns-port P] [--http-port P]
+dnsmesh node [--db-path PATH] [--dns-port P] [--http-port P]
 ```
 
 For real deployments use the docker-compose files — see

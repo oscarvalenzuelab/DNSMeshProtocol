@@ -75,7 +75,7 @@ def zone_anchored_identity_name(identity_domain_str: str) -> str:
 def parse_address(address: str) -> Optional[Tuple[str, str]]:
     """Parse `user@host` into (user, host). Returns None on malformed input.
 
-    Used to turn the human-readable address from `dmp identity fetch
+    Used to turn the human-readable address from `dnsmesh identity fetch
     alice@alice.example.com` into the DNS name `dmp.alice.example.com`.
     """
     if "@" not in address:

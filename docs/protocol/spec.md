@@ -232,7 +232,7 @@ layer has its own out-of-band-pinned Ed25519 public key:
 1. **Bootstrap signer** (zone operator). Signs the
    [bootstrap record](bootstrap.md) at `_dmp.<user_domain>`. Pinned
    out-of-band by the receiving client (CLI flow:
-   `dmp bootstrap pin <user_domain> <fingerprint>`). Authority: "I am
+   `dnsmesh bootstrap pin <user_domain> <fingerprint>`). Authority: "I am
    the domain operator; these are the clusters I endorse for this
    user domain."
 2. **Cluster operator**. Signs the

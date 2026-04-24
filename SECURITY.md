@@ -98,7 +98,7 @@ The protocol assumes:
 - **Post-compromise sender authentication (partial — M5.4).** If the
   sender's Ed25519 signing key leaks, an attacker can sign arbitrary
   messages as that sender *until the sender rotates*. M5.4 ships
-  `dmp identity rotate --experimental --reason compromise`, which
+  `dnsmesh identity rotate --experimental --reason compromise`, which
   publishes a co-signed `RotationRecord` (new key ← old) plus a
   self-signed `RevocationRecord` of the leaked key. Rotation-aware
   contacts chain-walk from the pinned old key to the new head
@@ -114,7 +114,7 @@ The protocol assumes:
 - **Username ownership under the shared mesh domain.** Identity
   records at `id-{sha256(username)[:16]}.{domain}` are publish-append.
   A squatter who publishes first has a valid self-signed record; a
-  later legitimate publisher adds a second record. `dmp identity
+  later legitimate publisher adds a second record. `dnsmesh identity
   fetch` refuses `--add` when multiple valid records exist and
   prints fingerprints for out-of-band verification. For real
   squat resistance, publish under a DNS zone you control and use
@@ -122,14 +122,14 @@ The protocol assumes:
 
 ## Zone-anchored identity (recommended for real deployments)
 
-Passing `--identity-domain alice.example.com` at `dmp init` switches
+Passing `--identity-domain alice.example.com` at `dnsmesh init` switches
 identity publishing from the hash-based path under the shared mesh
 domain to `dmp.alice.example.com`. Addresses take the form
 `alice@alice.example.com`. Because only the owner of
 `alice.example.com` can write records in that zone, squatting requires
 compromising DNS for that zone — the same trust model email has had
 for decades. The inner record body still carries the username, and
-`dmp identity fetch` rejects records whose internal username doesn't
+`dnsmesh identity fetch` rejects records whose internal username doesn't
 match the address (so a zone owner can't publish
 `dmp.alice.example.com` with a body naming someone else).
 
@@ -175,7 +175,7 @@ match the address (so a zone owner can't publish
    `DMPMessage` is unused and should be considered untrusted.
 6. **Key-rotation story (M5.4, draft wire format).** Identities are
    long-term Ed25519 + X25519 pairs derived from a passphrase.
-   `dmp identity rotate --experimental` publishes a co-signed
+   `dnsmesh identity rotate --experimental` publishes a co-signed
    `RotationRecord` + fresh `IdentityRecord`; rotation-aware
    contacts (`rotation_chain_enabled=True`) chain-walk to the new
    key without re-pinning. Pre-M5.4 contacts still need out-of-band
@@ -212,8 +212,8 @@ match the address (so a zone owner can't publish
 - SHA-256 via `hashlib`
 
 Passphrase → X25519 seed uses Argon2id (memory-hard, 32 MiB, t=2, p=2,
-32-byte output). The `dmp` CLI generates a 32-byte random salt at
-`dmp init` and stores it in the config file next to the username. Two
+32-byte output). The `dnsmesh` CLI generates a 32-byte random salt at
+`dnsmesh init` and stores it in the config file next to the username. Two
 users who pick the same passphrase still derive independent keys, and
 an attacker who captures a public identity has to repeat the memory-hard
 derivation per guess rather than precompute a rainbow table.

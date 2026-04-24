@@ -44,7 +44,7 @@ Items from the original spec that **ship today**:
 - ChaCha20-Poly1305 + X25519 message encryption — ships.
 - DNS chunking — ships (chunk sizing tuned from the spec's proposal).
 - **Resolver pool with per-host health and failover** — ships (M1:
-  `dmp/client/resolver_pool.py` + `dmp resolvers discover / list`).
+  `dmp/client/resolver_pool.py` + `dnsmesh resolvers discover / list`).
 - **Multi-node storage with write redundancy** — ships (M2:
   `FanoutWriter` writes to a quorum of cluster nodes;
   `UnionReader` reads from all; 3-node compose cluster with
@@ -56,7 +56,7 @@ Items from the original spec that **ship today**:
   cluster-manifest gossip over the same HTTP channel the nodes use
   for record sync).
 - **Bootstrap-domain gossip** — ships (M3.1 `BootstrapRecord` +
-  M3.2 `dmp bootstrap discover` + M3.3 cluster-manifest gossip).
+  M3.2 `dnsmesh bootstrap discover` + M3.3 cluster-manifest gossip).
 - **User-identity key rotation + revocation** — ships (M5.4: co-
   signed `RotationRecord` and self-signed `RevocationRecord`,
   client-side chain-walker, docker e2e coverage).

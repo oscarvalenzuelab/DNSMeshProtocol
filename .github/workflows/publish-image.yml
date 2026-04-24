@@ -1,6 +1,6 @@
 name: publish-image
 
-# Builds and pushes the dmp-node image to Docker Hub.
+# Builds and pushes the dnsmesh-node image to Docker Hub.
 #
 # Triggers:
 #   - push to main:        tagged as :latest and :main (tracking channel)
@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   publish:
-    name: build + push dmp-node
+    name: build + push dnsmesh-node
     runs-on: ubuntu-latest
     # No environment protection — this workflow is triggered only by
     # push to main or a v* tag, both already gated by branch protection.
@@ -54,7 +54,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/dmp-node
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/dnsmesh-node
           # Tag strategy:
           #   main         -> :latest, :main, :sha-<short>
           #   image-vX.Y.Z -> :X.Y.Z, :X.Y, :X, :latest, :sha-<short>

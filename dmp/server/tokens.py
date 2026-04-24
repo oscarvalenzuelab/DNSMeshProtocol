@@ -460,7 +460,7 @@ CREATE TABLE IF NOT EXISTS tokens (
     note           TEXT NOT NULL DEFAULT '',
     -- M5.5 phase 3: Ed25519 signing pubkey (32-byte hex) that registered
     -- this token via POST /v1/registration/confirm. NULL for operator-
-    -- issued (dmp-node-admin) tokens, which don't go through a signed
+    -- issued (dnsmesh-node-admin) tokens, which don't go through a signed
     -- challenge. Used by the anti-takeover rule: self-service re-
     -- registration for an existing subject must sign the new challenge
     -- with the SAME key the prior token was registered under, so an

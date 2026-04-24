@@ -1,8 +1,8 @@
 services:
-  dmp-node:
+  dnsmesh-node:
     build: .
-    image: dmp-node:latest
-    container_name: dmp-node
+    image: dnsmesh-node:latest
+    container_name: dnsmesh-node
     restart: unless-stopped
 
     # Production operators who want real port 53 can remap via:
@@ -35,7 +35,7 @@ services:
       # DMP_LOG_FORMAT: json
 
     volumes:
-      - dmp-data:/var/lib/dmp
+      - dnsmesh-data:/var/lib/dmp
 
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8053/health"]
@@ -45,4 +45,4 @@ services:
       retries: 3
 
 volumes:
-  dmp-data:
+  dnsmesh-data:

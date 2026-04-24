@@ -37,13 +37,13 @@ exposure.
 The repo ships `docker-compose.cluster.yml` plus a `docker/cluster/`
 directory with per-node env files. It stands up three containers:
 
-- `dmp-node-a` on host ports `127.0.0.1:5301` (DNS) + `127.0.0.1:8101` (HTTP)
-- `dmp-node-b` on `127.0.0.1:5302` + `127.0.0.1:8102`
-- `dmp-node-c` on `127.0.0.1:5303` + `127.0.0.1:8103`
+- `dnsmesh-node-a` on host ports `127.0.0.1:5301` (DNS) + `127.0.0.1:8101` (HTTP)
+- `dnsmesh-node-b` on `127.0.0.1:5302` + `127.0.0.1:8102`
+- `dnsmesh-node-c` on `127.0.0.1:5303` + `127.0.0.1:8103`
 
-All three share an internal docker network `dmp-cluster` so they can
-reach each other as `http://dmp-node-a:8053`, `http://dmp-node-b:8053`,
-`http://dmp-node-c:8053`. The host-side port bindings are `127.0.0.1`
+All three share an internal docker network `dnsmesh-cluster` so they can
+reach each other as `http://dnsmesh-node-a:8053`, `http://dnsmesh-node-b:8053`,
+`http://dnsmesh-node-c:8053`. The host-side port bindings are `127.0.0.1`
 only — **sync endpoints MUST NOT be exposed publicly**. A real
 production deployment adds a reverse-proxy layer (see
 [`docker-compose.prod.yml`]({{ site.baseurl }}/deployment/production))
@@ -212,9 +212,9 @@ python docker/cluster/generate-cluster-manifest.py \
     --cluster-name mesh.example.com \
     --manifest-out /tmp/cluster-manifest.wire \
     --operator-key-in ~/.dmp/operator-ed25519.hex \
-    --node node-a,http://dmp-node-a:8053 \
-    --node node-b,http://dmp-node-b:8053 \
-    --node node-d,http://dmp-node-d:8053
+    --node node-a,http://dnsmesh-node-a:8053 \
+    --node node-b,http://dnsmesh-node-b:8053 \
+    --node node-d,http://dnsmesh-node-d:8053
 
 # 2. Push to ONE node via the HTTP publish API. The bearer token is
 #    the node's DMP_OPERATOR_TOKEN (alias DMP_HTTP_TOKEN), not

@@ -35,5 +35,5 @@ an item here is the most common way a DMP node gets owned.
 
 {: .note }
 You only need to run a node if you want other people to publish to *your*
-zone. Using the `dmp` CLI against someone else's node does not require you
+zone. Using the `dnsmesh` CLI against someone else's node does not require you
 to run one yourself — just point `--endpoint` at theirs.
