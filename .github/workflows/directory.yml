@@ -50,14 +50,17 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install minimal deps
-        # Aggregator only needs requests + the local dmp package for
-        # HeartbeatRecord parsing. The full dev extras would slow this
-        # down without adding anything.
+      - name: Install runtime deps
+        # `pip install -e .` brings in the runtime dependency set from
+        # setup.py (requests, cryptography, argon2-cffi, dnspython,
+        # reedsolo, zfec, ...). The aggregator imports
+        # `dmp.core.heartbeat`, which transitively pulls argon2 via
+        # `dmp.core.crypto`, so an --no-deps install fails fast at
+        # import time. Dev extras (pytest, mypy, ...) intentionally
+        # not installed: this job doesn't need them.
         run: |
           python -m pip install --upgrade pip
-          pip install requests cryptography
-          pip install -e . --no-deps
+          pip install -e .
 
       - name: Run aggregator
         run: |
