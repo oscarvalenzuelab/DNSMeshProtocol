@@ -91,6 +91,81 @@ Ports:
   [Deployment]({{ site.baseurl }}/deployment))
 - **8053/tcp** — HTTP publish / metrics API
 
+## Set your passphrase
+
+Identity keys are derived from a passphrase + a per-identity random
+salt (Argon2id). The CLI looks for the passphrase in three places, in
+order:
+
+1. The `DMP_PASSPHRASE` environment variable.
+2. A file path named in your config's `passphrase_file` field.
+3. An interactive `getpass` prompt as a last resort.
+
+Pick the one that fits how you'll use the CLI.
+
+{: .warning }
+**The passphrase is the only thing protecting your keys.** Lose it →
+identity unrecoverable (the salt is useless without it). Leak it →
+full account compromise. Treat it like a password-manager entry: long,
+random, and backed up.
+
+### Option A — environment variable (quick, ephemeral)
+
+Good for a quick test on a dev box. The shell prompts you silently
+(no echo, no shell history):
+
+```bash
+read -rs DMP_PASSPHRASE
+export DMP_PASSPHRASE
+dnsmesh identity show
+```
+
+The passphrase lives in the shell's environment until you close the
+shell, then it's gone. You'll re-enter it next session.
+
+Avoid `export DMP_PASSPHRASE='hunter2'` directly — that lands in
+`~/.zsh_history` (or `~/.bash_history`).
+
+### Option B — passphrase file (durable, recommended)
+
+What you want for a long-running setup or a server. The file is
+read on every `dnsmesh` invocation; trailing whitespace is stripped.
+
+```bash
+umask 077                                   # new files default 0600
+mkdir -p ~/.dmp
+
+# Generate a strong random passphrase (or paste from a password manager):
+openssl rand -base64 32 > ~/.dmp/passphrase
+chmod 400 ~/.dmp/passphrase
+
+# Tell the CLI where to find it:
+echo 'passphrase_file: ~/.dmp/passphrase' >> ~/.dmp/config.yaml
+
+dnsmesh identity show
+```
+
+After that, every `dnsmesh` command uses the file automatically. Back
+up `~/.dmp/passphrase` to your password manager.
+
+### Option C — interactive prompt
+
+If neither the env var nor a file is configured, the CLI falls back
+to a `getpass` prompt. Safest for one-off invocations on a machine
+you don't fully trust, since nothing is stored. Annoying for
+day-to-day use because every command prompts again.
+
+### Verify
+
+```bash
+dnsmesh identity show
+```
+
+prints your Ed25519 + X25519 public keys + `user_id`. Run it twice
+with the same passphrase: identical output (deterministic derivation).
+Run with a wrong passphrase: silently different keys — and any record
+you publish under that mistake is a fresh identity nobody has pinned.
+
 ## Send your first message
 
 Two terminal windows simulate two users. In practice you'd run two

@@ -17,13 +17,61 @@ The CLI stores its per-identity config at `$DMP_CONFIG_HOME/config.yaml`
 (default `~/.dmp/config.yaml`), with file mode 0600. The config holds
 everything *except* the passphrase — that's read from:
 
-1. `DMP_PASSPHRASE` environment variable (preferred for scripting)
-2. `passphrase_file` entry in config pointing at a 0600 file
-3. Interactive prompt via `getpass` as a last resort
+1. `DMP_PASSPHRASE` environment variable (preferred for scripting).
+2. `passphrase_file` entry in config pointing at a 0400 / 0600 file.
+3. Interactive prompt via `getpass` as a last resort.
 
 The passphrase drives Argon2id key derivation against a per-identity
 random salt stored in the config. Losing the config means losing the
-identity even if you remember the passphrase.
+identity even if you remember the passphrase. Losing the passphrase
+means losing the identity even if you have the config. Back up both.
+
+### Setting the passphrase
+
+Three ways, ordered roughly by how they trade convenience for blast
+radius. Pick whichever matches how you'll be running the CLI.
+
+**Env var (shell-session scoped):**
+
+```bash
+read -rs DMP_PASSPHRASE        # silent prompt, not in shell history
+export DMP_PASSPHRASE
+```
+
+Re-enter on each new shell. Easy for one-off scripted runs; not for
+daily use.
+
+**Passphrase file (persistent):**
+
+```bash
+umask 077
+openssl rand -base64 32 > ~/.dmp/passphrase
+chmod 400 ~/.dmp/passphrase
+echo 'passphrase_file: ~/.dmp/passphrase' >> ~/.dmp/config.yaml
+```
+
+After that, every `dnsmesh` command reads the file automatically.
+Trailing whitespace is stripped. Back up the file to a password
+manager — losing it loses the identity.
+
+**Interactive prompt:** if neither the env var nor a file is set, the
+CLI falls back to `getpass.getpass()` and prompts on every command.
+Safest for one-off use on a machine you don't fully trust. Inconvenient
+for any real workflow.
+
+### Why the warning matters
+
+The keypair is fully reproducible from `passphrase + kdf_salt` via
+Argon2id (32 MiB, t=2, p=2). Two consequences:
+
+- A second device with the same `~/.dmp/config.yaml` (or just the
+  `kdf_salt` field) and the same passphrase derives identical keys.
+  That's how you migrate an identity. The salt is *not* a secret.
+- A typo in the passphrase silently produces a different identity —
+  no error, just a different `user_id`. Anything you publish then
+  goes under a fresh identity that no contact has pinned. Always
+  verify with `dnsmesh identity show` before publishing if you're
+  unsure you typed the right passphrase.
 
 ### Config fields of note
 
