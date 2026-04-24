@@ -1,10 +1,8 @@
 # DNS Mesh Protocol
 
 **End-to-end encrypted messaging with no central server, no app store, no
-gatekeeper — delivered over DNS, on the relays and infrastructure the
+gatekeeper, delivered over DNS, on the relays and infrastructure the
 internet already runs on.**
-
-📖 **Full documentation → https://oscarvalenzuelab.github.io/DNSMeshProtocol/**
 
 ---
 
@@ -19,13 +17,12 @@ internet already runs on.**
 > **Don't route secrets through DMP until the external cryptographic
 > audit is done.** The codebase has had ~40+ rounds of automated
 > review across all milestones, but automated review is not a
-> substitute for professional cryptanalysis — a human auditor catches
+> substitute for professional cryptanalysis. A human auditor catches
 > a different class of bugs (crypto composition errors, side-channel
 > weaknesses, protocol-level attacks, implementation-vs-spec drift)
 > that no amount of LLM-driven pattern matching will find. The audit
 > is a post-beta deliverable; until then treat DMP as experimental
-> for confidentiality-critical traffic. See [SECURITY.md](SECURITY.md)
-> and [ROADMAP.md](ROADMAP.md).
+> for confidentiality-critical traffic.
 
 ## The pitch
 
@@ -74,8 +71,8 @@ Full walk-through with two users:
   [Forward secrecy and prekeys](https://oscarvalenzuelab.github.io/DNSMeshProtocol/guide/forward-secrecy).
 - **Signed sender authentication.** With pinned contacts, unknown
   signers are dropped. Without, receive runs in trust-on-first-use.
-- **Zone-anchored identity addresses.** `alice@alice.example.com` —
-  squatting requires compromising DNS for the zone.
+- **Zone-anchored identity addresses.** `alice@alice.example.com`.
+  Squatting requires compromising DNS for the zone.
 - **Cross-chunk erasure coding.** Loss of up to `n-k` chunks still
   reconstructs the message.
 - **Resolver resilience.** `ResolverPool` fans queries across multiple
@@ -95,7 +92,7 @@ Full walk-through with two users:
   from their pinned key to the current head automatically; a
   revocation aborts trust on any path that touches the revoked
   key. See
-  [`docs/protocol/rotation.md`](https://oscarvalenzuelab.github.io/DNSMeshProtocol/protocol/rotation).
+  [`docs/protocol/rotation.md`](https://ovalenzuela.com/DNSMeshProtocol/protocol/rotation).
 - **Multi-tenant node auth (M5.5).** `DMP_AUTH_MODE=multi-tenant`
   enables per-user publish tokens: every write to `/v1/records/*`
   is scope-checked against the token's subject, and `dnsmesh register`
@@ -115,8 +112,8 @@ Full walk-through with two users:
   Encrypt overlay for production.
 - **Formal protocol spec.** Wire format, routing, flows, and threat
   model at
-  [docs/protocol/](https://oscarvalenzuelab.github.io/DNSMeshProtocol/protocol/)
-  — every constant cross-verified against the source; designed so a
+  [docs/protocol/](https://ovalenzuela.com/DNSMeshProtocol/protocol).
+  Every constant cross-verified against the source; designed so a
   third party can build an interoperable client.
 
 ## Running a node
@@ -132,8 +129,8 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
 See [Deployment](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment).
 **Before shipping to production, read the
-[operator hardening guide](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/hardening)** —
-mandatory checklist covering TLS, token hygiene, operator signing-key
+[operator hardening guide](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/hardening)**,
+a mandatory checklist covering TLS, token hygiene, operator signing-key
 handling, DNS zone hygiene, file permissions, and network exposure.
 
 ## Project layout
@@ -144,14 +141,14 @@ dmp/
 │               manifests, identity, prekeys, DNS encoding
 ├── network/    DNSRecordWriter / DNSRecordReader abstraction +
 │               Cloudflare, Route53, BIND, in-memory backends
-├── storage/    SqliteMailboxStore — persistent TTL-aware record store
+├── storage/    SqliteMailboxStore: persistent TTL-aware record store
 ├── server/     DMPNode: UDP DNS server, HTTP API, cleanup worker,
 │               metrics, rate limiting, structured logging
-├── client/     DMPClient — send / receive / identity / prekeys
+├── client/     DMPClient: send / receive / identity / prekeys
 └── cli.py      `dnsmesh` command-line interface
 
 docs/          Jekyll docs site (Just the Docs theme, GitHub Pages)
-               Includes docs/protocol/ — the formal wire spec
+               Includes docs/protocol/ for the formal wire spec
 tests/         1050+ unit, integration, fuzz, and docker-in-the-loop tests
                Includes tests/fuzz/ (hypothesis property tests) and
                tests/test_vectors.py (golden interop test vectors).
@@ -185,14 +182,14 @@ pip install . --no-deps
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Every PR that changes behavior
+See [CONTRIBUTING.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/CONTRIBUTING.md). Every PR that changes behavior
 needs a test. Security-sensitive changes in `dmp/core/crypto.py`,
 `dmp/core/manifest.py`, `dmp/core/prekeys.py`, or the AEAD AAD surface
 get an extra round of review.
 
 ## License
 
-[AGPL-3.0](LICENSE). If you host DMP as a service you must publish
+[AGPL-3.0](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/LICENSE). If you host DMP as a service you must publish
 your source changes.
 
 ## Author
