@@ -188,6 +188,7 @@ class ScopeClass:
 # single dots; we use a non-anchored sub-pattern so we can compose it.
 _LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
 _HASH12 = r"[0-9a-f]{12}"
+_HASH16 = r"[0-9a-f]{16}"
 
 # Username is a SINGLE label; domain is everything after it (>=2
 # labels to form a real FQDN). This matches how DMPClient addresses
@@ -205,6 +206,18 @@ _ROTATION_HASH_RE = re.compile(rf"^rotate\.dmp\.id-{_HASH12}\.{_LABEL}(?:\.{_LAB
 _PREKEY_RE = re.compile(rf"^pk-[0-9]+\.(?P<hash12>{_HASH12})\.{_LABEL}(?:\.{_LABEL})+$")
 _MAILBOX_RE = re.compile(rf"^slot-[0-9]+\.mb-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$")
 _CHUNK_RE = re.compile(rf"^chunk-[0-9]+-{_HASH12}\.{_LABEL}(?:\.{_LABEL})+$")
+# Unanchored identity record published by `dnsmesh identity publish` when no
+# `identity_domain` is set. Hash16 = sha256(username)[:16] — matches
+# `dmp.core.identity.identity_domain`. Authorized via on-the-fly recompute
+# from the token's subject (no schema column needed).
+_IDENTITY_HASH_RE = re.compile(
+    rf"^id-(?P<hash16>{_HASH16})\.(?P<domain>{_LABEL}(?:\.{_LABEL})+)$"
+)
+# Prekey pool RRset published by `dnsmesh identity refresh-prekeys`.
+# Hash12 = sha256(username)[:12] — matches `dmp.core.prekeys.prekey_rrset_name`.
+_PREKEY_POOL_RE = re.compile(
+    rf"^prekeys\.id-(?P<hash12>{_HASH12})\.(?P<domain>{_LABEL}(?:\.{_LABEL})+)$"
+)
 
 
 def classify_name(name: str) -> ScopeClass:
@@ -252,6 +265,26 @@ def classify_name(name: str) -> ScopeClass:
         return ScopeClass(
             ScopeClass.OWNER_EXCLUSIVE,
             subject=f"{m.group('user')}@{m.group('domain')}",
+        )
+
+    # Identity (unanchored hash form): id-<hash16>.<domain>
+    # Subject sentinel encodes both the hash and the domain so
+    # authorize_write can verify both halves against row.subject.
+    m = _IDENTITY_HASH_RE.match(n)
+    if m:
+        return ScopeClass(
+            ScopeClass.OWNER_EXCLUSIVE,
+            subject=f"#id16:{m.group('hash16')}@{m.group('domain')}",
+            reason="hashed identity",
+        )
+
+    # Prekey pool: prekeys.id-<hash12>.<domain>
+    m = _PREKEY_POOL_RE.match(n)
+    if m:
+        return ScopeClass(
+            ScopeClass.OWNER_EXCLUSIVE,
+            subject=f"#prekeys:{m.group('hash12')}@{m.group('domain')}",
+            reason="prekey pool hash-scoped",
         )
 
     # Rotation hash form is operator-only in v1; check before the zone form
@@ -916,8 +949,38 @@ class TokenStore:
 
             if scope.kind == ScopeClass.OWNER_EXCLUSIVE:
                 expected = scope.subject or ""
-                if expected.startswith("#"):
-                    # Hash-form check (prekey namespace).
+                if expected.startswith("#id16:") or expected.startswith("#prekeys:"):
+                    # Recompute the expected hash from row.subject's
+                    # user-half. row.subject is already canonicalized
+                    # (lowercase ASCII), so plain bytes hashing matches
+                    # the client-side `sha256(username)[:N]`. The sentinel
+                    # carries both the hash and the domain so we verify
+                    # both: an alkamod@mesh.local token must not be able
+                    # to publish id-<hash(alkamod)>.evil.com.
+                    prefix, _, payload = expected.partition(":")
+                    want_hash, _, want_domain = payload.partition("@")
+                    user, _, dom = row.subject.partition("@")
+                    hash_len = 16 if prefix == "#id16" else 12
+                    got_hash = hashlib.sha256(user.encode("utf-8")).hexdigest()[
+                        :hash_len
+                    ]
+                    if got_hash != want_hash or dom != want_domain:
+                        self._audit(
+                            "rejected",
+                            token_hash=token_hash,
+                            subject=row.subject,
+                            remote_addr=remote_addr,
+                            detail=f"hashed-namespace mismatch: want {expected}",
+                        )
+                        self._conn.commit()
+                        return AuthResult(
+                            False,
+                            row=row,
+                            scope=scope,
+                            reason="subject does not own this hashed record namespace",
+                        )
+                elif expected.startswith("#"):
+                    # Hash-form check (prekey-per-key namespace, legacy).
                     if not row.subject_hash12 or row.subject_hash12 != expected[1:]:
                         self._audit(
                             "rejected",
