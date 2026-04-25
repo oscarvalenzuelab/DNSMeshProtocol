@@ -127,14 +127,29 @@ class TestSelectProviders:
         out = select_providers([hb])
         assert out[0].zone == "node.example.com"
 
-    def test_endpoint_with_no_zone_skipped(self):
-        # IP-literal endpoint has no derivable zone — skip the entry
-        # rather than rejecting the whole call.
+    def test_ip_literal_endpoint_kept_with_empty_zone(self):
+        """Codex P2 round 4 fix: IP-literal endpoints stay in the
+        candidate list with zone="". The CLI's /v1/info hop is what
+        fills in the real zone (or drops the candidate when /v1/info
+        is unreachable). Filtering here would make valid public-IP
+        nodes invisible as claim providers."""
+        # Public IP literals (private ranges fail the heartbeat
+        # endpoint validator at construction time) — but for unit
+        # testing, the validator only blocks loopback/private/etc.
+        # We use a route-able example IP from RFC 5737.
         good = _hb(endpoint="https://good.example", operator_passphrase="p1")
-        bad = _hb(endpoint="https://192.168.1.1", operator_passphrase="p2")
-        out = select_providers([good, bad])
-        assert len(out) == 1
-        assert out[0].endpoint == "https://good.example"
+        ip_literal = _hb(
+            endpoint="https://203.0.113.10:8053", operator_passphrase="p2"
+        )
+        out = select_providers([good, ip_literal])
+        assert len(out) == 2
+        endpoints = {p.endpoint for p in out}
+        assert "https://good.example" in endpoints
+        assert "https://203.0.113.10:8053" in endpoints
+        # The IP-literal candidate has empty zone — the caller's
+        # /v1/info upgrade is responsible for filling it in.
+        ip_provider = next(p for p in out if p.endpoint.endswith(":8053"))
+        assert ip_provider.zone == ""
 
     def test_default_k(self):
         # Generate K+2 fresh providers; only K come back.

@@ -1028,6 +1028,12 @@ def _build_claim_providers(cfg: "CLIConfig") -> List[Tuple[str, str]]:
                     # though heartbeat advertised the capability.
                     continue
                 zone = advertised if advertised else p.zone
+                # Codex P2 round 4 fix: a candidate from an IP-literal
+                # endpoint has zone="" until /v1/info fills it in. If
+                # /v1/info was unreachable AND the host has no usable
+                # zone, we have nothing to query DNS against — drop.
+                if not zone:
+                    continue
                 _add(zone, p.endpoint)
 
     # Seeds: always on, always last in the list. Anti-entropy on
@@ -2031,28 +2037,62 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
                 f"not {resolved_username!r} as the address implied",
             )
         contact_key = identity.username
-        if contact_key in cfg.contacts:
-            print(f"(contact `{contact_key}` already exists — not overwriting)")
+        # Persist the remote host so the rotation fallback can walk
+        # chains against the right zone. Two shapes can supply it:
+        #   1) `dnsmesh identity fetch alice@other.example --add`
+        #      → parsed_addr = (alice, other.example)
+        #   2) `dnsmesh identity fetch alice --domain other.example --add`
+        #      → parsed_addr is None, args.domain carries the host
+        # Both must persist `domain` so _make_client doesn't later
+        # overwrite with the local effective_domain and break
+        # cross-zone prekey + rotation-chain lookups. Legacy bare-
+        # username adds (no args.domain, no @host) leave `domain`
+        # empty and inherit the local effective domain at
+        # _make_client time (pre-M5.4-followup behavior).
+        if parsed_addr is not None:
+            remote_host = parsed_addr[1]
+        elif args.domain:
+            remote_host = args.domain
         else:
-            # Persist the remote host so the rotation fallback can walk
-            # chains against the right zone. Two shapes can supply it:
-            #   1) `dnsmesh identity fetch alice@other.example --add`
-            #      → parsed_addr = (alice, other.example)
-            #   2) `dnsmesh identity fetch alice --domain other.example --add`
-            #      → parsed_addr is None, args.domain carries the host
-            # Both must persist `domain` so _make_client doesn't later
-            # overwrite with the local effective_domain and break
-            # cross-zone prekey + rotation-chain lookups. Legacy bare-
-            # username adds (no args.domain, no @host) leave `domain`
-            # empty and inherit the local effective domain at
-            # _make_client time (pre-M5.4-followup behavior).
-            if parsed_addr is not None:
-                remote_host = parsed_addr[1]
-            elif args.domain:
-                remote_host = args.domain
+            remote_host = ""
+        existing = cfg.contacts.get(contact_key)
+        # M8.3 codex P1 round 4 fix: when the existing entry is a
+        # spk-only placeholder left by `dnsmesh intro trust` (pub=""
+        # by construction), the documented upgrade path is to run
+        # `identity fetch <user>@<zone> --add` to fill in the X25519
+        # pubkey. Previously the "already exists" guard turned that
+        # into a no-op, leaving the contact permanently un-sendable.
+        # Allow overwrite ONLY when (a) existing pub is empty AND
+        # (b) the existing spk matches what we just fetched (defends
+        # against an attacker fetching some random identity to
+        # replace a legit pinned spk-only contact).
+        if existing is not None:
+            existing_pub = existing.get("pub", "")
+            existing_spk = existing.get("spk", "")
+            fetched_spk = identity.ed25519_spk.hex()
+            if not existing_pub and existing_spk == fetched_spk:
+                # Upgrade path — preserve the dict-key label and
+                # overwrite the placeholder with the full record.
+                entry: Dict[str, str] = {
+                    "pub": identity.x25519_pk.hex(),
+                    "spk": fetched_spk,
+                    "domain": remote_host or existing.get("domain", ""),
+                    "remote_username": existing.get(
+                        "remote_username", ""
+                    )
+                    or identity.username,
+                }
+                cfg.contacts[contact_key] = entry
+                cfg.save(_config_path())
+                print(
+                    f"upgraded contact {contact_key} (filled in X25519 pubkey)"
+                )
             else:
-                remote_host = ""
-            entry: Dict[str, str] = {
+                print(
+                    f"(contact `{contact_key}` already exists — not overwriting)"
+                )
+        else:
+            entry = {
                 "pub": identity.x25519_pk.hex(),
                 "spk": identity.ed25519_spk.hex(),
                 "domain": remote_host,
@@ -2230,6 +2270,37 @@ def cmd_intro_trust(args: argparse.Namespace) -> int:
             label = remote_username
         else:
             label = f"intro-{intro.sender_spk.hex()[:12]}"
+
+        # Codex P2 round 4 fix: refuse to clobber an existing
+        # pinned contact. A first-contact intro for "alice@other.zone"
+        # must NOT overwrite the user's existing "alice" contact at
+        # a different zone (or with a different signing key) — that
+        # would silently lose the pinned X25519 pubkey of the
+        # legitimate alice and rebind future receives to the
+        # impersonator. Same-spk + same-zone is the upgrade path
+        # (legacy spk-only stub re-trusted from a fresh intro), so
+        # we permit it.
+        existing = cfg.contacts.get(label)
+        if existing is not None:
+            existing_spk = existing.get("spk", "")
+            existing_domain = existing.get("domain", "")
+            new_spk = intro.sender_spk.hex()
+            new_domain = intro.sender_mailbox_domain
+            if existing_spk and existing_spk != new_spk:
+                _die(
+                    1,
+                    f"contact `{label}` already pinned to a different "
+                    f"signing key ({existing_spk[:16]}…); refusing to "
+                    f"overwrite with {new_spk[:16]}…. Re-run with "
+                    f"--label <a-different-name> to keep both.",
+                )
+            if existing_domain and existing_domain != new_domain:
+                _die(
+                    1,
+                    f"contact `{label}` already pinned at zone "
+                    f"`{existing_domain}`; this intro is from `{new_domain}`. "
+                    f"Re-run with --label <a-different-name> to keep both.",
+                )
         msg = client.trust_intro(
             int(args.intro_id), label=label, remote_username=remote_username
         )

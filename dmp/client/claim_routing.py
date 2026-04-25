@@ -180,8 +180,17 @@ def select_providers(
         if not (hb.capabilities & CAP_CLAIM_PROVIDER):
             continue
         zone = _zone_from_endpoint(hb.endpoint)
+        # Codex P2 round 4 fix: IP-literal endpoints don't expose a
+        # plausible DNS zone via host derivation, but the caller's
+        # `/v1/info` upgrade pass can still discover the actual
+        # served zone. Keep the candidate with `zone=""`; downstream
+        # logic asks the provider, falls back to skipping when both
+        # the host derivation and `/v1/info` return nothing usable.
+        # Without this, a node heartbeating `https://203.0.113.10:8053`
+        # (public IP, no DNS) becomes invisible as a claim provider
+        # even though it serves a valid zone.
         if zone is None:
-            continue
+            zone = ""
         op_hex = bytes(hb.operator_spk).hex()
         if op_hex in seen_operators:
             continue
