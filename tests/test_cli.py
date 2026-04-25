@@ -111,12 +111,23 @@ class TestInitAndIdentity:
     def test_init_refuses_overwrite_without_force(self, config_home):
         cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://a"])
         with pytest.raises(SystemExit) as exc:
-            cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://b"])
+            cli.main(
+                ["init", "--no-default-resolvers", "bob", "--endpoint", "http://b"]
+            )
         assert exc.value.code == 1
 
     def test_init_force_overwrites(self, config_home):
         cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://a"])
-        rc = cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://b", "--force"])
+        rc = cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "bob",
+                "--endpoint",
+                "http://b",
+                "--force",
+            ]
+        )
         assert rc == 0
         cfg = yaml.safe_load((config_home / "config.yaml").read_text())
         assert cfg["username"] == "bob"
@@ -271,7 +282,17 @@ class TestIdentityPublishFetch:
         # Bob (different local domain) fetches + adds.
         bob_home = config_home.parent / "bob-cross-zone"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
-        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x", "--domain", "bob.local"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "bob",
+                "--endpoint",
+                "http://x",
+                "--domain",
+                "bob.local",
+            ]
+        )
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         capsys.readouterr()
 
@@ -986,7 +1007,16 @@ class TestSendRecv:
         assert "sent" in capsys.readouterr().out
 
         # Switch "identity" to bob and read.
-        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x", "--force"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "bob",
+                "--endpoint",
+                "http://x",
+                "--force",
+            ]
+        )
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         cli.main(["recv"])
         out = capsys.readouterr().out
@@ -1025,7 +1055,16 @@ class TestSendRecv:
         capsys.readouterr()
 
         # bob's CLI reads once
-        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x", "--force"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "bob",
+                "--endpoint",
+                "http://x",
+                "--force",
+            ]
+        )
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         capsys.readouterr()
         cli.main(["recv"])
@@ -1321,7 +1360,16 @@ class TestDnsResolvers:
         cli.main(["send", "bob", "legacy hi"])
         assert "sent" in capsys.readouterr().out
 
-        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x", "--force"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "bob",
+                "--endpoint",
+                "http://x",
+                "--force",
+            ]
+        )
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         cli.main(["recv"])
         assert "legacy hi" in capsys.readouterr().out
@@ -1670,7 +1718,15 @@ class TestClusterEnableDisable:
         """Bare `cluster pin` leaves cluster_enabled=False even with both
         anchors set; `_cluster_mode_enabled` returns False; a subsequent
         `_make_client` uses the legacy single-endpoint path."""
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1708,7 +1764,15 @@ class TestClusterEnableDisable:
     def test_enable_requires_both_anchors(self, config_home, capsys):
         """`cluster enable` with no anchors pinned exits 1 with a clear
         error and does NOT flip cluster_enabled."""
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         with pytest.raises(SystemExit) as exc:
             cli.main(["cluster", "enable"])
         assert exc.value.code == 1
@@ -1725,7 +1789,15 @@ class TestClusterEnableDisable:
         tells the operator how to diagnose."""
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1751,7 +1823,15 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         op, wire, manifest = self._build_signed_manifest(n_nodes=2)
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1799,7 +1879,15 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1841,7 +1929,15 @@ class TestClusterEnableDisable:
     def test_disable_idempotent_when_already_disabled(self, config_home, capsys):
         """Running `cluster disable` on a never-enabled config is a
         no-op that exits 0 and reports current state."""
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         capsys.readouterr()
         rc = cli.main(["cluster", "disable"])
         assert rc == 0
@@ -1856,7 +1952,15 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1891,7 +1995,15 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1914,7 +2026,15 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1946,7 +2066,15 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://legacy.example",
+            ]
+        )
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
