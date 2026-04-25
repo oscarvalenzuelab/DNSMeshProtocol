@@ -43,7 +43,9 @@ class TestZoneFromEndpoint:
         assert _zone_from_endpoint("https://dnsmesh.io") == "dnsmesh.io"
 
     def test_with_port(self):
-        assert _zone_from_endpoint("https://node.example.com:8053") == "node.example.com"
+        assert (
+            _zone_from_endpoint("https://node.example.com:8053") == "node.example.com"
+        )
 
     def test_uppercase_normalized(self):
         assert _zone_from_endpoint("https://DnsMesh.IO") == "dnsmesh.io"
@@ -138,9 +140,7 @@ class TestSelectProviders:
         # testing, the validator only blocks loopback/private/etc.
         # We use a route-able example IP from RFC 5737.
         good = _hb(endpoint="https://good.example", operator_passphrase="p1")
-        ip_literal = _hb(
-            endpoint="https://203.0.113.10:8053", operator_passphrase="p2"
-        )
+        ip_literal = _hb(endpoint="https://203.0.113.10:8053", operator_passphrase="p2")
         out = select_providers([good, ip_literal])
         assert len(out) == 2
         endpoints = {p.endpoint for p in out}
@@ -189,9 +189,7 @@ class TestOverride:
 
 class TestParseSeenFeed:
     def test_skips_invalid_wires(self):
-        good = _hb().sign(
-            DMPCrypto.from_passphrase("operator-pass", salt=b"S" * 32)
-        )
+        good = _hb().sign(DMPCrypto.from_passphrase("operator-pass", salt=b"S" * 32))
         bad = "v=dmp1;t=heartbeat;not-base64!!!"
         out = parse_seen_feed([good, bad])
         # Good is signed by passing its own operator key — it should

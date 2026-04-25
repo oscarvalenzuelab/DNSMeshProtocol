@@ -9,7 +9,6 @@ import pytest
 from dmp.client.client import DMPClient, InboxMessage
 from dmp.network.memory import InMemoryDNSStore
 
-
 PROVIDER_ZONE = "claims.dnsmesh.io"
 # Empty endpoint forces publish_claim to fall back to self.writer (the
 # shared InMemoryDNSStore), rather than attempting an HTTP POST. The
@@ -310,7 +309,9 @@ class TestClaimFlow:
 
         msg_id = None
         for slot in range(10):
-            for r in store.query_txt_record(f"slot-{slot}.mb-{bob_hash}.alice.mesh") or []:
+            for r in (
+                store.query_txt_record(f"slot-{slot}.mb-{bob_hash}.alice.mesh") or []
+            ):
                 parsed = SlotManifest.parse_and_verify(r)
                 if parsed:
                     msg_id = parsed[0].msg_id
@@ -333,9 +334,7 @@ class TestClaimFlow:
             claim_rrset_name(bob_recipient_id, 0, PROVIDER_ZONE), wire, ttl=300
         )
 
-        result = bob.receive_claims(
-            provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)]
-        )
+        result = bob.receive_claims(provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)])
         # Alice's manifest is signed by alice's spk; the claim's
         # sender_spk is eve's; the cross-check at receive_claims
         # rejects the mismatch. Dropped, not delivered.
@@ -369,9 +368,7 @@ class TestIntroQueueCli:
             sender_zone="alice.mesh",
             provider_zone=PROVIDER_ZONE,
         )
-        result = bob.receive_claims(
-            provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)]
-        )
+        result = bob.receive_claims(provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)])
         assert len(result.quarantined_intro_ids) == 1
         return alice, bob, result.quarantined_intro_ids[0]
 
@@ -426,9 +423,7 @@ class TestIntroQueueCli:
         assert ok
         # The claim is published — bob's recv discovers it without
         # needing pre-pinned alice.
-        result = bob.receive_claims(
-            provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)]
-        )
+        result = bob.receive_claims(provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)])
         # Bob hasn't pinned alice → lands in intro queue.
         assert len(result.quarantined_intro_ids) == 1
         intros = bob.intro_queue.list_intros()
@@ -502,9 +497,7 @@ class TestIntroQueueCli:
             provider_zone=PROVIDER_ZONE,
             skip_msg_ids={first_msg_id},
         )
-        result = bob.receive_claims(
-            provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)]
-        )
+        result = bob.receive_claims(provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)])
         assert result.delivered == []
         assert result.quarantined_intro_ids == []
         assert "denylisted" in result.dropped_reasons

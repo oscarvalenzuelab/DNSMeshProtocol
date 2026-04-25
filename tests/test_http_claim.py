@@ -15,7 +15,6 @@ from dmp.core.heartbeat import CAP_CLAIM_PROVIDER
 from dmp.network.memory import InMemoryDNSStore
 from dmp.server.http_api import DMPHttpApi
 
-
 PROVIDER_ZONE = "claims.dnsmesh.io"
 
 
@@ -187,9 +186,7 @@ class TestClaimPublishViaClient:
     provider's HTTP endpoint, not fall back to the sender's local
     writer when an endpoint is given."""
 
-    def test_publish_claim_via_http_lands_in_provider_store(
-        self, server, store
-    ):
+    def test_publish_claim_via_http_lands_in_provider_store(self, server, store):
         """An end-to-end POST through publish_claim writes to the
         provider's authoritative store under the right RRset."""
         from dmp.client.client import DMPClient
@@ -224,8 +221,7 @@ class TestClaimPublishViaClient:
         assert records and len(records) == 1
         # And the sender's own store is untouched (no leakage).
         assert not (
-            sender_store.query_txt_record(f"claim-0.mb-{hex12}.{PROVIDER_ZONE}")
-            or []
+            sender_store.query_txt_record(f"claim-0.mb-{hex12}.{PROVIDER_ZONE}") or []
         )
 
 

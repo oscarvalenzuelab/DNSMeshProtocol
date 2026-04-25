@@ -1000,9 +1000,7 @@ No central directory, no phone numbers, no servers to trust.</p>
 
         zone = getattr(self.server, "claim_provider_zone", "") or ""
         if not zone:
-            self._send_json(
-                404, {"error": "this node is not a claim provider"}
-            )
+            self._send_json(404, {"error": "this node is not a claim provider"})
             return 404
         if not self._check_rate_limit():
             return 429

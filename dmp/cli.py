@@ -898,9 +898,7 @@ def _make_client(
         # the intro-trust origin. Once identity-fetch upgrades the
         # entry (pub gets filled in), this branch stops matching
         # and the remote_username (now set) takes precedence below.
-        is_intro_placeholder = (
-            not entry.get("pub", "") and entry.get("spk", "")
-        )
+        is_intro_placeholder = not entry.get("pub", "") and entry.get("spk", "")
         if is_intro_placeholder:
             existing = client.contacts[name]
             client.contacts[name] = Contact(
@@ -2183,9 +2181,7 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
                 f"(filled in X25519 pubkey for {identity.username})"
             )
         elif existing_at_username is not None:
-            print(
-                f"(contact `{contact_key}` already exists — not overwriting)"
-            )
+            print(f"(contact `{contact_key}` already exists — not overwriting)")
         else:
             entry = {
                 "pub": identity.x25519_pk.hex(),
@@ -3836,8 +3832,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_intro_trust.add_argument(
         "--label",
         default="",
-        help="local nickname for the new contact "
-        "(default: intro-<spk-prefix>)",
+        help="local nickname for the new contact " "(default: intro-<spk-prefix>)",
     )
     p_intro_trust.add_argument(
         "--username",

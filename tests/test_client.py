@@ -647,10 +647,7 @@ class TestSpkOnlyContact:
         store = InMemoryDNSStore()
         alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
         # Empty pub AND empty spk — nothing useful to pin.
-        assert (
-            alice.add_contact("ghost", public_key_hex="", domain="g.mesh")
-            is False
-        )
+        assert alice.add_contact("ghost", public_key_hex="", domain="g.mesh") is False
 
     def test_recv_walks_spk_only_contact_zone(self):
         """An spk-only pinned contact still gets their zone polled."""
@@ -777,18 +774,14 @@ class TestCrossZoneReceive:
             bytes.fromhex(bob.get_public_key_hex())
         ).digest()
         bob_hash = hashlib.sha256(bob_recipient_id).hexdigest()[:12]
-        bob_zone_names = [
-            n for n in store.list_names() if n.endswith(".bob.mesh")
-        ]
-        assert bob_zone_names == [], (
-            "manifest+chunks must not land in recipient's zone"
-        )
+        bob_zone_names = [n for n in store.list_names() if n.endswith(".bob.mesh")]
+        assert bob_zone_names == [], "manifest+chunks must not land in recipient's zone"
         alice_zone_names = [
             n for n in store.list_names() if f".mb-{bob_hash}.alice.mesh" in n
         ]
-        assert alice_zone_names, (
-            "manifest must land in sender's zone keyed by recipient hash"
-        )
+        assert (
+            alice_zone_names
+        ), "manifest must land in sender's zone keyed by recipient hash"
 
         inbox = bob.receive_messages()
         assert len(inbox) == 1

@@ -715,9 +715,7 @@ class DMPClient:
                     # we actually decode the message. Otherwise a transient
                     # DNS miss during chunk fetch would permanently suppress
                     # a still-valid manifest on later polls.
-                    if self.replay_cache.has_seen(
-                        manifest.sender_spk, manifest.msg_id
-                    ):
+                    if self.replay_cache.has_seen(manifest.sender_spk, manifest.msg_id):
                         continue
                     decoded = self._fetch_and_decrypt(manifest, source_zone=zone)
                     if decoded is None:
@@ -938,9 +936,7 @@ class DMPClient:
                         continue
                     # Same-spk + same-msg already pending in intro
                     # queue: don't try to fetch+decrypt again.
-                    if self.intro_queue.has_intro(
-                        claim.sender_spk, claim.msg_id
-                    ):
+                    if self.intro_queue.has_intro(claim.sender_spk, claim.msg_id):
                         _drop("already-pending")
                         continue
 

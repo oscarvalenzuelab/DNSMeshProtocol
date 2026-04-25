@@ -409,9 +409,7 @@ class TestCapabilities:
         assert parsed is not None
         assert parsed.capabilities == 0
 
-    def test_claim_provider_bit_roundtrips(
-        self, signer: DMPCrypto, now: int
-    ) -> None:
+    def test_claim_provider_bit_roundtrips(self, signer: DMPCrypto, now: int) -> None:
         from dmp.core.heartbeat import CAP_CLAIM_PROVIDER
 
         hb = _build(signer, now=now, capabilities=CAP_CLAIM_PROVIDER)

@@ -283,7 +283,9 @@ class TestRRsetName:
 
     def test_rrset_name_rejects_bad_slot(self):
         with pytest.raises(ValueError, match="slot"):
-            claim_rrset_name(b"\x42" * 32, slot=MAX_SLOT + 1, provider_zone="claims.mesh")
+            claim_rrset_name(
+                b"\x42" * 32, slot=MAX_SLOT + 1, provider_zone="claims.mesh"
+            )
 
     def test_rrset_name_rejects_empty_zone(self):
         with pytest.raises(ValueError, match="provider_zone"):

@@ -236,9 +236,7 @@ class IntroQueue:
         )
 
     def remove_intro(self, intro_id: int) -> bool:
-        cur = self._conn.execute(
-            "DELETE FROM intros WHERE id = ?", (int(intro_id),)
-        )
+        cur = self._conn.execute("DELETE FROM intros WHERE id = ?", (int(intro_id),))
         return cur.rowcount > 0
 
     def has_intro(self, sender_spk: bytes, msg_id: bytes) -> bool:

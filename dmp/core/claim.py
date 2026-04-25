@@ -225,9 +225,7 @@ class ClaimRecord:
         try:
             sender_mailbox_domain = body[off : off + domain_len].decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ValueError(
-                f"sender_mailbox_domain not valid utf-8: {exc}"
-            ) from exc
+            raise ValueError(f"sender_mailbox_domain not valid utf-8: {exc}") from exc
         off += domain_len
 
         if off + 1 > len(body):

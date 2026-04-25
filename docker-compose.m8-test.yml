@@ -1,0 +1,134 @@
+# docker-compose.m8-test.yml — multi-zone M8 cross-zone + claim layer e2e.
+#
+# Three independent dnsmesh-node containers, each authoritative for a
+# different DNS zone:
+#
+#   - alice.test    on alice-node:8053  HTTP / 5353 UDP
+#   - bob.test      on bob-node:8053    HTTP / 5353 UDP
+#   - claims.test   on provider-node:8053 / 5353 UDP  (claim provider)
+#
+# Heartbeats: every node points at the other two via DMP_HEARTBEAT_SEEDS,
+# so the seen-graph populates within one heartbeat tick (~5s in this
+# test config). The provider advertises CAP_CLAIM_PROVIDER; the leaf
+# nodes leave it on by default.
+#
+# Anti-entropy: nodes peer with each other via the cluster-anti-entropy
+# mechanism (M2.4). For the M8 test we keep them OUTSIDE a federated
+# cluster so they really do live in independent zones — anti-entropy
+# is exercised separately by the existing docker-compose.cluster.yml
+# integration tests. Claim records DO gossip via the existing record-
+# sync digest/pull when anti-entropy peers are configured (M8.4).
+#
+# Bring up:
+#
+#     docker compose -f docker-compose.m8-test.yml up -d
+#
+# Tear down:
+#
+#     docker compose -f docker-compose.m8-test.yml down -v
+#
+# Smoke test (from the host, after `up -d` settles):
+#
+#     curl -s http://127.0.0.1:8061/health
+#     curl -s http://127.0.0.1:8062/health
+#     curl -s http://127.0.0.1:8063/health
+#     curl -s http://127.0.0.1:8063/v1/info | jq .
+#     curl -s http://127.0.0.1:8061/v1/nodes/seen | jq '.seen | length'
+
+services:
+  alice-node:
+    image: dnsmesh-node:m8
+    container_name: alice-node
+    restart: unless-stopped
+    environment:
+      DMP_DOMAIN: alice.test
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_CLEANUP_INTERVAL: "30"
+      DMP_LOG_LEVEL: INFO
+      DMP_HEARTBEAT_ENABLED: "1"
+      DMP_HEARTBEAT_SELF_ENDPOINT: "http://alice-node:8053"
+      DMP_HEARTBEAT_OPERATOR_KEY_PATH: /etc/dmp/operator.key
+      DMP_HEARTBEAT_INTERVAL_SECONDS: "5"
+      DMP_HEARTBEAT_TTL_SECONDS: "300"
+      DMP_HEARTBEAT_SEEDS: "http://bob-node:8053,http://provider-node:8053"
+      DMP_CLAIM_PROVIDER: "1"
+    volumes:
+      - alice-data:/var/lib/dmp
+      - ./docker/m8-test/alice-operator.key:/etc/dmp/operator.key:ro
+    ports:
+      - "127.0.0.1:5361:5353/udp"
+      - "127.0.0.1:8061:8053/tcp"
+    networks: [m8-test]
+
+  bob-node:
+    image: dnsmesh-node:m8
+    container_name: bob-node
+    restart: unless-stopped
+    environment:
+      DMP_DOMAIN: bob.test
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_CLEANUP_INTERVAL: "30"
+      DMP_LOG_LEVEL: INFO
+      DMP_HEARTBEAT_ENABLED: "1"
+      DMP_HEARTBEAT_SELF_ENDPOINT: "http://bob-node:8053"
+      DMP_HEARTBEAT_OPERATOR_KEY_PATH: /etc/dmp/operator.key
+      DMP_HEARTBEAT_INTERVAL_SECONDS: "5"
+      DMP_HEARTBEAT_TTL_SECONDS: "300"
+      DMP_HEARTBEAT_SEEDS: "http://alice-node:8053,http://provider-node:8053"
+      DMP_CLAIM_PROVIDER: "1"
+    volumes:
+      - bob-data:/var/lib/dmp
+      - ./docker/m8-test/bob-operator.key:/etc/dmp/operator.key:ro
+    ports:
+      - "127.0.0.1:5362:5353/udp"
+      - "127.0.0.1:8062:8053/tcp"
+    networks: [m8-test]
+
+  provider-node:
+    image: dnsmesh-node:m8
+    container_name: provider-node
+    restart: unless-stopped
+    environment:
+      DMP_DOMAIN: claims.test
+      DMP_CLAIM_PROVIDER_ZONE: claims.test
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_CLEANUP_INTERVAL: "30"
+      DMP_LOG_LEVEL: INFO
+      DMP_HEARTBEAT_ENABLED: "1"
+      DMP_HEARTBEAT_SELF_ENDPOINT: "http://provider-node:8053"
+      DMP_HEARTBEAT_OPERATOR_KEY_PATH: /etc/dmp/operator.key
+      DMP_HEARTBEAT_INTERVAL_SECONDS: "5"
+      DMP_HEARTBEAT_TTL_SECONDS: "300"
+      DMP_HEARTBEAT_SEEDS: "http://alice-node:8053,http://bob-node:8053"
+      DMP_CLAIM_PROVIDER: "1"
+    volumes:
+      - provider-data:/var/lib/dmp
+      - ./docker/m8-test/provider-operator.key:/etc/dmp/operator.key:ro
+    ports:
+      - "127.0.0.1:5363:5353/udp"
+      - "127.0.0.1:8063:8053/tcp"
+    networks: [m8-test]
+
+networks:
+  m8-test:
+    driver: bridge
+
+volumes:
+  alice-data:
+  bob-data:
+  provider-data:
