@@ -67,11 +67,36 @@ Argon2id (32 MiB, t=2, p=2). Two consequences:
 - A second device with the same `~/.dmp/config.yaml` (or just the
   `kdf_salt` field) and the same passphrase derives identical keys.
   That's how you migrate an identity. The salt is *not* a secret.
-- A typo in the passphrase silently produces a different identity —
-  no error, just a different `user_id`. Anything you publish then
-  goes under a fresh identity that no contact has pinned. Always
-  verify with `dnsmesh identity show` before publishing if you're
-  unsure you typed the right passphrase.
+- A typo in the passphrase produces a different identity. Without a
+  guard, nothing would catch it: any string is a valid input to the
+  KDF, and the derived keys would just be different.
+
+### Typo tripwire
+
+To catch typos before they cause damage, the CLI writes the canonical
+Ed25519 signing pubkey into the config as `verify_pubkey:` on the
+first successful derive. Every later command that derives keys
+compares against it and aborts on mismatch:
+
+```
+dnsmesh: passphrase mismatch: the derived signing pubkey does not
+match the one this config was first used with.
+  expected: 66921bb7...
+  derived:  930f0ae6...
+```
+
+The tripwire is a public key, not a secret — it's published on DNS
+the moment you `dnsmesh identity publish`. Storing it in config does
+not weaken the threat model.
+
+To bypass the check for a single invocation (e.g. you intentionally
+want to derive a different identity on the same config without
+`init --force`), set `DMP_PASSPHRASE_OVERRIDE_VERIFY=1`. The override
+prints a warning and proceeds. Use sparingly.
+
+`dnsmesh identity rotate` updates `verify_pubkey` to the new key
+automatically — rotation is the supported way to change the
+underlying passphrase while keeping the same identity address.
 
 ### Config fields of note
 

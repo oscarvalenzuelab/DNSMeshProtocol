@@ -161,10 +161,16 @@ day-to-day use because every command prompts again.
 dnsmesh identity show
 ```
 
-prints your Ed25519 + X25519 public keys + `user_id`. Run it twice
-with the same passphrase: identical output (deterministic derivation).
-Run with a wrong passphrase: silently different keys — and any record
-you publish under that mistake is a fresh identity nobody has pinned.
+prints your Ed25519 + X25519 public keys + `user_id`. The first
+successful derive on a fresh config writes the derived signing pubkey
+into the config as a typo-tripwire (`verify_pubkey:`). Every later
+command compares against it: a mismatch aborts with a clear message
+rather than silently producing a different identity.
+
+If you ever need to bypass the check (e.g. you actually do want to
+swap to a new identity on the same config without `init --force`),
+set `DMP_PASSPHRASE_OVERRIDE_VERIFY=1` for that one invocation.
+Use sparingly — it's the wrong tool for almost every scenario.
 
 ## Send your first message
 
