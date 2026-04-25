@@ -61,12 +61,20 @@ plaintext.
 
 Replay / freshness
 ------------------
-``ts`` must verify within ±``_DEFAULT_TS_SKEW_SECONDS`` of now;
-``exp`` must be strictly in the future. These mirror the heartbeat
-freshness policy. Replay protection inside the recipient's pipeline
-is the existing ``ReplayCache`` keyed on (sender_spk, msg_id) —
-once a claim leads to a successful decrypt, the underlying message's
-replay protection takes over.
+``exp`` governs lifetime: a claim with ``exp <= now`` is rejected.
+``ts`` must not be far in the FUTURE — a claim arriving with
+``ts > now + ts_skew_seconds`` is rejected as a forward-dated forgery
+(used to extend lifetime past what the operator's TTL cap allows).
+Past ts is accepted as long as ``exp`` is still in the future, so a
+sender publishing with a long TTL and a recipient polling several
+minutes later doesn't lose the message — codex round 2 P2 caught a
+prior version that wrongly capped lifetime at 5 minutes by also
+rejecting past-skewed ts.
+
+Replay protection inside the recipient's pipeline is the existing
+``ReplayCache`` keyed on (sender_spk, msg_id) — once a claim leads
+to a successful decrypt, the underlying message's replay protection
+takes over.
 """
 
 from __future__ import annotations
@@ -299,7 +307,9 @@ class ClaimRecord:
           - Base64 decode failure.
           - ``sender_spk`` is an Ed25519 low-order point (degenerate).
           - Signature verification failure.
-          - ``ts`` is outside ``±ts_skew_seconds`` of ``now``.
+          - ``ts`` is more than ``ts_skew_seconds`` in the FUTURE
+            relative to ``now`` (forward-dated forgery defense).
+            Past-skewed ts is accepted; ``exp`` governs lifetime.
           - ``exp`` is at or before ``now`` (claim is expired).
         """
         if not isinstance(wire, str) or not wire.startswith(RECORD_PREFIX):
@@ -331,7 +341,12 @@ class ClaimRecord:
             return None
 
         now = now if now is not None else int(time.time())
-        if abs(record.ts - now) > ts_skew_seconds:
+        # Future-skew only: a claim signed in the future is suspicious
+        # (forward-dated forgery to extend lifetime past TTL caps).
+        # A claim signed in the past is fine — `exp` is what bounds
+        # how long it stays valid, and a recipient polling minutes
+        # after a sender publishes must not lose the claim.
+        if record.ts - now > ts_skew_seconds:
             return None
         if record.exp <= now:
             return None

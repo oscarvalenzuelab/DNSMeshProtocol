@@ -34,7 +34,7 @@ from typing import Dict, List, Optional, Tuple
 import yaml
 
 from dmp.client.bootstrap_discovery import fetch_bootstrap_record
-from dmp.client.client import DMPClient
+from dmp.client.client import Contact, DMPClient
 from dmp.client.cluster_bootstrap import ClusterClient, fetch_cluster_manifest
 from dmp.core.bootstrap import bootstrap_rrset_name
 from dmp.core.cluster import ClusterNode
@@ -165,10 +165,16 @@ class CLIConfig:
                 # rotation-chain walks). Absent means "use the local
                 # effective domain" — preserves behavior for pre-existing
                 # `{pub, spk}` entries.
+                # `remote_username` is the protocol-level identity name
+                # used by prekey + rotation lookups. It comes from the
+                # M8.3 `dnsmesh intro trust --username` flow; absent
+                # falls back to the dict key (back-compat for legacy
+                # contacts where username == local label).
                 contacts[name] = {
                     "pub": value.get("pub", ""),
                     "spk": value.get("spk", ""),
                     "domain": value.get("domain", ""),
+                    "remote_username": value.get("remote_username", ""),
                 }
         raw_resolvers = data.get("dns_resolvers", []) or []
         # Be generous in what we accept: a single-string config (legacy
@@ -869,12 +875,31 @@ def _make_client(
     # local effective domain — back-compat for pre-M5.4 configs.
     for name, entry in config.contacts.items():
         contact_domain = entry.get("domain", "") or effective_domain
-        client.add_contact(
+        # `remote_username` overrides the dict-key as the protocol-
+        # level username used for prekey + rotation lookups.
+        # Empty/absent falls back to the dict key (legacy behavior).
+        # Per M8.3 codex round 2 (P2): trusted-intro contacts have
+        # remote_username="" until `dnsmesh identity fetch` fills
+        # it in; downstream protocol code skips lookups gracefully
+        # when username is empty.
+        remote_username = entry.get("remote_username", "")
+        ok = client.add_contact(
             name,
             entry.get("pub", ""),
             domain=contact_domain,
             signing_key_hex=entry.get("spk", ""),
         )
+        # Override Contact.username if a remote_username was stored.
+        # add_contact uses `name` (the dict key / local label); the
+        # protocol layer wants the remote name when we have it.
+        if ok and remote_username and name in client.contacts:
+            existing = client.contacts[name]
+            client.contacts[name] = Contact(
+                username=remote_username,
+                public_key_bytes=existing.public_key_bytes,
+                signing_key_bytes=existing.signing_key_bytes,
+                domain=existing.domain,
+            )
     return client
 
 
@@ -2132,16 +2157,23 @@ def cmd_intro_trust(args: argparse.Namespace) -> int:
         if intro is None:
             _die(1, f"no pending intro with id {args.intro_id}")
         label = args.label or f"intro-{intro.sender_spk.hex()[:12]}"
-        msg = client.trust_intro(int(args.intro_id), label=label)
+        remote_username = args.username or ""
+        msg = client.trust_intro(
+            int(args.intro_id), label=label, remote_username=remote_username
+        )
         if msg is None:
             _die(2, "trust_intro failed (raced removal?)")
         # Persist the new contact in the config so it survives across
         # CLI invocations. Pin signing key only — X25519 stays empty
         # until `dnsmesh identity fetch user@host --add` fills it in.
+        # The protocol-level username (used for prekey + rotation
+        # lookups) lives in `pub_username`; an empty value means
+        # "skip those lookups until identity fetch fills it in."
         cfg.contacts[label] = {
             "pub": "",
             "spk": intro.sender_spk.hex(),
             "domain": intro.sender_mailbox_domain,
+            "remote_username": remote_username,
         }
         cfg.save(_config_path())
         print(f"trusted intro #{args.intro_id} as `{label}`")
@@ -2149,11 +2181,19 @@ def cmd_intro_trust(args: argparse.Namespace) -> int:
             print(f"  {msg.plaintext.decode('utf-8')}")
         except UnicodeDecodeError:
             print(f"  (binary, {len(msg.plaintext)} bytes)")
-        print(
-            "  pinned signing key only — run `dnsmesh identity fetch "
-            f"{label}@{intro.sender_mailbox_domain} --add` to fill in the "
-            "X25519 key needed to send back."
-        )
+        if remote_username:
+            print(
+                "  pinned signing key only — run `dnsmesh identity fetch "
+                f"{remote_username}@{intro.sender_mailbox_domain} --add` to "
+                "fill in the X25519 key needed to reply."
+            )
+        else:
+            print(
+                "  pinned signing key only — run `dnsmesh identity fetch "
+                f"<remote-username>@{intro.sender_mailbox_domain} --add` to "
+                "fill in the X25519 key needed to reply (pass --username on "
+                "trust to skip the prompt next time)."
+            )
         return 0
     finally:
         _close_client(client)
@@ -3511,6 +3551,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="local nickname for the new contact "
         "(default: intro-<spk-prefix>)",
+    )
+    p_intro_trust.add_argument(
+        "--username",
+        default="",
+        help="sender's actual identity name on their home node — "
+        "used by prekey + rotation-chain lookups. Empty (default) "
+        "skips those lookups until you run `dnsmesh identity fetch`.",
     )
     p_intro_trust.set_defaults(func=cmd_intro_trust)
 

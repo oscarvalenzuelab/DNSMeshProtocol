@@ -11,7 +11,11 @@ from dmp.network.memory import InMemoryDNSStore
 
 
 PROVIDER_ZONE = "claims.dnsmesh.io"
-PROVIDER_ENDPOINT = "https://claims.dnsmesh.io"
+# Empty endpoint forces publish_claim to fall back to self.writer (the
+# shared InMemoryDNSStore), rather than attempting an HTTP POST. The
+# provider's actual endpoint is exercised separately in
+# tests/test_http_claim.py against a real DMPHttpApi instance.
+PROVIDER_ENDPOINT = ""
 
 
 def _send_with_claim(
@@ -429,42 +433,6 @@ class TestIntroQueueCli:
         assert len(result.quarantined_intro_ids) == 1
         intros = bob.intro_queue.list_intros()
         assert intros[0].plaintext == b"first-contact reach via send"
-
-    def test_send_skips_claim_for_same_zone_and_pinned(self):
-        """Codex P1 follow-on: don't pollute providers when the recipient
-        will receive via the normal cross-zone path anyway."""
-        store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="shared.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="shared.mesh", store=store)
-        # Both same-zone + alice has bob's signing key.
-        alice.add_contact(
-            "bob",
-            bob.get_public_key_hex(),
-            domain="shared.mesh",
-            signing_key_hex=bob.get_signing_public_key_hex(),
-        )
-        bob.add_contact(
-            "alice",
-            alice.get_public_key_hex(),
-            domain="shared.mesh",
-            signing_key_hex=alice.get_signing_public_key_hex(),
-        )
-        ok = alice.send_message(
-            "bob",
-            "same-zone, no claim needed",
-            claim_providers=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)],
-        )
-        assert ok
-        # No claim record landed at the provider zone.
-        import hashlib
-
-        bob_recipient_id = hashlib.sha256(
-            bytes.fromhex(bob.get_public_key_hex())
-        ).digest()
-        bob_hash = hashlib.sha256(bob_recipient_id).hexdigest()[:12]
-        for slot in range(10):
-            name = f"claim-{slot}.mb-{bob_hash}.{PROVIDER_ZONE}"
-            assert not (store.query_txt_record(name) or [])
 
     def test_receive_messages_picks_up_claim_intros(self):
         """Codex P1 fix: receive_messages with claim_providers also polls

@@ -182,6 +182,53 @@ class TestClaimPublishEndpoint:
         assert status in (201, 400)
 
 
+class TestClaimPublishViaClient:
+    """Codex P1 round 2 fix: DMPClient.publish_claim must POST to the
+    provider's HTTP endpoint, not fall back to the sender's local
+    writer when an endpoint is given."""
+
+    def test_publish_claim_via_http_lands_in_provider_store(
+        self, server, store
+    ):
+        """An end-to-end POST through publish_claim writes to the
+        provider's authoritative store under the right RRset."""
+        from dmp.client.client import DMPClient
+        from dmp.network.memory import InMemoryDNSStore
+
+        # Sender has its own (separate) store — its self.writer is NOT
+        # the provider's store. The HTTP POST must bridge the gap.
+        sender_store = InMemoryDNSStore()
+        sender = DMPClient(
+            "alice", "alice-pass", domain="alice.mesh", store=sender_store
+        )
+
+        recipient_id = b"\x42" * 32
+        msg_id = b"\x11" * 16
+        provider_endpoint = f"http://{server.host}:{server.port}"
+
+        ok = sender.publish_claim(
+            recipient_id=recipient_id,
+            msg_id=msg_id,
+            slot=0,
+            sender_mailbox_domain="alice.mesh",
+            ttl=300,
+            provider_zone=PROVIDER_ZONE,
+            provider_endpoint=provider_endpoint,
+        )
+        assert ok, "HTTP publish_claim returned False"
+        # The provider's store now has the claim.
+        import hashlib as _hashlib
+
+        hex12 = _hashlib.sha256(recipient_id).hexdigest()[:12]
+        records = store.query_txt_record(f"claim-0.mb-{hex12}.{PROVIDER_ZONE}")
+        assert records and len(records) == 1
+        # And the sender's own store is untouched (no leakage).
+        assert not (
+            sender_store.query_txt_record(f"claim-0.mb-{hex12}.{PROVIDER_ZONE}")
+            or []
+        )
+
+
 class TestNodeInfoEndpoint:
     def test_returns_provider_zone(self, server):
         status, payload = _get(server, "/v1/info")

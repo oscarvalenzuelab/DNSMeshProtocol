@@ -582,26 +582,27 @@ class DMPClient:
         if not ok:
             return False
 
-        # M8.3 — first-contact reach. If the recipient may not have us
-        # pinned (different zone, or no signing-key match in our
-        # contacts so they probably don't have ours pinned either),
-        # publish a claim to each provider so their recv can discover
-        # this message. Same-zone + mutually-pinned pairs skip — the
-        # normal recv path (M8.1) already covers them, and dropping a
-        # claim there would just inflate the namespace pointlessly.
+        # M8.3 — first-contact reach. Always publish a claim when the
+        # caller configured providers, regardless of zone/pin state.
+        # Codex P1 (round 2): a "skip if same-zone and we have their
+        # signing key pinned" optimization breaks first-contact for
+        # any same-zone recipient who has ANY pinned contact, because
+        # their pin fence at receive_messages() drops un-pinned
+        # senders globally. We can't know whether the recipient has
+        # us pinned, so the safe default is always-publish. Cost is
+        # M extra DNS records per send (M = number of providers) —
+        # acceptable for first-contact correctness.
         if claim_providers:
-            cross_zone = bool(contact.domain) and contact.domain != self.domain
-            unpinned_by_them = not bool(contact.signing_key_bytes)
-            if cross_zone or unpinned_by_them:
-                for provider_zone, _provider_endpoint in claim_providers:
-                    self.publish_claim(
-                        recipient_id=recipient_id,
-                        msg_id=msg_id,
-                        slot=slot,
-                        sender_mailbox_domain=self.domain,
-                        ttl=ttl,
-                        provider_zone=provider_zone,
-                    )
+            for provider_zone, provider_endpoint in claim_providers:
+                self.publish_claim(
+                    recipient_id=recipient_id,
+                    msg_id=msg_id,
+                    slot=slot,
+                    sender_mailbox_domain=self.domain,
+                    ttl=ttl,
+                    provider_zone=provider_zone,
+                    provider_endpoint=provider_endpoint or "",
+                )
         return True
 
     # ---- receive -----------------------------------------------------------
@@ -748,9 +749,10 @@ class DMPClient:
         sender_mailbox_domain: str,
         ttl: int,
         provider_zone: str,
+        provider_endpoint: str = "",
         provider_writer: Optional[DNSRecordWriter] = None,
     ) -> bool:
-        """Publish one signed claim record at a single provider zone.
+        """Publish one signed claim record at a single provider.
 
         The claim is a tiny pointer: it tells whoever polls that
         `sender_spk` has mail for the recipient (identified by the
@@ -759,18 +761,20 @@ class DMPClient:
         then fetches the manifest+chunks from `sender_mailbox_domain`
         via the normal cross-zone receive path (M8.1).
 
-        `provider_writer` defaults to `self.writer`. In tests the
-        sender + provider share an `InMemoryDNSStore` and a single
-        writer covers both. In production the sender uses an HTTP-
-        backed writer that POSTs to the provider's `/v1/claim/publish`
-        endpoint; that writer publishes under the provider's local
-        DNS authoritative tree.
+        Two delivery paths:
+
+          - ``provider_endpoint`` is a non-empty URL → HTTP POST to
+            ``{endpoint}/v1/claim/publish``. This is the production
+            path: claims must actually arrive at the provider's
+            store, not the sender's home node.
+          - ``provider_writer`` is set OR endpoint is empty → write
+            via the writer (for tests where sender + provider share
+            an in-memory store, and as a back-compat path).
 
         Returns True on successful publish. Failures (oversize,
-        signing mismatch, write rejection) return False without
-        raising — first-message reach is best-effort, not a delivery
-        guarantee, and a failure to publish to one provider must not
-        block publishing to others.
+        signing mismatch, write rejection, network error) return
+        False without raising — first-message reach is best-effort,
+        not a delivery guarantee.
         """
         from dmp.core.claim import (
             MAX_MAILBOX_DOMAIN_LEN,
@@ -793,6 +797,12 @@ class DMPClient:
             wire = record.sign(self.crypto)
         except (ValueError, Exception):
             return False
+
+        if provider_endpoint:
+            return self._http_publish_claim(
+                provider_endpoint, wire, recipient_id, int(ttl)
+            )
+
         try:
             name = claim_rrset_name(recipient_id, int(slot), provider_zone)
         except ValueError:
@@ -800,6 +810,46 @@ class DMPClient:
         writer = provider_writer or self.writer
         try:
             return writer.publish_txt_record(name, wire, ttl=int(ttl))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _http_publish_claim(
+        provider_endpoint: str,
+        wire: str,
+        recipient_id: bytes,
+        ttl: int,
+    ) -> bool:
+        """POST a signed claim to ``{endpoint}/v1/claim/publish``.
+
+        Returns True on 2xx. The provider's endpoint expects:
+
+            { "value": <wire>, "recipient_id_hex12": <hex12>, "ttl": int }
+
+        Errors are swallowed and surfaced as False — first-contact
+        reach is best-effort. ``requests`` is imported lazily so a
+        process that never publishes claims (legacy / read-only) does
+        not pull in the dependency.
+        """
+        import hashlib
+
+        try:
+            import requests  # type: ignore[import-not-found]
+        except Exception:
+            return False
+        try:
+            hex12 = hashlib.sha256(bytes(recipient_id)).hexdigest()[:12]
+            url = provider_endpoint.rstrip("/") + "/v1/claim/publish"
+            resp = requests.post(
+                url,
+                json={
+                    "value": wire,
+                    "recipient_id_hex12": hex12,
+                    "ttl": int(ttl),
+                },
+                timeout=5,
+            )
+            return resp.status_code in (200, 201)
         except Exception:
             return False
 
@@ -1017,29 +1067,44 @@ class DMPClient:
         self.intro_queue.remove_intro(intro_id)
         return msg
 
-    def trust_intro(self, intro_id: int, *, label: str = "") -> Optional[InboxMessage]:
+    def trust_intro(
+        self,
+        intro_id: int,
+        *,
+        label: str = "",
+        remote_username: str = "",
+    ) -> Optional[InboxMessage]:
         """Promote + pin the sender as a trusted contact.
 
-        `label` is the local nickname for the new pinned contact;
-        defaults to the sender's hex spk if empty so the contact
-        always has a stable key in `self.contacts`.
+        ``label`` is the local nickname for the new pinned contact
+        (the dict key in ``self.contacts``); defaults to
+        ``intro-{spk-prefix}`` if empty.
+
+        ``remote_username`` is the sender's actual identity name on
+        their home node — used by ``Contact.username`` for protocol
+        lookups (prekey RRsets, rotation-chain subjects). When
+        empty, ``Contact.username`` is left empty too; downstream
+        protocol lookups skip gracefully (prekey fetch falls back
+        to long-term ECDH; rotation walks return None). The user
+        fills this in by running
+        ``dnsmesh identity fetch user@host --add`` after the trust
+        action; that flow knows the real name from the identity
+        record it just verified.
+
+        We deliberately do NOT use ``label`` as ``Contact.username``
+        — codex P2 round 2 caught the bug where the local label
+        leaks into protocol queries (prekey_rrset_name builds
+        ``_prekey.<label>.<domain>`` which doesn't exist). Empty
+        username + the existing protocol-skip logic is the safe
+        default.
         """
         intro = self.intro_queue.get_intro(intro_id)
         if intro is None:
             return None
         spk_hex = bytes(intro.sender_spk).hex()
         contact_label = label or f"intro-{spk_hex[:12]}"
-        # Pin under the sender's mailbox domain so future cross-zone
-        # receives (M8.1) walk that zone for this sender.
-        # We don't have the sender's X25519 pubkey from the claim
-        # alone — that only carries Ed25519 sender_spk. The legacy
-        # add_contact flow requires both; for an intro-promoted
-        # contact, we record the spk and leave the X25519 pubkey
-        # empty until the user fetches the sender's identity record.
-        # This is a known soft edge: send_message to this contact
-        # will fail until X25519 is filled in. Documented in CLI.
         self.contacts[contact_label] = Contact(
-            username=contact_label,
+            username=remote_username,  # empty unless caller knows the real name
             public_key_bytes=b"",  # filled by `dnsmesh identity fetch`
             signing_key_bytes=intro.sender_spk,
             domain=intro.sender_mailbox_domain,

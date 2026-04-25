@@ -196,6 +196,21 @@ class TestFreshness:
         wire = record.sign(c)
         assert ClaimRecord.parse_and_verify(wire) is not None
 
+    def test_past_ts_with_future_exp_accepted(self):
+        """Codex P2 round 2 fix: past-skewed ts must be accepted while
+        exp is still in the future. Sender publishes with TTL=3600,
+        recipient polls 6 minutes later: must not be silently dropped.
+        """
+        c = _crypto()
+        ts = int(time.time()) - 600  # 10 minutes ago — well past 5-min skew
+        record = _claim(
+            sender_spk=c.get_signing_public_key_bytes(),
+            ts=ts,
+            exp=ts + 3600,  # exp 50 minutes in the future
+        )
+        wire = record.sign(c)
+        assert ClaimRecord.parse_and_verify(wire) is not None
+
 
 class TestFieldValidation:
     def test_msg_id_wrong_length_rejected(self):
