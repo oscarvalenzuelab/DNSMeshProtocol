@@ -226,67 +226,79 @@ flowchart LR
   <div class="takeaway"><strong>Result:</strong> the "server" is just a DNS host. You don't need to trust it the way you trust a messaging company.</div>
 </section>
 
-<!-- 4. Two activities -->
+<!-- 4. Two channels — concrete from the start -->
 <section>
-  <h2>Two channels: HTTPS for writes, DNS for reads</h2>
+  <h2>Two channels: HTTPS for writes (to your own node), DNS for reads</h2>
   <pre class="mermaid">
 flowchart LR
-    A["Alice's CLI"] -- "writes (HTTPS,<br>token required)" --> Node["a DMP node"]
-    B["any reader"] -- "reads (DNS,<br>no auth)" --> Node
+    A["Alice's CLI"] -- "HTTPS POST<br>(token-authenticated)" --> ANode["Alice's home node<br>(serves alice.example)"]
+    B["Bob's CLI"] -- "DNS query<br>(no auth)" --> Resolvers["public DNS<br>resolvers"]
+    Resolvers -- "recursive chain" --> ANode
   </pre>
-  <ul>
-    <li><strong>Writes</strong> = publishing your identity, sending a message, refreshing prekeys. Uses <strong>HTTPS</strong>. Token-authenticated.</li>
-    <li><strong>Reads</strong> = fetching someone's identity, receiving messages, looking up cluster manifests. Uses <strong>DNS</strong>. No auth.</li>
+  <ul style="text-align: left;">
+    <li><strong>Writes:</strong> Alice's CLI POSTs encrypted records to <strong>her own home node only</strong>. That's the single HTTPS connection she ever opens.</li>
+    <li><strong>Reads:</strong> Bob queries DNS for the record. Public resolvers walk the standard chain to Alice's authoritative node and pull it back. No HTTPS handshake between nodes.</li>
   </ul>
-  <div class="takeaway"><strong>Important nuance coming up:</strong> when Alice sends a message to Bob, Alice's CLI doesn't write to Alice's home node. It writes <em>directly to Bob's home node</em>. Next slide.</div>
+  <div class="takeaway">
+    <strong>Each user only needs HTTPS to their own home node.</strong>
+    Cross-user delivery is the recursive DNS resolver chain doing
+    what it already does for every other lookup on the internet.
+  </div>
 </section>
 
-<!-- 4b. Where messages actually go -->
+<!-- 4b. Where messages actually go (the deep dive) -->
 <section>
-  <h2>Where messages actually go (the truth)</h2>
+  <h2>Where messages actually go (the deep dive)</h2>
   <pre class="mermaid">
 sequenceDiagram
     participant A as Alice CLI
-    participant ANode as Alice's home node<br>(serves mesh.gnu.cl)
+    participant ANode as Alice's home node<br>(serves alice.example)
     participant DNS as DNS (any resolver)
     participant B as Bob CLI
-    A->>ANode: HTTPS POST<br>slot-N.mb-{hash(bob)}.mesh.gnu.cl
+    A->>ANode: HTTPS POST<br>slot-N.mb-{hash(bob)}.alice.example
     Note over ANode: stored in sqlite<br>served on UDP 53
-    B->>DNS: TXT? slot-N.mb-{hash(bob)}.mesh.gnu.cl
-    DNS->>ANode: forwards
+    B->>DNS: TXT? slot-N.mb-{hash(bob)}.alice.example
+    DNS->>ANode: walks the chain<br>to Alice's authoritative
     ANode-->>DNS: ciphertext
     DNS-->>B: ciphertext
     B->>B: decrypt + verify Alice's signature
   </pre>
-  <p class="small"><strong>Both parties share the mesh domain.</strong> Alice writes to her own home node only; Bob reads via DNS from the same zone. Each user only ever needs HTTPS to one node — their own.</p>
+  <p class="small">
+    Records live under the <em>sender's</em> zone — Alice publishes
+    to <code>...alice.example</code>, addressed to Bob's recipient
+    hash. Bob's CLI walks Alice's zone (because he's pinned her as
+    a contact) and pulls the record via DNS. Bob never needs HTTPS
+    to Alice's node, even though he's reading her records.
+  </p>
 </section>
 
-<!-- 4c. Restriction model -->
+<!-- 4c. Cross-zone delivery (M8.1 — what the protocol does today) -->
 <section>
-  <h2>The HTTP restriction model</h2>
-  <p>Each user only needs HTTPS to <strong>their own home node</strong>. Nothing else.</p>
-  <ul>
-    <li>Alice's CLI talks HTTPS to Alice's home only. To send anyone a message, she POSTs to her own node.</li>
-    <li>Bob's CLI talks HTTPS to Bob's home only (for publishing his identity, sending messages of his own).</li>
-    <li>To <em>receive</em>, Bob just queries DNS — works from any network with port 53 / DoH.</li>
-  </ul>
-  <div class="takeaway"><strong>"Node-to-node" is the recursive DNS resolver chain.</strong> When Bob's CLI queries a name in Alice's zone, the resolver walks roots → registrar → Alice's authoritative node and pulls the record. No HTTPS handshake between nodes is required for this path.</div>
-</section>
-
-<!-- 4d. Limitation: cross-mesh -->
-<section>
-  <h2>Limitation: same mesh today</h2>
-  <p>The current implementation expects Alice and Bob to share <code>mesh_domain</code>. Both their CLIs are configured with the same <code>domain: mesh.gnu.cl</code>, so the mailbox name they each derive matches.</p>
-  <p>Three current paths to messaging:</p>
+  <h2>Cross-zone delivery just works</h2>
+  <p style="text-align: left;">
+    Alice and Bob can be on completely different home nodes (and
+    different DNS zones) and still exchange messages. Bob's
+    <code>dnsmesh recv</code> polls each of his pinned contacts'
+    zones through the recursive DNS chain.
+  </p>
   <table>
     <thead><tr><th>Setup</th><th>Works today?</th></tr></thead>
     <tbody>
-      <tr><td>Both users register at the same node, share the same mesh domain</td><td class="ok">✓</td></tr>
-      <tr><td>Both users on a federated 3-node cluster (HTTPS anti-entropy syncs between nodes)</td><td class="ok">✓</td></tr>
-      <tr><td>Different home nodes, different mesh domains, no cluster</td><td class="err">✗</td></tr>
+      <tr><td>Both users registered at the same node, same zone</td><td class="ok">✓</td></tr>
+      <tr><td>Both users in a federated 3-node cluster (anti-entropy sync)</td><td class="ok">✓</td></tr>
+      <tr><td>Different nodes, different zones, no cluster — pinned contacts on each side</td><td class="ok">✓</td></tr>
+      <tr><td>Different nodes, different zones, an unpinned stranger reaches you for the first time</td><td class="ok">✓ (M8 claim layer)</td></tr>
     </tbody>
   </table>
-  <p class="small">A future "DNS-only federation" — where Bob's <code>recv</code> walks his pinned contacts' domains and polls each via DNS — would lift the third case without requiring inter-node HTTPS.</p>
+  <p class="small">
+    The "different zones, no cluster" case is what M8.1 fixed in
+    0.4.0 — the recv path now walks each pinned contact's zone
+    instead of being hard-bound to <code>self.domain</code>.
+    First-contact reach (the last row) routes through a tiny
+    signed pointer at a claim-provider node — see the M8 design
+    notes in
+    <a href="/DNSMeshProtocol/protocol/">/protocol/</a>.
+  </p>
 </section>
 
 <!-- 5. Where the user usually trips -->
