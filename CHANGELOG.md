@@ -7,6 +7,97 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] — discovery surface, native install path, typo tripwire
+
+Additive release on top of 0.2.0. No breaking changes for clients;
+existing 0.2.0 configs upgrade in place. The biggest visible thing
+is that hitting `https://<node>/` in a browser now shows a status
+page instead of a 404, and the node can render its known peers as
+HTML at `/nodes` once the operator opts into the heartbeat layer.
+
+### Added
+
+- **`GET /` landing page** on every node. Shows hostname, operator
+  pubkey, record count, and either the recent-peers table (when
+  heartbeat is on) or a hint about how to enable discovery (when
+  off). Links out to `/health`, `/stats`, the project docs, and
+  PyPI client. Cached 30s.
+- **`GET /nodes`** human-readable HTML view of `/v1/nodes/seen`.
+  Same data, rendered for browsers — operators can point a
+  teammate at the URL without explaining JSON. 404 when heartbeat
+  is disabled.
+- **`dnsmesh peers <endpoint>`** new CLI subcommand. Hits
+  `/v1/nodes/seen` on any node and prints a human-readable peer
+  table (`--json` for raw output, `--timeout` for the HTTP
+  budget).
+- **Discovery startup logs.** After "DMP node up", the server
+  emits explicit log lines saying whether heartbeat is enabled
+  and where the JSON + HTML peer-list URLs live; when disabled,
+  names the env vars to set to be discoverable.
+- **Typo tripwire on the passphrase derivation.** `CLIConfig`
+  gains a `verify_pubkey` field, populated on first successful
+  derive. Subsequent derives compare against it and abort with
+  a clear diagnostic on mismatch instead of silently producing
+  a different identity. `DMP_PASSPHRASE_OVERRIDE_VERIFY=1` for
+  the one-shot bypass; `dnsmesh identity rotate` updates the
+  tripwire automatically.
+- **`deploy/native-ubuntu/`** install path. Bare-metal install for
+  operators who don't want a Docker daemon (~50 MB idle vs
+  ~150 MB with Docker). Runs as a systemd unit under a `dnsmesh`
+  user with `CAP_NET_BIND_SERVICE` plus the standard sandboxing
+  directives (`NoNewPrivileges`, `ProtectSystem=strict`,
+  `MemoryDenyWriteExecute`, etc.), Caddy fronts auto-TLS.
+- **`deploy/digitalocean/quickstart.sh`** Docker-based one-shot
+  for a single Droplet (any UDP-capable VPS).
+- **`deploy/native-ubuntu/upgrade.sh`** + **`deploy/digitalocean/upgrade.sh`**
+  for in-place upgrades. Both leave operator config + state
+  untouched.
+- **Canonical directory feed** at
+  `https://ovalenzuela.com/DNSMeshProtocol/directory/`. Cron-driven
+  workflow runs `examples/directory_aggregator.py` against
+  `directory/seeds.txt` every 30 minutes; only commits when the
+  rendered output changes (filtering out the cosmetic timestamp).
+  Federated by design — anyone can run their own aggregator off
+  any subset of seeds.
+
+### Changed
+
+- **Documentation:** `getting-started.md` now explains how to set
+  the passphrase (env var, file, interactive prompt) and what the
+  typo tripwire does. `guide/cli.md` got an expanded
+  `Config and passphrase` section. README links cleaned up so the
+  PyPI rendering doesn't 404 on repo-relative paths and protocol
+  links go through the canonical custom domain. Em dashes in
+  README replaced with periods/commas/colons per project style.
+- **Daemon hardening.** `docker-compose.cluster.yml` was the only
+  compose file missing `restart: unless-stopped`; added on all three
+  cluster nodes. `deploy/native-ubuntu/dnsmesh-node.service` got
+  explicit `KillSignal=SIGTERM`, `TimeoutStopSec=30s`,
+  `LogRateLimitIntervalSec=0` for predictable lifecycle behavior.
+- **Docker Hub repo page** auto-syncs from
+  `deploy/docker/README.md` on every push to main via
+  `peter-evans/dockerhub-description@v4`. Includes back-links to
+  the GitHub project, PyPI client, and docs site (the page used
+  to be empty).
+
+### Fixed
+
+- **Stale Docker Hub namespace** in 5 docs (`oscarvalenzuelab` →
+  `ovalenzuela`). Anyone copy-pasting `docker pull
+  oscarvalenzuelab/dnsmesh-node` was hitting a 404.
+- **`Caddyfile`** still proxied to `dmp-node:8053` after the
+  v0.2.0 image rename to `dnsmesh-node` — would have 502'd in
+  production. Caught by codex review and fixed.
+- **Directory aggregator's "skip cosmetic-only refresh" filter**
+  used `grep -v` (basic-regex) on a pattern with `{3}`, where the
+  quantifier is taken literally. Result: every cron tick committed
+  an empty refresh because the file-header lines (---/+++) tripped
+  the "real changes?" check. Fixed with `grep -vE`.
+- **Bot identity in the directory workflow** used
+  `noreply@anthropic.com`, which GitHub mapped to a real account.
+  Switched to the canonical `github-actions[bot]` identity
+  (UID 41898282).
+
 ### Changed — CLI rename (breaking for source installs)
 
 - **CLI command renamed** from `dmp` to `dnsmesh`. The distribution on
