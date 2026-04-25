@@ -1,11 +1,17 @@
 """Tests for the UDP DNS server."""
 
+import base64
 import socket
 import time
 
 import dns.message
+import dns.name
 import dns.query
+import dns.rcode
 import dns.rdatatype
+import dns.tsig
+import dns.tsigkeyring
+import dns.update
 import pytest
 
 from dmp.network.memory import InMemoryDNSStore
@@ -111,3 +117,208 @@ class TestDMPDnsServer:
             assert response2.rcode() == 0
         finally:
             server2.stop()
+
+
+# ---------------------------------------------------------------------------
+# M9.2.1 — RFC 2136 UPDATE + TSIG
+# ---------------------------------------------------------------------------
+
+
+def _keyring(name: str = "client.", secret: bytes = b"\x10" * 32):
+    """Build a one-key TSIG keyring (HMAC-SHA256, 32-byte secret)."""
+    return dns.tsigkeyring.from_text(
+        {name: base64.b64encode(secret).decode("ascii")}
+    )
+
+
+def _send_update(update: dns.update.UpdateMessage, port: int):
+    return dns.query.udp(update, "127.0.0.1", port=port, timeout=2.0)
+
+
+class TestDnsUpdate:
+    """End-to-end coverage of the UPDATE path: build a signed UPDATE on
+    the client side, send it via UDP, assert the writer received the
+    publish (or rejection codes when the request shouldn't be honored).
+    """
+
+    def _server(self, store, **kwargs):
+        port = _free_port()
+        defaults = dict(
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keyring=_keyring(),
+            allowed_zones=("example.com",),
+        )
+        defaults.update(kwargs)
+        return DMPDnsServer(store, **defaults), port
+
+    def _build_add(self, owner: str, value: str, zone: str = "example.com"):
+        upd = dns.update.UpdateMessage(zone)
+        # dnspython relativizes a non-FQDN owner against the zone, so pass
+        # an absolute name. Quote the TXT value: presentation-format TXT
+        # treats ``;`` as a comment delimiter, which would silently
+        # truncate ``v=dmp1;t=...`` wires otherwise.
+        upd.add(
+            dns.name.from_text(owner.rstrip(".") + "."),
+            300,
+            "TXT",
+            '"' + value.replace('"', r"\"") + '"',
+        )
+        upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
+        return upd
+
+    def test_signed_update_writes_record(self):
+        """The happy path: TSIG-signed UPDATE → store gets the value
+        and the response is NOERROR."""
+        store = InMemoryDNSStore()
+        server, port = self._server(store)
+        with server:
+            response = _send_update(
+                self._build_add("foo.example.com", "v=dmp1;t=test"), port
+            )
+        assert response.rcode() == dns.rcode.NOERROR
+        assert store.query_txt_record("foo.example.com") == ["v=dmp1;t=test"]
+
+    def test_unsigned_update_is_refused(self):
+        """An UPDATE that doesn't carry TSIG must not write anything."""
+        store = InMemoryDNSStore()
+        server, port = self._server(store)
+        upd = dns.update.UpdateMessage("example.com")
+        upd.add(
+            dns.name.from_text("foo.example.com."),
+            300,
+            "TXT",
+            '"should-not-write"',
+        )
+        with server:
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED
+        assert store.query_txt_record("foo.example.com") is None
+
+    def test_wrong_key_is_notauth(self):
+        """An UPDATE signed with a key the server doesn't know fails
+        TSIG verification at parse time → NOTAUTH, no write."""
+        store = InMemoryDNSStore()
+        server, port = self._server(store)
+        upd = dns.update.UpdateMessage("example.com")
+        upd.add(
+            dns.name.from_text("foo.example.com."), 300, "TXT", '"intruder"'
+        )
+        upd.use_tsig(
+            _keyring(name="other.", secret=b"\xff" * 32),
+            keyname=dns.name.from_text("other."),
+        )
+        with server:
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.NOTAUTH
+        assert store.query_txt_record("foo.example.com") is None
+
+    def test_zone_outside_allowed_list_is_notauth(self):
+        """A signed UPDATE for a zone we don't claim authority for
+        must be rejected even when the TSIG key is valid."""
+        store = InMemoryDNSStore()
+        server, port = self._server(store)
+        with server:
+            response = _send_update(
+                self._build_add("foo.other.com", "x", zone="other.com"),
+                port,
+            )
+        assert response.rcode() == dns.rcode.NOTAUTH
+        assert store.query_txt_record("foo.other.com") is None
+
+    def test_owner_outside_zone_is_notzone(self):
+        """RFC 2136 §3.4.1.3 — an owner outside the declared zone must
+        be rejected."""
+        store = InMemoryDNSStore()
+        server, port = self._server(store)
+        # Zone in UPDATE is example.com but the owner is in other.com.
+        upd = dns.update.UpdateMessage("example.com")
+        upd.add(
+            dns.name.from_text("foo.other.com."), 300, "TXT", '"bad"'
+        )
+        upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
+        with server:
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.NOTZONE
+        assert store.query_txt_record("foo.other.com") is None
+
+    def test_delete_specific_value(self):
+        """Delete-RR-from-RRset: TXT class NONE with the rdata to drop."""
+        store = InMemoryDNSStore()
+        store.publish_txt_record("foo.example.com", "keep")
+        store.publish_txt_record("foo.example.com", "drop")
+        server, port = self._server(store)
+
+        upd = dns.update.UpdateMessage("example.com")
+        upd.delete(dns.name.from_text("foo.example.com."), "TXT", '"drop"')
+        upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
+        with server:
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.NOERROR
+        remaining = store.query_txt_record("foo.example.com")
+        assert remaining == ["keep"]
+
+    def test_authorizer_rejects_per_rr_scope(self):
+        """The per-RR authorizer can refuse one record, which rejects
+        the entire UPDATE so we never apply a partial change."""
+        store = InMemoryDNSStore()
+
+        def authorizer(key_name, op, owner):
+            return owner.startswith("allowed.")
+
+        server, port = self._server(store, update_authorizer=authorizer)
+        upd = dns.update.UpdateMessage("example.com")
+        upd.add(
+            dns.name.from_text("allowed.example.com."), 300, "TXT", '"ok"'
+        )
+        upd.add(
+            dns.name.from_text("denied.example.com."), 300, "TXT", '"no"'
+        )
+        upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
+        with server:
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED
+        # All-or-nothing: even the allowed name didn't land.
+        assert store.query_txt_record("allowed.example.com") is None
+        assert store.query_txt_record("denied.example.com") is None
+
+    def test_authorizer_passes_through_when_all_allowed(self):
+        store = InMemoryDNSStore()
+
+        seen_calls = []
+
+        def authorizer(key_name, op, owner):
+            seen_calls.append((str(key_name), op, owner))
+            return True
+
+        server, port = self._server(store, update_authorizer=authorizer)
+        with server:
+            response = _send_update(
+                self._build_add("ok.example.com", "v"), port
+            )
+        assert response.rcode() == dns.rcode.NOERROR
+        assert store.query_txt_record("ok.example.com") == ["v"]
+        # Authorizer received the verified TSIG key name.
+        assert seen_calls and seen_calls[0][0].rstrip(".") == "client"
+        assert seen_calls[0][1] == "add"
+
+    def test_no_writer_means_refused(self):
+        """A server constructed without a writer (read-only) refuses
+        any UPDATE regardless of TSIG."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        # writer left unset; server is read-only.
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            tsig_keyring=_keyring(),
+            allowed_zones=("example.com",),
+        )
+        with server:
+            response = _send_update(
+                self._build_add("foo.example.com", "v"), port
+            )
+        assert response.rcode() == dns.rcode.REFUSED
+        assert store.query_txt_record("foo.example.com") is None
