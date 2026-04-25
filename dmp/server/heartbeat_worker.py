@@ -279,6 +279,15 @@ class HeartbeatWorker:
     def _publish_own(self, now_i: int) -> bool:
         """Publish this node's signed heartbeat at
         ``_dnsmesh-heartbeat.<dns_zone>``. Returns True on success.
+
+        Replace-the-RRset semantic: ``DNSRecordWriter.publish_txt_record``
+        is APPEND, so a long-running node would otherwise leave every
+        historical heartbeat at the same name. Readers like
+        ``cmd_peers`` and ``_seed_provider_via_dns`` short-circuit on
+        the first verifiable wire and could lock onto an arbitrarily
+        old self-record (wrong ts, capabilities, or endpoint) instead
+        of the current one (codex round-5 P1). We delete the existing
+        RRset first, then publish the fresh wire.
         """
         if self._record_writer is None or not self._cfg.dns_zone:
             return False
@@ -291,6 +300,12 @@ class HeartbeatWorker:
             name = heartbeat_rrset_name(self._cfg.dns_zone)
         except ValueError:
             return False
+        try:
+            self._record_writer.delete_txt_record(name, value=None)
+        except Exception:
+            log.exception(
+                "heartbeat self-publish wipe raised for %s; continuing", name
+            )
         try:
             ok = bool(
                 self._record_writer.publish_txt_record(

@@ -32,6 +32,7 @@ import logging
 from typing import Optional
 
 import dns.exception
+import dns.flags
 import dns.message
 import dns.name
 import dns.query
@@ -195,9 +196,19 @@ class _DnsUpdateWriter(DNSRecordWriter):
         # UDP first, TCP fallback when the response comes back
         # truncated. Real servers may also force TCP for large
         # signed UPDATEs (the HMAC tag pushes the on-wire size).
+        # dnspython's ``dns.query.udp()`` does NOT raise on TC=1 by
+        # default — it returns the truncated response with the TC
+        # flag set. ``raise_on_truncation=True`` flips that to an
+        # exception we can catch (codex round-5 P2). The except block
+        # is kept as belt-and-suspenders for older dnspython versions
+        # that may surface truncation differently.
         try:
             response = dns.query.udp(
-                upd, self._server, port=self._port, timeout=self._timeout
+                upd,
+                self._server,
+                port=self._port,
+                timeout=self._timeout,
+                raise_on_truncation=True,
             )
         except dns.exception.Truncated:
             try:
@@ -210,6 +221,23 @@ class _DnsUpdateWriter(DNSRecordWriter):
         except (dns.exception.DNSException, OSError):
             log.exception("DNS UPDATE UDP failed for %s/%s", op, name)
             return False
+        else:
+            # Defensive: some dnspython versions / configurations may
+            # still hand back a TC=1 response without raising. Retry
+            # over TCP in that case.
+            if response.flags & dns.flags.TC:
+                try:
+                    response = dns.query.tcp(
+                        upd,
+                        self._server,
+                        port=self._port,
+                        timeout=self._timeout,
+                    )
+                except (dns.exception.DNSException, OSError):
+                    log.exception(
+                        "DNS UPDATE TCP retry failed for %s/%s", op, name
+                    )
+                    return False
 
         rcode = response.rcode()
         if rcode != dns.rcode.NOERROR:

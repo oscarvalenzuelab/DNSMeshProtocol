@@ -426,18 +426,30 @@ def _load_heartbeat_from_env(
     claim_zone = _load_claim_provider_zone()
     has_zone = bool(claim_zone)
     capabilities = CAP_CLAIM_PROVIDER if (claim_provider_on and has_zone) else 0
-    # Wire field: only populated when the node is actually acting as
-    # a claim provider. Empty signals "I don't host claims" to peers.
-    advertised_zone = claim_zone if (claim_provider_on and has_zone) else ""
 
     # Codex round-3 P1: heartbeat publishing has to keep working when
     # claim-provider is disabled. The zone the worker publishes UNDER
     # is the served zone, which doesn't get cleared by
     # ``DMP_CLAIM_PROVIDER=0``. The advertised claim-provider role
-    # IS still tied to the opt-out (above), so a non-claim-provider
-    # node still appears in DNS discovery but doesn't get picked up
-    # by ``select_providers``.
+    # IS still tied to the opt-out (capabilities=0 above), so a
+    # non-claim-provider node still appears in DNS discovery but
+    # doesn't get picked up by ``select_providers``.
     publish_zone = _load_served_zone()
+
+    # Codex round-5 P2: the wire's zone field is now the SERVED zone,
+    # always populated (not gated on claim-provider role). Peers use
+    # this to drive transitive harvest at ``_dnsmesh-heartbeat.<zone>``;
+    # without it, harvest falls back to URL-host derivation and
+    # silently misses any node whose HTTP host sits beneath its
+    # served zone. Whether the node is a claim PROVIDER is decided
+    # by the ``capabilities`` bitfield alone — clients combine
+    # ``capabilities & CAP_CLAIM_PROVIDER`` AND ``zone non-empty``
+    # to filter ``select_providers``. The field name stays
+    # ``claim_provider_zone`` for back-compat with existing
+    # consumers; the semantic is "the zone this node publishes
+    # under" and is interpreted as a claim-provider zone iff the
+    # cap bit is set.
+    advertised_zone = publish_zone
 
     cfg = HeartbeatWorkerConfig(
         self_endpoint=self_endpoint,
