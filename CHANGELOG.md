@@ -7,6 +7,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.4] — upgrade scripts backfill DMP_HEARTBEAT_SEEDS
+
+### Added
+
+- **Upgrade scripts now backfill `DMP_HEARTBEAT_SEEDS`** into existing
+  env files when missing. `deploy/native-ubuntu/upgrade.sh` and
+  `deploy/digitalocean/upgrade.sh` both check for the line before
+  appending; idempotent across re-runs. Closes the gap where a
+  pre-0.3.3 deploy (whose env file was generated before the seed
+  line existed in the install scripts) couldn't bootstrap into the
+  federation without manual edits. Existing values are left alone —
+  the backfill only kicks in when the line is absent entirely.
+
 ## [0.3.3] — self in peers table + DMP_HEARTBEAT_SEEDS bootstrap
 
 ### Fixed

@@ -101,6 +101,32 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────
+# Backfill DMP_HEARTBEAT_SEEDS into pre-0.3.3 env files
+# ──────────────────────────────────────────────────────────────────────
+
+step "Checking node.env for DMP_HEARTBEAT_SEEDS"
+ENV_FILE="$ETC_DIR/node.env"
+if [[ -f "$ENV_FILE" ]] && ! grep -qE '^[[:space:]]*DMP_HEARTBEAT_SEEDS=' "$ENV_FILE"; then
+    # Pre-0.3.3 installs were created without the seeds line. Add it so
+    # the heartbeat worker has somewhere to gossip on the first tick
+    # after the upgrade. dnsmesh.io is the canonical bootstrap.
+    cat >> "$ENV_FILE" <<EOF
+
+# Added by upgrade.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ).
+# Heartbeat seeds: nodes this one will pre-emptively send its own
+# heartbeat to on every tick. Without seeds, a new node only meets
+# peers that find it first — dnsmesh.io acts as the canonical
+# bootstrap so federation works out of the box. Comma-separated.
+DMP_HEARTBEAT_SEEDS=https://dnsmesh.io
+EOF
+    chown root:"$DNSMESH_USER" "$ENV_FILE"
+    chmod 0640 "$ENV_FILE"
+    ok "added DMP_HEARTBEAT_SEEDS=https://dnsmesh.io to $ENV_FILE"
+else
+    ok "DMP_HEARTBEAT_SEEDS already present (left alone)"
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # Restart and wait for health
 # ──────────────────────────────────────────────────────────────────────
 
