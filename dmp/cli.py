@@ -1801,11 +1801,25 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
             sys.exit(2)
         identity = match
 
+    # Build a display address that includes the host part the lookup
+    # actually used. The IdentityRecord stores just the username, but
+    # without the host part `alkamod` on dnsmesh.io is indistinguishable
+    # from `alkamod` on some other node — operators need to see the full
+    # address they fetched.
+    if parsed_addr is not None:
+        _user, _host = parsed_addr
+        display_address = f"{identity.username}@{_host}"
+    elif args.domain:
+        display_address = f"{identity.username}@{args.domain}"
+    else:
+        display_address = f"{identity.username}@{_effective_domain(cfg)}"
+
     if args.json:
         print(
             json.dumps(
                 {
                     "username": identity.username,
+                    "address": display_address,
                     "public_key": identity.x25519_pk.hex(),
                     "signing_public_key": identity.ed25519_spk.hex(),
                     "ts": identity.ts,
@@ -1815,6 +1829,7 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
             )
         )
     else:
+        print(f"address:            {display_address}")
         print(f"username:           {identity.username}")
         print(f"public_key:         {identity.x25519_pk.hex()}")
         print(f"signing_public_key: {identity.ed25519_spk.hex()}")
