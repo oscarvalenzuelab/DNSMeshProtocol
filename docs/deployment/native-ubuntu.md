@@ -149,8 +149,8 @@ sudo systemctl restart dnsmesh-node
 ```
 
 Existing per-user tokens stored under `~/.dmp/tokens/<host>.json` on
-client machines need to be re-issued (run `dnsmesh register --node
-<host>` from the client side).
+client machines need to be re-issued (run `dnsmesh register --node <host>`
+from the client side).
 
 ### Enabling multi-tenant auth
 
