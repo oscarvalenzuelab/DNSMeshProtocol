@@ -1,6 +1,18 @@
 {
   "version": 1,
-  "generated_at": 1777104017,
-  "node_count": 0,
-  "nodes": []
+  "generated_at": 1777139284,
+  "node_count": 1,
+  "nodes": [
+    {
+      "operator_spk_hex": "55dd5085bb16dbf5adaf24d53a13bbd50c8f9f93e026b194059235a3fd82bfef",
+      "endpoint": "https://dnsmesh.pro",
+      "version": "dev",
+      "ts": 1777139281,
+      "exp": 1777225681,
+      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMgATaHR0cHM6Ly9kbnNtZXNoLnByb1XdUIW7Ftv1ra8k1ToTu9UMj5+T4CaxlAWSNaP9gr/vA2RldgABAAAAAGns/lEAAAAAae5P0U1voCPS7IPgzXhW3f41wSNP3z7Wmi+AZqV91yWfPAWM1yKuCVD/r0L9DV0GUSWmKnBceTWHQEH9MQ3c2z0C1Qc=",
+      "last_seen_via": [
+        "https://dnsmesh.io"
+      ]
+    }
+  ]
 }
