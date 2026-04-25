@@ -401,6 +401,68 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             else ""
         )
 
+        # Registration block: tell visitors whether they can self-register
+        # for a publish token, need an operator-issued token, or are
+        # looking at an open / dev-mode node.
+        auth_mode = getattr(self.server, "auth_mode", None) or "open"
+        reg_cfg = getattr(self.server, "registration_config", None)
+        reg_self_service = self._registration_enabled()
+        reg_endpoint = self_endpoint or (
+            f"https://{host_header}" if host_header else "https://<this-host>"
+        )
+
+        if reg_self_service:
+            allowlist = reg_cfg.allowlist if reg_cfg else ()
+            if allowlist:
+                allow_html = (
+                    "<p><small>Subjects must be in the operator's allowlist: "
+                    + ", ".join(f"<code>{_html.escape(d)}</code>" for d in allowlist)
+                    + ".</small></p>"
+                )
+            else:
+                allow_html = (
+                    "<p><small>No subject allowlist — any "
+                    "<code>user@example.com</code> address can register.</small></p>"
+                )
+            expiry_days = int(reg_cfg.expires_in_seconds // 86400) if reg_cfg else 90
+            registration_block = (
+                "<h2>Registration</h2>"
+                "<p>This node accepts <strong>self-service registration</strong>. "
+                "Anyone with the <code>dnsmesh</code> CLI can mint a "
+                f"per-user publish token here (default expiry: {expiry_days} days).</p>"
+                f"<pre>pip install dnsmesh\n"
+                f"dnsmesh init alice --domain &lt;your-domain&gt; --endpoint {_html.escape(reg_endpoint)}\n"
+                f"dnsmesh register --node {_html.escape(reg_endpoint)}</pre>"
+                + allow_html
+            )
+        elif auth_mode == "multi-tenant":
+            registration_block = (
+                "<h2>Registration</h2>"
+                "<p>This node uses per-user publish tokens "
+                "(<code>multi-tenant</code> mode), but self-service registration "
+                "is currently <strong>disabled</strong>. Tokens are issued by the "
+                "operator on request — contact the operator of "
+                f"<code>{_html.escape(reg_endpoint)}</code>.</p>"
+            )
+        elif auth_mode == "legacy":
+            registration_block = (
+                "<h2>Registration</h2>"
+                "<p>This node is in <strong>legacy</strong> auth mode: a single "
+                "operator bearer token gates all writes. Contact the operator "
+                "to request access.</p>"
+            )
+        else:
+            registration_block = (
+                "<h2>Registration</h2>"
+                "<p>This node is in <strong>open</strong> mode and accepts "
+                "unauthenticated writes. Operators should set "
+                "<code>DMP_AUTH_MODE=multi-tenant</code> + an "
+                "<code>DMP_OPERATOR_TOKEN</code> before exposing the node "
+                "to the public internet. See the "
+                '<a href="https://ovalenzuela.com/DNSMeshProtocol/deployment/multi-tenant">'
+                "multi-tenant deployment guide</a>.</p>"
+            )
+
         body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -435,6 +497,8 @@ pre {{ background: #f6f8fa; border: 1px solid #d1d9e0; padding: 0.6em 0.8em; bor
 {spk_line}
 <li><strong>API:</strong> <a href="/health">/health</a> &middot; <a href="/stats">/stats</a></li>
 </ul>
+
+{registration_block}
 
 {discovery_block}
 

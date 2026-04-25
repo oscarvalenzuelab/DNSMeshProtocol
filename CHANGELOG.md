@@ -7,6 +7,25 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.2] — registration block on the landing page
+
+### Added
+
+- **Landing page now shows the node's registration policy.** The
+  `/` page renders one of four blocks depending on the auth_mode +
+  registration env vars:
+  - `multi-tenant` + `DMP_REGISTRATION_ENABLED=1`: copy-pasteable
+    `dnsmesh init` + `dnsmesh register` snippet, plus the operator
+    allowlist if any.
+  - `multi-tenant` without registration: explains tokens are
+    operator-issued and points at the operator.
+  - `legacy`: explains a single operator bearer token gates all
+    writes.
+  - `open` (default): warns that the node accepts unauthenticated
+    writes and links the multi-tenant deployment guide.
+  Lets visitors landing at the node know whether they can self-onboard
+  or have to ask the operator without having to read the source.
+
 ## [0.3.1] — HEAD-method support + seed dnsmesh.io
 
 ### Fixed
