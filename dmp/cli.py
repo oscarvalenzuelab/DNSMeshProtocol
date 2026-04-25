@@ -131,6 +131,13 @@ class CLIConfig:
     # this field leave it empty and fall back to the local effective
     # domain for all addressing (back-compat).
     contacts: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    # Canonical Ed25519 signing pubkey (hex) established on first
+    # successful key derivation. Used as a typo-tripwire only: every
+    # subsequent passphrase derive compares against this and aborts on
+    # mismatch. NOT a secret — it's a public key by definition. Empty
+    # on a fresh `dnsmesh init`; populated lazily on first
+    # `_make_client` call. Updated by `dnsmesh identity rotate`.
+    verify_pubkey: str = ""
 
     @classmethod
     def load(cls, path: Path) -> "CLIConfig":
@@ -171,6 +178,7 @@ class CLIConfig:
             dns_resolvers=dns_resolvers,
             passphrase_file=data.get("passphrase_file"),
             kdf_salt=data.get("kdf_salt", ""),
+            verify_pubkey=data.get("verify_pubkey", "") or "",
             identity_domain=data.get("identity_domain", ""),
             cluster_base_domain=data.get("cluster_base_domain", "") or "",
             cluster_operator_spk=data.get("cluster_operator_spk", "") or "",
@@ -749,6 +757,49 @@ def _make_client(
     # intentionally unintrusive — we do not modify DMPClient itself,
     # per the M2.wire hard-rules constraint.
     client._cluster_client = cluster_client  # type: ignore[attr-defined]
+
+    # Passphrase-typo tripwire. The keypair is derived purely from
+    # passphrase + kdf_salt, so any string produces some valid keypair
+    # — there's no built-in "wrong passphrase" detection. We compare
+    # the derived signing pubkey against the canonical we stored on
+    # first derive. Mismatch is almost always a typo (or a config
+    # someone copied without the matching passphrase).
+    derived_spk_hex = client.crypto.get_signing_public_key_bytes().hex()
+    if not config.verify_pubkey:
+        # First derive on this config: write the derived pubkey as the
+        # canonical. NOT a secret; it's published when identity is.
+        config.verify_pubkey = derived_spk_hex
+        try:
+            config.save(_config_path())
+        except OSError as e:
+            # Don't take the command down if config is read-only;
+            # subsequent runs just skip the tripwire.
+            print(
+                f"warning: could not persist verify_pubkey to config: {e}",
+                file=sys.stderr,
+            )
+    elif config.verify_pubkey != derived_spk_hex:
+        if os.environ.get("DMP_PASSPHRASE_OVERRIDE_VERIFY") == "1":
+            print(
+                "warning: passphrase derives a different identity than the "
+                f"one saved in config ({derived_spk_hex} != "
+                f"{config.verify_pubkey}); proceeding because "
+                "DMP_PASSPHRASE_OVERRIDE_VERIFY=1.",
+                file=sys.stderr,
+            )
+        else:
+            _die(
+                1,
+                "passphrase mismatch: the derived signing pubkey does "
+                "not match the one this config was first used with.\n"
+                f"  expected: {config.verify_pubkey}\n"
+                f"  derived:  {derived_spk_hex}\n\n"
+                "Almost certainly a typo. Re-enter the passphrase that "
+                "produced your published identity. If you genuinely "
+                "intended a different identity, run `dnsmesh init "
+                "--force` (loses the current identity) or set "
+                "DMP_PASSPHRASE_OVERRIDE_VERIFY=1 to bypass once.",
+            )
     # Contacts must use the same effective domain as the client itself
     # for mailbox-local addressing (slot/chunk RRsets); otherwise
     # send_message() builds prekey_rrset_name under the legacy domain
@@ -1235,6 +1286,10 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
                 if env_pp != new_pp_contents:
                     env_passphrase_mismatch = True
             cfg.passphrase_file = str(Path(new_pp_file).expanduser())
+            # Identity changed: refresh the typo-tripwire to the
+            # post-rotation pubkey, otherwise every subsequent command
+            # would die on the (now intentional) mismatch.
+            cfg.verify_pubkey = new_spk_hex
             cfg.save(_config_path())
             swapped_locally = True
             print(
