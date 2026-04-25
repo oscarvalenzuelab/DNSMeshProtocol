@@ -118,6 +118,48 @@ class TestVerifyRecord:
     def test_unknown_prefix_accepted(self):
         assert verify_record("random-string") is True
 
+    def test_valid_claim_passes(self):
+        """M8.4 — anti-entropy gossip must accept signed claims."""
+        import time as _time
+
+        from dmp.core.claim import ClaimRecord
+
+        c = DMPCrypto()
+        now = int(_time.time())
+        wire = ClaimRecord(
+            msg_id=b"\x11" * 16,
+            sender_spk=c.get_signing_public_key_bytes(),
+            sender_mailbox_domain="alice.mesh",
+            slot=0,
+            ts=now,
+            exp=now + 300,
+        ).sign(c)
+        assert verify_record(wire) is True
+
+    def test_tampered_claim_fails(self):
+        """M8.4 — claims with broken signatures must NOT be replicated.
+
+        Without this, a malicious peer could poison every downstream
+        provider's claim namespace by gossiping forged wires.
+        """
+        import time as _time
+
+        from dmp.core.claim import ClaimRecord
+
+        c = DMPCrypto()
+        now = int(_time.time())
+        wire = ClaimRecord(
+            msg_id=b"\x11" * 16,
+            sender_spk=c.get_signing_public_key_bytes(),
+            sender_mailbox_domain="alice.mesh",
+            slot=0,
+            ts=now,
+            exp=now + 300,
+        ).sign(c)
+        # Flip bits in the signature region.
+        tampered = wire[:-5] + "AAAAA"
+        assert verify_record(tampered) is False
+
     def test_empty_rejected(self):
         assert verify_record("") is False
 

@@ -267,6 +267,8 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             return self._handle_nodes_seen()
         if self.path == "/nodes":
             return self._handle_nodes_html()
+        if self.path == "/v1/info":
+            return self._handle_node_info()
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/sync/digest":
             return self._handle_sync_digest(parsed.query)
@@ -598,6 +600,8 @@ No central directory, no phone numbers, no servers to trust.</p>
             return self._handle_registration_confirm()
         if parsed.path == "/v1/heartbeat":
             return self._handle_heartbeat_submit()
+        if parsed.path == "/v1/claim/publish":
+            return self._handle_claim_publish()
         name = self._match_name()
         if name is None:
             self._send_json(404, {"error": "not found"})
@@ -931,6 +935,130 @@ No central directory, no phone numbers, no servers to trust.</p>
         self.end_headers()
         self.wfile.write(data)
         return 200
+
+    # ----------------------- M8.3: claim publish + node info ------------
+
+    def _handle_node_info(self) -> int:
+        """GET /v1/info: discovery endpoint for this node's identity + caps.
+
+        Used by clients to learn the DNS zone a claim-provider node
+        serves under. Without this endpoint, clients fall back to the
+        endpoint hostname as the implied zone — which is the right
+        guess for the common case but breaks when a multi-tenant node
+        serves claims under a zone different from its HTTP host.
+
+        The response is a small JSON document; no auth required.
+        """
+        zone = getattr(self.server, "claim_provider_zone", "") or ""
+        endpoint = getattr(self.server, "heartbeat_self_endpoint", "") or ""
+        spk_hex = getattr(self.server, "heartbeat_self_spk_hex", "") or ""
+        capabilities = int(getattr(self.server, "advertised_capabilities", 0) or 0)
+        self._send_json(
+            200,
+            {
+                "endpoint": endpoint,
+                "operator_spk": spk_hex,
+                "claim_provider_zone": zone,
+                "capabilities": capabilities,
+            },
+        )
+        return 200
+
+    def _handle_claim_publish(self) -> int:
+        """POST /v1/claim/publish: store a signed claim under our zone.
+
+        The body is ``{"value": "<wire>"}`` — a signed
+        ``v=dmp1;t=claim;...`` record produced by the sender. The
+        server:
+
+          1. Verifies the wire parses + signature checks (the
+             sender's Ed25519 sig over the claim body is the
+             authentication; no bearer token required).
+          2. Refuses if the server isn't configured as a claim
+             provider (``DMP_CLAIM_PROVIDER=0`` or no zone set).
+          3. Computes the RRset name as
+             ``claim-{slot}.mb-{hash12(recipient_id)}.{provider_zone}``
+             — but the recipient_id isn't in the claim body
+             (M8.2 dropped it for wire-size). The server has no
+             way to know the recipient_id, so the publishing
+             client provides ``recipient_id_hex12`` alongside
+             ``value`` in the body. The server validates that
+             the hash is a 12-char hex string and uses it
+             verbatim in the RRset name; cross-recipient replay
+             of a captured claim is harmless because the manifest
+             still ties the message to a specific recipient_id
+             (see ``dmp/core/claim.py`` design notes).
+          4. Stores the wire under the computed name.
+
+        Rate-limited per source IP via the standard
+        ``self._check_rate_limit()``; aggressive flooding by a
+        single IP gets 429ed before signature verification (cheap
+        defense for the provider operator).
+        """
+        from dmp.core.claim import RECORD_PREFIX as _CLAIM_PREFIX
+        from dmp.core.claim import ClaimRecord
+
+        zone = getattr(self.server, "claim_provider_zone", "") or ""
+        if not zone:
+            self._send_json(
+                404, {"error": "this node is not a claim provider"}
+            )
+            return 404
+        if not self._check_rate_limit():
+            return 429
+
+        body = self._read_json_body()
+        if body is None:
+            self._send_json(400, {"error": "invalid body"})
+            return 400
+        wire = body.get("value")
+        recip_hex = body.get("recipient_id_hex12")
+        ttl = body.get("ttl", 300)
+        if (
+            not isinstance(wire, str)
+            or not isinstance(recip_hex, str)
+            or not isinstance(ttl, int)
+            or ttl <= 0
+        ):
+            self._send_json(
+                400,
+                {
+                    "error": "value (str), recipient_id_hex12 (str), "
+                    "ttl (int > 0) required"
+                },
+            )
+            return 400
+        if len(recip_hex) != 12 or not all(c in "0123456789abcdef" for c in recip_hex):
+            self._send_json(
+                400, {"error": "recipient_id_hex12 must be 12 lowercase hex chars"}
+            )
+            return 400
+        if not wire.startswith(_CLAIM_PREFIX):
+            self._send_json(400, {"error": "value is not a claim wire"})
+            return 400
+
+        record = ClaimRecord.parse_and_verify(wire)
+        if record is None:
+            # Sig didn't verify or freshness check failed.
+            self._send_json(400, {"error": "claim verification failed"})
+            return 400
+
+        # Cap TTL at the server's max_ttl so a sender can't pin a
+        # long-lived claim past the operator's policy.
+        max_ttl = self.server.max_ttl
+        if ttl > max_ttl:
+            ttl = max_ttl
+
+        rrset_name = f"claim-{record.slot}.mb-{recip_hex}.{zone}"
+
+        writer = self._writer()
+        if writer is None:
+            self._send_json(501, {"error": "writer not configured"})
+            return 501
+        ok = writer.publish_txt_record(rrset_name, wire, ttl=ttl)
+        status = 201 if ok else 502
+        self._send_json(status, {"ok": ok, "name": rrset_name})
+        return status
 
     def _handle_nodes_seen(self) -> int:
         """GET /v1/nodes/seen: public snapshot of verified heartbeats
@@ -1441,6 +1569,8 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         heartbeat_self_spk_hex=None,
         heartbeat_gossip_limit: int = 10,
         heartbeat_seen_limit: int = 500,
+        claim_provider_zone: str = "",
+        advertised_capabilities: int = 0,
     ):
         super().__init__(addr, handler)
         self.store = store
@@ -1477,6 +1607,17 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.heartbeat_self_spk_hex = heartbeat_self_spk_hex
         self.heartbeat_gossip_limit = int(heartbeat_gossip_limit)
         self.heartbeat_seen_limit = int(heartbeat_seen_limit)
+        # M8.3: claim-provider role config. ``claim_provider_zone`` is
+        # the DNS zone this node serves claim records under (typically
+        # the same as ``cluster_base_domain`` or the heartbeat host).
+        # Empty string means this node is NOT acting as a claim
+        # provider — POST /v1/claim/publish will 404.
+        # ``advertised_capabilities`` is the bitfield this node
+        # heartbeats with; surfaced via /v1/info so clients can avoid
+        # the heartbeat-feed roundtrip when they only want the local
+        # node's caps.
+        self.claim_provider_zone = str(claim_provider_zone or "")
+        self.advertised_capabilities = int(advertised_capabilities or 0)
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -1535,6 +1676,8 @@ class DMPHttpApi:
         heartbeat_self_spk_hex: Optional[str] = None,
         heartbeat_gossip_limit: int = 10,
         heartbeat_seen_limit: int = 500,
+        claim_provider_zone: str = "",
+        advertised_capabilities: int = 0,
     ):
         self.store = store
         self.host = host
@@ -1582,6 +1725,10 @@ class DMPHttpApi:
         self.heartbeat_self_spk_hex = heartbeat_self_spk_hex
         self.heartbeat_gossip_limit = int(heartbeat_gossip_limit)
         self.heartbeat_seen_limit = int(heartbeat_seen_limit)
+        # M8.3: claim-provider role config (zone served + capabilities
+        # advertised). Empty zone disables claim publishing here.
+        self.claim_provider_zone = str(claim_provider_zone or "")
+        self.advertised_capabilities = int(advertised_capabilities or 0)
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -1659,6 +1806,8 @@ class DMPHttpApi:
             heartbeat_self_spk_hex=self.heartbeat_self_spk_hex,
             heartbeat_gossip_limit=self.heartbeat_gossip_limit,
             heartbeat_seen_limit=self.heartbeat_seen_limit,
+            claim_provider_zone=self.claim_provider_zone,
+            advertised_capabilities=self.advertised_capabilities,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(

@@ -302,6 +302,35 @@ primary deliverable up to `v1.0`; applications ship afterwards and
 on their own cadence. Contributors interested in any M7 item are
 welcome to prototype in a separate repo and reconverge.
 
+### M8 — Cross-zone routing + first-message reach
+
+Restores the original spec's cross-zone delivery path (sender publishes
+to own zone, recipient polls pinned senders' zones via the recursive
+DNS chain) and adds a recipient-keyed claim layer so unpinned strangers
+can reach a recipient over DNS without sender-recipient zone collusion.
+Detailed scope, wire formats, and trust split live in the design doc
+(`docs/protocol/claims.md`, drafted alongside this milestone).
+
+- [ ] **M8.1** Cross-zone receive bug fix — `receive_messages()` walks
+      pinned contacts' zones; `_slot_domain` and `_chunk_domain` take
+      an explicit zone; chunk-fetch zone is sourced from the manifest's
+      query zone, not re-derived from `sender_spk`.
+- [ ] **M8.2** Claim record wire format + heartbeat capability bit
+      (claim-provider on by default; `DMP_CLAIM_PROVIDER=0` opts out).
+- [ ] **M8.3** Claim provider selection from `SeenStore` recency,
+      send-side claim publish, recv-side claim poll, intro queue with
+      sqlite persistence, `dnsmesh intro {list,accept,trust,block}`
+      CLI surface, `claim_provider_override` config field.
+- [ ] **M8.4** Anti-entropy gossip on the claim namespace
+      (extension of the M2.4 mechanism, scoped to `claim-*` records).
+- [ ] **M8.5** Provider "received" attestations — DEFERRED.
+      Signed receipts published by claim providers ("I accepted this
+      claim at ts T") give recipients a provenance trail and a way to
+      detect silent-drop misbehavior by a single provider. Not load-
+      bearing while M8.4 anti-entropy is in place; revisit if real
+      deployments surface drop incidents that anti-entropy doesn't
+      catch.
+
 ## Deferred / unlikely
 
 These appear in the design-intent docs but are unlikely to ship as-spec:

@@ -2,12 +2,12 @@
 
 Every opted-in node periodically emits a ``HeartbeatRecord`` asserting
 "I am <endpoint>, operated by <operator_spk>, running version
-<version>, as of <ts>, valid until <exp>." Peers store received
-heartbeats in a local seen-store and re-export them on
-``GET /v1/nodes/seen`` so aggregators (including a central directory
-website) can render "which nodes are reachable right now" without
-introducing a new trust anchor: every entry in the aggregated list is
-a verifiable signature under the operator key.
+<version>, capabilities <bitfield>, as of <ts>, valid until <exp>."
+Peers store received heartbeats in a local seen-store and re-export
+them on ``GET /v1/nodes/seen`` so aggregators (including a central
+directory website) can render "which nodes are reachable right now"
+without introducing a new trust anchor: every entry in the aggregated
+list is a verifiable signature under the operator key.
 
 Wire format — flat binary, same style as ``ClusterManifest`` /
 ``RotationRecord``. Base64 of ``body || sig`` with a
@@ -15,12 +15,13 @@ Wire format — flat binary, same style as ``ClusterManifest`` /
 
 Body layout (all integers big-endian):
 
-    magic            b"DMPHB01"              7 bytes
+    magic            b"DMPHB02"              7 bytes
     endpoint_len     uint16                  2 bytes
     endpoint         utf-8 bytes             var, 1..MAX_ENDPOINT_LEN
     operator_spk     bytes                   32 bytes (Ed25519 pubkey)
     version_len      uint8                   1 byte
     version          utf-8 bytes             0..MAX_VERSION_LEN
+    capabilities     uint16                  2 bytes (bitfield, M8.2+)
     ts               uint64                  8 bytes (unix seconds)
     exp              uint64                  8 bytes (unix seconds)
     signature        bytes                   64 bytes
@@ -29,6 +30,21 @@ The operator key is the same Ed25519 key that signs
 ``ClusterManifest`` / ``BootstrapRecord`` — heartbeat does not add
 a new trust anchor, and a leaked operator key's blast radius is
 unchanged.
+
+**Capabilities (M8.2):** bit 0 (``CAP_CLAIM_PROVIDER``) advertises
+that this node hosts the M8 first-contact claim namespace under its
+own zone. Defaults ON in production heartbeat workers; operators who
+don't want to host claims for arbitrary recipients opt out via
+``DMP_CLAIM_PROVIDER=0``. The bitfield carries 15 reserved bits for
+future capabilities (e.g. directory aggregator, rendezvous
+operator) — pre-M8.2 nodes that read a v=DMPHB02 record but don't
+understand a given bit should ignore unknown bits, not reject the
+record.
+
+Magic was bumped from ``DMPHB01`` to ``DMPHB02`` for this format
+change; pre-M8.2 nodes will fail to parse v=DMPHB02 records and
+vice versa. This is acceptable for the alpha — no production
+deployments rely on the v01 wire today.
 """
 
 from __future__ import annotations
@@ -48,9 +64,19 @@ from dmp.core.ed25519_points import is_low_order as _is_low_order
 # v=dmp1; jumping to v=dmp2 is a flag day across everything post-audit.
 RECORD_PREFIX = "v=dmp1;t=heartbeat;"
 
-_MAGIC = b"DMPHB01"
+_MAGIC = b"DMPHB02"
 _SPK_LEN = 32
 _SIG_LEN = 64
+
+# Capability bits advertised in the ``capabilities`` field. Bit 0 is
+# claim-provider (M8.2); subsequent bits are reserved. Use the
+# constants rather than literals to keep grep-ability and avoid
+# typos.
+CAP_CLAIM_PROVIDER = 1 << 0
+# Mask of all bits this code understands. Unknown bits in a parsed
+# record are tolerated (forward-compat) but a node won't act on
+# capabilities it doesn't have a constant for.
+CAP_KNOWN_MASK = CAP_CLAIM_PROVIDER
 
 # Size caps. Deliberately tight — a heartbeat is a discovery record,
 # not a carrier for arbitrary metadata. Callers who want to hang
@@ -205,6 +231,11 @@ class HeartbeatRecord:
     :meth:`parse_and_verify`. The record is signed by ``operator_spk``
     (the Ed25519 key the node operator already uses for cluster
     manifests / bootstrap records).
+
+    ``capabilities`` is a uint16 bitfield (M8.2+). Bit 0 is
+    ``CAP_CLAIM_PROVIDER``; the rest are reserved. A node that reads
+    a heartbeat with bits it doesn't recognize must ignore the unknown
+    bits rather than refusing the record (forward-compat).
     """
 
     endpoint: str
@@ -212,6 +243,7 @@ class HeartbeatRecord:
     version: str
     ts: int
     exp: int
+    capabilities: int = 0
 
     # ------------------------------------------------------------------
     # body layout
@@ -233,6 +265,12 @@ class HeartbeatRecord:
             raise ValueError("exp must be a non-negative int64")
         if self.exp <= self.ts:
             raise ValueError("exp must be strictly greater than ts")
+        if (
+            not isinstance(self.capabilities, int)
+            or self.capabilities < 0
+            or self.capabilities > 0xFFFF
+        ):
+            raise ValueError("capabilities must be a uint16 (0..65535)")
 
         endpoint_bytes = self.endpoint.encode("utf-8")
         version_bytes = self.version.encode("utf-8")
@@ -243,6 +281,7 @@ class HeartbeatRecord:
             + bytes(self.operator_spk)
             + struct.pack(">B", len(version_bytes))
             + version_bytes
+            + struct.pack(">H", self.capabilities)
             + struct.pack(">Q", self.ts)
             + struct.pack(">Q", self.exp)
         )
@@ -291,6 +330,11 @@ class HeartbeatRecord:
             raise ValueError(f"version not valid utf-8: {exc}") from exc
         off += version_len
 
+        if off + 2 > len(body):
+            raise ValueError("body truncated in capabilities")
+        (capabilities,) = struct.unpack(">H", body[off : off + 2])
+        off += 2
+
         if off + 16 > len(body):
             raise ValueError("body truncated in ts/exp")
         (ts,) = struct.unpack(">Q", body[off : off + 8])
@@ -316,6 +360,7 @@ class HeartbeatRecord:
             version=version,
             ts=ts,
             exp=exp,
+            capabilities=capabilities,
         )
 
     # ------------------------------------------------------------------
@@ -377,7 +422,11 @@ class HeartbeatRecord:
             blob = base64.b64decode(wire[len(RECORD_PREFIX) :], validate=True)
         except Exception:
             return None
-        if len(blob) < len(_MAGIC) + _SIG_LEN + 2 + _SPK_LEN + 1 + 16:
+        # magic + endpoint_len + operator_spk + version_len + capabilities
+        # + ts + exp + signature. The smallest legal body has 0-byte
+        # endpoint and version, 2-byte capabilities, 16 bytes for
+        # ts/exp, plus the 64-byte sig.
+        if len(blob) < len(_MAGIC) + _SIG_LEN + 2 + _SPK_LEN + 1 + 2 + 16:
             return None
         body = blob[:-_SIG_LEN]
         sig = blob[-_SIG_LEN:]

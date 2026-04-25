@@ -108,6 +108,12 @@ class HeartbeatWorkerConfig:
     # can force O(N) sig-verify + sqlite work by returning a
     # very-long `seen` array.
     max_gossip_per_response: int = DEFAULT_MAX_GOSSIP_PER_RESPONSE
+    # Capability bitfield advertised in this node's heartbeat
+    # (M8.2). Bit 0 = CAP_CLAIM_PROVIDER. Defaults to 0 here so the
+    # dataclass remains pure-data; DMPNode wiring populates it from
+    # ``DMP_CLAIM_PROVIDER`` env (default ON unless explicitly
+    # disabled).
+    capabilities: int = 0
 
 
 class HeartbeatWorker:
@@ -280,6 +286,7 @@ class HeartbeatWorker:
             version=self._cfg.version,
             ts=now_i,
             exp=now_i + self._cfg.ttl_seconds,
+            capabilities=self._cfg.capabilities,
         )
         return hb.sign(self._crypto)
 

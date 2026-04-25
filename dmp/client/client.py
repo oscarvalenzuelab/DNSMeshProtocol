@@ -7,7 +7,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
@@ -55,6 +55,24 @@ class InboxMessage:
     msg_id: bytes
 
 
+@dataclass
+class ClaimDeliveryResult:
+    """Outcome of a single claim-poll pass on `receive_claims`.
+
+    `delivered` are messages that landed in the inbox (sender was
+    pinned). `quarantined_intro_ids` are intro_queue ids the user
+    can review with `dnsmesh intro list`. `dropped` is a count of
+    claims that were dropped silently — denylisted senders, expired
+    claims, or sigverify failures. The detail breakdown is in
+    `dropped_reasons` for diagnostics.
+    """
+
+    delivered: List["InboxMessage"]
+    quarantined_intro_ids: List[int]
+    dropped: int
+    dropped_reasons: Dict[str, int]
+
+
 class DMPClient:
     """Send and receive end-to-end encrypted messages over DNS TXT records.
 
@@ -86,6 +104,7 @@ class DMPClient:
         kdf_salt: Optional[bytes] = None,
         prekey_store_path: Optional[str] = None,
         rotation_chain_enabled: bool = False,
+        intro_queue_path: Optional[str] = None,
     ):
         if store is not None:
             if writer is None:
@@ -140,21 +159,32 @@ class DMPClient:
             },
         )
 
+        # M8.3 — pending-intro queue for claim-discovered messages from
+        # un-pinned senders. Lazy-imported so legacy code paths that
+        # never invoke claim send/recv don't pay the import cost.
+        from dmp.client.intro_queue import IntroQueue
+
+        self.intro_queue = IntroQueue(intro_queue_path or ":memory:")
+
     # ---- addressing helpers ------------------------------------------------
 
     @staticmethod
     def _hash12(b: bytes) -> str:
         return hashlib.sha256(b).hexdigest()[:12]
 
-    def _slot_domain(self, recipient_id: bytes, slot: int) -> str:
-        return f"slot-{slot}.mb-{self._hash12(recipient_id)}.{self.domain}"
+    def _slot_domain(
+        self, recipient_id: bytes, slot: int, *, zone: Optional[str] = None
+    ) -> str:
+        return f"slot-{slot}.mb-{self._hash12(recipient_id)}.{zone or self.domain}"
 
     @staticmethod
     def _msg_key(msg_id: bytes, recipient_id: bytes, sender_spk: bytes) -> str:
         return hashlib.sha256(msg_id + recipient_id + sender_spk).hexdigest()[:12]
 
-    def _chunk_domain(self, msg_key: str, chunk_num: int) -> str:
-        return f"chunk-{chunk_num:04d}-{msg_key}.{self.domain}"
+    def _chunk_domain(
+        self, msg_key: str, chunk_num: int, *, zone: Optional[str] = None
+    ) -> str:
+        return f"chunk-{chunk_num:04d}-{msg_key}.{zone or self.domain}"
 
     # ---- contacts ----------------------------------------------------------
 
@@ -507,8 +537,49 @@ class DMPClient:
 
     # ---- receive -----------------------------------------------------------
 
+    def _zones_to_poll(self) -> List[str]:
+        """Zones we walk on receive: each pinned contact's zone plus our own.
+
+        The original DMP spec (`docs/design-intent/protocol.md`) puts the
+        sender's records under the sender's zone — Alice publishes to
+        `slot-N.mb-{hash(bob)}.{alice-zone}`, and Bob fetches from the same
+        name via the recursive DNS chain. M8.1 restores that property by
+        walking each pinned contact's zone in addition to `self.domain`.
+
+        `Contact.domain` is populated when a contact is added via
+        `dnsmesh identity fetch user@host --add` (cli.py:854). Legacy
+        contacts that predate the field fall back to `self.domain` in
+        `add_contact`, so same-mesh deployments keep working: their pinned
+        contacts' domain equals `self.domain` and we collapse to a single
+        zone walk.
+
+        `self.domain` is always included even when we have no contacts —
+        that's the legacy same-mesh path and keeps the TOFU bootstrap
+        flow ("publish identity, exchange keys, pin") working before any
+        contact is added.
+        """
+        zones: List[str] = []
+        seen: set = set()
+        for contact in self.contacts.values():
+            z = contact.domain or self.domain
+            if z and z not in seen:
+                zones.append(z)
+                seen.add(z)
+        if self.domain and self.domain not in seen:
+            zones.append(self.domain)
+        return zones
+
     def receive_messages(self) -> List[InboxMessage]:
         """Poll all mailbox slots; verify and decrypt any fresh messages.
+
+        Walks each zone in `_zones_to_poll()` — pinned contacts' zones plus
+        our own — and queries the 10 slot RRsets under each. The chunk
+        zone for any accepted manifest is the SAME zone the manifest was
+        fetched from; we never re-derive it from `sender_spk`, because a
+        manifest signed by Alice but published in a zone Alice doesn't
+        control would otherwise be allowed to redirect chunk fetches to
+        that zone. Manifest-zone integrity is the load-bearing security
+        property here.
 
         Returns the list of newly-delivered messages. Replay-cache rejections,
         signature failures, and manifests from un-pinned senders are silently
@@ -519,9 +590,319 @@ class DMPClient:
         """
         results: List[InboxMessage] = []
         known_spks = self._known_signing_keys()
+        for zone in self._zones_to_poll():
+            for slot in range(SLOT_COUNT):
+                slot_domain = self._slot_domain(self.user_id, slot, zone=zone)
+                records = self.reader.query_txt_record(slot_domain)
+                if not records:
+                    continue
+                for record in records:
+                    parsed = SlotManifest.parse_and_verify(record)
+                    if parsed is None:
+                        continue
+                    manifest, _ = parsed
+                    if manifest.recipient_id != self.user_id:
+                        continue
+                    if manifest.is_expired():
+                        continue
+                    # If the user has pinned any signing keys, only accept
+                    # manifests from those senders. Unknown signers are dropped.
+                    if known_spks and manifest.sender_spk not in known_spks:
+                        # EXPERIMENTAL (M5.4): if rotation-chain walking is
+                        # enabled, try walking each pinned contact's chain
+                        # forward to see if the manifest's sender_spk is the
+                        # current head of a rotation. A valid walk means the
+                        # contact rotated their identity key; we extend the
+                        # accepted set for this receive pass. If the walk
+                        # fails or aborts (revocation, ambiguity, max_hops),
+                        # the manifest stays dropped. Never modifies
+                        # self.contacts — a rotation-chain walk is a
+                        # per-receive trust decision, not a permanent re-pin.
+                        if not self._rotation_manifest_accepted(manifest.sender_spk):
+                            continue
+                    # EXPERIMENTAL (M5.4): cross-check that a PINNED
+                    # signing key hasn't itself been revoked. Without this,
+                    # a sender who published (rotation A→B) + (revocation of
+                    # A) would still have manifests signed by A accepted by
+                    # every contact that pinned A — defeating the whole
+                    # point of revocation. Only fires when rotation chain
+                    # walking is enabled; legacy clients keep their byte-
+                    # identical behavior.
+                    elif self._rotation_manifest_revoked(manifest.sender_spk):
+                        continue
+                    # Check-only here; we record in the replay cache *after*
+                    # we actually decode the message. Otherwise a transient
+                    # DNS miss during chunk fetch would permanently suppress
+                    # a still-valid manifest on later polls.
+                    if self.replay_cache.has_seen(
+                        manifest.sender_spk, manifest.msg_id
+                    ):
+                        continue
+                    decoded = self._fetch_and_decrypt(manifest, source_zone=zone)
+                    if decoded is None:
+                        continue
+                    plaintext, ts, msg_id = decoded
+                    self.replay_cache.record(
+                        manifest.sender_spk, manifest.msg_id, manifest.exp
+                    )
+                    results.append(
+                        InboxMessage(
+                            sender_signing_pk=manifest.sender_spk,
+                            plaintext=plaintext,
+                            timestamp=ts,
+                            msg_id=msg_id,
+                        )
+                    )
+        return results
+
+    # ---- claims (M8.3) -----------------------------------------------------
+
+    def publish_claim(
+        self,
+        *,
+        recipient_id: bytes,
+        msg_id: bytes,
+        slot: int,
+        sender_mailbox_domain: str,
+        ttl: int,
+        provider_zone: str,
+        provider_writer: Optional[DNSRecordWriter] = None,
+    ) -> bool:
+        """Publish one signed claim record at a single provider zone.
+
+        The claim is a tiny pointer: it tells whoever polls that
+        `sender_spk` has mail for the recipient (identified by the
+        hash12 in the RRset name) at slot `slot` of zone
+        `sender_mailbox_domain`. The recipient verifies the signature,
+        then fetches the manifest+chunks from `sender_mailbox_domain`
+        via the normal cross-zone receive path (M8.1).
+
+        `provider_writer` defaults to `self.writer`. In tests the
+        sender + provider share an `InMemoryDNSStore` and a single
+        writer covers both. In production the sender uses an HTTP-
+        backed writer that POSTs to the provider's `/v1/claim/publish`
+        endpoint; that writer publishes under the provider's local
+        DNS authoritative tree.
+
+        Returns True on successful publish. Failures (oversize,
+        signing mismatch, write rejection) return False without
+        raising — first-message reach is best-effort, not a delivery
+        guarantee, and a failure to publish to one provider must not
+        block publishing to others.
+        """
+        from dmp.core.claim import (
+            MAX_MAILBOX_DOMAIN_LEN,
+            ClaimRecord,
+            claim_rrset_name,
+        )
+
+        if len(sender_mailbox_domain) > MAX_MAILBOX_DOMAIN_LEN:
+            return False
+        now = int(time.time())
+        try:
+            record = ClaimRecord(
+                msg_id=bytes(msg_id),
+                sender_spk=self.crypto.get_signing_public_key_bytes(),
+                sender_mailbox_domain=sender_mailbox_domain,
+                slot=int(slot),
+                ts=now,
+                exp=now + int(ttl),
+            )
+            wire = record.sign(self.crypto)
+        except (ValueError, Exception):
+            return False
+        try:
+            name = claim_rrset_name(recipient_id, int(slot), provider_zone)
+        except ValueError:
+            return False
+        writer = provider_writer or self.writer
+        try:
+            return writer.publish_txt_record(name, wire, ttl=int(ttl))
+        except Exception:
+            return False
+
+    def receive_claims(
+        self,
+        *,
+        provider_zones: Sequence[Tuple[str, str]] = (),
+    ) -> ClaimDeliveryResult:
+        """Poll claim providers for first-contact pointers, deliver / quarantine.
+
+        `provider_zones` is the ranked list `[(provider_zone,
+        provider_endpoint), ...]` from `claim_routing.select_providers`.
+        Only the `provider_zone` is used here (the DNS query name);
+        the endpoint is informational, surfaced for logging.
+
+        For each verified, unexpired claim:
+
+          1. Fetch the manifest at
+             `slot-{N}.mb-{hash(self)}.{claim.sender_mailbox_domain}`.
+          2. Verify signature, recipient_id, freshness.
+          3. Fetch chunks from the SAME zone (M8.1 manifest-zone
+             integrity).
+          4. Decrypt.
+          5. If `claim.sender_spk` is pinned → deliver to inbox.
+             Else → land in `intro_queue` with the decrypted plaintext.
+
+        Claims from denylisted senders are dropped at `intro_queue.add_intro`
+        time. Replay protection uses the existing `ReplayCache` once a
+        claim leads to a successful decrypt — the replay cache is keyed
+        on (sender_spk, msg_id), so a re-poll that re-discovers the same
+        claim is naturally deduplicated.
+
+        Returns a `ClaimDeliveryResult` with the delivered messages,
+        the quarantined intro ids (for `dnsmesh intro list`), and a
+        small drop-reasons counter for diagnostics.
+        """
+        from dmp.core.claim import ClaimRecord, claim_rrset_name
+        from dmp.core.manifest import SlotManifest
+
+        delivered: List[InboxMessage] = []
+        quarantined_ids: List[int] = []
+        drop_reasons: Dict[str, int] = {}
+        dropped = 0
+
+        def _drop(reason: str) -> None:
+            nonlocal dropped
+            dropped += 1
+            drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
+
+        known_spks = self._known_signing_keys()
+
+        for provider_zone, _provider_endpoint in provider_zones:
+            for slot in range(SLOT_COUNT):
+                try:
+                    name = claim_rrset_name(self.user_id, slot, provider_zone)
+                except ValueError:
+                    _drop("bad-provider-zone")
+                    continue
+                try:
+                    records = self.reader.query_txt_record(name)
+                except Exception:
+                    _drop("dns-query-failed")
+                    continue
+                if not records:
+                    continue
+                for record in records:
+                    claim = ClaimRecord.parse_and_verify(record)
+                    if claim is None:
+                        _drop("invalid-claim")
+                        continue
+                    # Already delivered or seen-once — skip without
+                    # paying the manifest+chunk fetch cost.
+                    if self.replay_cache.has_seen(claim.sender_spk, claim.msg_id):
+                        _drop("replay")
+                        continue
+                    # Denylist short-circuit.
+                    if self.intro_queue.is_blocked(claim.sender_spk):
+                        _drop("denylisted")
+                        continue
+                    # Same-spk + same-msg already pending in intro
+                    # queue: don't try to fetch+decrypt again.
+                    if self.intro_queue.has_intro(
+                        claim.sender_spk, claim.msg_id
+                    ):
+                        _drop("already-pending")
+                        continue
+
+                    # Fetch the manifest from the sender's zone.
+                    manifest = self._fetch_claim_manifest(
+                        claim.sender_mailbox_domain, claim
+                    )
+                    if manifest is None:
+                        _drop("manifest-not-found")
+                        continue
+                    # Cross-bind: the manifest's sender_spk must match
+                    # the claim's. Otherwise a malicious provider can
+                    # claim "alice@zoneX has mail at zoneY" but zoneY's
+                    # manifest is signed by bob — refuse the mismatch.
+                    if manifest.sender_spk != claim.sender_spk:
+                        _drop("manifest-spk-mismatch")
+                        continue
+                    if manifest.recipient_id != self.user_id:
+                        _drop("manifest-recipient-mismatch")
+                        continue
+                    if manifest.is_expired():
+                        _drop("manifest-expired")
+                        continue
+                    # M5.4: revocation check, same as receive_messages.
+                    if self._rotation_manifest_revoked(manifest.sender_spk):
+                        _drop("revoked")
+                        continue
+                    decoded = self._fetch_and_decrypt(
+                        manifest, source_zone=claim.sender_mailbox_domain
+                    )
+                    if decoded is None:
+                        _drop("decrypt-failed")
+                        continue
+                    plaintext, ts, msg_id = decoded
+                    # Record in replay cache only after successful
+                    # decrypt — a transient chunk fetch miss must not
+                    # permanently suppress this claim.
+                    self.replay_cache.record(
+                        manifest.sender_spk, manifest.msg_id, manifest.exp
+                    )
+
+                    if known_spks and manifest.sender_spk in known_spks:
+                        # Pinned sender → straight to the inbox, same
+                        # semantics as receive_messages.
+                        delivered.append(
+                            InboxMessage(
+                                sender_signing_pk=manifest.sender_spk,
+                                plaintext=plaintext,
+                                timestamp=ts,
+                                msg_id=msg_id,
+                            )
+                        )
+                    else:
+                        # Un-pinned sender → quarantine in intro queue.
+                        intro_id = self.intro_queue.add_intro(
+                            sender_spk=manifest.sender_spk,
+                            msg_id=manifest.msg_id,
+                            plaintext=plaintext,
+                            sender_mailbox_domain=claim.sender_mailbox_domain,
+                            msg_exp=manifest.exp,
+                        )
+                        if intro_id is not None:
+                            quarantined_ids.append(intro_id)
+                        else:
+                            # Either denylisted (raced) or duplicate.
+                            _drop("intro-add-failed")
+
+        return ClaimDeliveryResult(
+            delivered=delivered,
+            quarantined_intro_ids=quarantined_ids,
+            dropped=dropped,
+            dropped_reasons=drop_reasons,
+        )
+
+    def _fetch_claim_manifest(
+        self,
+        sender_mailbox_domain: str,
+        claim: "ClaimRecord",  # forward ref; ClaimRecord imported in caller
+    ):
+        """Fetch the slot manifest a claim points at, verify it.
+
+        Returns the verified `SlotManifest` or None. The slot field
+        in the claim is informational — we walk all slots in the
+        sender's zone keyed by hash(self.user_id), because the sender
+        chooses a deterministic-by-msg_id slot at publish time and
+        the claim's slot may have drifted (or been published as a
+        sentinel). Robust against minor sender bugs.
+        """
+        from dmp.core.manifest import SlotManifest
+
         for slot in range(SLOT_COUNT):
-            slot_domain = self._slot_domain(self.user_id, slot)
-            records = self.reader.query_txt_record(slot_domain)
+            try:
+                slot_name = self._slot_domain(
+                    self.user_id, slot, zone=sender_mailbox_domain
+                )
+            except ValueError:
+                continue
+            try:
+                records = self.reader.query_txt_record(slot_name)
+            except Exception:
+                continue
             if not records:
                 continue
             for record in records:
@@ -529,66 +910,94 @@ class DMPClient:
                 if parsed is None:
                     continue
                 manifest, _ = parsed
-                if manifest.recipient_id != self.user_id:
-                    continue
-                if manifest.is_expired():
-                    continue
-                # If the user has pinned any signing keys, only accept
-                # manifests from those senders. Unknown signers are dropped.
-                if known_spks and manifest.sender_spk not in known_spks:
-                    # EXPERIMENTAL (M5.4): if rotation-chain walking is
-                    # enabled, try walking each pinned contact's chain
-                    # forward to see if the manifest's sender_spk is the
-                    # current head of a rotation. A valid walk means the
-                    # contact rotated their identity key; we extend the
-                    # accepted set for this receive pass. If the walk
-                    # fails or aborts (revocation, ambiguity, max_hops),
-                    # the manifest stays dropped. Never modifies
-                    # self.contacts — a rotation-chain walk is a
-                    # per-receive trust decision, not a permanent re-pin.
-                    if not self._rotation_manifest_accepted(manifest.sender_spk):
-                        continue
-                # EXPERIMENTAL (M5.4): cross-check that a PINNED
-                # signing key hasn't itself been revoked. Without this,
-                # a sender who published (rotation A→B) + (revocation of
-                # A) would still have manifests signed by A accepted by
-                # every contact that pinned A — defeating the whole
-                # point of revocation. Only fires when rotation chain
-                # walking is enabled; legacy clients keep their byte-
-                # identical behavior.
-                elif self._rotation_manifest_revoked(manifest.sender_spk):
-                    continue
-                # Check-only here; we record in the replay cache *after* we
-                # actually decode the message. Otherwise a transient DNS miss
-                # during chunk fetch would permanently suppress a still-valid
-                # manifest on later polls.
-                if self.replay_cache.has_seen(manifest.sender_spk, manifest.msg_id):
-                    continue
-                decoded = self._fetch_and_decrypt(manifest)
-                if decoded is None:
-                    continue
-                plaintext, ts, msg_id = decoded
-                self.replay_cache.record(
-                    manifest.sender_spk, manifest.msg_id, manifest.exp
-                )
-                results.append(
-                    InboxMessage(
-                        sender_signing_pk=manifest.sender_spk,
-                        plaintext=plaintext,
-                        timestamp=ts,
-                        msg_id=msg_id,
-                    )
-                )
-        return results
+                if manifest.msg_id == claim.msg_id:
+                    return manifest
+        return None
+
+    # ---- intro queue actions (M8.3) ----------------------------------------
+
+    def accept_intro(self, intro_id: int) -> Optional[InboxMessage]:
+        """Promote a pending intro into a delivered message; do NOT pin.
+
+        Returns the InboxMessage equivalent on success, None if the
+        intro_id doesn't exist. The intro row is removed after promotion
+        so the same id can't be replayed.
+        """
+        intro = self.intro_queue.get_intro(intro_id)
+        if intro is None:
+            return None
+        msg = InboxMessage(
+            sender_signing_pk=intro.sender_spk,
+            plaintext=intro.plaintext,
+            timestamp=intro.received_at,
+            msg_id=intro.msg_id,
+        )
+        self.intro_queue.remove_intro(intro_id)
+        return msg
+
+    def trust_intro(self, intro_id: int, *, label: str = "") -> Optional[InboxMessage]:
+        """Promote + pin the sender as a trusted contact.
+
+        `label` is the local nickname for the new pinned contact;
+        defaults to the sender's hex spk if empty so the contact
+        always has a stable key in `self.contacts`.
+        """
+        intro = self.intro_queue.get_intro(intro_id)
+        if intro is None:
+            return None
+        spk_hex = bytes(intro.sender_spk).hex()
+        contact_label = label or f"intro-{spk_hex[:12]}"
+        # Pin under the sender's mailbox domain so future cross-zone
+        # receives (M8.1) walk that zone for this sender.
+        # We don't have the sender's X25519 pubkey from the claim
+        # alone — that only carries Ed25519 sender_spk. The legacy
+        # add_contact flow requires both; for an intro-promoted
+        # contact, we record the spk and leave the X25519 pubkey
+        # empty until the user fetches the sender's identity record.
+        # This is a known soft edge: send_message to this contact
+        # will fail until X25519 is filled in. Documented in CLI.
+        self.contacts[contact_label] = Contact(
+            username=contact_label,
+            public_key_bytes=b"",  # filled by `dnsmesh identity fetch`
+            signing_key_bytes=intro.sender_spk,
+            domain=intro.sender_mailbox_domain,
+        )
+        return self.accept_intro(intro_id)
+
+    def block_intro(self, intro_id: int, *, note: str = "") -> bool:
+        """Drop the intro and add the sender_spk to the denylist."""
+        intro = self.intro_queue.get_intro(intro_id)
+        if intro is None:
+            return False
+        self.intro_queue.block_sender(intro.sender_spk, note=note)
+        self.intro_queue.remove_intro(intro_id)
+        return True
 
     def _fetch_and_decrypt(
         self,
         manifest: SlotManifest,
+        *,
+        source_zone: Optional[str] = None,
     ) -> Optional[Tuple[bytes, int, bytes]]:
-        """Return (plaintext, timestamp, msg_id) or None if assembly/decrypt fails."""
+        """Return (plaintext, timestamp, msg_id) or None if assembly/decrypt fails.
+
+        `source_zone` MUST be the zone the manifest itself was fetched from.
+        The chunk RRsets for this message live in the same zone the manifest
+        does — the sender publishes both at once under their own zone — so
+        we hard-bind the chunk query to that zone. We do NOT look up the
+        chunk zone via `sender_spk` → contact lookup, because a manifest
+        signed by a pinned sender but published in a zone the sender
+        doesn't control would otherwise redirect chunk fetches to that
+        zone. The contract: a manifest fetched at zone X may only point
+        at chunks at zone X.
+
+        Defaults to `self.domain` only as a safety net for legacy callers
+        that don't yet thread the source zone through.
+        """
         msg_key = self._msg_key(
             manifest.msg_id, manifest.recipient_id, manifest.sender_spk
         )
+        zone = source_zone or self.domain
 
         # Walk every chunk position up to total_chunks, collecting valid
         # shares into a dict keyed by share_id. Stop early once we have k
@@ -598,7 +1007,7 @@ class DMPClient:
             if len(shares) >= manifest.data_chunks:
                 break
             records = self.reader.query_txt_record(
-                self._chunk_domain(msg_key, chunk_num)
+                self._chunk_domain(msg_key, chunk_num, zone=zone)
             )
             if not records:
                 continue

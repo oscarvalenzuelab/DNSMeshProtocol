@@ -772,6 +772,11 @@ def _make_client(
     # Prekey store sits in the same config dir; forward-secrecy property
     # depends on this file's permissions matching the passphrase file.
     prekey_path = str(_config_path().parent / "prekeys.db")
+    # M8.3 — intro queue persistence. Pending first-contact intros must
+    # survive across CLI invocations so `dnsmesh intro list` after a
+    # `dnsmesh recv` shows what was just quarantined. Same dir as
+    # the prekey store; same permission expectations.
+    intro_queue_path = str(_config_path().parent / "intros.db")
     # Prefer the per-identity salt from config; fall back to the library
     # default only if this config predates the kdf_salt field.
     kdf_salt = bytes.fromhex(config.kdf_salt) if config.kdf_salt else None
@@ -790,6 +795,7 @@ def _make_client(
         replay_cache_path=replay_path,
         kdf_salt=kdf_salt,
         prekey_store_path=prekey_path,
+        intro_queue_path=intro_queue_path,
     )
     # Attach the cluster handle (if any) so the CLI can close it at
     # exit. Setting an attribute on DMPClient after construction is
@@ -1952,6 +1958,119 @@ def cmd_send(args: argparse.Namespace) -> int:
         if not ok:
             _die(2, f"send failed (see node logs for details)")
         print(f"sent → {args.recipient}")
+        return 0
+    finally:
+        _close_client(client)
+
+
+def cmd_intro_list(args: argparse.Namespace) -> int:
+    """List pending first-contact intros awaiting review (M8.3)."""
+    cfg = CLIConfig.load(_config_path())
+    passphrase = _load_passphrase(cfg)
+    client = _make_client(cfg, passphrase)
+    try:
+        intros = client.intro_queue.list_intros()
+        if not intros:
+            print("(no pending intros)")
+            return 0
+        now = int(time.time())
+        for intro in intros:
+            spk_hex = intro.sender_spk.hex()
+            expires_in = intro.msg_exp - now
+            status = "fresh" if expires_in > 0 else "EXPIRED"
+            label = intro.sender_label or f"intro-{spk_hex[:12]}"
+            print(f"#{intro.intro_id}  {label}  [{status}]")
+            print(f"  sender_spk: {spk_hex}")
+            print(f"  from zone:  {intro.sender_mailbox_domain}")
+            print(f"  received:   {intro.received_at}")
+            try:
+                preview = intro.plaintext.decode("utf-8")
+                if len(preview) > 120:
+                    preview = preview[:120] + "…"
+            except UnicodeDecodeError:
+                preview = f"(binary, {len(intro.plaintext)} bytes)"
+            print(f"  message:    {preview}")
+            print()
+        return 0
+    finally:
+        _close_client(client)
+
+
+def cmd_intro_accept(args: argparse.Namespace) -> int:
+    """Deliver one pending intro into the inbox; do NOT pin the sender."""
+    cfg = CLIConfig.load(_config_path())
+    passphrase = _load_passphrase(cfg)
+    client = _make_client(cfg, passphrase)
+    try:
+        msg = client.accept_intro(int(args.intro_id))
+        if msg is None:
+            _die(1, f"no pending intro with id {args.intro_id}")
+        print(f"accepted intro #{args.intro_id}")
+        try:
+            print(f"  {msg.plaintext.decode('utf-8')}")
+        except UnicodeDecodeError:
+            print(f"  (binary, {len(msg.plaintext)} bytes)")
+        print(
+            "  (sender NOT pinned — `dnsmesh intro trust` if you want future "
+            "messages from this key to bypass quarantine)"
+        )
+        return 0
+    finally:
+        _close_client(client)
+
+
+def cmd_intro_trust(args: argparse.Namespace) -> int:
+    """Deliver + pin the sender as a trusted contact."""
+    cfg = CLIConfig.load(_config_path())
+    passphrase = _load_passphrase(cfg)
+    client = _make_client(cfg, passphrase)
+    try:
+        intro = client.intro_queue.get_intro(int(args.intro_id))
+        if intro is None:
+            _die(1, f"no pending intro with id {args.intro_id}")
+        label = args.label or f"intro-{intro.sender_spk.hex()[:12]}"
+        msg = client.trust_intro(int(args.intro_id), label=label)
+        if msg is None:
+            _die(2, "trust_intro failed (raced removal?)")
+        # Persist the new contact in the config so it survives across
+        # CLI invocations. Pin signing key only — X25519 stays empty
+        # until `dnsmesh identity fetch user@host --add` fills it in.
+        cfg.contacts[label] = {
+            "pub": "",
+            "spk": intro.sender_spk.hex(),
+            "domain": intro.sender_mailbox_domain,
+        }
+        cfg.save(_config_path())
+        print(f"trusted intro #{args.intro_id} as `{label}`")
+        try:
+            print(f"  {msg.plaintext.decode('utf-8')}")
+        except UnicodeDecodeError:
+            print(f"  (binary, {len(msg.plaintext)} bytes)")
+        print(
+            "  pinned signing key only — run `dnsmesh identity fetch "
+            f"{label}@{intro.sender_mailbox_domain} --add` to fill in the "
+            "X25519 key needed to send back."
+        )
+        return 0
+    finally:
+        _close_client(client)
+
+
+def cmd_intro_block(args: argparse.Namespace) -> int:
+    """Drop the intro and add the sender to the local denylist."""
+    cfg = CLIConfig.load(_config_path())
+    passphrase = _load_passphrase(cfg)
+    client = _make_client(cfg, passphrase)
+    try:
+        intro = client.intro_queue.get_intro(int(args.intro_id))
+        if intro is None:
+            _die(1, f"no pending intro with id {args.intro_id}")
+        ok = client.block_intro(int(args.intro_id), note=args.note or "")
+        if not ok:
+            _die(2, "block_intro failed")
+        print(f"blocked intro #{args.intro_id}")
+        print(f"  sender_spk: {intro.sender_spk.hex()}")
+        print("  future claims signed by this key will be silently dropped.")
         return 0
     finally:
         _close_client(client)
@@ -3244,6 +3363,53 @@ def build_parser() -> argparse.ArgumentParser:
     # recv
     p_r = sub.add_parser("recv", help="poll for new messages")
     p_r.set_defaults(func=cmd_recv)
+
+    # intro — M8.3 first-contact quarantine queue. Claim-discovered
+    # messages from un-pinned senders land here; the user reviews
+    # and decides whether to accept (deliver only), trust (deliver
+    # + pin), or block (denylist the sender).
+    p_intro = sub.add_parser(
+        "intro",
+        help="manage pending first-contact intros (M8.3)",
+    )
+    sub_intro = p_intro.add_subparsers(dest="intro_cmd", required=True)
+
+    p_intro_list = sub_intro.add_parser(
+        "list", help="list pending intros awaiting review"
+    )
+    p_intro_list.set_defaults(func=cmd_intro_list)
+
+    p_intro_accept = sub_intro.add_parser(
+        "accept",
+        help="deliver one intro into the inbox without pinning the sender",
+    )
+    p_intro_accept.add_argument("intro_id", type=int)
+    p_intro_accept.set_defaults(func=cmd_intro_accept)
+
+    p_intro_trust = sub_intro.add_parser(
+        "trust",
+        help="deliver + pin the sender as a trusted contact",
+    )
+    p_intro_trust.add_argument("intro_id", type=int)
+    p_intro_trust.add_argument(
+        "--label",
+        default="",
+        help="local nickname for the new contact "
+        "(default: intro-<spk-prefix>)",
+    )
+    p_intro_trust.set_defaults(func=cmd_intro_trust)
+
+    p_intro_block = sub_intro.add_parser(
+        "block",
+        help="drop the intro and add the sender to the local denylist",
+    )
+    p_intro_block.add_argument("intro_id", type=int)
+    p_intro_block.add_argument(
+        "--note",
+        default="",
+        help="reason recorded alongside the denylist entry",
+    )
+    p_intro_block.set_defaults(func=cmd_intro_block)
 
     # register — mint a per-user publish token via the node's
     # /v1/registration/* endpoints (M5.5 phase 3). Saves the

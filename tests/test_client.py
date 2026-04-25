@@ -621,3 +621,174 @@ class TestSendReceive:
 
         # Bob polls — the forged manifest fails signature verification.
         assert bob.receive_messages() == []
+
+
+class TestCrossZoneReceive:
+    """M8.1 — receive walks pinned contacts' zones, not just self.domain.
+
+    Original spec: sender publishes records under sender's own zone;
+    recipient polls sender's zone via the recursive DNS chain. Before
+    M8.1 the recv path queried `self.domain`, silently restricting
+    delivery to same-mesh pairs (or same-cluster federated peers).
+    These tests guard the fix.
+    """
+
+    def test_cross_zone_delivery_with_pinned_contact(self):
+        """Alice on `alice.mesh`, Bob on `bob.mesh`, single shared store.
+
+        Alice publishes manifests + chunks under `alice.mesh`. Bob walks
+        `alice.mesh` because alice is pinned with that domain. Without
+        M8.1, Bob would query `slot-N.mb-{hash(bob)}.bob.mesh` and find
+        nothing.
+        """
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+
+        # Bob pins alice and explicitly records her zone — this is what
+        # `dnsmesh identity fetch alice@alice.mesh --add` writes today.
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.mesh",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        # Alice pins bob symmetrically so the prekey/forward-secrecy path
+        # has somewhere to look (not load-bearing for this test, but
+        # mirrors a realistic deployment).
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        assert alice.send_message("bob", "from another zone")
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"from another zone"
+        assert inbox[0].sender_signing_pk == alice.crypto.get_signing_public_key_bytes()
+
+    def test_chunks_fetched_from_manifest_source_zone(self):
+        """Chunk fetch is hard-bound to the manifest's source zone.
+
+        If Mallory squats Bob's zone with a manifest that claims Alice
+        as sender (via her pinned spk somehow leaked or — more
+        realistically — via a rotation or anti-entropy relay), the
+        chunk fetch must NOT fall back to Alice's zone via sender_spk
+        lookup. Bob expects chunks where the manifest lives.
+
+        This test verifies that when chunks for Alice's message live
+        ONLY in alice.mesh, a Bob who incorrectly queried bob.mesh
+        for chunks would get nothing — but the fixed Bob queries
+        alice.mesh and decodes successfully.
+        """
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.mesh",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        # Multi-chunk forces the chunk fetch path to run.
+        payload = "B" * 2000
+        assert alice.send_message("bob", payload)
+
+        # Sanity: the slot RRset lives at alice.mesh, not bob.mesh.
+        import hashlib
+
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        bob_hash = hashlib.sha256(bob_recipient_id).hexdigest()[:12]
+        bob_zone_names = [
+            n for n in store.list_names() if n.endswith(".bob.mesh")
+        ]
+        assert bob_zone_names == [], (
+            "manifest+chunks must not land in recipient's zone"
+        )
+        alice_zone_names = [
+            n for n in store.list_names() if f".mb-{bob_hash}.alice.mesh" in n
+        ]
+        assert alice_zone_names, (
+            "manifest must land in sender's zone keyed by recipient hash"
+        )
+
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == payload.encode("utf-8")
+
+    def test_legacy_same_mesh_still_works(self):
+        """Pre-M8.1 same-mesh deployments must keep working.
+
+        When alice and bob share a `mesh_domain` and contacts are added
+        without an explicit `domain=` (the legacy `dnsmesh contacts add`
+        path), `Contact.domain` falls back to `self.domain` — both
+        zones collapse and `_zones_to_poll()` returns a single entry.
+        """
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        # Legacy add — no domain= passed, no signing key (TOFU mode).
+        alice.add_contact("bob", bob.get_public_key_hex())
+        bob.add_contact("alice", alice.get_public_key_hex())
+
+        assert alice.send_message("bob", "same mesh")
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"same mesh"
+
+    def test_unrelated_zone_not_polled(self):
+        """Recv only walks zones we've explicitly pinned (or our own).
+
+        Mallory publishes a malformed-but-recipient-targeted manifest in
+        her own zone. Bob has not pinned mallory's zone. Mallory's
+        manifest must not be discovered.
+        """
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        mallory = DMPClient(
+            "mallory", "mallory-pass", domain="mallory.mesh", store=store
+        )
+
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.mesh",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        # Mallory pretends Bob is hers and publishes addressed to him.
+        # Her records land at slot-N.mb-{hash(bob)}.mallory.mesh.
+        mallory.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        assert mallory.send_message("bob", "you don't know me")
+        # And alice sends a real message.
+        assert alice.send_message("bob", "from alice")
+
+        inbox = bob.receive_messages()
+        # Bob's `_zones_to_poll` is {alice.mesh, bob.mesh}; mallory's
+        # zone is not walked, so her manifest is invisible. Even if it
+        # were walked, the pin fence would drop it (mallory's spk isn't
+        # pinned) — but the M8.1 promise is that we don't even look.
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"from alice"

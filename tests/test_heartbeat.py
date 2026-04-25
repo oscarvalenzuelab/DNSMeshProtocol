@@ -397,3 +397,46 @@ class TestMalformedWire:
         # input and instead monkey-patch MAX_WIRE_LEN downstream.
         # Simpler: just assert the existing MAX_WIRE_LEN is sane.
         assert MAX_WIRE_LEN >= 200  # heartbeat is small; no-op canary.
+
+
+class TestCapabilities:
+    """M8.2 — capabilities bitfield in the heartbeat record."""
+
+    def test_default_capabilities_is_zero(self, signer: DMPCrypto, now: int) -> None:
+        hb = _build(signer, now=now)
+        wire = hb.sign(signer)
+        parsed = HeartbeatRecord.parse_and_verify(wire, now=now)
+        assert parsed is not None
+        assert parsed.capabilities == 0
+
+    def test_claim_provider_bit_roundtrips(
+        self, signer: DMPCrypto, now: int
+    ) -> None:
+        from dmp.core.heartbeat import CAP_CLAIM_PROVIDER
+
+        hb = _build(signer, now=now, capabilities=CAP_CLAIM_PROVIDER)
+        wire = hb.sign(signer)
+        parsed = HeartbeatRecord.parse_and_verify(wire, now=now)
+        assert parsed is not None
+        assert parsed.capabilities == CAP_CLAIM_PROVIDER
+        assert parsed.capabilities & CAP_CLAIM_PROVIDER
+
+    def test_unknown_bits_are_preserved(self, signer: DMPCrypto, now: int) -> None:
+        """Forward-compat: a parser MUST preserve unknown bits, not strip them.
+
+        A future bit (say bit 5) added by a newer node should round-trip
+        through this parser unchanged so legacy aggregators show
+        accurate capability data even for capabilities they don't act on.
+        """
+        unknown_bit = 1 << 5
+        hb = _build(signer, now=now, capabilities=unknown_bit)
+        wire = hb.sign(signer)
+        parsed = HeartbeatRecord.parse_and_verify(wire, now=now)
+        assert parsed is not None
+        assert parsed.capabilities == unknown_bit
+
+    def test_capabilities_out_of_range_rejected(
+        self, signer: DMPCrypto, now: int
+    ) -> None:
+        with pytest.raises(ValueError, match="capabilities"):
+            _build(signer, now=now, capabilities=0x10000).to_body_bytes()

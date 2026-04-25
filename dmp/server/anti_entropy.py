@@ -59,6 +59,8 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from dmp.core.bootstrap import RECORD_PREFIX as _BOOTSTRAP_PREFIX
+from dmp.core.claim import RECORD_PREFIX as _CLAIM_PREFIX
+from dmp.core.claim import ClaimRecord
 from dmp.core.cluster import ClusterManifest
 from dmp.core.cluster import RECORD_PREFIX as _CLUSTER_PREFIX
 from dmp.core.identity import IdentityRecord
@@ -317,7 +319,7 @@ def _peers_from_wire(
 
 def _classify_record(value: str) -> str:
     """Return a short tag for the record type: manifest/identity/prekey/
-    cluster/bootstrap/chunk/unknown. Used only for logging + dispatch."""
+    cluster/bootstrap/chunk/claim/unknown. Used only for logging + dispatch."""
     if value.startswith(_MANIFEST_PREFIX):
         return "manifest"
     if value.startswith(_IDENTITY_PREFIX):
@@ -330,6 +332,8 @@ def _classify_record(value: str) -> str:
         return "bootstrap"
     if value.startswith(_CHUNK_PREFIX):
         return "chunk"
+    if value.startswith(_CLAIM_PREFIX):
+        return "claim"
     return "unknown"
 
 
@@ -390,6 +394,13 @@ def verify_record(
         return _structural_parse_signed(value, _PREKEY_PREFIX)
     if kind == "bootstrap":
         return _structural_parse_signed(value, _BOOTSTRAP_PREFIX)
+    if kind == "claim":
+        # M8.4 — full sig verify, just like manifest/identity. The
+        # signer is self-identifying (sender_spk in the body), so we
+        # don't need a pre-pinned key. Replicating an unsigned or
+        # tampered claim would let a malicious peer poison every
+        # downstream provider's namespace.
+        return ClaimRecord.parse_and_verify(value) is not None
     # chunks and unknown — accept. Chunks are bound by their manifest;
     # unknown types are future-proofing.
     return True

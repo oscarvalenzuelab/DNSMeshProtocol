@@ -126,6 +126,33 @@ class _HeartbeatBundle:
     self_spk_hex: str
 
 
+def _load_claim_provider_zone() -> str:
+    """Return the DNS zone this node serves claim records under.
+
+    Resolution order:
+
+      1. ``DMP_CLAIM_PROVIDER_ZONE`` — explicit override.
+      2. ``DMP_CLUSTER_BASE_DOMAIN`` — same zone the cluster manifest
+         is published under; the natural default for federated
+         deployments where one node serves both mailbox and claim
+         records under the cluster's public zone.
+      3. ``DMP_DOMAIN`` — single-zone deployments use the same name.
+
+    Returns the empty string when none is set; the HTTP handler
+    interprets that as "this node is not a claim provider" and
+    refuses POST /v1/claim/publish with a 404.
+    """
+    for var in (
+        "DMP_CLAIM_PROVIDER_ZONE",
+        "DMP_CLUSTER_BASE_DOMAIN",
+        "DMP_DOMAIN",
+    ):
+        v = os.environ.get(var, "").strip()
+        if v:
+            return v
+    return ""
+
+
 def _load_heartbeat_from_env(record_db_path: str):
     """Return a ``_HeartbeatBundle`` if opt-in-enabled, else None.
 
@@ -229,6 +256,18 @@ def _load_heartbeat_from_env(record_db_path: str):
     ttl = int(os.environ.get("DMP_HEARTBEAT_TTL_SECONDS", "86400"))
     max_peers = int(os.environ.get("DMP_HEARTBEAT_MAX_PEERS", "25"))
     version = os.environ.get("DMP_HEARTBEAT_VERSION", "").strip() or "dev"
+
+    # M8.2 — claim-provider capability defaults ON for every node that
+    # has heartbeat enabled. Operators who don't want to host claims
+    # for arbitrary recipients opt out with DMP_CLAIM_PROVIDER=0.
+    # Truthiness mirrors DMP_HEARTBEAT_ENABLED's check above (any
+    # value other than "0"/"false"/"" is on).
+    from dmp.core.heartbeat import CAP_CLAIM_PROVIDER
+
+    claim_provider_raw = os.environ.get("DMP_CLAIM_PROVIDER", "").strip().lower()
+    claim_provider_on = claim_provider_raw not in ("0", "false", "no", "off")
+    capabilities = CAP_CLAIM_PROVIDER if claim_provider_on else 0
+
     cfg = HeartbeatWorkerConfig(
         self_endpoint=self_endpoint,
         version=version,
@@ -236,6 +275,7 @@ def _load_heartbeat_from_env(record_db_path: str):
         interval_seconds=interval,
         ttl_seconds=ttl,
         max_peers=max_peers,
+        capabilities=capabilities,
     )
     worker = HeartbeatWorker(cfg, crypto, store)
 
@@ -661,6 +701,16 @@ class DMPNode:
             ),
             heartbeat_self_spk_hex=(
                 heartbeat_bundle.self_spk_hex if heartbeat_bundle else None
+            ),
+            # M8.3 — claim-provider role. The zone defaults to the
+            # node's cluster_base_domain (or the DMP_DOMAIN env), and
+            # we surface the heartbeat capabilities bitfield here so
+            # GET /v1/info reflects what's actually advertised.
+            claim_provider_zone=_load_claim_provider_zone(),
+            advertised_capabilities=(
+                heartbeat_bundle.worker._cfg.capabilities
+                if heartbeat_bundle and heartbeat_bundle.worker
+                else 0
             ),
         )
         self.heartbeat_worker = heartbeat_bundle.worker if heartbeat_bundle else None
