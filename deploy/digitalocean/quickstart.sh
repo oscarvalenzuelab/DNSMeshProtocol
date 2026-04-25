@@ -165,6 +165,24 @@ cat > .env <<EOF
 DMP_NODE_HOSTNAME=${DMP_NODE_HOSTNAME}
 DMP_OPERATOR_TOKEN=${DMP_OPERATOR_TOKEN}
 DMP_HTTP_TOKEN=${DMP_OPERATOR_TOKEN}
+
+# Heartbeat / discovery (M5.8). Off by default — uncomment + drop an
+# operator key file alongside compose.yml to be discoverable in the
+# federated directory: https://ovalenzuela.com/DNSMeshProtocol/directory/
+#
+# Key generation:
+#   openssl rand -hex 32 | tee ${INSTALL_DIR}/operator-ed25519.hex >/dev/null
+#   chmod 0440 ${INSTALL_DIR}/operator-ed25519.hex
+# Then under the dnsmesh-node service in compose.yml, add to volumes:
+#   - ./operator-ed25519.hex:/etc/dmp/operator-ed25519.hex:ro
+#
+#DMP_HEARTBEAT_ENABLED=1
+#DMP_HEARTBEAT_SELF_ENDPOINT=https://${DMP_NODE_HOSTNAME}
+#DMP_HEARTBEAT_OPERATOR_KEY_PATH=/etc/dmp/operator-ed25519.hex
+
+# Bootstrap seeds. dnsmesh.io is the canonical bootstrap so a fresh
+# node sees the federation on its first heartbeat tick. Comma-separated.
+DMP_HEARTBEAT_SEEDS=https://dnsmesh.io
 EOF
 chmod 600 .env
 ok "wrote .env (mode 0600)"

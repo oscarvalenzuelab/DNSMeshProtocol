@@ -202,6 +202,26 @@ DMP_HTTP_TOKEN=${DMP_OPERATOR_TOKEN}
 
 DMP_LOG_LEVEL=INFO
 DMP_LOG_FORMAT=text
+
+# ── Heartbeat / discovery (M5.8) ─────────────────────────────────────
+# Off by default. Uncomment + provide the operator key to make this
+# node discoverable in the federated directory:
+#   https://ovalenzuela.com/DNSMeshProtocol/directory/
+#
+# Generate the operator key once:
+#   sudo openssl rand -hex 32 | sudo tee ${ETC_DIR}/operator-ed25519.hex >/dev/null
+#   sudo chown root:${DNSMESH_USER} ${ETC_DIR}/operator-ed25519.hex
+#   sudo chmod 0440 ${ETC_DIR}/operator-ed25519.hex
+#
+#DMP_HEARTBEAT_ENABLED=1
+#DMP_HEARTBEAT_SELF_ENDPOINT=https://${DMP_NODE_HOSTNAME}
+#DMP_HEARTBEAT_OPERATOR_KEY_PATH=${ETC_DIR}/operator-ed25519.hex
+
+# Bootstrap seeds: nodes this one will pre-emptively send its own
+# heartbeat to on every tick. Without seeds, a new node only meets
+# peers that find it first — dnsmesh.io acts as the canonical
+# bootstrap so federation works out of the box. Comma-separated.
+DMP_HEARTBEAT_SEEDS=https://dnsmesh.io
 EOF
 chown root:"$DNSMESH_USER" "$ETC_DIR/node.env"
 chmod 0640 "$ETC_DIR/node.env"

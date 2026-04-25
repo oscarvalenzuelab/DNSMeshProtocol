@@ -7,6 +7,31 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.3] — self in peers table + DMP_HEARTBEAT_SEEDS bootstrap
+
+### Fixed
+
+- **Solo nodes showed an empty Recent peers table.** The heartbeat
+  worker posts its own signed wire to peers but never ingests it
+  into its own SeenStore, so a node with no `DMP_HEARTBEAT_SEEDS`
+  configured had nothing in `/v1/nodes/seen` even though it
+  obviously knows about itself. The render path (used by both
+  `GET /` and `GET /nodes`) now synthesizes a self row at request
+  time, deduped against any peer-gossiped self entry by
+  `(operator_spk, endpoint)` keeping the highest ts. Result: the
+  table is never artificially empty when heartbeat is on.
+
+### Added
+
+- **Bootstrap seeds in install scripts.** Both
+  `deploy/native-ubuntu/install.sh` and
+  `deploy/digitalocean/quickstart.sh` now write
+  `DMP_HEARTBEAT_SEEDS=https://dnsmesh.io` to the generated env
+  file by default. Federated discovery works on first heartbeat
+  tick without operators having to read the heartbeat-deployment
+  doc. The heartbeat-enable env vars are written commented-out
+  with a clear how-to-enable block.
+
 ## [0.3.2] — registration block on the landing page
 
 ### Added
