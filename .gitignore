@@ -72,3 +72,7 @@ NOTES.md
 docker/cluster/operator-ed25519.hex
 docker/cluster/cluster-manifest.wire
 venv
+
+# M8 test fixtures — local-only operator keys, never commit
+docker/m8-test/*.key
+docker/m8-test/*operator*
