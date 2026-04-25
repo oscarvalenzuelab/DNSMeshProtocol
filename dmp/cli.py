@@ -2166,9 +2166,15 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
                 "pub": identity.x25519_pk.hex(),
                 "spk": fetched_spk,
                 "domain": remote_host or existing.get("domain", ""),
-                "remote_username": (
-                    existing.get("remote_username", "") or identity.username
-                ),
+                # Codex P2 round 7 fix: ALWAYS use the just-verified
+                # identity.username, even when the placeholder
+                # already had a remote_username. The placeholder's
+                # value may be a user-typo'd `--username` from
+                # `dnsmesh intro trust`, in which case prekey +
+                # rotation lookups would keep querying the wrong
+                # RRset. The fetch verifies the spk signature over
+                # this username, so it's the authoritative source.
+                "remote_username": identity.username,
             }
             cfg.contacts[upgrade_label] = entry
             cfg.save(_config_path())
@@ -2405,11 +2411,16 @@ def cmd_intro_trust(args: argparse.Namespace) -> int:
         # legitimate alice and rebind future receives to the
         # impersonator. Same-spk + same-zone is the upgrade path
         # (legacy spk-only stub re-trusted from a fresh intro), so
-        # we permit it.
+        # we permit it. Codex P1 round 7 fix: when permitted, we
+        # PRESERVE the existing pub/spk metadata rather than
+        # overwriting with empty pub (which would silently downgrade
+        # a sendable contact into a placeholder).
         existing = cfg.contacts.get(label)
+        existing_pub = ""
         if existing is not None:
             existing_spk = existing.get("spk", "")
             existing_domain = existing.get("domain", "")
+            existing_pub = existing.get("pub", "")
             new_spk = intro.sender_spk.hex()
             new_domain = intro.sender_mailbox_domain
             if existing_spk and existing_spk != new_spk:
@@ -2439,7 +2450,10 @@ def cmd_intro_trust(args: argparse.Namespace) -> int:
         # lookups) lives in `pub_username`; an empty value means
         # "skip those lookups until identity fetch fills it in."
         cfg.contacts[label] = {
-            "pub": "",
+            # Preserve any existing X25519 pubkey on a same-label
+            # in-place re-trust (codex P1 round 7) — otherwise we'd
+            # silently downgrade a sendable contact into a placeholder.
+            "pub": existing_pub,
             "spk": intro.sender_spk.hex(),
             "domain": intro.sender_mailbox_domain,
             "remote_username": remote_username,

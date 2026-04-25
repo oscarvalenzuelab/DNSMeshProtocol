@@ -174,35 +174,37 @@ def select_providers(
             )
         ]
 
-    candidates: List[ClaimProvider] = []
-    seen_operators: set = set()
+    # Codex P2 round 7 fix: sort by ts BEFORE deduplicating by
+    # operator. Otherwise an older heartbeat earlier in the input
+    # marks the operator "seen" first, locking us onto its stale
+    # endpoint even when a fresher heartbeat for the same operator
+    # appears later. Build full candidate list first, sort
+    # descending by ts, then dedupe — the highest-ts entry wins.
+    raw: List[ClaimProvider] = []
     for hb in heartbeats:
         if not (hb.capabilities & CAP_CLAIM_PROVIDER):
             continue
         zone = _zone_from_endpoint(hb.endpoint)
-        # Codex P2 round 4 fix: IP-literal endpoints don't expose a
-        # plausible DNS zone via host derivation, but the caller's
-        # `/v1/info` upgrade pass can still discover the actual
-        # served zone. Keep the candidate with `zone=""`; downstream
-        # logic asks the provider, falls back to skipping when both
-        # the host derivation and `/v1/info` return nothing usable.
-        # Without this, a node heartbeating `https://203.0.113.10:8053`
-        # (public IP, no DNS) becomes invisible as a claim provider
-        # even though it serves a valid zone.
+        # IP-literal endpoints don't expose a DNS zone via host
+        # derivation, but the caller's /v1/info upgrade pass can
+        # still discover the served zone. Keep with zone="".
         if zone is None:
             zone = ""
-        op_hex = bytes(hb.operator_spk).hex()
-        if op_hex in seen_operators:
-            continue
-        seen_operators.add(op_hex)
-        candidates.append(
+        raw.append(
             ClaimProvider(
                 endpoint=hb.endpoint,
                 zone=zone,
-                operator_spk_hex=op_hex,
+                operator_spk_hex=bytes(hb.operator_spk).hex(),
                 ts=int(hb.ts),
             )
         )
 
-    candidates.sort(key=lambda p: p.ts, reverse=True)
+    raw.sort(key=lambda p: p.ts, reverse=True)
+    candidates: List[ClaimProvider] = []
+    seen_operators: set = set()
+    for p in raw:
+        if p.operator_spk_hex in seen_operators:
+            continue
+        seen_operators.add(p.operator_spk_hex)
+        candidates.append(p)
     return candidates[:k]
