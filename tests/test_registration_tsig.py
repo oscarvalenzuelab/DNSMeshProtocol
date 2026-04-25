@@ -71,6 +71,8 @@ def _signed_body(
 
 class TestMintTsigViaRegistration:
     def test_happy_path(self, keystore, config, challenges):
+        import hashlib
+
         pc = challenges.issue(config.node_hostname)
         body, spk_hex = _signed_body(
             subject="alice@ops.example",
@@ -88,8 +90,12 @@ class TestMintTsigViaRegistration:
         assert minted.zone == "ops.example"
         assert minted.name.startswith("alice-" + spk_hex[:8])
         assert minted.name.endswith(".ops.example.")
-        # Scope is exactly the user's subtree + their claim records.
-        assert "alice.ops.example" in minted.allowed_suffixes
+        # Scope: identity hash + legacy claim record. Without
+        # ``x25519_pub`` in the body, mailbox suffix is omitted.
+        username_hash = hashlib.sha256(
+            "alice@ops.example".encode("utf-8")
+        ).hexdigest()[:16]
+        assert f"id-{username_hash}.ops.example" in minted.allowed_suffixes
         claim_suffix = f"_dnsmesh-claim-{spk_hex[:16]}.ops.example"
         assert claim_suffix in minted.allowed_suffixes
         # Secret is fresh random bytes (32) and survives a re-read
@@ -100,6 +106,54 @@ class TestMintTsigViaRegistration:
         assert stored.secret == bytes.fromhex(minted.secret_hex)
         # Expires_at is in the future per config.
         assert minted.expires_at > 0
+
+    def test_x25519_pub_extends_scope_to_mailbox(
+        self, keystore, config, challenges
+    ):
+        """Codex round-6 P1: when the registration body includes
+        ``x25519_pub``, the minted key also authorizes mailbox /
+        claim record writes via ``mb-<hash12>.<zone>`` tail
+        matches."""
+        import hashlib
+        import os
+
+        x_pub = os.urandom(32)
+        pc = challenges.issue(config.node_hostname)
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        body["x25519_pub"] = x_pub.hex()
+        minted = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=config,
+            body=body,
+        )
+        mailbox_hash = hashlib.sha256(x_pub).hexdigest()[:12]
+        assert f"mb-{mailbox_hash}.ops.example" in minted.allowed_suffixes
+
+    def test_long_local_part_rejected(self, keystore, config, challenges):
+        """Codex round-6 P2: a local part too long for a 63-octet
+        DNS label (after the ``-<spk8>`` suffix) must be rejected
+        up-front, not silently produce a credential the DNS server
+        will never honor."""
+        long_local = "a" * 60  # 60 + 9 ('-' + 8 spk chars) > 63
+        pc = challenges.issue(config.node_hostname)
+        body, _ = _signed_body(
+            subject=f"{long_local}@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        with pytest.raises(RegistrationError) as exc:
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=config,
+                body=body,
+            )
+        assert exc.value.http_status == 400
 
     def test_disabled_returns_404(self, keystore, challenges):
         cfg = RegistrationConfig(enabled=False, node_hostname="ops.example")
@@ -192,8 +246,10 @@ class TestMintTsigViaRegistration:
         """Codex P1 regression: when DMP_NODE_HOSTNAME is a host BENEATH
         the served zone (api.example.com under example.com), the minted
         TSIG scope must anchor to the served zone. Otherwise every
-        normal write to alice.example.com bounces as REFUSED because
-        the suffix incorrectly reads alice.api.example.com."""
+        normal write under example.com bounces as REFUSED because the
+        suffix incorrectly reads ...api.example.com."""
+        import hashlib
+
         cfg = RegistrationConfig(
             enabled=True,
             node_hostname="api.example.com",
@@ -202,7 +258,7 @@ class TestMintTsigViaRegistration:
             expires_in_seconds=3600,
         )
         pc = challenges.issue(cfg.node_hostname)
-        body, spk_hex = _signed_body(
+        body, _ = _signed_body(
             subject="alice@example.com",
             challenge_hex=pc.challenge_hex,
             node=pc.node,
@@ -215,9 +271,14 @@ class TestMintTsigViaRegistration:
         )
         # Anchored under the served zone, not the hostname.
         assert minted.zone == "example.com"
-        assert "alice.example.com" in minted.allowed_suffixes
-        # And NOT the broken hostname-anchored form.
-        assert "alice.api.example.com" not in minted.allowed_suffixes
+        username_hash = hashlib.sha256(
+            "alice@example.com".encode("utf-8")
+        ).hexdigest()[:16]
+        assert f"id-{username_hash}.example.com" in minted.allowed_suffixes
+        # And NOT under the hostname.
+        for suffix in minted.allowed_suffixes:
+            assert ".api.example.com" not in suffix
+            assert "api.example.com" != suffix
 
     def test_served_zone_falls_back_to_node_hostname(
         self, keystore, challenges
@@ -462,9 +523,18 @@ class TestHttpEndpoint:
                         ).decode("ascii")
                     }
                 )
+                # Use an actual DMP record owner — identity at
+                # ``id-<hash16>.<zone>``. This is the suffix we
+                # actually granted, so the UPDATE should land.
+                import hashlib as _hashlib
+
+                username_hash = _hashlib.sha256(
+                    subject.encode("utf-8")
+                ).hexdigest()[:16]
+                identity_owner = f"id-{username_hash}.ops.example."
                 upd = dns.update.UpdateMessage("ops.example")
                 upd.add(
-                    dns.name.from_text("identity.alice.ops.example."),
+                    dns.name.from_text(identity_owner),
                     300,
                     "TXT",
                     '"v=dmp1;t=identity"',
@@ -478,7 +548,7 @@ class TestHttpEndpoint:
                 )
             assert response.rcode() == dns.rcode.NOERROR
             assert record_store.query_txt_record(
-                "identity.alice.ops.example"
+                identity_owner.rstrip(".")
             ) == ["v=dmp1;t=identity"]
         finally:
             keystore.close()

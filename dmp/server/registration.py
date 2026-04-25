@@ -503,37 +503,87 @@ def _spk_short(spk_hex: str, *, length: int = 8) -> str:
     return (spk_hex or "").lower()[:length]
 
 
-def _suffixes_for(local_part: str, spk_hex: str, zone: str) -> Tuple[str, ...]:
+# DNS labels are capped at 63 octets (RFC 1035). The TSIG key name's
+# first label is ``<local_part>-<spk8>``; we have to validate the
+# composite so a 60-character username doesn't mint a key whose
+# Name parsing fails downstream and whose UPDATEs silently fail.
+_MAX_DNS_LABEL = 63
+_KEY_NAME_LABEL_OVERHEAD = 1 + 8  # `-<spk8>`
+
+
+def _suffixes_for(
+    subject: str,
+    local_part: str,
+    spk_hex: str,
+    zone: str,
+    *,
+    x25519_pub_hex: str = "",
+) -> Tuple[str, ...]:
     """Compute the per-user suffix scope for the minted TSIG key.
 
-    A registered user owns:
-      - their personal subtree at ``<local_part>.<zone>`` — identity,
-        mailbox, prekeys, anything anchored under their name.
-      - their claim provider records at
-        ``_dnsmesh-claim-<spk16>.<zone>`` (M8 claim publish path).
+    Codex round-6 P1: the scope must match the actual owner names
+    DMP records use. Concretely:
 
-    Both of these ride the same TSIG key. The set is deliberately
-    narrow: a user cannot publish under arbitrary owner names, and
-    cannot edit other users' subtrees even though their UPDATE
-    technically targets the same zone.
+      - identity / prekeys: ``id-<sha256(subject)[:16]>.<zone>``
+        and ``prekeys.id-<hash16>.<zone>`` (the suffix
+        ``id-<hash16>.<zone>`` covers both via tail match).
+      - mailbox slots / claims: ``slot-N.mb-<hash12>.<zone>`` and
+        ``claim-N.mb-<hash12>.<zone>`` — both end with
+        ``.mb-<hash12>.<zone>``. The hash is sha256 of the user's
+        X25519 public key, which the registration body MAY supply
+        as ``x25519_pub``. Without it, mailbox writes won't
+        authorize and the user is limited to identity / prekey /
+        legacy claim publication.
+      - legacy claim records: ``_dnsmesh-claim-<spk16>.<zone>``
+        — kept for the pre-M9 claim publishing path.
+
+    Returns the tuple of allowed suffixes, all canonicalized
+    lowercase with no trailing dot.
+    """
+    import hashlib
+
+    z = (zone or "").strip().lower().rstrip(".")
+    subj = (subject or "").strip().lower()
+    spk16 = _spk_short(spk_hex, length=16)
+    if not z or not subj or not spk16:
+        return ()
+    suffixes = []
+    # identity + prekeys
+    username_hash = hashlib.sha256(subj.encode("utf-8")).hexdigest()[:16]
+    suffixes.append(f"id-{username_hash}.{z}")
+    # legacy claim record path
+    suffixes.append(f"_dnsmesh-claim-{spk16}.{z}")
+    # mailbox + claim records — only when the registration body
+    # supplied the X25519 pubkey we need to derive the hash.
+    x_norm = (x25519_pub_hex or "").strip().lower()
+    if x_norm:
+        try:
+            x_bytes = bytes.fromhex(x_norm)
+        except ValueError:
+            x_bytes = b""
+        if len(x_bytes) == 32:
+            mailbox_hash = hashlib.sha256(x_bytes).hexdigest()[:12]
+            suffixes.append(f"mb-{mailbox_hash}.{z}")
+    return tuple(suffixes)
+
+
+def _key_name_for(local_part: str, spk_hex: str, zone: str) -> Optional[str]:
+    """Stable per-user TSIG key name. The spk-prefix in the label
+    keeps the name unique even if two users share a local part on
+    different zones (or one is rotated and re-registered).
+
+    Returns None when the resulting first label would exceed the
+    63-octet DNS label limit (codex round-6 P2: a long but otherwise
+    valid local part used to mint a usable secret whose key name
+    dnspython then refused to parse, so the user got a 200 response
+    for a credential the DNS server silently never honored).
     """
     z = (zone or "").strip().lower().rstrip(".")
     lp = (local_part or "").strip().lower()
-    spk16 = _spk_short(spk_hex, length=16)
-    if not z or not lp or not spk16:
-        return ()
-    return (
-        f"{lp}.{z}",
-        f"_dnsmesh-claim-{spk16}.{z}",
-    )
-
-
-def _key_name_for(local_part: str, spk_hex: str, zone: str) -> str:
-    """Stable per-user TSIG key name. The spk-prefix in the label
-    keeps the name unique even if two users share a local part on
-    different zones (or one is rotated and re-registered)."""
-    z = (zone or "").strip().lower().rstrip(".")
-    lp = (local_part or "").strip().lower()
+    if not z or not lp:
+        return None
+    if len(lp) + _KEY_NAME_LABEL_OVERHEAD > _MAX_DNS_LABEL:
+        return None
     return f"{lp}-{_spk_short(spk_hex)}.{z}."
 
 
@@ -625,13 +675,31 @@ def mint_tsig_via_registration(
         raise RegistrationError("subject missing local part") from exc
 
     zone = (config.served_zone or config.node_hostname).strip().lower().rstrip(".")
-    suffixes = _suffixes_for(local_part, spk_hex, zone)
+    # ``x25519_pub`` is optional — when supplied, the scope can include
+    # the user's mailbox subtree ``mb-<sha256(x25519_pub)[:12]>.<zone>``.
+    # Without it, the minted key works for identity + prekey + legacy
+    # claim publishing but mailbox writes will be rejected by the DNS
+    # server. Documented limitation; CLI passes the pubkey by default.
+    x_pub_raw = body.get("x25519_pub")
+    x_pub_hex = x_pub_raw.strip().lower() if isinstance(x_pub_raw, str) else ""
+    suffixes = _suffixes_for(
+        subject, local_part, spk_hex, zone, x25519_pub_hex=x_pub_hex
+    )
     if not suffixes:
         raise RegistrationError(
             "could not derive TSIG scope from subject + zone",
             http_status=500,
         )
     key_name = _key_name_for(local_part, spk_hex, zone)
+    if key_name is None:
+        # Local part too long for a single DNS label after the
+        # ``-<spk8>`` suffix — refuse rather than mint a key whose
+        # Name parsing later fails silently in build_keyring.
+        raise RegistrationError(
+            "subject local part too long for TSIG key label "
+            f"(max {_MAX_DNS_LABEL - _KEY_NAME_LABEL_OVERHEAD} chars)",
+            http_status=400,
+        )
 
     # Anti-takeover (codex round-3 P1): if a live key already exists
     # for this subject and was minted under a DIFFERENT spk, refuse.
