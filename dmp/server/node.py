@@ -299,8 +299,12 @@ def _load_heartbeat_from_env(record_db_path: str):
 
     claim_provider_raw = os.environ.get("DMP_CLAIM_PROVIDER", "").strip().lower()
     claim_provider_on = claim_provider_raw not in ("0", "false", "no", "off")
-    has_zone = bool(_load_claim_provider_zone())
+    claim_zone = _load_claim_provider_zone()
+    has_zone = bool(claim_zone)
     capabilities = CAP_CLAIM_PROVIDER if (claim_provider_on and has_zone) else 0
+    # M9: heartbeat wire carries claim_provider_zone too — peers
+    # discover it via DNS instead of /v1/info.
+    advertised_zone = claim_zone if (claim_provider_on and has_zone) else ""
 
     cfg = HeartbeatWorkerConfig(
         self_endpoint=self_endpoint,
@@ -310,6 +314,7 @@ def _load_heartbeat_from_env(record_db_path: str):
         ttl_seconds=ttl,
         max_peers=max_peers,
         capabilities=capabilities,
+        claim_provider_zone=advertised_zone,
     )
     worker = HeartbeatWorker(cfg, crypto, store)
 

@@ -2,12 +2,18 @@
 
 Every opted-in node periodically emits a ``HeartbeatRecord`` asserting
 "I am <endpoint>, operated by <operator_spk>, running version
-<version>, capabilities <bitfield>, as of <ts>, valid until <exp>."
-Peers store received heartbeats in a local seen-store and re-export
-them on ``GET /v1/nodes/seen`` so aggregators (including a central
+<version>, capabilities <bitfield>, claim_provider_zone <zone>, as of
+<ts>, valid until <exp>." Peers store received heartbeats in a local
+seen-store and re-export them so aggregators (including a central
 directory website) can render "which nodes are reachable right now"
 without introducing a new trust anchor: every entry in the aggregated
 list is a verifiable signature under the operator key.
+
+In M9 (0.5.0) the heartbeat record subsumes the M8 ``/v1/info``
+endpoint — peers fetch it directly from DNS at
+``_dnsmesh-heartbeat.<zone>`` instead of HTTP-polling, and the
+``claim_provider_zone`` field that lived only in the JSON ``/v1/info``
+response now travels in the signed wire.
 
 Wire format — flat binary, same style as ``ClusterManifest`` /
 ``RotationRecord``. Base64 of ``body || sig`` with a
@@ -15,16 +21,18 @@ Wire format — flat binary, same style as ``ClusterManifest`` /
 
 Body layout (all integers big-endian):
 
-    magic            b"DMPHB02"              7 bytes
-    endpoint_len     uint16                  2 bytes
-    endpoint         utf-8 bytes             var, 1..MAX_ENDPOINT_LEN
-    operator_spk     bytes                   32 bytes (Ed25519 pubkey)
-    version_len      uint8                   1 byte
-    version          utf-8 bytes             0..MAX_VERSION_LEN
-    capabilities     uint16                  2 bytes (bitfield, M8.2+)
-    ts               uint64                  8 bytes (unix seconds)
-    exp              uint64                  8 bytes (unix seconds)
-    signature        bytes                   64 bytes
+    magic                       b"DMPHB03"          7 bytes
+    endpoint_len                uint16              2 bytes
+    endpoint                    utf-8 bytes         var, 1..MAX_ENDPOINT_LEN
+    operator_spk                bytes               32 bytes (Ed25519 pubkey)
+    version_len                 uint8               1 byte
+    version                     utf-8 bytes         0..MAX_VERSION_LEN
+    capabilities                uint16              2 bytes (bitfield, M8.2+)
+    claim_provider_zone_len     uint8               1 byte
+    claim_provider_zone         utf-8 bytes         0..MAX_ZONE_LEN  (M9)
+    ts                          uint64              8 bytes (unix seconds)
+    exp                         uint64              8 bytes (unix seconds)
+    signature                   bytes               64 bytes
 
 The operator key is the same Ed25519 key that signs
 ``ClusterManifest`` / ``BootstrapRecord`` — heartbeat does not add
@@ -64,7 +72,7 @@ from dmp.core.ed25519_points import is_low_order as _is_low_order
 # v=dmp1; jumping to v=dmp2 is a flag day across everything post-audit.
 RECORD_PREFIX = "v=dmp1;t=heartbeat;"
 
-_MAGIC = b"DMPHB02"
+_MAGIC = b"DMPHB03"
 _SPK_LEN = 32
 _SIG_LEN = 64
 
@@ -77,6 +85,11 @@ CAP_CLAIM_PROVIDER = 1 << 0
 # record are tolerated (forward-compat) but a node won't act on
 # capabilities it doesn't have a constant for.
 CAP_KNOWN_MASK = CAP_CLAIM_PROVIDER
+
+# Cap on the embedded claim_provider_zone DNS name. Same ceiling as
+# claim records' MAX_MAILBOX_DOMAIN_LEN — keeps the heartbeat wire
+# inside a single 255-byte DNS TXT after sig + base64 overhead.
+MAX_CLAIM_PROVIDER_ZONE_LEN = 64
 
 # Size caps. Deliberately tight — a heartbeat is a discovery record,
 # not a carrier for arbitrary metadata. Callers who want to hang
@@ -244,6 +257,14 @@ class HeartbeatRecord:
     ts: int
     exp: int
     capabilities: int = 0
+    # M9: claim provider zone the node serves under. Empty string when
+    # the node isn't acting as a claim provider (CAP_CLAIM_PROVIDER bit
+    # off, or no DMP_DOMAIN configured). Carries the same data the
+    # legacy /v1/info HTTP endpoint reports, but inside the signed
+    # heartbeat wire — peers query this from DNS at
+    # _dnsmesh-heartbeat.<zone> to learn each other's role + zone in
+    # one round trip.
+    claim_provider_zone: str = ""
 
     # ------------------------------------------------------------------
     # body layout
@@ -271,9 +292,32 @@ class HeartbeatRecord:
             or self.capabilities > 0xFFFF
         ):
             raise ValueError("capabilities must be a uint16 (0..65535)")
+        if not isinstance(self.claim_provider_zone, str):
+            raise ValueError("claim_provider_zone must be a string")
+        if len(self.claim_provider_zone) > MAX_CLAIM_PROVIDER_ZONE_LEN:
+            raise ValueError(
+                f"claim_provider_zone length "
+                f"{len(self.claim_provider_zone)} > "
+                f"MAX_CLAIM_PROVIDER_ZONE_LEN {MAX_CLAIM_PROVIDER_ZONE_LEN}"
+            )
+        if self.claim_provider_zone:
+            try:
+                self.claim_provider_zone.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    "claim_provider_zone must be ASCII"
+                ) from exc
+            if any(
+                ord(c) < 0x21 or ord(c) == 0x7F
+                for c in self.claim_provider_zone
+            ):
+                raise ValueError(
+                    "claim_provider_zone contains whitespace or control characters"
+                )
 
         endpoint_bytes = self.endpoint.encode("utf-8")
         version_bytes = self.version.encode("utf-8")
+        zone_bytes = self.claim_provider_zone.encode("utf-8")
         return (
             _MAGIC
             + struct.pack(">H", len(endpoint_bytes))
@@ -282,6 +326,8 @@ class HeartbeatRecord:
             + struct.pack(">B", len(version_bytes))
             + version_bytes
             + struct.pack(">H", self.capabilities)
+            + struct.pack(">B", len(zone_bytes))
+            + zone_bytes
             + struct.pack(">Q", self.ts)
             + struct.pack(">Q", self.exp)
         )
@@ -335,6 +381,27 @@ class HeartbeatRecord:
         (capabilities,) = struct.unpack(">H", body[off : off + 2])
         off += 2
 
+        # M9: claim_provider_zone (uint8 length-prefixed utf-8). Empty
+        # string for nodes that don't host claims; up to
+        # MAX_CLAIM_PROVIDER_ZONE_LEN otherwise.
+        if off + 1 > len(body):
+            raise ValueError("body truncated in claim_provider_zone_len")
+        (zone_len,) = struct.unpack(">B", body[off : off + 1])
+        off += 1
+        if zone_len > MAX_CLAIM_PROVIDER_ZONE_LEN:
+            raise ValueError(
+                f"claim_provider_zone_len out of range: {zone_len}"
+            )
+        if off + zone_len > len(body):
+            raise ValueError("body truncated in claim_provider_zone")
+        try:
+            claim_provider_zone = body[off : off + zone_len].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"claim_provider_zone not valid utf-8: {exc}"
+            ) from exc
+        off += zone_len
+
         if off + 16 > len(body):
             raise ValueError("body truncated in ts/exp")
         (ts,) = struct.unpack(">Q", body[off : off + 8])
@@ -361,6 +428,7 @@ class HeartbeatRecord:
             ts=ts,
             exp=exp,
             capabilities=capabilities,
+            claim_provider_zone=claim_provider_zone,
         )
 
     # ------------------------------------------------------------------
@@ -423,10 +491,11 @@ class HeartbeatRecord:
         except Exception:
             return None
         # magic + endpoint_len + operator_spk + version_len + capabilities
-        # + ts + exp + signature. The smallest legal body has 0-byte
-        # endpoint and version, 2-byte capabilities, 16 bytes for
-        # ts/exp, plus the 64-byte sig.
-        if len(blob) < len(_MAGIC) + _SIG_LEN + 2 + _SPK_LEN + 1 + 2 + 16:
+        # + claim_provider_zone_len + ts + exp + signature. The
+        # smallest legal body has 0-byte endpoint, version, and
+        # claim_provider_zone; 2-byte capabilities; 16 bytes for
+        # ts/exp; plus the 64-byte sig.
+        if len(blob) < len(_MAGIC) + _SIG_LEN + 2 + _SPK_LEN + 1 + 2 + 1 + 16:
             return None
         body = blob[:-_SIG_LEN]
         sig = blob[-_SIG_LEN:]

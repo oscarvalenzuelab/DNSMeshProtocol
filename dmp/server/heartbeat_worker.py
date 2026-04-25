@@ -114,6 +114,11 @@ class HeartbeatWorkerConfig:
     # ``DMP_CLAIM_PROVIDER`` env (default ON unless explicitly
     # disabled).
     capabilities: int = 0
+    # M9: claim_provider_zone advertised in the heartbeat wire. Same
+    # data the legacy /v1/info JSON used to expose; now travels in the
+    # signed record so peers can discover it via DNS only. Empty when
+    # the node isn't acting as a claim provider.
+    claim_provider_zone: str = ""
 
 
 class HeartbeatWorker:
@@ -287,6 +292,7 @@ class HeartbeatWorker:
             ts=now_i,
             exp=now_i + self._cfg.ttl_seconds,
             capabilities=self._cfg.capabilities,
+            claim_provider_zone=self._cfg.claim_provider_zone,
         )
         return hb.sign(self._crypto)
 
