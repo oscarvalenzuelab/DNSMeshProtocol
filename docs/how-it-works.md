@@ -57,6 +57,55 @@ much smaller than the trust you place in a messaging company.** You
 still trust them to stay online and not drop your records, but not to
 keep your secrets.
 
+## Where bytes actually go
+
+A common confusion: when Alice sends a message to Bob, does her
+client talk to Bob's home node directly? **No.** The CLI POSTs records
+to its own configured endpoint — Alice's home node — over HTTPS. Bob
+later polls his own mailbox via DNS.
+
+Concretely:
+
+- Alice's send writes records like
+  `slot-N.mb-{hash(bob)}.<alice's mesh_domain>` to **Alice's home node**.
+- Bob's receive queries `slot-N.mb-{hash(bob)}.<bob's mesh_domain>` via
+  DNS.
+
+For these names to match, **both clients must share the same
+`mesh_domain`**. This is the load-bearing fact about current
+end-to-end messaging:
+
+| Setup | End-to-end works? |
+|---|---|
+| Alice + Bob both register at the same node, share `domain: mesh.gnu.cl` | ✅ |
+| Alice + Bob in a federated 3-node cluster (anti-entropy syncs records between cluster members over HTTPS) | ✅ |
+| Alice on `dnsmesh.io`, Bob on `dnsmesh.pro` with different `mesh_domain`s, no cluster | ❌ |
+
+The third row is a real gap in current implementation. A future
+"DNS-only federation" model — where Bob's `recv` walks his pinned
+contacts' domains and polls each via the recursive DNS chain — would
+let Alice and Bob each only need HTTPS to their own home, with
+"node-to-node" being whatever path the resolver takes (typically
+`Bob's CLI → public resolver → roots → Alice's domain's authoritative
+node → record`). That's not in the code today.
+
+### What HTTP and DNS each do
+
+- **HTTPS, client-to-own-node:** every write goes here. Publishing
+  identity, sending messages, refreshing prekeys, registering for a
+  token. Each user only ever needs HTTPS to **one** node — their own.
+- **DNS, anywhere-to-any-node:** every read goes here. Fetching
+  identities, polling mailboxes, looking up cluster manifests. No
+  auth. Survives port 53 blocks via DNS-over-HTTPS at public
+  resolvers like 1.1.1.1.
+- **HTTPS, node-to-node (cluster only):** anti-entropy at
+  `/v1/sync/digest` + `/v1/sync/pull`. Required only when the
+  recipient's mesh is hosted on a cluster.
+
+Visual walkthrough in the
+[How resolution works]({{ site.baseurl }}/how-resolution-works.html)
+slide deck.
+
 ## Who operates what
 
 | Role | What they run | Where |

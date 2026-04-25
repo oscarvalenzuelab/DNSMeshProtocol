@@ -101,43 +101,52 @@ flowchart LR
   <div class="takeaway"><strong>Important nuance coming up:</strong> when Alice sends a message to Bob, Alice's CLI doesn't write to Alice's home node. It writes <em>directly to Bob's home node</em>. Next slide.</div>
 </section>
 
-<!-- 4b. Where do messages actually go -->
+<!-- 4b. Where messages actually go -->
 <section>
-  <h2>Where messages actually go</h2>
+  <h2>Where messages actually go (the truth)</h2>
   <pre class="mermaid">
 sequenceDiagram
     participant A as Alice CLI
+    participant ANode as Alice's home node<br>(serves mesh.gnu.cl)
     participant DNS as DNS (any resolver)
-    participant BNode as Bob's home node
-    A->>DNS: 1. fetch Bob's identity (open read)
-    DNS-->>A: Bob's pubkey
-    A->>A: 2. encrypt locally
-    A->>BNode: 3. POST ciphertext to Bob's mailbox<br>(HTTPS, Alice's token at Bob's node)
-    Note over BNode: stored in sqlite,<br>served on UDP 53 from this point on
+    participant B as Bob CLI
+    A->>ANode: HTTPS POST<br>slot-N.mb-{hash(bob)}.mesh.gnu.cl
+    Note over ANode: stored in sqlite<br>served on UDP 53
+    B->>DNS: TXT? slot-N.mb-{hash(bob)}.mesh.gnu.cl
+    DNS->>ANode: forwards
+    ANode-->>DNS: ciphertext
+    DNS-->>B: ciphertext
+    B->>B: decrypt + verify Alice's signature
   </pre>
-  <ul>
-    <li>Alice's <strong>home node is irrelevant for outgoing messages</strong>. Alice's CLI is the publisher; the destination is Bob's mailbox at Bob's home node.</li>
-    <li>Alice needs a <strong>write token at Bob's node</strong> — <code>dnsmesh register --node bob-node.example</code> once, stored in <code>~/.dmp/tokens/&lt;node&gt;.json</code>, auto-attached to subsequent sends.</li>
-    <li>Nodes <strong>never use DNS as an outbound transport</strong>. DNS is read-only at every node, always. Writes go through HTTPS only.</li>
-  </ul>
+  <p class="small"><strong>Both parties share the mesh domain.</strong> Alice writes to her own home node only; Bob reads via DNS from the same zone. Each user only ever needs HTTPS to one node — their own.</p>
 </section>
 
-<!-- 4c. Bob receives -->
+<!-- 4c. Restriction model -->
 <section>
-  <h2>Bob receives — DNS only</h2>
-  <pre class="mermaid">
-sequenceDiagram
-    participant B as Bob CLI
-    participant DNS as DNS (any resolver)
-    participant BNode as Bob's home node
-    B->>DNS: TXT? slot-N.mb-{hash}.bob-domain
-    DNS->>BNode: forwards
-    BNode-->>DNS: ciphertext rows
-    DNS-->>B: ciphertext rows
-    B->>B: decrypt with private key,<br>verify Alice's signature
-  </pre>
-  <p class="small">Bob doesn't need a token to <em>receive</em> messages addressed to him. The mailbox is served openly via DNS like any other DMP record.</p>
-  <div class="takeaway">Restricted networks (port 53 blocked, no outbound HTTPS): Bob can <strong>still read messages</strong> via DNS-over-HTTPS at 1.1.1.1. He just can't send new ones until he can reach a node's HTTPS port.</div>
+  <h2>The HTTP restriction model</h2>
+  <p>Each user only needs HTTPS to <strong>their own home node</strong>. Nothing else.</p>
+  <ul>
+    <li>Alice's CLI talks HTTPS to Alice's home only. To send anyone a message, she POSTs to her own node.</li>
+    <li>Bob's CLI talks HTTPS to Bob's home only (for publishing his identity, sending messages of his own).</li>
+    <li>To <em>receive</em>, Bob just queries DNS — works from any network with port 53 / DoH.</li>
+  </ul>
+  <div class="takeaway"><strong>"Node-to-node" is the recursive DNS resolver chain.</strong> When Bob's CLI queries a name in Alice's zone, the resolver walks roots → registrar → Alice's authoritative node and pulls the record. No HTTPS handshake between nodes is required for this path.</div>
+</section>
+
+<!-- 4d. Limitation: cross-mesh -->
+<section>
+  <h2>Limitation: same mesh today</h2>
+  <p>The current implementation expects Alice and Bob to share <code>mesh_domain</code>. Both their CLIs are configured with the same <code>domain: mesh.gnu.cl</code>, so the mailbox name they each derive matches.</p>
+  <p>Three current paths to messaging:</p>
+  <table>
+    <thead><tr><th>Setup</th><th>Works today?</th></tr></thead>
+    <tbody>
+      <tr><td>Both users register at the same node, share the same mesh domain</td><td class="ok">✓</td></tr>
+      <tr><td>Both users on a federated 3-node cluster (HTTPS anti-entropy syncs between nodes)</td><td class="ok">✓</td></tr>
+      <tr><td>Different home nodes, different mesh domains, no cluster</td><td class="err">✗</td></tr>
+    </tbody>
+  </table>
+  <p class="small">A future "DNS-only federation" — where Bob's <code>recv</code> walks his pinned contacts' domains and polls each via DNS — would lift the third case without requiring inter-node HTTPS.</p>
 </section>
 
 <!-- 5. Where the user usually trips -->
