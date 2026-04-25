@@ -1,18 +1,68 @@
 # DNS Mesh Protocol
 
 **End-to-end encrypted messaging with no central server, no app store, no
-gatekeeper, delivered over DNS, on the relays and infrastructure the
+gatekeeper — delivered over DNS, on the relays and infrastructure the
 internet already runs on.**
+
+---
+
+## What this is
+
+DMP is an **open, free messaging protocol** built around one job:
+deliver a private message from one person to another, even when the
+network actively tries to stop you. Not a company, not a product —
+a specification anyone can implement, plus a permissively-licensed
+reference implementation.
+
+Think of it as **the email of private messaging**: nobody owns email,
+nobody can shut it off. DMP aims for the same durability, with
+end-to-end encryption baked in from the start.
+
+## Why it exists
+
+Today's "private" messaging looks like this:
+
+```
+You ↔ One company ↔ The other person
+```
+
+That company is a single point of failure. They can be subpoenaed,
+blocked at a national border, acquired, hacked, or simply shut down.
+End-to-end encryption protects message *content* — none of it
+protects you from the company in the middle disappearing or being
+made to.
+
+DMP removes the company from the middle.
+
+## Who this is for
+
+- **Journalists and sources** in countries where the usual apps are
+  blocked, monitored, or unsafe to have on a phone.
+- **Organizations** that want a backup channel that keeps working
+  when their primary vendor is down, regulated, or subpoenaed.
+- **Privacy advocates** who don't want a phone number, an account,
+  or any company in between two people who agreed to talk.
+- **Builders** who need a small, auditable messaging primitive they
+  can embed into their own products with no licensing or vendor
+  lock-in.
+
+If DNS works on your network, DMP works on your network. That's the
+whole pitch.
+
+[**→ 5-minute training deck**](https://oscarvalenzuelab.github.io/DNSMeshProtocol/how-resolution-works.html) ·
+[**→ Try the public node**](#try-it-on-dnsmeshio) ·
+[**→ Self-host**](#self-host)
 
 ---
 
 > **Status: alpha, pre-external-audit.** Full federation (client
 > fan-out + union reader + node-side anti-entropy + manifest gossip),
 > bootstrap discovery, key rotation + revocation (M5.4), multi-tenant
-> node auth with per-user publish tokens (M5.5), and the formal
-> protocol spec are shipped. The remaining path to `v1.0` is a
-> certification backlog: external cryptographic audit, mobile/web
-> clients, standalone CLI binaries, traffic-analysis hardening.
+> node auth with per-user publish tokens (M5.5), cross-zone receive
+> + first-message claim layer (M8 / 0.4.x), and the formal protocol
+> spec are shipped. The remaining path to `v1.0` is a certification
+> backlog: external cryptographic audit, mobile/web clients,
+> standalone CLI binaries, traffic-analysis hardening.
 >
 > **Don't route secrets through DMP until the external cryptographic
 > audit is done.** The codebase has had ~40+ rounds of automated
@@ -24,7 +74,7 @@ internet already runs on.**
 > is a post-beta deliverable; until then treat DMP as experimental
 > for confidentiality-critical traffic.
 
-## The pitch
+## How it works (30-second version)
 
 Instead of sending messages through a central server you have to trust,
 DNS Mesh Protocol encrypts each message end-to-end and writes it as
@@ -39,7 +89,23 @@ your network, DMP works on your network.
   ChaCha20-Poly1305, Argon2id passphrase derivation, one-time prekeys
   for forward secrecy, and Reed-Solomon erasure coding for chunk loss.
 
-## Quick start
+## Try it on dnsmesh.io
+
+The public reference node at `dnsmesh.io` is open: no operator approval,
+no email, just a CLI command. It advertises open registration, the
+M8 claim-provider role, and acts as the canonical bootstrap seed for
+the federated network.
+
+```bash
+pip install dnsmesh
+dnsmesh init alice --domain <your-zone> --endpoint dnsmesh.io
+dnsmesh register --node dnsmesh.io
+dnsmesh identity publish
+```
+
+Curious what's actually advertised: `curl https://dnsmesh.io/v1/info`.
+
+## Self-host
 
 ```bash
 git clone https://github.com/oscarvalenzuelab/DNSMeshProtocol.git
@@ -59,6 +125,13 @@ dnsmesh init alice --domain mesh.local \
                --endpoint http://127.0.0.1:8053 \
                --dns-host 127.0.0.1 --dns-port 5353
 dnsmesh identity publish
+```
+
+For a production Ubuntu deployment with auto-TLS and systemd:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/oscarvalenzuelab/DNSMeshProtocol/main/deploy/native-ubuntu/install.sh \
+    | sudo DMP_NODE_HOSTNAME=dmp.example.com bash
 ```
 
 Full walk-through with two users:

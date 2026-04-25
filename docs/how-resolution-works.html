@@ -55,22 +55,162 @@
 
 <!-- 1. Title -->
 <section class="center">
-  <h1>How DMP works</h1>
-  <h3>The visual version. No prior knowledge assumed.</h3>
+  <h1>DNS Mesh Protocol</h1>
+  <h3>A training guide. No prior knowledge of DNS or cryptography assumed.</h3>
   <p class="small">← / → arrow keys to navigate · <code>F</code> for fullscreen · <code>O</code> for grid view</p>
 </section>
 
-<!-- 2. The problem -->
+<!-- 1b. What is DMP? -->
 <section>
-  <h2>The problem</h2>
-  <p>You want to send an end-to-end encrypted message to someone. Today the typical answer is "use a messaging app" — Signal, WhatsApp, iMessage.</p>
-  <p>But every one of those:</p>
+  <h2>What is DNS Mesh Protocol?</h2>
+  <p>DMP is an open, free messaging protocol designed to do one job well:</p>
+  <blockquote style="text-align: left;">
+    Deliver a private message from one person to another, even when
+    the network actively tries to stop you.
+  </blockquote>
+  <p>It is <em>not</em> a company, a product, or an app. It is a
+  specification anyone can implement, plus a reference open-source
+  implementation released under a permissive license.</p>
+  <div class="takeaway">
+    <strong>Think of it as the email of private messaging:</strong>
+    nobody owns email; nobody can shut it off. DMP aims for the same
+    durability, with end-to-end encryption baked in from the start.
+  </div>
+</section>
+
+<!-- 1c. Why does it exist? -->
+<section>
+  <h2>Why does this exist?</h2>
+  <p style="text-align: left;">Today's "private" messaging looks like
+  this:</p>
+  <ul>
+    <li><strong>You</strong> ↔ <strong>One company</strong> ↔ <strong>The other person</strong></li>
+  </ul>
+  <p>That company is a single point of failure. They can be:</p>
+  <table>
+    <thead><tr><th>Threat</th><th>Real-world example</th></tr></thead>
+    <tbody>
+      <tr><td>Subpoenaed</td><td>Government compels a metadata handover</td></tr>
+      <tr><td>Blocked</td><td>National firewall drops the company's domain</td></tr>
+      <tr><td>Acquired</td><td>New owner changes the privacy policy</td></tr>
+      <tr><td>Hacked</td><td>One breach exposes everyone's contact graph</td></tr>
+      <tr><td>Shut down</td><td>Company decides the product isn't profitable</td></tr>
+    </tbody>
+  </table>
+  <p class="small">
+    Encryption protects the <em>content</em>. None of it protects you
+    from the company in the middle disappearing — or being made to.
+  </p>
+</section>
+
+<!-- 1d. Who is this for? -->
+<section>
+  <h2>Who is this for?</h2>
+  <div class="two-col">
+    <div>
+      <h3>Journalists &amp; sources</h3>
+      <p>Need to talk to people in countries where the usual apps are
+      blocked, monitored, or simply too dangerous to install on a
+      phone.</p>
+    </div>
+    <div>
+      <h3>Organizations</h3>
+      <p>Want a backup channel that keeps working when their primary
+      messaging vendor is down, regulated, or under a subpoena.</p>
+    </div>
+  </div>
+  <div class="two-col" style="margin-top: 1em;">
+    <div>
+      <h3>Privacy advocates</h3>
+      <p>Don't want a phone number, an account, or any company in
+      between two people who agreed to talk.</p>
+    </div>
+    <div>
+      <h3>Builders</h3>
+      <p>Need a small, auditable messaging primitive they can embed
+      into their own products without licensing or vendor lock-in.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 1e. Refresher: how the internet finds things -->
+<section>
+  <h2>Refresher: how the internet finds things</h2>
+  <p>Every time you visit <code>example.com</code>, your computer asks
+  a question:</p>
+  <pre class="mermaid">
+sequenceDiagram
+    participant You as Your laptop
+    participant DNS as A DNS server<br>(e.g. 1.1.1.1)
+    participant Auth as The owner of<br>example.com
+    You->>DNS: "What is example.com?"
+    DNS->>Auth: "What is example.com?"
+    Auth-->>DNS: "It's at 93.184.216.34"
+    DNS-->>You: "It's at 93.184.216.34"
+  </pre>
+  <p>This system is called <strong>DNS</strong> (Domain Name System).
+  It's how every device on Earth turns names into addresses.</p>
+  <div class="takeaway">
+    <strong>Three things you should know about DNS:</strong> nobody
+    owns it (it's federated), every network on Earth allows it (or
+    nothing else works), and you can put more than just IP addresses
+    into it — small text records too.
+  </div>
+</section>
+
+<!-- 1f. Refresher: end-to-end encryption -->
+<section>
+  <h2>Refresher: what does "end-to-end encrypted" mean?</h2>
+  <p>End-to-end means: the message is encrypted on the
+  <em>sender's device</em>, decrypted on the
+  <em>recipient's device</em>, and unreadable to everyone in
+  between.</p>
+  <p>Even the company hosting the message can't read it.</p>
+  <pre class="mermaid">
+flowchart LR
+    Alice["Alice<br>writes 'hello'"]
+    Server["Storage<br>(sees only<br>encrypted bytes)"]
+    Bob["Bob<br>reads 'hello'"]
+    Alice -- "encrypts" --> Server
+    Server -- "decrypts" --> Bob
+  </pre>
+  <p class="small">
+    Signal, WhatsApp, iMessage all do end-to-end encryption.
+    What they <em>don't</em> hide: who is talking to whom, when, and
+    through whose company. That's the gap DMP closes.
+  </p>
+</section>
+
+<!-- 1g. The pitch in one sentence -->
+<section class="center">
+  <h2>DMP in one sentence</h2>
+  <p style="font-size: 1.4em; margin-top: 1em;">
+    Take the universal <strong>read-API of the internet (DNS)</strong>,
+    repurpose it as a <strong>private mailbox</strong> for end-to-end
+    encrypted messages, and let anyone host their own.
+  </p>
+  <div class="takeaway" style="margin-top: 2em;">
+    <strong>Result:</strong> a messaging protocol with no central
+    company, no app-store gatekeeper, that works on any network where
+    DNS still resolves — which is almost all of them.
+  </div>
+</section>
+
+<!-- 2. The problem (now reframed for context after the intro) -->
+<section>
+  <h2>The gap DMP fills</h2>
+  <p>You want to send an end-to-end encrypted message to someone.
+  Today the typical answer is "use a messaging app" — Signal,
+  WhatsApp, iMessage.</p>
+  <p>Each of these:</p>
   <ul>
     <li>Has a company in the middle that can be subpoenaed, hacked, or shut down.</li>
     <li>Requires a phone number or account on their service.</li>
     <li>Goes dark if the company decides to.</li>
   </ul>
-  <p class="small">DMP solves the same problem without any of those.</p>
+  <p class="small">DMP solves the same problem without any of those —
+  no company, no account, no phone number. The next slides show
+  <em>how</em>.</p>
 </section>
 
 <!-- 3. The big idea -->
