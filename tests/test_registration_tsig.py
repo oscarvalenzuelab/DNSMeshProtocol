@@ -245,12 +245,84 @@ class TestMintTsigViaRegistration:
         )
         assert minted.zone == "solo.example"
 
-    def test_remint_rotates_secret(self, keystore, config, challenges):
-        """Re-registration replaces the secret. The user's old secret
-        is unrecoverable; a new UPDATE must use the freshly-issued one.
-        Same-spk re-registration is intentional — a user who lost their
-        TSIG key can re-register (the Ed25519 challenge proves identity)."""
-        # First mint.
+    def test_same_spk_remint_rotates_secret(self, keystore, config, challenges):
+        """Re-registration with the SAME spk replaces the secret. A
+        user who lost their TSIG key can re-mint by signing a fresh
+        challenge with the same Ed25519 key they registered with."""
+        priv = Ed25519PrivateKey.generate()
+        pub = priv.public_key().public_bytes_raw()
+
+        def _mint() -> any:
+            pc = challenges.issue(config.node_hostname)
+            payload = _build_signing_payload(
+                pc.challenge_hex, "alice@ops.example", pc.node
+            )
+            body = {
+                "subject": "alice@ops.example",
+                "ed25519_spk": pub.hex(),
+                "challenge": pc.challenge_hex,
+                "signature": priv.sign(payload).hex(),
+            }
+            return mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=config,
+                body=body,
+            )
+
+        first = _mint()
+        second = _mint()
+        # Same key name (spk-derived), fresh secret bytes.
+        assert first.name == second.name
+        assert first.secret_hex != second.secret_hex
+
+    def test_different_spk_for_same_subject_rejected(
+        self, keystore, config, challenges
+    ):
+        """Anti-takeover (codex round-3 P1): a second registrant for
+        the same subject under a DIFFERENT spk must be rejected. The
+        legitimate user has to revoke first to re-register with a new
+        identity. Without this check anyone who could complete the
+        Ed25519 challenge for ``alice@ops.example`` got a parallel
+        TSIG key with full publish authority on Alice's records."""
+        # First registrant succeeds.
+        pc1 = challenges.issue(config.node_hostname)
+        body1, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc1.challenge_hex,
+            node=pc1.node,
+        )
+        mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=config,
+            body=body1,
+        )
+        # Second registrant — different keypair, same subject — bounced.
+        pc2 = challenges.issue(config.node_hostname)
+        body2, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc2.challenge_hex,
+            node=pc2.node,
+        )
+        from dmp.server.registration import SubjectAlreadyOwned
+
+        with pytest.raises(SubjectAlreadyOwned):
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=config,
+                body=body2,
+            )
+
+    def test_revoked_subject_can_re_register_with_new_spk(
+        self, keystore, config, challenges
+    ):
+        """The escape hatch: revoke the existing key and the same
+        subject becomes available for a fresh registration under a
+        different spk. Lets a user who lost their original Ed25519
+        key recover by going through admin-side revocation."""
+        # First mint, then revoke.
         pc1 = challenges.issue(config.node_hostname)
         body1, _ = _signed_body(
             subject="alice@ops.example",
@@ -263,28 +335,21 @@ class TestMintTsigViaRegistration:
             config=config,
             body=body1,
         )
-        # Second mint with a fresh challenge (same key reused).
+        keystore.revoke(first.name)
+        # Now a different spk can register for the same subject.
         pc2 = challenges.issue(config.node_hostname)
-        priv = Ed25519PrivateKey.generate()
-        pub = priv.public_key().public_bytes_raw()
-        payload = _build_signing_payload(pc2.challenge_hex, "alice@ops.example", pc2.node)
-        body2 = {
-            "subject": "alice@ops.example",
-            "ed25519_spk": pub.hex(),
-            "challenge": pc2.challenge_hex,
-            "signature": priv.sign(payload).hex(),
-        }
+        body2, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc2.challenge_hex,
+            node=pc2.node,
+        )
         second = mint_tsig_via_registration(
             keystore=keystore,
             challenges=challenges,
             config=config,
             body=body2,
         )
-        # Different spk → different key name; both rows live in the
-        # store. A re-mint with the SAME spk would overwrite (covered
-        # by test_tsig_keystore::TestPutAndGet::test_put_replaces_existing).
-        assert first.secret_hex != second.secret_hex
-        assert first.name != second.name
+        assert second.name != first.name
 
 
 class TestHttpEndpoint:

@@ -633,6 +633,20 @@ def mint_tsig_via_registration(
         )
     key_name = _key_name_for(local_part, spk_hex, zone)
 
+    # Anti-takeover (codex round-3 P1): if a live key already exists
+    # for this subject and was minted under a DIFFERENT spk, refuse.
+    # The legitimate user must revoke first (or sign with the same spk
+    # to get a re-mint, which IS allowed and rotates the secret).
+    # Without this check, anyone who can complete the Ed25519 challenge
+    # for ``alice@example.com`` got a parallel key alongside the
+    # rightful owner, with full publish/delete authority on Alice's
+    # records. Mirrors the rotate_self_service guarantee in
+    # confirm_registration.
+    spk_lower = spk_hex.lower()
+    existing = keystore.get_active_for_subject(subject, now=now)
+    if existing is not None and existing.registered_spk and existing.registered_spk != spk_lower:
+        raise SubjectAlreadyOwned()
+
     expires_at = (
         int(time.time() if now is None else now) + int(config.expires_in_seconds)
         if config.expires_in_seconds
@@ -643,6 +657,8 @@ def mint_tsig_via_registration(
         name=key_name,
         allowed_suffixes=suffixes,
         expires_at=expires_at,
+        subject=subject,
+        registered_spk=spk_lower,
         now=now,
     )
     return MintedTSIGKey(

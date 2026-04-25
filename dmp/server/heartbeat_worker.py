@@ -464,15 +464,32 @@ class HeartbeatWorker:
             log.exception(
                 "cluster_peers_provider raised; continuing with seeds + gossip"
             )
-        # Gossip-learned: pull endpoints from seen-store and project
-        # to zones. Pull twice the cap so we still have candidates
-        # after self + dup elimination.
+        # Gossip-learned: pull peer zones directly from the wires in
+        # the seen-store. ``list_zones_for_harvest`` reads the
+        # operator-advertised ``claim_provider_zone`` field
+        # (M9.1.1) and only falls back to endpoint-host derivation
+        # for legacy peers. This matters when a node's HTTP host
+        # sits beneath the served zone (e.g. api.example.com /
+        # example.com) — the previous endpoint-host projection
+        # produced ``api.example.com`` and the worker queried the
+        # wrong RRset, breaking transitive discovery (codex
+        # round-3 P2).
         try:
-            for u in self._store.list_for_ping(
+            for zone in self._store.list_zones_for_harvest(
                 limit=self._cfg.max_peers * 2, now=None
             ):
-                _add(u)
+                _add(zone)
+        except AttributeError:
+            # Older SeenStore that doesn't have the new helper —
+            # fall back to the URL-host projection.
+            try:
+                for u in self._store.list_for_ping(
+                    limit=self._cfg.max_peers * 2, now=None
+                ):
+                    _add(u)
+            except Exception:
+                log.exception("SeenStore.list_for_ping raised; continuing")
         except Exception:
-            log.exception("SeenStore.list_for_ping raised; continuing")
+            log.exception("SeenStore.list_zones_for_harvest raised; continuing")
 
         return out[: self._cfg.max_peers]

@@ -61,11 +61,22 @@ CREATE TABLE IF NOT EXISTS tsig_keys (
     allowed_suffixes TEXT NOT NULL DEFAULT '',
     created_at       INTEGER NOT NULL,
     expires_at       INTEGER NOT NULL DEFAULT 0,
-    revoked          INTEGER NOT NULL DEFAULT 0
+    revoked          INTEGER NOT NULL DEFAULT 0,
+    subject          TEXT NOT NULL DEFAULT '',
+    registered_spk   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_tsig_active ON tsig_keys(revoked, expires_at);
+CREATE INDEX IF NOT EXISTS idx_tsig_subject ON tsig_keys(subject);
 """
+
+# Schema migration for keystores created before M9 round-3. ALTER TABLE
+# IF NOT EXISTS is sqlite 3.35+, which we don't depend on, so we
+# add the columns conditionally via PRAGMA inspection. Idempotent.
+_MIGRATIONS = (
+    "ALTER TABLE tsig_keys ADD COLUMN subject TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE tsig_keys ADD COLUMN registered_spk TEXT NOT NULL DEFAULT ''",
+)
 
 
 def _normalize_name(name: str) -> str:
@@ -111,6 +122,15 @@ class TSIGKey:
     created_at: int
     expires_at: int  # 0 = no expiry
     revoked: bool
+    # M9.2.3 anti-takeover: when the key was minted via
+    # mint_tsig_via_registration, ``subject`` is the canonical
+    # ``user@host`` and ``registered_spk`` is the hex Ed25519 spk
+    # that proved ownership. A second registrant for the same
+    # subject must sign with the same spk OR the existing key must
+    # be revoked first. Empty values (legacy / admin-issued) skip
+    # the anti-takeover check.
+    subject: str = ""
+    registered_spk: str = ""
 
     def is_active(self, now: Optional[int] = None) -> bool:
         if self.revoked:
@@ -147,6 +167,14 @@ class TSIGKeyStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        # Best-effort column adds for keystores created before the
+        # subject + registered_spk columns landed. SQLite raises on
+        # duplicate ADD COLUMN, which we swallow.
+        for stmt in _MIGRATIONS:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -161,12 +189,19 @@ class TSIGKeyStore:
         allowed_suffixes: Iterable[str],
         algorithm: str = DEFAULT_ALGORITHM,
         expires_at: int = 0,
+        subject: str = "",
+        registered_spk: str = "",
         now: Optional[int] = None,
     ) -> TSIGKey:
         """Insert or replace a key. Replacing is intentional — the
         registration flow may re-issue a key for a user who lost
         theirs; the new key carries fresh secret bytes and the same
-        scope. Old key bytes are unrecoverable from the row."""
+        scope. Old key bytes are unrecoverable from the row.
+
+        ``subject`` + ``registered_spk`` are persisted so the
+        anti-takeover check in ``ensure_subject_owner`` can reject a
+        second registrant attempting to mint a key for an already-
+        owned subject."""
         canonical = _normalize_name(name)
         if not isinstance(secret, (bytes, bytearray)) or not secret:
             raise ValueError("secret must be non-empty bytes")
@@ -175,20 +210,24 @@ class TSIGKeyStore:
         )
         if not suffixes:
             raise ValueError("at least one non-empty allowed suffix is required")
+        subject_norm = (subject or "").strip().lower()
+        spk_norm = (registered_spk or "").strip().lower()
         created_at = int(time.time() if now is None else now)
         with self._lock:
             self._conn.execute(
                 """INSERT INTO tsig_keys
                    (name, algorithm, secret, allowed_suffixes,
-                    created_at, expires_at, revoked)
-                   VALUES (?, ?, ?, ?, ?, ?, 0)
+                    created_at, expires_at, revoked, subject, registered_spk)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
                    ON CONFLICT(name) DO UPDATE SET
                      algorithm = excluded.algorithm,
                      secret = excluded.secret,
                      allowed_suffixes = excluded.allowed_suffixes,
                      created_at = excluded.created_at,
                      expires_at = excluded.expires_at,
-                     revoked = 0""",
+                     revoked = 0,
+                     subject = excluded.subject,
+                     registered_spk = excluded.registered_spk""",
                 (
                     canonical,
                     algorithm,
@@ -196,6 +235,8 @@ class TSIGKeyStore:
                     "\n".join(suffixes),
                     created_at,
                     int(expires_at),
+                    subject_norm,
+                    spk_norm,
                 ),
             )
             self._conn.commit()
@@ -207,6 +248,8 @@ class TSIGKeyStore:
             created_at=created_at,
             expires_at=int(expires_at),
             revoked=False,
+            subject=subject_norm,
+            registered_spk=spk_norm,
         )
 
     def mint(
@@ -217,6 +260,8 @@ class TSIGKeyStore:
         algorithm: str = DEFAULT_ALGORITHM,
         secret_bytes: int = DEFAULT_SECRET_BYTES,
         expires_at: int = 0,
+        subject: str = "",
+        registered_spk: str = "",
         now: Optional[int] = None,
     ) -> TSIGKey:
         """Generate a fresh secret and store the key. Returns the
@@ -231,8 +276,44 @@ class TSIGKeyStore:
             allowed_suffixes=allowed_suffixes,
             algorithm=algorithm,
             expires_at=expires_at,
+            subject=subject,
+            registered_spk=registered_spk,
             now=now,
         )
+
+    # ------------------------------------------------------------------
+    # subject ownership
+    # ------------------------------------------------------------------
+
+    def get_active_for_subject(
+        self, subject: str, now: Optional[int] = None
+    ) -> Optional[TSIGKey]:
+        """Return the live key minted for ``subject`` (if any).
+
+        Used by the anti-takeover check in ``mint_tsig_via_registration``.
+        Skips revoked / expired rows so a previously-revoked key for
+        the same subject doesn't block a fresh registration with a
+        different signing identity (the legitimate user can revoke
+        their compromised key and re-register).
+        """
+        subject_norm = (subject or "").strip().lower()
+        if not subject_norm:
+            return None
+        now_i = int(time.time() if now is None else now)
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT name, algorithm, secret, allowed_suffixes,
+                          created_at, expires_at, revoked, subject,
+                          registered_spk
+                   FROM tsig_keys
+                   WHERE subject = ?
+                     AND revoked = 0
+                     AND (expires_at = 0 OR expires_at > ?)
+                   ORDER BY created_at DESC
+                   LIMIT 1""",
+                (subject_norm, now_i),
+            ).fetchone()
+        return _row_to_key(row) if row else None
 
     def revoke(self, name: str) -> bool:
         """Mark a key revoked. Returns True iff the key existed."""
@@ -273,7 +354,8 @@ class TSIGKeyStore:
         with self._lock:
             row = self._conn.execute(
                 """SELECT name, algorithm, secret, allowed_suffixes,
-                          created_at, expires_at, revoked
+                          created_at, expires_at, revoked, subject,
+                          registered_spk
                    FROM tsig_keys WHERE name = ?""",
                 (canonical,),
             ).fetchone()
@@ -284,7 +366,8 @@ class TSIGKeyStore:
         with self._lock:
             rows = self._conn.execute(
                 """SELECT name, algorithm, secret, allowed_suffixes,
-                          created_at, expires_at, revoked
+                          created_at, expires_at, revoked, subject,
+                          registered_spk
                    FROM tsig_keys
                    WHERE revoked = 0
                      AND (expires_at = 0 OR expires_at > ?)
@@ -297,7 +380,8 @@ class TSIGKeyStore:
         with self._lock:
             rows = self._conn.execute(
                 """SELECT name, algorithm, secret, allowed_suffixes,
-                          created_at, expires_at, revoked
+                          created_at, expires_at, revoked, subject,
+                          registered_spk
                    FROM tsig_keys ORDER BY created_at ASC"""
             ).fetchall()
         return [_row_to_key(r) for r in rows]
@@ -369,7 +453,17 @@ class TSIGKeyStore:
 
 
 def _row_to_key(row) -> TSIGKey:
-    name, algorithm, secret, suffixes_blob, created_at, expires_at, revoked = row
+    (
+        name,
+        algorithm,
+        secret,
+        suffixes_blob,
+        created_at,
+        expires_at,
+        revoked,
+        subject,
+        registered_spk,
+    ) = row
     suffixes = tuple(s for s in (suffixes_blob or "").split("\n") if s)
     return TSIGKey(
         name=name,
@@ -379,4 +473,6 @@ def _row_to_key(row) -> TSIGKey:
         created_at=int(created_at),
         expires_at=int(expires_at),
         revoked=bool(revoked),
+        subject=str(subject or ""),
+        registered_spk=str(registered_spk or ""),
     )

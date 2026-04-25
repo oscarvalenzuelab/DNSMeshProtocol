@@ -254,7 +254,14 @@ def _load_served_zone() -> str:
     UPDATE even though the registration flow happily issued keys
     scoped to that same hostname).
     """
+    # Fallback chain MUST start with DMP_SERVED_ZONE so the DNS
+    # server's allowed_zones match the registration scope.
+    # RegistrationConfig.from_env() reads the same env in the same
+    # order; if these two helpers diverge, registration mints keys
+    # for one zone while the DNS server authorizes another and every
+    # UPDATE bounces NOTZONE/REFUSED (codex round 3 P1).
     for var in (
+        "DMP_SERVED_ZONE",
         "DMP_CLAIM_PROVIDER_ZONE",
         "DMP_CLUSTER_BASE_DOMAIN",
         "DMP_DOMAIN",

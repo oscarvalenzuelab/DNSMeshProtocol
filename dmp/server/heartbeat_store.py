@@ -20,8 +20,27 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from dmp.core.heartbeat import HeartbeatRecord
+
+
+def _zone_from_endpoint_host(endpoint: str) -> str:
+    """Best-effort URL-host fallback for peers that don't yet advertise
+    ``claim_provider_zone``. Returns lowercase bare hostname or "".
+    """
+    if not isinstance(endpoint, str) or not endpoint:
+        return ""
+    try:
+        parts = urlsplit(endpoint if "://" in endpoint else "https://" + endpoint)
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").strip().lower()
+    if not host:
+        return ""
+    if host.replace(".", "").isdigit() or ":" in host:
+        return ""
+    return host
 
 # Default retention — how long past `exp` we keep a row before the
 # sweep evicts it. Tuned so a brief operator outage (a few hours)
@@ -267,6 +286,51 @@ class SeenStore:
             (now_i, limit),
         ).fetchall()
         return [r[0] for r in rows]
+
+    def list_zones_for_harvest(
+        self,
+        *,
+        limit: int,
+        now: Optional[int] = None,
+    ) -> List[str]:
+        """Return up to ``limit`` peer DNS zones for transitive
+        discovery (M9 codex round-3 P2).
+
+        Reads the operator-advertised ``claim_provider_zone`` field
+        directly off each verified wire (M9.1.1). Falls back to the
+        endpoint host when the wire field is empty (legacy / opt-out
+        peers). Endpoint-host derivation is wrong in general — a node
+        publishing under ``example.com`` may serve HTTP at
+        ``api.example.com`` — so the wire-zone path is preferred
+        when present.
+        """
+        now_i = int(now) if now is not None else int(time.time())
+        limit = max(0, int(limit))
+        rows = self._conn.execute(
+            """SELECT wire, endpoint
+               FROM heartbeats_seen
+               WHERE exp > ?
+               ORDER BY ts DESC
+               LIMIT ?""",
+            (now_i, limit),
+        ).fetchall()
+        out: List[str] = []
+        for wire, endpoint in rows:
+            zone = ""
+            try:
+                rec = HeartbeatRecord.parse_and_verify(wire, now=now_i)
+                if rec is not None and rec.claim_provider_zone:
+                    zone = rec.claim_provider_zone.strip().lower().rstrip(".")
+            except Exception:
+                zone = ""
+            if not zone:
+                # Fallback — derive from endpoint host. Same path as
+                # the legacy heartbeat-worker behavior; covers older
+                # peers that don't advertise the field yet.
+                zone = _zone_from_endpoint_host(endpoint)
+            if zone:
+                out.append(zone)
+        return out
 
     def count(self) -> int:
         with self._lock:
