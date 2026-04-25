@@ -613,15 +613,26 @@ Reveal.initialize({
     return mermaid.run({ querySelector: 'pre.mermaid' });
 }).then(() => {
     // Some browsers won't lay out an SVG that was rendered while its
-    // container was display:none (Reveal hides off-screen slides this way
-    // depending on transitions). Re-run on slidechanged for any block we
-    // haven't already turned into an SVG.
-    Reveal.on('slidechanged', () => {
-        const pending = document.querySelectorAll('pre.mermaid:not([data-processed])');
-        if (pending.length) {
-            mermaid.run({ nodes: Array.from(pending) }).catch(e => console.warn('mermaid:', e));
-        }
-    });
+    // container was display:none (Reveal hides off-screen slides this
+    // way depending on transitions). Mermaid 10.9 sometimes marks the
+    // pre `data-processed="true"` even when its layout pass crashed
+    // with "translate(undefined, NaN)" — the resulting block has no
+    // <svg> child. Filter on "missing svg", not on the data-processed
+    // marker, so we recover those blocks on every slide-change. The
+    // `removeAttribute` resets mermaid's idempotency guard so it
+    // actually re-renders instead of returning early.
+    function _rerunBrokenMermaid() {
+        const broken = Array.from(document.querySelectorAll('pre.mermaid'))
+            .filter(el => !el.querySelector('svg'));
+        if (!broken.length) return;
+        broken.forEach(el => el.removeAttribute('data-processed'));
+        mermaid.run({ nodes: broken }).catch(err => console.warn('mermaid:', err));
+    }
+    Reveal.on('slidechanged', _rerunBrokenMermaid);
+    // Also re-check on `ready` and after a short delay — some
+    // browsers emit slidechanged BEFORE the layout settles, so the
+    // first re-run can still hit a 0x0 box.
+    Reveal.on('ready', () => setTimeout(_rerunBrokenMermaid, 100));
 });
 </script>
 
