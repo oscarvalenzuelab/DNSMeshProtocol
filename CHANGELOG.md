@@ -7,6 +7,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.7] — `identity fetch` shows the full address
+
+### Changed
+
+- **`dnsmesh identity fetch` now prints the full `<user>@<host>`
+  address** along with the bare username. Without the host part, two
+  different `alkamod`s on different nodes look identical in the
+  output. The host comes from the @-form input, the `--domain` flag,
+  or the local config's effective domain — whichever the lookup
+  actually used. The `--json` payload gains a sibling `address` field
+  alongside `username` so scripts can branch on either.
+
 ## [0.3.6] — `@-style fetch` falls back from zone-anchored to TOFU
 
 ### Fixed
