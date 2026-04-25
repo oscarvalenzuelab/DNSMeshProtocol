@@ -28,9 +28,11 @@ work in M8 design notes.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 
@@ -83,6 +85,23 @@ class IntroQueue:
 
     def __init__(self, path: str = ":memory:") -> None:
         self._path = path
+        # On-disk paths: ensure the parent directory exists with
+        # tight permissions BEFORE creating the file, then chmod
+        # the file too. The intro queue stores fully decrypted
+        # plaintext (codex P2 round 3 caught the confidentiality
+        # regression: previously a default umask-022 system left
+        # this world-readable). Mirror the PrekeyStore + replay-
+        # cache pattern: 0o700 on the dir, 0o600 on the file.
+        if path != ":memory:":
+            try:
+                parent = Path(path).expanduser().resolve().parent
+                parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.chmod(parent, 0o700)
+                except OSError:
+                    pass
+            except OSError:
+                pass
         # check_same_thread=False so the CLI and the receive worker
         # can both write. WAL mode keeps reads non-blocking against
         # writers.
@@ -97,6 +116,15 @@ class IntroQueue:
                 self._conn.execute("PRAGMA journal_mode=WAL")
             except sqlite3.DatabaseError:
                 pass
+            # Tighten the file itself, plus any WAL/SHM siblings
+            # sqlite materializes alongside it.
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    sibling = Path(path + suffix)
+                    if sibling.exists():
+                        os.chmod(sibling, 0o600)
+                except OSError:
+                    pass
 
     def close(self) -> None:
         try:

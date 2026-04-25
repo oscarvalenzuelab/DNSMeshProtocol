@@ -128,3 +128,17 @@ class TestPersistence:
         assert rows[0].intro_id == intro_id
         assert rows[0].plaintext == b"hello stranger"
         q2.close()
+
+    def test_db_file_is_0600(self, tmp_path):
+        """Codex P2 round 3 fix: intro DB stores decrypted plaintext;
+        must not be world-readable on a default-umask system."""
+        import stat
+
+        path = str(tmp_path / "intros.db")
+        q = IntroQueue(path)
+        _seed(q)
+        q.close()
+        # File mode masking the high bits — only the owner-rw bits
+        # should be set (0o600).
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode & 0o077 == 0, f"intros.db is too permissive: 0o{mode:o}"

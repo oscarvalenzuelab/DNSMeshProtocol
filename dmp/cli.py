@@ -903,6 +903,49 @@ def _make_client(
     return client
 
 
+# Built-in seed claim providers — shipped with the package so every
+# client has a baseline for first-contact reach even before the local
+# seen-graph populates. Codex P1 round 3 caught the bug where Alice's
+# top-K and Bob's top-K can be disjoint when each computes from their
+# own home node's /v1/nodes/seen; including these seeds in BOTH lists
+# guarantees overlap until anti-entropy gossip on claim records
+# (M8.4) converges the two views.
+#
+# The seeds are intentionally also entries in `directory/seeds.txt`
+# so a user can drop a node from one and still have the other path.
+# Operators who want a different default fleet override via
+# `claim_provider_override` in their config.
+_BUILTIN_CLAIM_PROVIDER_SEEDS: List[Tuple[str, str]] = [
+    ("dnsmesh.io", "https://dnsmesh.io"),
+]
+
+
+def _resolve_provider_zone_via_info(endpoint: str) -> Optional[str]:
+    """Fetch ``GET {endpoint}/v1/info`` and return the advertised zone.
+
+    Returns:
+      - the zone string when reachable + non-empty,
+      - ``""`` (explicitly empty) when reachable but provider opted
+        out — caller should skip the provider entirely,
+      - ``None`` when unreachable / malformed — caller falls back to
+        host-derived zone.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    info_url = endpoint.rstrip("/") + "/v1/info"
+    try:
+        with urllib.request.urlopen(info_url, timeout=2) as resp:
+            info = json.loads(resp.read())
+    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+        return None
+    advertised = info.get("claim_provider_zone", None)
+    if not isinstance(advertised, str):
+        return None
+    return advertised
+
+
 def _build_claim_providers(cfg: "CLIConfig") -> List[Tuple[str, str]]:
     """Build the ranked claim-provider list for send/recv (M8.3).
 
@@ -915,11 +958,17 @@ def _build_claim_providers(cfg: "CLIConfig") -> List[Tuple[str, str]]:
          SeenStore recency via
          :mod:`dmp.client.claim_routing`, and for each candidate try
          the provider's ``/v1/info`` to confirm the actual served
-         zone (codex P2: a provider whose claim zone differs from
-         its HTTP host would otherwise be unreachable). On
+         zone (codex round 1 P2: a provider whose claim zone differs
+         from its HTTP host would otherwise be unreachable). On
          ``/v1/info`` failure, fall back to host-derived zone.
-      3. On any exception (no endpoint, network down, malformed
-         JSON), return ``[]``. Send/recv handle empty lists by
+      3. Always APPEND the built-in seeds (codex round 3 P1: without
+         a shared baseline, sender and recipient computing from
+         their own home nodes can land on disjoint provider sets
+         and drop first-contact claims entirely). Seeds are dedup'd
+         by endpoint so an operator who happens to be running their
+         own dnsmesh.io mirror doesn't see double-publish.
+      4. On any exception in steps 2, return whatever was built so
+         far + the seeds. Send/recv handle the empty case by
          skipping claim publish/poll — first-contact reach degrades
          gracefully to "pinned-only" mode.
 
@@ -945,45 +994,55 @@ def _build_claim_providers(cfg: "CLIConfig") -> List[Tuple[str, str]]:
         )
         return [(p.zone, p.endpoint) for p in out]
 
-    if not cfg.endpoint:
-        return []
-    seen_url = cfg.endpoint.rstrip("/") + "/v1/nodes/seen"
-    try:
-        with urllib.request.urlopen(seen_url, timeout=5) as resp:
-            data = json.loads(resp.read())
-    except (urllib.error.URLError, json.JSONDecodeError, OSError):
-        return []
-    seen_wires = [
-        entry.get("wire", "") for entry in data.get("seen", []) if isinstance(entry, dict)
-    ]
-    heartbeats = parse_seen_feed(seen_wires)
-    providers = select_providers(heartbeats, k=DEFAULT_K)
-
-    # /v1/info upgrade pass: ask each provider what zone it actually
-    # serves under, override the host-derived zone when the response
-    # is well-formed. Drop providers whose /v1/info advertises an
-    # empty claim_provider_zone (operator opted out).
     out: List[Tuple[str, str]] = []
-    for p in providers:
-        info_url = p.endpoint.rstrip("/") + "/v1/info"
-        zone = p.zone
+    seen_endpoints: set = set()
+
+    def _add(zone: str, endpoint: str) -> None:
+        if not zone or not endpoint:
+            return
+        canon = endpoint.rstrip("/").lower()
+        if canon in seen_endpoints:
+            return
+        seen_endpoints.add(canon)
+        out.append((zone, endpoint))
+
+    if cfg.endpoint:
+        seen_url = cfg.endpoint.rstrip("/") + "/v1/nodes/seen"
         try:
-            with urllib.request.urlopen(info_url, timeout=2) as resp:
-                info = json.loads(resp.read())
-            advertised = info.get("claim_provider_zone", "")
-            if advertised == "":
-                # Provider explicitly opted out (DMP_CLAIM_PROVIDER=0)
-                # — skip even though their heartbeat advertised the
-                # capability. Heartbeat staleness can lag opt-out.
-                continue
-            zone = advertised
+            with urllib.request.urlopen(seen_url, timeout=5) as resp:
+                data = json.loads(resp.read())
         except (urllib.error.URLError, json.JSONDecodeError, OSError):
-            # /v1/info unreachable — fall back to host-derived zone.
-            # That's only correct when the provider serves claims
-            # under their HTTP hostname; for legacy / single-zone
-            # deployments this is true.
-            pass
-        out.append((zone, p.endpoint))
+            data = None
+        if isinstance(data, dict):
+            seen_wires = [
+                entry.get("wire", "")
+                for entry in data.get("seen", [])
+                if isinstance(entry, dict)
+            ]
+            heartbeats = parse_seen_feed(seen_wires)
+            providers = select_providers(heartbeats, k=DEFAULT_K)
+            for p in providers:
+                advertised = _resolve_provider_zone_via_info(p.endpoint)
+                if advertised == "":
+                    # Provider explicitly opted out — skip even
+                    # though heartbeat advertised the capability.
+                    continue
+                zone = advertised if advertised else p.zone
+                _add(zone, p.endpoint)
+
+    # Seeds: always on, always last in the list. Anti-entropy on
+    # claim records (M8.4) eventually converges the seen-graph view,
+    # but the seeds give us a cross-deployment overlap floor today.
+    for seed_zone, seed_endpoint in _BUILTIN_CLAIM_PROVIDER_SEEDS:
+        # Trust /v1/info if reachable; otherwise use the seed's
+        # built-in zone.
+        advertised = _resolve_provider_zone_via_info(seed_endpoint)
+        if advertised == "":
+            # Seed operator has opted out of claim provider role —
+            # respect that. Surprising in practice, but correct.
+            continue
+        zone = advertised if advertised else seed_zone
+        _add(zone, seed_endpoint)
     return out
 
 
@@ -2156,8 +2215,21 @@ def cmd_intro_trust(args: argparse.Namespace) -> int:
         intro = client.intro_queue.get_intro(int(args.intro_id))
         if intro is None:
             _die(1, f"no pending intro with id {args.intro_id}")
-        label = args.label or f"intro-{intro.sender_spk.hex()[:12]}"
         remote_username = args.username or ""
+        # Codex P2 round 3 fix: when the user passes --username, the
+        # trusted contact's dict key defaults to that name so a
+        # follow-up `dnsmesh identity fetch <username>@<zone> --add`
+        # keys to the SAME entry and fills in pub. Without this
+        # alignment, identity-fetch creates a second contact under
+        # the username while the trust label stays spk-only forever.
+        # Explicit --label still wins for users who want a custom
+        # local nickname (they accept the trade-off).
+        if args.label:
+            label = args.label
+        elif remote_username:
+            label = remote_username
+        else:
+            label = f"intro-{intro.sender_spk.hex()[:12]}"
         msg = client.trust_intro(
             int(args.intro_id), label=label, remote_username=remote_username
         )
