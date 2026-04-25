@@ -88,16 +88,56 @@
 
 <!-- 4. Two activities -->
 <section>
-  <h2>Two activities. Two channels.</h2>
+  <h2>Two channels: HTTPS for writes, DNS for reads</h2>
   <pre class="mermaid">
 flowchart LR
-    A["Alice's CLI"] -- "1. PUBLISH<br>(HTTPS POST,<br>token required)" --> Node["A DMP node"]
-    B["Anyone in the world"] -- "2. READ<br>(DNS query,<br>no auth)" --> Node
+    A["Alice's CLI"] -- "writes (HTTPS,<br>token required)" --> Node["a DMP node"]
+    B["any reader"] -- "reads (DNS,<br>no auth)" --> Node
   </pre>
   <ul>
-    <li><strong>Publishing</strong> (writing your identity, sending a message) — uses <strong>HTTP/HTTPS</strong>. You authenticate with a token.</li>
-    <li><strong>Reading</strong> (fetching someone's identity, receiving a message) — uses <strong>DNS</strong>. No auth, anywhere on the internet.</li>
+    <li><strong>Writes</strong> = publishing your identity, sending a message, refreshing prekeys. Uses <strong>HTTPS</strong>. Token-authenticated.</li>
+    <li><strong>Reads</strong> = fetching someone's identity, receiving messages, looking up cluster manifests. Uses <strong>DNS</strong>. No auth.</li>
   </ul>
+  <div class="takeaway"><strong>Important nuance coming up:</strong> when Alice sends a message to Bob, Alice's CLI doesn't write to Alice's home node. It writes <em>directly to Bob's home node</em>. Next slide.</div>
+</section>
+
+<!-- 4b. Where do messages actually go -->
+<section>
+  <h2>Where messages actually go</h2>
+  <pre class="mermaid">
+sequenceDiagram
+    participant A as Alice CLI
+    participant DNS as DNS (any resolver)
+    participant BNode as Bob's home node
+    A->>DNS: 1. fetch Bob's identity (open read)
+    DNS-->>A: Bob's pubkey
+    A->>A: 2. encrypt locally
+    A->>BNode: 3. POST ciphertext to Bob's mailbox<br>(HTTPS, Alice's token at Bob's node)
+    Note over BNode: stored in sqlite,<br>served on UDP 53 from this point on
+  </pre>
+  <ul>
+    <li>Alice's <strong>home node is irrelevant for outgoing messages</strong>. Alice's CLI is the publisher; the destination is Bob's mailbox at Bob's home node.</li>
+    <li>Alice needs a <strong>write token at Bob's node</strong> — <code>dnsmesh register --node bob-node.example</code> once, stored in <code>~/.dmp/tokens/&lt;node&gt;.json</code>, auto-attached to subsequent sends.</li>
+    <li>Nodes <strong>never use DNS as an outbound transport</strong>. DNS is read-only at every node, always. Writes go through HTTPS only.</li>
+  </ul>
+</section>
+
+<!-- 4c. Bob receives -->
+<section>
+  <h2>Bob receives — DNS only</h2>
+  <pre class="mermaid">
+sequenceDiagram
+    participant B as Bob CLI
+    participant DNS as DNS (any resolver)
+    participant BNode as Bob's home node
+    B->>DNS: TXT? slot-N.mb-{hash}.bob-domain
+    DNS->>BNode: forwards
+    BNode-->>DNS: ciphertext rows
+    DNS-->>B: ciphertext rows
+    B->>B: decrypt with private key,<br>verify Alice's signature
+  </pre>
+  <p class="small">Bob doesn't need a token to <em>receive</em> messages addressed to him. The mailbox is served openly via DNS like any other DMP record.</p>
+  <div class="takeaway">Restricted networks (port 53 blocked, no outbound HTTPS): Bob can <strong>still read messages</strong> via DNS-over-HTTPS at 1.1.1.1. He just can't send new ones until he can reach a node's HTTPS port.</div>
 </section>
 
 <!-- 5. Where the user usually trips -->
@@ -295,17 +335,17 @@ sequenceDiagram
   <h2>Federated cluster: surviving a node failure</h2>
   <pre class="mermaid">
 flowchart LR
-    Client
-    Client --> A
-    Client --> C
+    Client["sender's CLI"]
+    Client -- "HTTPS POST<br>fan to majority" --> A
+    Client -- "HTTPS POST<br>fan to majority" --> C
     subgraph Cluster
       A["node-a"]
       B["node-b<br>(down)"]
       C["node-c"]
-      A <--> C
+      A <-- "HTTPS<br>anti-entropy" --> C
     end
   </pre>
-  <p class="small">Three nodes anti-entropy-sync the same record set every 30s. Writes fan to a majority — single-node failure is survivable. Reads union across all nodes. When the dead node returns, it pulls everything it missed since the last sync.</p>
+  <p class="small">Three nodes anti-entropy-sync the same record set every ~30s, <strong>over HTTPS</strong> (<code>/v1/sync/digest</code> + <code>/v1/sync/pull</code>) — never over DNS. Writes from senders fan to a majority of cluster nodes for durability. Reads from the world union across all nodes. When the dead node returns, it pulls everything it missed since its last sync watermark.</p>
 </section>
 
 <!-- 16. FAQ -->
