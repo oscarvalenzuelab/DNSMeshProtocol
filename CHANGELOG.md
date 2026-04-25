@@ -7,6 +7,29 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.3] — final pre-release codex sweep on the M8 path
+
+Two P2 fixes from a release-readiness codex review of the cumulative
+0.3.7 → 0.4.x diff.
+
+### Fixed
+
+- **Claim-discovered messages from a rotated contact now go straight
+  to the inbox.** `receive_claims` only checked literal pinned
+  `known_spks` membership; a contact who had rotated their Ed25519
+  key would have had claim messages quarantined as an intro even
+  though the same contact's same-zone messages were delivered via
+  the rotation-chain walker. The claim path now mirrors the
+  receive_messages logic: pinned ∪ rotated → inbox, everyone else →
+  intro queue.
+- **Claim publish now rejects overlong claims at parse time** rather
+  than silently truncating only the DNS-record TTL. Capping the
+  RRset TTL while leaving the signed `exp` untouched means an
+  anti-entropy peer that pulls the wire (M8.4 gossip) would happily
+  verify and re-publish under whatever TTL it picks — defeating the
+  operator's `max_ttl` policy. Now the server returns 400 if
+  `record.exp - now > max_ttl`.
+
 ## [0.4.2] — operator UX from a real deploy trace
 
 Two follow-on fixes from a `dnsmesh.pro` install trace where the

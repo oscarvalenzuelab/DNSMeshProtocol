@@ -978,9 +978,25 @@ class DMPClient:
                         manifest.sender_spk, manifest.msg_id, manifest.exp
                     )
 
-                    if known_spks and manifest.sender_spk in known_spks:
-                        # Pinned sender → straight to the inbox, same
-                        # semantics as receive_messages.
+                    # Codex P2 final-review fix: a contact who rotated
+                    # their Ed25519 key has manifest.sender_spk that
+                    # isn't literally in known_spks, but the
+                    # rotation-chain walk (M5.4) accepts it on the
+                    # mailbox path. Without this branch, a rotated
+                    # contact's claim-discovered message gets
+                    # quarantined as an intro even though the same
+                    # contact's same-zone message would be delivered
+                    # straight to the inbox. Mirror the receive_messages
+                    # logic: pinned ∪ rotated → inbox; everyone else →
+                    # intro queue.
+                    is_pinned_or_rotated = bool(known_spks) and (
+                        manifest.sender_spk in known_spks
+                        or self._rotation_manifest_accepted(manifest.sender_spk)
+                    )
+                    if is_pinned_or_rotated:
+                        # Pinned (possibly via rotation chain) sender →
+                        # straight to the inbox, same semantics as
+                        # receive_messages.
                         delivered.append(
                             InboxMessage(
                                 sender_signing_pk=manifest.sender_spk,

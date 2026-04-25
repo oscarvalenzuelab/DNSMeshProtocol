@@ -1058,8 +1058,29 @@ No central directory, no phone numbers, no servers to trust.</p>
             return 400
 
         # Cap TTL at the server's max_ttl so a sender can't pin a
-        # long-lived claim past the operator's policy.
+        # long-lived claim past the operator's policy. Codex P2
+        # final-review fix: ALSO reject claims whose signed `exp` is
+        # further in the future than `max_ttl` allows. Truncating
+        # only the DNS-record TTL leaves the signed payload
+        # advertising a far-future exp; an anti-entropy peer that
+        # pulls the wire (M8.4 gossip) would happily verify and
+        # re-publish under whatever TTL it likes — defeating the
+        # operator's policy. Refuse the wire instead.
         max_ttl = self.server.max_ttl
+        now = int(__import__("time").time())
+        claim_lifetime = int(record.exp) - now
+        if claim_lifetime > max_ttl:
+            self._send_json(
+                400,
+                {
+                    "error": (
+                        f"claim exp {record.exp} requests "
+                        f"{claim_lifetime}s of lifetime, exceeds "
+                        f"operator cap of {max_ttl}s"
+                    )
+                },
+            )
+            return 400
         if ttl > max_ttl:
             ttl = max_ttl
 
