@@ -294,6 +294,65 @@ class TestEndToEndWithDnsServer:
             "v=dmp1;t=test"
         ]
 
+    def test_live_keystore_picks_up_keys_minted_after_server_start(
+        self, store, tmp_path
+    ):
+        """Pass tsig_keystore (not tsig_keyring) and confirm a key
+        minted AFTER the server is running can be used to publish.
+        Critical for M9.2.3 — the registration HTTP endpoint mints
+        new keys at runtime and the very next UPDATE has to honor
+        them without restarting the DNS server."""
+        import base64
+        import socket
+
+        import dns.message
+        import dns.query
+        import dns.rcode
+        import dns.tsigkeyring
+        import dns.update
+
+        from dmp.network.memory import InMemoryDNSStore
+        from dmp.server.dns_server import DMPDnsServer
+
+        record_store = InMemoryDNSStore()
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        # Start the server with the keystore but no keys yet.
+        server = DMPDnsServer(
+            record_store,
+            host="127.0.0.1",
+            port=port,
+            writer=record_store,
+            tsig_keystore=store,
+            allowed_zones=("example.com",),
+        )
+        with server:
+            # Mint the key AFTER startup.
+            secret = b"\x99" * 32
+            store.put(
+                name="late",
+                secret=secret,
+                allowed_suffixes=("alice.example.com",),
+            )
+            client_keyring = dns.tsigkeyring.from_text(
+                {"late.": base64.b64encode(secret).decode("ascii")}
+            )
+            upd = dns.update.UpdateMessage("example.com")
+            upd.add(
+                dns.name.from_text("alice.example.com."),
+                300,
+                "TXT",
+                '"v=hello"',
+            )
+            upd.use_tsig(client_keyring, keyname=dns.name.from_text("late."))
+            response = dns.query.udp(upd, "127.0.0.1", port=port, timeout=2.0)
+        assert response.rcode() == dns.rcode.NOERROR
+        assert record_store.query_txt_record("alice.example.com") == ["v=hello"]
+
     def test_dns_update_rejected_for_out_of_scope_owner(self, store, tmp_path):
         import base64
         import socket

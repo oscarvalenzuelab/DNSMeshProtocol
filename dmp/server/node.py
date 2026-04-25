@@ -112,6 +112,16 @@ def _default_heartbeat_db_path(record_db_path: str) -> str:
     return str(p.with_name(p.stem + "_heartbeats" + p.suffix))
 
 
+def _default_tsig_db_path(record_db_path: str) -> str:
+    """``dmp.db`` -> ``dmp_tsig.db`` alongside the record DB. Holds the
+    M9.2.2 keystore powering DNS UPDATE auth + the M9.2.3 registration
+    mint flow."""
+    from pathlib import Path as _Path
+
+    p = _Path(record_db_path)
+    return str(p.with_name(p.stem + "_tsig" + p.suffix))
+
+
 @dataclass
 class _HeartbeatBundle:
     """Everything DMPNode hands to the HTTP API + worker when the
@@ -478,6 +488,16 @@ class DMPNodeConfig:
     auth_mode: Optional[str] = None
     # Path to the sqlite token store. Defaults to sibling of db_path.
     token_db_path: Optional[str] = None
+    # Path to the sqlite TSIG keystore (M9.2.2 / M9.2.3). When unset
+    # ``DMP_TSIG_DB_PATH`` env, falls back to a sibling of db_path.
+    # The keystore is wired only when DNS UPDATE is enabled
+    # (``DMP_DNS_UPDATE_ENABLED=1``).
+    tsig_db_path: Optional[str] = None
+    # Master switch for the DNS UPDATE path + the TSIG-mint route on
+    # /v1/registration/tsig-confirm. Off by default — operators opt in
+    # explicitly. Disabled means the legacy bearer-token path is the
+    # only credential surface.
+    dns_update_enabled: bool = False
     # Bursts are sized for legitimate bulk publishes: a fresh
     # `dnsmesh identity refresh-prekeys --count 50` + a manifest and half a
     # dozen chunks lands under the burst, while a sustained flood is
@@ -603,6 +623,11 @@ class DMPNodeConfig:
             ),
             auth_mode=os.environ.get("DMP_AUTH_MODE") or None,
             token_db_path=os.environ.get("DMP_TOKEN_DB_PATH") or None,
+            tsig_db_path=os.environ.get("DMP_TSIG_DB_PATH") or None,
+            dns_update_enabled=(
+                os.environ.get("DMP_DNS_UPDATE_ENABLED", "").strip().lower()
+                in ("1", "true", "yes", "on")
+            ),
             http_rate=float(os.environ.get("DMP_HTTP_RATE", cls.http_rate)),
             http_burst=float(os.environ.get("DMP_HTTP_BURST", cls.http_burst)),
             max_ttl=int(os.environ.get("DMP_MAX_TTL", cls.max_ttl)),
@@ -646,6 +671,9 @@ class DMPNode:
         self.http: Optional[DMPHttpApi] = None
         self.cleanup: Optional[CleanupWorker] = None
         self.anti_entropy: Optional[AntiEntropyWorker] = None
+        # M9.2.2 / M9.2.3 — TSIG keystore for the DNS UPDATE path.
+        # Materialized in start() iff dns_update_enabled is set.
+        self.tsig_keystore = None
         self._stopped = threading.Event()
 
     @classmethod
@@ -658,6 +686,19 @@ class DMPNode:
         self._ensure_db_parent_exists()
 
         self.store = SqliteMailboxStore(self.config.db_path)
+
+        # M9.2.2 / M9.2.3 — open the TSIG keystore when DNS UPDATE is
+        # enabled. The store is reused by both the DNS server (keyring +
+        # authorizer for incoming UPDATEs) and the HTTP API (the
+        # /tsig-confirm route mints fresh keys here). Disabled means
+        # neither path is wired.
+        if self.config.dns_update_enabled:
+            from dmp.server.tsig_keystore import TSIGKeyStore
+
+            tsig_db = self.config.tsig_db_path or _default_tsig_db_path(
+                self.config.db_path
+            )
+            self.tsig_keystore = TSIGKeyStore(tsig_db)
 
         # Publish the signed cluster manifest into the store on startup
         # if one is mounted. Clients fan out / union-read against the
@@ -677,6 +718,21 @@ class DMPNode:
             help_text="Live records in the DMP mailbox store",
         )
 
+        # M9.2.1 / M9.2.2 — when DNS UPDATE is enabled, hand the DNS
+        # server the keystore (live, so newly-minted keys authorize
+        # without restarting), the writer (same sqlite store the
+        # reader uses), and the list of zones this node is authoritative
+        # for. Disabled → DNS server stays query-only, REFUSING any
+        # UPDATE.
+        update_kwargs: dict = {}
+        if self.tsig_keystore is not None:
+            update_zone = _load_claim_provider_zone()
+            allowed_zones = (update_zone,) if update_zone else ()
+            update_kwargs = {
+                "writer": self.store,
+                "tsig_keystore": self.tsig_keystore,
+                "allowed_zones": allowed_zones,
+            }
         self.dns = DMPDnsServer(
             self.store,
             host=self.config.dns_host,
@@ -687,6 +743,7 @@ class DMPNode:
                 burst=self.config.dns_burst,
             ),
             max_concurrency=self.config.dns_max_concurrency,
+            **update_kwargs,
         )
         # Derive the cluster base domain for the gossip endpoint — same
         # derivation path the anti-entropy worker uses. Configured
@@ -803,6 +860,7 @@ class DMPNode:
                 if heartbeat_bundle and heartbeat_bundle.worker
                 else 0
             ),
+            tsig_keystore=self.tsig_keystore,
         )
         self.heartbeat_worker = heartbeat_bundle.worker if heartbeat_bundle else None
         self.cleanup = CleanupWorker(

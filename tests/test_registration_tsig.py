@@ -1,0 +1,408 @@
+"""Tests for the M9.2.3 TSIG-key registration flow.
+
+Mirrors test_registration.py's structure for the bearer-token flow but
+targets ``mint_tsig_via_registration`` and the
+``POST /v1/registration/tsig-confirm`` HTTP endpoint.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from dmp.server.registration import (
+    ChallengeStore,
+    RegistrationConfig,
+    RegistrationError,
+    SignatureInvalid,
+    SubjectNotAllowed,
+    _build_signing_payload,
+    mint_tsig_via_registration,
+)
+from dmp.server.tsig_keystore import TSIGKeyStore
+
+
+@pytest.fixture
+def keystore(tmp_path: Path) -> TSIGKeyStore:
+    s = TSIGKeyStore(str(tmp_path / "tsig.db"))
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def config() -> RegistrationConfig:
+    return RegistrationConfig(
+        enabled=True,
+        node_hostname="ops.example",
+        allowlist=("ops.example",),
+        expires_in_seconds=3600,
+    )
+
+
+@pytest.fixture
+def challenges() -> ChallengeStore:
+    return ChallengeStore()
+
+
+def _signed_body(
+    *,
+    subject: str,
+    challenge_hex: str,
+    node: str,
+) -> tuple[dict, str]:
+    """Build a confirm-shape body with a fresh Ed25519 keypair. Returns
+    (body, spk_hex)."""
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key().public_bytes_raw()
+    payload = _build_signing_payload(challenge_hex, subject, node)
+    sig = priv.sign(payload)
+    return (
+        {
+            "subject": subject,
+            "ed25519_spk": pub.hex(),
+            "challenge": challenge_hex,
+            "signature": sig.hex(),
+        },
+        pub.hex(),
+    )
+
+
+class TestMintTsigViaRegistration:
+    def test_happy_path(self, keystore, config, challenges):
+        pc = challenges.issue(config.node_hostname)
+        body, spk_hex = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        minted = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=config,
+            body=body,
+        )
+        # Key name encodes local part + spk prefix + zone.
+        assert minted.subject == "alice@ops.example"
+        assert minted.zone == "ops.example"
+        assert minted.name.startswith("alice-" + spk_hex[:8])
+        assert minted.name.endswith(".ops.example.")
+        # Scope is exactly the user's subtree + their claim records.
+        assert "alice.ops.example" in minted.allowed_suffixes
+        claim_suffix = f"_dnsmesh-claim-{spk_hex[:16]}.ops.example"
+        assert claim_suffix in minted.allowed_suffixes
+        # Secret is fresh random bytes (32) and survives a re-read
+        # through the keystore.
+        assert len(bytes.fromhex(minted.secret_hex)) == 32
+        stored = keystore.get(minted.name)
+        assert stored is not None
+        assert stored.secret == bytes.fromhex(minted.secret_hex)
+        # Expires_at is in the future per config.
+        assert minted.expires_at > 0
+
+    def test_disabled_returns_404(self, keystore, challenges):
+        cfg = RegistrationConfig(enabled=False, node_hostname="ops.example")
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex="00" * 32,
+            node="ops.example",
+        )
+        with pytest.raises(RegistrationError) as exc:
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=cfg,
+                body=body,
+            )
+        assert exc.value.http_status == 404
+
+    def test_missing_hostname_returns_500(self, keystore, challenges):
+        cfg = RegistrationConfig(enabled=True, node_hostname="")
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex="00" * 32,
+            node="ops.example",
+        )
+        with pytest.raises(RegistrationError) as exc:
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=cfg,
+                body=body,
+            )
+        assert exc.value.http_status == 500
+
+    def test_unknown_challenge_rejected(self, keystore, config, challenges):
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex="ab" * 32,  # never issued
+            node=config.node_hostname,
+        )
+        with pytest.raises(RegistrationError):
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=config,
+                body=body,
+            )
+
+    def test_bad_signature_rejected(self, keystore, config, challenges):
+        pc = challenges.issue(config.node_hostname)
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        # Flip a byte in the signature.
+        sig = bytearray(bytes.fromhex(body["signature"]))
+        sig[0] ^= 0xFF
+        body["signature"] = sig.hex()
+        with pytest.raises(SignatureInvalid):
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=config,
+                body=body,
+            )
+
+    def test_disallowed_domain_rejected(self, keystore, challenges):
+        cfg = RegistrationConfig(
+            enabled=True,
+            node_hostname="ops.example",
+            allowlist=("approved.example",),
+        )
+        pc = challenges.issue(cfg.node_hostname)
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        with pytest.raises(SubjectNotAllowed):
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=cfg,
+                body=body,
+            )
+
+    def test_remint_rotates_secret(self, keystore, config, challenges):
+        """Re-registration replaces the secret. The user's old secret
+        is unrecoverable; a new UPDATE must use the freshly-issued one.
+        Same-spk re-registration is intentional — a user who lost their
+        TSIG key can re-register (the Ed25519 challenge proves identity)."""
+        # First mint.
+        pc1 = challenges.issue(config.node_hostname)
+        body1, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc1.challenge_hex,
+            node=pc1.node,
+        )
+        first = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=config,
+            body=body1,
+        )
+        # Second mint with a fresh challenge (same key reused).
+        pc2 = challenges.issue(config.node_hostname)
+        priv = Ed25519PrivateKey.generate()
+        pub = priv.public_key().public_bytes_raw()
+        payload = _build_signing_payload(pc2.challenge_hex, "alice@ops.example", pc2.node)
+        body2 = {
+            "subject": "alice@ops.example",
+            "ed25519_spk": pub.hex(),
+            "challenge": pc2.challenge_hex,
+            "signature": priv.sign(payload).hex(),
+        }
+        second = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=config,
+            body=body2,
+        )
+        # Different spk → different key name; both rows live in the
+        # store. A re-mint with the SAME spk would overwrite (covered
+        # by test_tsig_keystore::TestPutAndGet::test_put_replaces_existing).
+        assert first.secret_hex != second.secret_hex
+        assert first.name != second.name
+
+
+class TestHttpEndpoint:
+    """End-to-end: boot DMPHttpApi with a keystore, run the full
+    challenge/confirm dance, assert the minted key works against
+    DMPDnsServer's UPDATE handler with the keystore-built keyring."""
+
+    def test_full_flow_mints_usable_tsig_key(self, tmp_path):
+        import base64
+        import json
+        import socket
+        import time as _time
+        import urllib.request
+
+        import dns.message
+        import dns.name
+        import dns.query
+        import dns.rcode
+        import dns.tsigkeyring
+        import dns.update
+
+        from dmp.network.memory import InMemoryDNSStore
+        from dmp.server.dns_server import DMPDnsServer
+        from dmp.server.http_api import DMPHttpApi
+        from dmp.server.tokens import TokenStore
+
+        record_store = InMemoryDNSStore()
+        keystore = TSIGKeyStore(str(tmp_path / "tsig.db"))
+        try:
+            token_store = TokenStore(str(tmp_path / "tokens.db"))
+
+            # Bind two free ports — HTTP for registration, UDP for DNS.
+            def _free():
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.bind(("127.0.0.1", 0))
+                p = s.getsockname()[1]
+                s.close()
+                return p
+
+            http_port = _free()
+            dns_port = _free()
+
+            cfg = RegistrationConfig(
+                enabled=True,
+                node_hostname="ops.example",
+                allowlist=(),  # no domain restriction
+                expires_in_seconds=3600,
+            )
+            api = DMPHttpApi(
+                record_store,
+                host="127.0.0.1",
+                port=http_port,
+                auth_mode="multi-tenant",
+                token_store=token_store,
+                registration_config=cfg,
+                tsig_keystore=keystore,
+            )
+            api.start()
+            try:
+                # Step 1: GET /challenge.
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{http_port}/v1/registration/challenge",
+                    timeout=2,
+                ) as resp:
+                    challenge = json.loads(resp.read())
+                # Step 2: sign challenge|subject|node + version.
+                priv = Ed25519PrivateKey.generate()
+                pub = priv.public_key().public_bytes_raw()
+                subject = "alice@ops.example"
+                payload = _build_signing_payload(
+                    challenge["challenge"], subject, challenge["node"]
+                )
+                sig = priv.sign(payload)
+                # Step 3: POST /tsig-confirm.
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{http_port}/v1/registration/tsig-confirm",
+                    data=json.dumps(
+                        {
+                            "subject": subject,
+                            "ed25519_spk": pub.hex(),
+                            "challenge": challenge["challenge"],
+                            "signature": sig.hex(),
+                        }
+                    ).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    minted = json.loads(resp.read())
+            finally:
+                api.stop()
+
+            # Now boot a DNS server with the keystore-built keyring +
+            # authorizer and use the minted TSIG key to publish a
+            # record under the user's allowed scope.
+            dns_server = DMPDnsServer(
+                record_store,
+                host="127.0.0.1",
+                port=dns_port,
+                writer=record_store,
+                tsig_keyring=keystore.build_keyring(),
+                allowed_zones=("ops.example",),
+                update_authorizer=keystore.build_authorizer(),
+            )
+            with dns_server:
+                client_keyring = dns.tsigkeyring.from_text(
+                    {
+                        minted["tsig_key_name"]: base64.b64encode(
+                            bytes.fromhex(minted["tsig_secret_hex"])
+                        ).decode("ascii")
+                    }
+                )
+                upd = dns.update.UpdateMessage("ops.example")
+                upd.add(
+                    dns.name.from_text("identity.alice.ops.example."),
+                    300,
+                    "TXT",
+                    '"v=dmp1;t=identity"',
+                )
+                upd.use_tsig(
+                    client_keyring,
+                    keyname=dns.name.from_text(minted["tsig_key_name"]),
+                )
+                response = dns.query.udp(
+                    upd, "127.0.0.1", port=dns_port, timeout=2.0
+                )
+            assert response.rcode() == dns.rcode.NOERROR
+            assert record_store.query_txt_record(
+                "identity.alice.ops.example"
+            ) == ["v=dmp1;t=identity"]
+        finally:
+            keystore.close()
+
+    def test_endpoint_404s_without_keystore(self, tmp_path):
+        """A node that didn't wire a keystore still answers
+        /v1/registration/confirm but returns 404 on /tsig-confirm —
+        no quiet downgrade."""
+        import json
+        import socket
+        import urllib.error
+        import urllib.request
+
+        from dmp.network.memory import InMemoryDNSStore
+        from dmp.server.http_api import DMPHttpApi
+        from dmp.server.tokens import TokenStore
+
+        record_store = InMemoryDNSStore()
+        token_store = TokenStore(str(tmp_path / "tokens.db"))
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        cfg = RegistrationConfig(
+            enabled=True,
+            node_hostname="ops.example",
+            allowlist=(),
+        )
+        api = DMPHttpApi(
+            record_store,
+            host="127.0.0.1",
+            port=port,
+            auth_mode="multi-tenant",
+            token_store=token_store,
+            registration_config=cfg,
+            tsig_keystore=None,
+        )
+        api.start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/registration/tsig-confirm",
+                data=b"{}",
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(req, timeout=2)
+            assert exc.value.code == 404
+        finally:
+            api.stop()

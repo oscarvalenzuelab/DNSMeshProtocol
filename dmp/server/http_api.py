@@ -629,6 +629,8 @@ No central directory, no phone numbers, no servers to trust.</p>
             return self._handle_sync_pull()
         if parsed.path == "/v1/registration/confirm":
             return self._handle_registration_confirm()
+        if parsed.path == "/v1/registration/tsig-confirm":
+            return self._handle_registration_tsig_confirm()
         if parsed.path == "/v1/heartbeat":
             return self._handle_heartbeat_submit()
         if parsed.path == "/v1/claim/publish":
@@ -819,6 +821,60 @@ No central directory, no phone numbers, no servers to trust.</p>
                 "expires_at": row.expires_at,
                 "rate_per_sec": row.rate_per_sec,
                 "rate_burst": row.rate_burst,
+            },
+        )
+        return 200
+
+    def _handle_registration_tsig_confirm(self) -> int:
+        """M9.2.3 — same Ed25519 challenge/confirm ceremony, but the
+        deliverable is a TSIG key the user installs in their CLI for
+        DNS UPDATE writes. 404s when no keystore is wired in (read-only
+        / open-mode nodes don't expose the route)."""
+        if not self._registration_enabled():
+            self._send_json(404, {"error": "not found"})
+            return 404
+        keystore = getattr(self.server, "tsig_keystore", None)
+        if keystore is None:
+            self._send_json(404, {"error": "tsig registration disabled"})
+            return 404
+        if not self._registration_rate_ok():
+            self._send_json(429, {"error": "registration rate limit exceeded"})
+            return 429
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "invalid body"})
+            return 400
+        from dmp.server.registration import (
+            RegistrationError,
+            mint_tsig_via_registration,
+        )
+
+        remote_addr = self.client_address[0] if self.client_address else ""
+        try:
+            minted = mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=self.server.challenge_store,
+                config=self.server.registration_config,
+                body=body,
+                remote_addr=remote_addr,
+            )
+        except RegistrationError as exc:
+            self._send_json(exc.http_status, {"error": exc.reason})
+            return exc.http_status
+        except Exception:
+            self._send_json(500, {"error": "internal error"})
+            return 500
+
+        self._send_json(
+            200,
+            {
+                "tsig_key_name": minted.name,
+                "tsig_secret_hex": minted.secret_hex,
+                "tsig_algorithm": minted.algorithm,
+                "allowed_suffixes": list(minted.allowed_suffixes),
+                "subject": minted.subject,
+                "zone": minted.zone,
+                "expires_at": minted.expires_at,
             },
         )
         return 200
@@ -1621,6 +1677,7 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         heartbeat_seen_limit: int = 500,
         claim_provider_zone: str = "",
         advertised_capabilities: int = 0,
+        tsig_keystore=None,
     ):
         super().__init__(addr, handler)
         self.store = store
@@ -1668,6 +1725,9 @@ class _BoundedThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         # node's caps.
         self.claim_provider_zone = str(claim_provider_zone or "")
         self.advertised_capabilities = int(advertised_capabilities or 0)
+        # M9.2.3 — TSIG keystore exposed to the handler on
+        # POST /v1/registration/tsig-confirm. None disables the route.
+        self.tsig_keystore = tsig_keystore
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -1728,6 +1788,7 @@ class DMPHttpApi:
         heartbeat_seen_limit: int = 500,
         claim_provider_zone: str = "",
         advertised_capabilities: int = 0,
+        tsig_keystore=None,
     ):
         self.store = store
         self.host = host
@@ -1779,6 +1840,11 @@ class DMPHttpApi:
         # advertised). Empty zone disables claim publishing here.
         self.claim_provider_zone = str(claim_provider_zone or "")
         self.advertised_capabilities = int(advertised_capabilities or 0)
+        # M9.2.3 — TSIG keystore powering POST /v1/registration/tsig-confirm.
+        # When None the endpoint 404s. Wired alongside the existing token
+        # store; the two coexist since the registration ceremony is shared
+        # but produces different deliverables (bearer token vs. TSIG key).
+        self.tsig_keystore = tsig_keystore
         self._server: Optional[_DMPHttpServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -1858,6 +1924,7 @@ class DMPHttpApi:
             heartbeat_seen_limit=self.heartbeat_seen_limit,
             claim_provider_zone=self.claim_provider_zone,
             advertised_capabilities=self.advertised_capabilities,
+            tsig_keystore=self.tsig_keystore,
         )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(

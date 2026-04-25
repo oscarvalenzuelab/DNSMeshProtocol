@@ -120,7 +120,17 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         #   - dns.message.BadTSIG (malformed TSIG record)
         # All three map to NOTAUTH — the request was authenticated by
         # someone we can't or won't trust.
-        keyring = self.server.tsig_keyring
+        #
+        # When a keystore is wired in, build a fresh keyring per packet
+        # so newly-minted keys authorize without restarting the server.
+        # (Common case: a user just registered, dnspython needs to know
+        # their key name on the very next UPDATE.) Stored keyrings stay
+        # supported for tests that pass a static dict.
+        keystore = self.server.tsig_keystore
+        if keystore is not None:
+            keyring = keystore.build_keyring()
+        else:
+            keyring = self.server.tsig_keyring
         try:
             query = dns.message.from_wire(data, keyring=keyring)
         except (
@@ -261,8 +271,15 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         response.flags |= dns.flags.AA
 
         writer = self.server.writer
-        keyring = self.server.tsig_keyring
-        if writer is None or keyring is None:
+        # Either a static keyring or a keystore qualifies — both unlock
+        # the UPDATE path. The keystore's per-packet build runs in the
+        # outer ``handle()`` for parse-time TSIG verification; we just
+        # need to confirm one is wired here.
+        keyring_present = (
+            self.server.tsig_keystore is not None
+            or self.server.tsig_keyring is not None
+        )
+        if writer is None or not keyring_present:
             response.set_rcode(dns.rcode.REFUSED)
             return response
         # Without a verified TSIG, we won't accept any update. dnspython
@@ -282,7 +299,12 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             response.set_rcode(dns.rcode.NOTAUTH)
             return response
 
+        # Static authorizer wins (tests use this). Otherwise build a
+        # fresh authorizer from the keystore so revokes and scope
+        # updates land without a server restart.
         authorizer: Optional[UpdateAuthorizer] = self.server.update_authorizer
+        if authorizer is None and self.server.tsig_keystore is not None:
+            authorizer = self.server.tsig_keystore.build_authorizer()
         # Collect ops first so we can authorize all of them before
         # applying any. Halts on first auth failure.
         ops: List[Tuple[str, str, Optional[str], int]] = []
@@ -373,6 +395,7 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         *,
         writer=None,
         tsig_keyring=None,
+        tsig_keystore=None,
         allowed_zones=None,
         update_authorizer=None,
     ):
@@ -383,6 +406,7 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         self.max_concurrency = max_concurrency
         self.writer = writer
         self.tsig_keyring = tsig_keyring
+        self.tsig_keystore = tsig_keystore
         self.allowed_zones = allowed_zones or ()
         self.update_authorizer = update_authorizer
         self._semaphore = threading.Semaphore(max_concurrency)
@@ -423,14 +447,25 @@ class DMPDnsServer:
         max_concurrency: int = 128,
         writer: Optional[DNSRecordWriter] = None,
         tsig_keyring=None,
+        tsig_keystore=None,
         allowed_zones: Optional[Sequence[str]] = None,
         update_authorizer: Optional[UpdateAuthorizer] = None,
     ):
-        """``writer``, ``tsig_keyring``, and ``allowed_zones`` together
+        """``writer``, a TSIG source, and ``allowed_zones`` together
         switch on RFC 2136 UPDATE handling. With any of them missing
         the server still answers TXT queries but REFUSES updates.
-        ``update_authorizer`` is an optional per-RR gate (M9.2.2 plugs
-        a real one)."""
+
+        TSIG sources (mutually exclusive — pass at most one):
+          - ``tsig_keyring``: static dict[Name, Key] for tests.
+          - ``tsig_keystore``: an object exposing ``build_keyring()`` +
+            ``build_authorizer()`` (e.g. :class:`TSIGKeyStore`). The
+            handler calls these per UPDATE so newly-minted keys
+            authorize without restarting the server.
+
+        ``update_authorizer`` is an optional per-RR gate that overrides
+        whatever the keystore returns. Tests pass it directly; in
+        production the keystore-built authorizer is preferred.
+        """
         self.reader = reader
         self.host = host
         self.port = port
@@ -443,6 +478,7 @@ class DMPDnsServer:
         self.max_concurrency = int(max_concurrency)
         self.writer = writer
         self.tsig_keyring = tsig_keyring
+        self.tsig_keystore = tsig_keystore
         self.allowed_zones = tuple(allowed_zones or ())
         self.update_authorizer = update_authorizer
         self._server: Optional[_ThreadingUDPServer] = None
@@ -466,6 +502,7 @@ class DMPDnsServer:
             self.max_concurrency,
             writer=self.writer,
             tsig_keyring=self.tsig_keyring,
+            tsig_keystore=self.tsig_keystore,
             allowed_zones=self.allowed_zones,
             update_authorizer=self.update_authorizer,
         )

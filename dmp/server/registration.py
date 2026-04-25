@@ -442,3 +442,192 @@ def confirm_registration(
         raise SubjectAlreadyOwned() from exc
 
     return token, row
+
+
+# ---------------------------------------------------------------------------
+# M9.2.3 — TSIG-key minting via the same Ed25519 challenge/confirm protocol.
+#
+# The DMP-on-DNS write path (DNS UPDATE / RFC 2136) needs symmetric TSIG keys
+# instead of bearer tokens. ``mint_tsig_via_registration`` reuses the
+# challenge ceremony from ``confirm_registration`` — same crypto, same anti-
+# squat policy — but the deliverable is a TSIG key the user installs in
+# their CLI config and uses to sign ``DNS UPDATE`` to the operator's zone.
+#
+# This is the operator-side counterpart of M9.2.4's ``_DnsUpdateWriter``.
+# The user→own-node hop here is HTTPS (the one HTTPS exchange the user
+# explicitly authorizes); every later cross-node step is DNS UPDATE under
+# the minted key.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MintedTSIGKey:
+    """The deliverable of a successful TSIG registration.
+
+    The HTTP layer ships these fields back to the client; the client's
+    CLI persists them as the TSIG-key block in its config.
+    """
+
+    name: str  # dnspython key name, with trailing dot
+    secret_hex: str  # raw secret bytes, hex-encoded
+    algorithm: str
+    allowed_suffixes: Tuple[str, ...]
+    subject: str  # canonical "user@host"
+    zone: str  # zone the suffixes are anchored under
+    expires_at: int  # 0 = no expiry
+
+
+def _spk_short(spk_hex: str, *, length: int = 8) -> str:
+    """First N chars of the spk hex — fits into a DNS label and gives
+    the key name a human-recognizable handle."""
+    return (spk_hex or "").lower()[:length]
+
+
+def _suffixes_for(local_part: str, spk_hex: str, zone: str) -> Tuple[str, ...]:
+    """Compute the per-user suffix scope for the minted TSIG key.
+
+    A registered user owns:
+      - their personal subtree at ``<local_part>.<zone>`` — identity,
+        mailbox, prekeys, anything anchored under their name.
+      - their claim provider records at
+        ``_dnsmesh-claim-<spk16>.<zone>`` (M8 claim publish path).
+
+    Both of these ride the same TSIG key. The set is deliberately
+    narrow: a user cannot publish under arbitrary owner names, and
+    cannot edit other users' subtrees even though their UPDATE
+    technically targets the same zone.
+    """
+    z = (zone or "").strip().lower().rstrip(".")
+    lp = (local_part or "").strip().lower()
+    spk16 = _spk_short(spk_hex, length=16)
+    if not z or not lp or not spk16:
+        return ()
+    return (
+        f"{lp}.{z}",
+        f"_dnsmesh-claim-{spk16}.{z}",
+    )
+
+
+def _key_name_for(local_part: str, spk_hex: str, zone: str) -> str:
+    """Stable per-user TSIG key name. The spk-prefix in the label
+    keeps the name unique even if two users share a local part on
+    different zones (or one is rotated and re-registered)."""
+    z = (zone or "").strip().lower().rstrip(".")
+    lp = (local_part or "").strip().lower()
+    return f"{lp}-{_spk_short(spk_hex)}.{z}."
+
+
+def mint_tsig_via_registration(
+    *,
+    keystore,
+    challenges: ChallengeStore,
+    config: RegistrationConfig,
+    body: dict,
+    remote_addr: str = "",
+    now: Optional[int] = None,
+) -> MintedTSIGKey:
+    """Same Ed25519 challenge/confirm flow as ``confirm_registration``,
+    but the deliverable is a TSIG key persisted in ``keystore`` and
+    returned to the caller.
+
+    Order of checks mirrors ``confirm_registration`` so an attacker
+    without the private key sees the same 400/401/403/404 surface and
+    cannot distinguish the token-mint and tsig-mint endpoints by
+    behavior.
+
+    Required body fields (same names as ``/v1/registration/confirm``
+    so the client side can reuse the existing challenge plumbing):
+
+      - ``subject`` — canonical ``user@host``.
+      - ``ed25519_spk`` — 32-byte hex public key.
+      - ``challenge`` — 32-byte hex nonce from ``GET .../challenge``.
+      - ``signature`` — 64-byte hex signature over the same payload
+        the token-mint flow signs. The DMP CLI signs once and can
+        try whichever endpoint succeeds first.
+    """
+    if not config.enabled:
+        raise RegistrationError(
+            "self-service registration is disabled on this node",
+            http_status=404,
+        )
+    if not config.node_hostname:
+        raise RegistrationError(
+            "node misconfigured: DMP_NODE_HOSTNAME is required for registration",
+            http_status=500,
+        )
+
+    subject_raw = body.get("subject")
+    spk_hex = body.get("ed25519_spk")
+    challenge_hex = body.get("challenge")
+    signature_hex = body.get("signature")
+
+    for name, value in (
+        ("subject", subject_raw),
+        ("ed25519_spk", spk_hex),
+        ("challenge", challenge_hex),
+        ("signature", signature_hex),
+    ):
+        if not isinstance(value, str) or not value:
+            raise RegistrationError(f"missing or non-string field: {name}")
+
+    try:
+        subject = canonicalize_subject(subject_raw)
+    except ValueError as exc:
+        raise RegistrationError(f"subject invalid: {exc}") from exc
+
+    spk_bytes = _parse_hex(spk_hex, 32, "ed25519_spk")
+    sig_bytes = _parse_hex(signature_hex, 64, "signature")
+    _parse_hex(challenge_hex, 32, "challenge")
+
+    if spk_bytes in _LOW_ORDER_ED25519_PUBKEYS:
+        raise SignatureInvalid("low-order public key rejected")
+
+    pc = challenges.consume(challenge_hex, now=now)
+
+    payload = _build_signing_payload(challenge_hex, subject, pc.node)
+    try:
+        Ed25519PublicKey.from_public_bytes(spk_bytes).verify(sig_bytes, payload)
+    except InvalidSignature as exc:
+        raise SignatureInvalid() from exc
+
+    if not _domain_allowed(subject, config.allowlist):
+        raise SubjectNotAllowed()
+
+    # Subject has already passed canonicalize_subject, which guarantees
+    # exactly one '@'. Use the registered hostname's zone — the operator
+    # is authoritative for that, and the user's records live beneath it.
+    try:
+        local_part, _ = subject.rsplit("@", 1)
+    except ValueError as exc:
+        raise RegistrationError("subject missing local part") from exc
+
+    zone = config.node_hostname.strip().lower().rstrip(".")
+    suffixes = _suffixes_for(local_part, spk_hex, zone)
+    if not suffixes:
+        raise RegistrationError(
+            "could not derive TSIG scope from subject + zone",
+            http_status=500,
+        )
+    key_name = _key_name_for(local_part, spk_hex, zone)
+
+    expires_at = (
+        int(time.time() if now is None else now) + int(config.expires_in_seconds)
+        if config.expires_in_seconds
+        else 0
+    )
+
+    minted = keystore.mint(
+        name=key_name,
+        allowed_suffixes=suffixes,
+        expires_at=expires_at,
+        now=now,
+    )
+    return MintedTSIGKey(
+        name=minted.name,
+        secret_hex=minted.secret.hex(),
+        algorithm=minted.algorithm,
+        allowed_suffixes=minted.allowed_suffixes,
+        subject=subject,
+        zone=zone,
+        expires_at=minted.expires_at,
+    )
