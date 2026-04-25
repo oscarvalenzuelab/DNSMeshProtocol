@@ -272,11 +272,19 @@ def _load_heartbeat_from_env(record_db_path: str):
     # for arbitrary recipients opt out with DMP_CLAIM_PROVIDER=0.
     # Truthiness mirrors DMP_HEARTBEAT_ENABLED's check above (any
     # value other than "0"/"false"/"" is on).
+    #
+    # Codex P2 round 6 fix: ALSO require a non-empty
+    # _load_claim_provider_zone() before advertising the bit.
+    # Without a zone, /v1/claim/publish 404s every request, so a
+    # node that heartbeated CAP_CLAIM_PROVIDER while serving no
+    # zone would crowd real providers out of the recipient's
+    # top-K candidate set and silently break first-contact reach.
     from dmp.core.heartbeat import CAP_CLAIM_PROVIDER
 
     claim_provider_raw = os.environ.get("DMP_CLAIM_PROVIDER", "").strip().lower()
     claim_provider_on = claim_provider_raw not in ("0", "false", "no", "off")
-    capabilities = CAP_CLAIM_PROVIDER if claim_provider_on else 0
+    has_zone = bool(_load_claim_provider_zone())
+    capabilities = CAP_CLAIM_PROVIDER if (claim_provider_on and has_zone) else 0
 
     cfg = HeartbeatWorkerConfig(
         self_endpoint=self_endpoint,

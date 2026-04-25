@@ -967,7 +967,85 @@ def _resolve_provider_zone_via_info(endpoint: str) -> Optional[str]:
     return advertised
 
 
-def _build_claim_providers(cfg: "CLIConfig") -> List[Tuple[str, str]]:
+def _candidate_seen_endpoints(
+    cfg: "CLIConfig", client: Optional[DMPClient] = None
+) -> List[str]:
+    """Return the ordered list of HTTP endpoints to try for /v1/nodes/seen.
+
+    Codex P1 round 6 fix: in cluster mode, the legacy ``cfg.endpoint``
+    can be unset, stale, or point at a different node than the active
+    cluster. Without consulting the cluster manifest we'd silently
+    fall back to the seed list and lose every locally-known provider.
+
+    Resolution order (first-non-empty wins on the wire; we try them
+    in sequence inside ``_build_claim_providers``):
+
+      1. Cluster-mode peers — when ``client._cluster_client`` is
+         attached AND the manifest has nodes, every node's
+         ``http_endpoint``. Picking the FIRST that responds wins.
+      2. ``cfg.endpoint`` — the legacy single-node hint, also used
+         outside cluster mode.
+
+    Empty list when neither is available; the caller falls back to
+    the built-in seeds.
+    """
+    out: List[str] = []
+    seen: set = set()
+
+    def _push(url: str) -> None:
+        if not url:
+            return
+        canon = url.rstrip("/").lower()
+        if canon in seen:
+            return
+        seen.add(canon)
+        out.append(url)
+
+    cluster_client = (
+        getattr(client, "_cluster_client", None) if client is not None else None
+    )
+    manifest = getattr(cluster_client, "manifest", None) if cluster_client else None
+    nodes = getattr(manifest, "nodes", None) if manifest is not None else None
+    if nodes:
+        for node in nodes:
+            ep = getattr(node, "http_endpoint", "")
+            _push(ep)
+    if cfg.endpoint:
+        _push(cfg.endpoint)
+    return out
+
+
+def _fetch_seen_feed(endpoints: Sequence[str]) -> List[str]:
+    """Try each endpoint's ``/v1/nodes/seen`` in order; return the first
+    successful payload's wire list. Empty on total failure.
+
+    Tolerates JSON / network errors per-candidate, since cluster
+    nodes go up and down.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    for endpoint in endpoints:
+        seen_url = endpoint.rstrip("/") + "/v1/nodes/seen"
+        try:
+            with urllib.request.urlopen(seen_url, timeout=5) as resp:
+                data = json.loads(resp.read())
+        except (urllib.error.URLError, json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        return [
+            entry.get("wire", "")
+            for entry in data.get("seen", [])
+            if isinstance(entry, dict)
+        ]
+    return []
+
+
+def _build_claim_providers(
+    cfg: "CLIConfig", client: Optional[DMPClient] = None
+) -> List[Tuple[str, str]]:
     """Build the ranked claim-provider list for send/recv (M8.3).
 
     Resolution order:
@@ -1027,35 +1105,26 @@ def _build_claim_providers(cfg: "CLIConfig") -> List[Tuple[str, str]]:
         seen_endpoints.add(canon)
         out.append((zone, endpoint))
 
-    if cfg.endpoint:
-        seen_url = cfg.endpoint.rstrip("/") + "/v1/nodes/seen"
-        try:
-            with urllib.request.urlopen(seen_url, timeout=5) as resp:
-                data = json.loads(resp.read())
-        except (urllib.error.URLError, json.JSONDecodeError, OSError):
-            data = None
-        if isinstance(data, dict):
-            seen_wires = [
-                entry.get("wire", "")
-                for entry in data.get("seen", [])
-                if isinstance(entry, dict)
-            ]
-            heartbeats = parse_seen_feed(seen_wires)
-            providers = select_providers(heartbeats, k=DEFAULT_K)
-            for p in providers:
-                advertised = _resolve_provider_zone_via_info(p.endpoint)
-                if advertised == "":
-                    # Provider explicitly opted out — skip even
-                    # though heartbeat advertised the capability.
-                    continue
-                zone = advertised if advertised else p.zone
-                # Codex P2 round 4 fix: a candidate from an IP-literal
-                # endpoint has zone="" until /v1/info fills it in. If
-                # /v1/info was unreachable AND the host has no usable
-                # zone, we have nothing to query DNS against — drop.
-                if not zone:
-                    continue
-                _add(zone, p.endpoint)
+    # Codex P1 round 6 fix: in cluster mode, ``cfg.endpoint`` can be
+    # stale/unset; use the cluster manifest's nodes via the active
+    # client. Falls back to ``cfg.endpoint`` when no client given
+    # OR the cluster_client isn't attached.
+    candidate_endpoints = _candidate_seen_endpoints(cfg, client=client)
+    seen_wires = _fetch_seen_feed(candidate_endpoints)
+    if seen_wires:
+        heartbeats = parse_seen_feed(seen_wires)
+        providers = select_providers(heartbeats, k=DEFAULT_K)
+        for p in providers:
+            advertised = _resolve_provider_zone_via_info(p.endpoint)
+            if advertised == "":
+                # Provider explicitly opted out — skip even though
+                # heartbeat advertised the capability.
+                continue
+            zone = advertised if advertised else p.zone
+            # IP-literal endpoint with no resolved zone → drop.
+            if not zone:
+                continue
+            _add(zone, p.endpoint)
 
     # Seeds: always on, always last in the list. Anti-entropy on
     # claim records (M8.4) eventually converges the seen-graph view,
@@ -2058,64 +2127,63 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
                 f"not {resolved_username!r} as the address implied",
             )
         contact_key = identity.username
-        # Persist the remote host so the rotation fallback can walk
-        # chains against the right zone. Two shapes can supply it:
-        #   1) `dnsmesh identity fetch alice@other.example --add`
-        #      → parsed_addr = (alice, other.example)
-        #   2) `dnsmesh identity fetch alice --domain other.example --add`
-        #      → parsed_addr is None, args.domain carries the host
-        # Both must persist `domain` so _make_client doesn't later
-        # overwrite with the local effective_domain and break
-        # cross-zone prekey + rotation-chain lookups. Legacy bare-
-        # username adds (no args.domain, no @host) leave `domain`
-        # empty and inherit the local effective domain at
-        # _make_client time (pre-M5.4-followup behavior).
         if parsed_addr is not None:
             remote_host = parsed_addr[1]
         elif args.domain:
             remote_host = args.domain
         else:
             remote_host = ""
-        existing = cfg.contacts.get(contact_key)
-        # M8.3 codex P1 round 4 fix: when the existing entry is a
-        # spk-only placeholder left by `dnsmesh intro trust` (pub=""
-        # by construction), the documented upgrade path is to run
-        # `identity fetch <user>@<zone> --add` to fill in the X25519
-        # pubkey. Previously the "already exists" guard turned that
-        # into a no-op, leaving the contact permanently un-sendable.
-        # Allow overwrite ONLY when (a) existing pub is empty AND
-        # (b) the existing spk matches what we just fetched (defends
-        # against an attacker fetching some random identity to
-        # replace a legit pinned spk-only contact).
-        if existing is not None:
-            existing_pub = existing.get("pub", "")
-            existing_spk = existing.get("spk", "")
-            fetched_spk = identity.ed25519_spk.hex()
-            if not existing_pub and existing_spk == fetched_spk:
-                # Upgrade path — preserve the dict-key label and
-                # overwrite the placeholder with the full record.
-                entry: Dict[str, str] = {
-                    "pub": identity.x25519_pk.hex(),
-                    "spk": fetched_spk,
-                    "domain": remote_host or existing.get("domain", ""),
-                    "remote_username": existing.get(
-                        "remote_username", ""
-                    )
-                    or identity.username,
-                }
-                cfg.contacts[contact_key] = entry
-                cfg.save(_config_path())
-                print(
-                    f"upgraded contact {contact_key} (filled in X25519 pubkey)"
-                )
-            else:
-                print(
-                    f"(contact `{contact_key}` already exists — not overwriting)"
-                )
+        fetched_spk = identity.ed25519_spk.hex()
+
+        # M8.3 codex P2 round 6 fix: search the WHOLE contact list
+        # for a trusted-intro placeholder with matching spk + empty
+        # pub, regardless of label. The default `dnsmesh intro trust`
+        # without --username keys the placeholder under
+        # `intro-<spk-prefix>`, so looking up only by
+        # identity.username would miss the upgrade and create a
+        # second contact (codex P2 round 4 + 6).
+        upgrade_label = None
+        for existing_label, entry_dict in cfg.contacts.items():
+            if (
+                not entry_dict.get("pub", "")
+                and entry_dict.get("spk", "") == fetched_spk
+            ):
+                upgrade_label = existing_label
+                break
+
+        existing_at_username = cfg.contacts.get(contact_key)
+        # Three branches:
+        #   (A) a placeholder under any label has matching spk →
+        #       upgrade THAT entry under its existing label.
+        #   (B) a normal entry exists at `contact_key` → preserve
+        #       the "already exists" no-op (legacy behavior;
+        #       prevents identity-fetch from clobbering a manually
+        #       added contact).
+        #   (C) clean add — create a new entry under `contact_key`.
+        if upgrade_label is not None:
+            existing = cfg.contacts[upgrade_label]
+            entry: Dict[str, str] = {
+                "pub": identity.x25519_pk.hex(),
+                "spk": fetched_spk,
+                "domain": remote_host or existing.get("domain", ""),
+                "remote_username": (
+                    existing.get("remote_username", "") or identity.username
+                ),
+            }
+            cfg.contacts[upgrade_label] = entry
+            cfg.save(_config_path())
+            print(
+                f"upgraded contact `{upgrade_label}` "
+                f"(filled in X25519 pubkey for {identity.username})"
+            )
+        elif existing_at_username is not None:
+            print(
+                f"(contact `{contact_key}` already exists — not overwriting)"
+            )
         else:
             entry = {
                 "pub": identity.x25519_pk.hex(),
-                "spk": identity.ed25519_spk.hex(),
+                "spk": fetched_spk,
                 "domain": remote_host,
             }
             cfg.contacts[contact_key] = entry
@@ -2196,7 +2264,10 @@ def cmd_send(args: argparse.Namespace) -> int:
         # M8.3 — build the claim-provider list once per CLI invocation.
         # Empty list (no providers configured / fetchable) means we
         # skip the claim publish; the message itself still goes out.
-        claim_providers = _build_claim_providers(cfg)
+        # Pass `client` so cluster-mode deployments can route the
+        # /v1/nodes/seen lookup through the cluster manifest's nodes
+        # (codex P1 round 6) instead of a stale cfg.endpoint.
+        claim_providers = _build_claim_providers(cfg, client=client)
         # Codex P2 round 5: collect each claim's success/failure so
         # we can warn the user when first-contact reach silently
         # breaks (every claim provider rejected or unreachable).
@@ -2234,10 +2305,16 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_intro_list(args: argparse.Namespace) -> int:
-    """List pending first-contact intros awaiting review (M8.3)."""
+    """List pending first-contact intros awaiting review (M8.3).
+
+    Codex P2 round 6 fix: intro management is purely local
+    (sqlite + config); never touches DNS / cluster bootstrap. Pass
+    ``requires_network=False`` so a user without network can still
+    review their queue.
+    """
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
-    client = _make_client(cfg, passphrase)
+    client = _make_client(cfg, passphrase, requires_network=False)
     try:
         intros = client.intro_queue.list_intros()
         if not intros:
@@ -2267,10 +2344,13 @@ def cmd_intro_list(args: argparse.Namespace) -> int:
 
 
 def cmd_intro_accept(args: argparse.Namespace) -> int:
-    """Deliver one pending intro into the inbox; do NOT pin the sender."""
+    """Deliver one pending intro into the inbox; do NOT pin the sender.
+
+    Local-only — no network needed (codex P2 round 6).
+    """
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
-    client = _make_client(cfg, passphrase)
+    client = _make_client(cfg, passphrase, requires_network=False)
     try:
         msg = client.accept_intro(int(args.intro_id))
         if msg is None:
@@ -2290,10 +2370,13 @@ def cmd_intro_accept(args: argparse.Namespace) -> int:
 
 
 def cmd_intro_trust(args: argparse.Namespace) -> int:
-    """Deliver + pin the sender as a trusted contact."""
+    """Deliver + pin the sender as a trusted contact.
+
+    Local-only — no network needed (codex P2 round 6).
+    """
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
-    client = _make_client(cfg, passphrase)
+    client = _make_client(cfg, passphrase, requires_network=False)
     try:
         intro = client.intro_queue.get_intro(int(args.intro_id))
         if intro is None:
@@ -2386,10 +2469,13 @@ def cmd_intro_trust(args: argparse.Namespace) -> int:
 
 
 def cmd_intro_block(args: argparse.Namespace) -> int:
-    """Drop the intro and add the sender to the local denylist."""
+    """Drop the intro and add the sender to the local denylist.
+
+    Local-only — no network needed (codex P2 round 6).
+    """
     cfg = CLIConfig.load(_config_path())
     passphrase = _load_passphrase(cfg)
-    client = _make_client(cfg, passphrase)
+    client = _make_client(cfg, passphrase, requires_network=False)
     try:
         intro = client.intro_queue.get_intro(int(args.intro_id))
         if intro is None:
@@ -2413,7 +2499,8 @@ def cmd_recv(args: argparse.Namespace) -> int:
         # M8.3 — also poll claim providers in the same recv pass.
         # Pinned-sender claims roll into `inbox`; un-pinned ones land
         # in the intro queue (`dnsmesh intro list` to review).
-        claim_providers = _build_claim_providers(cfg)
+        # Pass `client` for cluster-mode discovery (codex P1 round 6).
+        claim_providers = _build_claim_providers(cfg, client=client)
         intro_queue_size_before = len(client.intro_queue.list_intros())
         inbox = client.receive_messages(claim_providers=claim_providers)
         intro_queue_size_after = len(client.intro_queue.list_intros())
