@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1.0, user-scalable=no">
+<title>How DMP resolution works</title>
+<meta name="description" content="A visual walkthrough of the DNS Mesh Protocol resolution chain — clients, public resolvers, authoritative DNS, dnsmesh-node, and what fails when a node is offline.">
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.0.4/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.0.4/dist/theme/black.css" id="theme">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.0.4/plugin/highlight/monokai.css">
+
+<style>
+:root {
+  --r-main-font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --r-heading-font: ui-sans-serif, system-ui, sans-serif;
+  --r-link-color: #58a6ff;
+  --r-link-color-dark: #1f6feb;
+  --r-link-color-hover: #79c0ff;
+  --r-background-color: #0d1117;
+  --r-main-color: #c9d1d9;
+  --r-heading-color: #f0f6fc;
+}
+.reveal { font-size: 32px; }
+.reveal h1 { font-size: 1.8em; letter-spacing: -0.02em; }
+.reveal h2 { font-size: 1.4em; letter-spacing: -0.02em; margin-bottom: 0.6em; }
+.reveal h3 { font-size: 1.0em; color: #8b949e; font-weight: 400; margin-bottom: 1em; }
+.reveal pre code { font-size: 0.7em; line-height: 1.5; padding: 1em; }
+.reveal code { color: #f0f6fc; background: #21262d; padding: 0.05em 0.4em; border-radius: 4px; font-size: 0.85em; }
+.reveal table { font-size: 0.7em; border-collapse: collapse; margin: 0 auto; }
+.reveal th, .reveal td { border: 1px solid #30363d; padding: 0.4em 0.8em; text-align: left; }
+.reveal th { background: #161b22; }
+.reveal blockquote { border-left: 3px solid #58a6ff; padding: 0.4em 1em; font-style: normal; background: #161b22; }
+.reveal ul, .reveal ol { display: block; }
+.reveal .small { font-size: 0.7em; color: #8b949e; }
+.reveal .footer-link { position: fixed; bottom: 12px; right: 24px; font-size: 14px; color: #8b949e; text-decoration: none; }
+.reveal .footer-link:hover { color: #58a6ff; }
+.reveal .mermaid svg { max-height: 500px; }
+.reveal .badge { display: inline-block; padding: 0.05em 0.5em; background: #21262d; border: 1px solid #30363d; border-radius: 4px; font-size: 0.7em; color: #c9d1d9; }
+.reveal .ok { color: #3fb950; }
+.reveal .warn { color: #d29922; }
+.reveal .err { color: #f85149; }
+.reveal section.center > * { text-align: center; }
+.reveal .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 2em; align-items: start; text-align: left; }
+</style>
+</head>
+<body>
+
+<div class="reveal">
+<div class="slides">
+
+<!-- 1. Title -->
+<section class="center">
+  <h1>How DMP resolution works</h1>
+  <h3>What happens when you publish or fetch — at the wire level.</h3>
+  <p class="small">← / → arrow keys to navigate · <code>F</code> for fullscreen · <code>S</code> for speaker view</p>
+</section>
+
+<!-- 2. The two planes -->
+<section>
+  <h2>Two planes, one sqlite store</h2>
+  <pre class="mermaid">
+flowchart LR
+    subgraph Client["Your machine"]
+        CLI["dnsmesh CLI<br/>(holds private keys)"]
+    end
+    subgraph Node["dnsmesh-node (VPS)"]
+        HTTP["HTTP API<br/>:443 → :8053"]
+        DNS["DNS server<br/>UDP :53"]
+        Store[("sqlite store")]
+        HTTP --> Store
+        DNS --> Store
+    end
+    World["Anyone on the internet"]
+    CLI -- "POST /v1/records<br/>(token-auth)" --> HTTP
+    World -- "TXT query (open)" --> DNS
+  </pre>
+  <p class="small">HTTP plane = writes only, token-gated. DNS plane = reads only, open. Same sqlite under both.</p>
+</section>
+
+<!-- 3. The full resolution chain -->
+<section>
+  <h2>What <code>dig</code> actually does</h2>
+  <pre class="mermaid">
+sequenceDiagram
+    participant Bob as Bob's CLI
+    participant R as 1.1.1.1<br/>(public resolver)
+    participant Roots as . / .cl roots
+    participant DO as DigitalOcean DNS<br/>(authoritative for gnu.cl)
+    participant Node as dnsmesh.io<br/>(authoritative for mesh.gnu.cl)
+    Bob->>R: TXT? id-{hash}.mesh.gnu.cl
+    alt cached
+      R-->>Bob: cached value (within TTL)
+    else cache miss
+      R->>Roots: who serves cl?
+      Roots-->>R: ns.nic.cl
+      R->>Roots: who serves gnu.cl?
+      Roots-->>R: ns1.digitalocean.com
+      R->>DO: TXT? id-...mesh.gnu.cl
+      DO-->>R: NS dnsmesh.io for mesh.gnu.cl
+      R->>Node: TXT? id-...mesh.gnu.cl
+      Node-->>R: "v=dmp1;t=identity;d=..."
+      R-->>Bob: same record
+    end
+    Bob->>Bob: parse + verify Ed25519 signature
+  </pre>
+</section>
+
+<!-- 4. Three things make it fast -->
+<section>
+  <h2>Three things make this fast</h2>
+  <ol>
+    <li><strong>Resolver caching.</strong> 1.1.1.1 sees billions of queries — &gt;95% cache hit rates are typical.</li>
+    <li><strong>Short TTLs (60s default).</strong> Churn visible quickly without hammering the authoritative node.</li>
+    <li><strong>Local signature verification.</strong> Bob's CLI doesn't trust the resolver, the path, or the node — only the Ed25519 signature on the record bytes.</li>
+  </ol>
+</section>
+
+<!-- 5. Why default to public resolver -->
+<section>
+  <h2>Why <code>dnsmesh init</code> defaults to <code>1.1.1.1</code></h2>
+  <pre><code class="language-yaml">dns_resolvers:
+  - 1.1.1.1     # Cloudflare
+  - 8.8.8.8     # Google (failover)</code></pre>
+  <ul>
+    <li><strong>Skip stale negative cache.</strong> Your ISP's resolver might still hold "NXDOMAIN" from before a delegation existed. Public resolvers' caches are fresher.</li>
+    <li><strong>Failover.</strong> ResolverPool quietly fails over between the two if one stops responding.</li>
+    <li><strong>Reproducibility.</strong> Triage is faster when "what resolver?" has a known answer.</li>
+  </ul>
+  <p class="small">Privacy-conscious deploys: <code>dnsmesh init --no-default-resolvers</code> to fall back to your local resolver.</p>
+</section>
+
+<!-- 6. Resolver vs node directly -->
+<section>
+  <h2>Querying resolver vs node directly</h2>
+  <div class="two-col">
+    <div>
+      <h3>Through a public resolver</h3>
+      <pre><code class="language-bash">dig @1.1.1.1 \
+    id-{hash}.mesh.gnu.cl \
+    TXT +short</code></pre>
+      <p class="small">What everyone else sees. Goes through the full resolution chain.</p>
+    </div>
+    <div>
+      <h3>Direct to the node</h3>
+      <pre><code class="language-bash">dig @dnsmesh.io \
+    id-{hash}.mesh.gnu.cl \
+    TXT +short</code></pre>
+      <p class="small">Source of truth. Bypasses every cache. If this returns nothing but the resolver did, you're seeing stale cache upstream.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 7. Node down — read path -->
+<section>
+  <h2>Node offline — read path</h2>
+  <pre class="mermaid">
+sequenceDiagram
+    participant Bob
+    participant R as 1.1.1.1
+    participant Node as dnsmesh.io 💀
+    Note over Node: process crashed,<br/>VPS rebooting, network split
+    Bob->>R: TXT? id-...mesh.gnu.cl
+    alt within cache TTL
+      R-->>Bob: cached record (still resolves)
+    else cache expired
+      R->>Node: TXT? (timeout)
+      R-->>Bob: SERVFAIL or empty
+    end
+  </pre>
+  <p class="small"><strong>Visible outage</strong> = TTL (60s) + maybe a few minutes of negative-cache lag. From a normal client's view, the address just stops resolving.</p>
+</section>
+
+<!-- 8. Node down — write path -->
+<section>
+  <h2>Node offline — write path</h2>
+  <pre class="mermaid">
+sequenceDiagram
+    participant Alice
+    participant Node as dnsmesh.io 💀
+    Note over Node: Node down
+    Alice->>Node: POST /v1/records (timeout)
+    Note right of Alice: send fails immediately<br/>(no retry queue;<br/>operator's job)
+  </pre>
+  <p class="small">Sends fail immediately. No retry queue. Pending sends do not survive a node restart unless tooling persists them.</p>
+</section>
+
+<!-- 9. What survives, what dies -->
+<section>
+  <h2>Node-down: what survives</h2>
+  <table>
+    <thead><tr><th>State</th><th>Survives node-down?</th></tr></thead>
+    <tbody>
+      <tr><td>Records already published (sqlite on disk)</td><td class="ok">✅</td></tr>
+      <tr><td>Resolver-cached records (within TTL)</td><td class="ok">✅</td></tr>
+      <tr><td>Pending sends from clients</td><td class="err">❌</td></tr>
+      <tr><td>Live HTTP requests in flight</td><td class="err">❌</td></tr>
+      <tr><td>Heartbeat / discovery liveness</td><td class="err">❌ until restart</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- 10. Federated cluster -->
+<section>
+  <h2>Federated cluster — surviving a single-node failure</h2>
+  <pre class="mermaid">
+flowchart TB
+    Client["Client (Alice)"]
+    subgraph Cluster["3-node DMP cluster"]
+        N1["node-a"]
+        N2["node-b 💀"]
+        N3["node-c"]
+        N1 <-- "anti-entropy<br/>(every 30s)" --> N3
+    end
+    Manifest[("Signed cluster manifest<br/>cluster.mesh.example.com")]
+    Client --> Manifest
+    Client --> N1
+    Client --> N3
+  </pre>
+  <p class="small">Writes fan to ⌈N/2⌉ of the named nodes (single-node failure survivable). Reads union across all N. When node-b returns, anti-entropy walks the cursor since its last sync and ingests everything it missed.</p>
+</section>
+
+<!-- 11. FAQ -->
+<section>
+  <h2>Things people actually ask</h2>
+  <ul>
+    <li><strong>"<code>dig @dnsmesh.io</code> works but my CLI doesn't"</strong> — caching upstream. Try <code>@1.1.1.1</code> or wait for the negative-cache TTL.</li>
+    <li><strong>"How long until everyone sees my publish?"</strong> — As long as the longest negative-cache TTL on the path. ~3 min for active resolvers, up to 15 min for slow caches.</li>
+    <li><strong>"Should I run my own resolver to avoid leaking my contact list to Cloudflare?"</strong> — Maybe. Public resolvers see <em>which DMP names you query</em>, not message contents (E2EE). If that's a concern: <code>dns_resolvers: ['127.0.0.1']</code>.</li>
+  </ul>
+</section>
+
+<!-- 12. See also -->
+<section class="center">
+  <h2>Read more</h2>
+  <ul style="display: inline-block; text-align: left;">
+    <li><a href="/DNSMeshProtocol/how-it-works">How DMP works (high-level)</a></li>
+    <li><a href="/DNSMeshProtocol/protocol">Protocol spec</a> — wire format, threat model</li>
+    <li><a href="/DNSMeshProtocol/deployment/digitalocean">Deploy to a Droplet</a></li>
+    <li><a href="/DNSMeshProtocol/deployment/cluster">Federated cluster setup</a></li>
+    <li><a href="https://github.com/oscarvalenzuelab/DNSMeshProtocol">Source on GitHub</a></li>
+  </ul>
+  <p style="margin-top: 2em;" class="small"><code>pip install dnsmesh</code></p>
+</section>
+
+</div>
+</div>
+
+<a class="footer-link" href="/DNSMeshProtocol/">← back to docs</a>
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.0.4/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.0.4/plugin/highlight/highlight.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.0.4/plugin/notes/notes.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.0/dist/mermaid.min.js"></script>
+
+<script>
+mermaid.initialize({
+    startOnLoad: false,
+    theme: 'dark',
+    securityLevel: 'loose',
+    themeVariables: {
+        background: '#0d1117',
+        primaryColor: '#21262d',
+        primaryTextColor: '#f0f6fc',
+        primaryBorderColor: '#30363d',
+        lineColor: '#8b949e',
+        secondaryColor: '#161b22',
+        tertiaryColor: '#0d1117',
+        actorBkg: '#21262d',
+        actorBorder: '#30363d',
+        actorTextColor: '#f0f6fc',
+        signalColor: '#8b949e',
+        signalTextColor: '#c9d1d9',
+        labelBoxBkgColor: '#21262d',
+        noteBkgColor: '#1c2128',
+        noteTextColor: '#c9d1d9'
+    }
+});
+
+Reveal.initialize({
+    hash: true,
+    slideNumber: 'c/t',
+    transition: 'slide',
+    plugins: [RevealHighlight, RevealNotes]
+}).then(() => {
+    // Run mermaid AFTER Reveal sets up the DOM so each <pre class="mermaid">
+    // gets a real height context (otherwise diagrams render at 0×0 inside
+    // hidden slides).
+    mermaid.run({ querySelector: 'pre.mermaid' });
+
+    // Re-render mermaid on slide change because Reveal aggressively manages
+    // visibility of off-screen slides; some browsers won't lay out an SVG
+    // that was rendered while its container was display:none.
+    Reveal.on('slidechanged', () => {
+        document.querySelectorAll('pre.mermaid:not([data-processed])').forEach(el => {
+            mermaid.run({ nodes: [el] });
+        });
+    });
+});
+</script>
+
+</body>
+</html>
