@@ -1071,11 +1071,18 @@ def _seed_provider_via_dns(
 ) -> Optional[Tuple[str, str]]:
     """Query a built-in seed's heartbeat over DNS.
 
-    Returns ``(zone, endpoint)`` from the verified wire when reachable,
-    or ``None`` when the seed has no heartbeat record / is opted out.
-    Falls back to the static (zone, endpoint) tuple when the DNS
-    query fails — keeps first-contact reach working before the
-    upgrade has propagated through public DNS caches.
+    Returns ``(zone, endpoint)`` from the verified wire when present
+    and the seed advertises ``CAP_CLAIM_PROVIDER``. Returns ``None``
+    when the seed has no record OR has explicitly opted out of the
+    claim-provider role; the caller drops the seed.
+
+    Codex round-3 P2: an empty / absent ``_dnsmesh-heartbeat.<seed>``
+    RRset is treated as "operator stopped publishing", not as a
+    transient transport hiccup. We only fall back to the static
+    ``(seed_zone, seed_endpoint)`` tuple if the reader RAISED, which
+    is the unambiguous "I couldn't talk to DNS" signal — otherwise
+    a removed seed would keep claiming routes after intentional
+    decommissioning.
     """
     from dmp.core.heartbeat import CAP_CLAIM_PROVIDER, HeartbeatRecord
     from dmp.server.heartbeat_worker import heartbeat_rrset_name
@@ -1087,9 +1094,13 @@ def _seed_provider_via_dns(
     try:
         values = reader.query_txt_record(name)
     except Exception:
+        # Transport-level failure: fall back to the static tuple so a
+        # split-horizon / outage doesn't drop first-contact reach.
         return (seed_zone, seed_endpoint)
     if not values:
-        return (seed_zone, seed_endpoint)
+        # Reachable, no record. Operator intent is "I'm not in this
+        # role" — drop the seed entirely.
+        return None
     for wire in values:
         if not isinstance(wire, str):
             continue
@@ -1097,11 +1108,11 @@ def _seed_provider_via_dns(
         if rec is None:
             continue
         if not (rec.capabilities & CAP_CLAIM_PROVIDER):
-            # Operator is reachable but explicitly opted out.
             return None
         zone = (rec.claim_provider_zone or "").strip().lower() or seed_zone
         return (zone, rec.endpoint or seed_endpoint)
-    return (seed_zone, seed_endpoint)
+    # Records existed but none verified — same disposition as no records.
+    return None
 
 
 def _build_claim_providers(

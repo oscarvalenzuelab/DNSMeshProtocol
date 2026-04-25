@@ -73,6 +73,16 @@ from dmp.core.ed25519_points import is_low_order as _is_low_order
 RECORD_PREFIX = "v=dmp1;t=heartbeat;"
 
 _MAGIC = b"DMPHB03"
+# M9 rolling-upgrade compatibility (codex round-3 P1): the wire-format
+# magic was bumped from DMPHB02 -> DMPHB03 for the new
+# claim_provider_zone field. We continue PARSING legacy DMPHB02 wires
+# (treating claim_provider_zone as empty) so a 0.5 node can still
+# verify heartbeats from peers that haven't upgraded yet, and so a
+# 0.5 node ingesting its own pre-upgrade SeenStore rows doesn't lose
+# every peer until they republish. We sign new wires with DMPHB03
+# only — there's no legacy emission path.
+_LEGACY_MAGIC = b"DMPHB02"
+_KNOWN_MAGICS = (_MAGIC, _LEGACY_MAGIC)
 _SPK_LEN = 32
 _SIG_LEN = 64
 
@@ -341,8 +351,10 @@ class HeartbeatRecord:
         """
         if len(body) < len(_MAGIC) + 2:
             raise ValueError("body too short for magic+endpoint_len")
-        if body[: len(_MAGIC)] != _MAGIC:
+        magic = body[: len(_MAGIC)]
+        if magic not in _KNOWN_MAGICS:
             raise ValueError("bad magic")
+        is_legacy = magic == _LEGACY_MAGIC
         off = len(_MAGIC)
 
         (endpoint_len,) = struct.unpack(">H", body[off : off + 2])
@@ -384,23 +396,29 @@ class HeartbeatRecord:
         # M9: claim_provider_zone (uint8 length-prefixed utf-8). Empty
         # string for nodes that don't host claims; up to
         # MAX_CLAIM_PROVIDER_ZONE_LEN otherwise.
-        if off + 1 > len(body):
-            raise ValueError("body truncated in claim_provider_zone_len")
-        (zone_len,) = struct.unpack(">B", body[off : off + 1])
-        off += 1
-        if zone_len > MAX_CLAIM_PROVIDER_ZONE_LEN:
-            raise ValueError(
-                f"claim_provider_zone_len out of range: {zone_len}"
-            )
-        if off + zone_len > len(body):
-            raise ValueError("body truncated in claim_provider_zone")
-        try:
-            claim_provider_zone = body[off : off + zone_len].decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(
-                f"claim_provider_zone not valid utf-8: {exc}"
-            ) from exc
-        off += zone_len
+        # Legacy DMPHB02 wires don't carry this field — treat as
+        # empty so cross-version verification keeps working through
+        # the rolling upgrade.
+        if is_legacy:
+            claim_provider_zone = ""
+        else:
+            if off + 1 > len(body):
+                raise ValueError("body truncated in claim_provider_zone_len")
+            (zone_len,) = struct.unpack(">B", body[off : off + 1])
+            off += 1
+            if zone_len > MAX_CLAIM_PROVIDER_ZONE_LEN:
+                raise ValueError(
+                    f"claim_provider_zone_len out of range: {zone_len}"
+                )
+            if off + zone_len > len(body):
+                raise ValueError("body truncated in claim_provider_zone")
+            try:
+                claim_provider_zone = body[off : off + zone_len].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    f"claim_provider_zone not valid utf-8: {exc}"
+                ) from exc
+            off += zone_len
 
         if off + 16 > len(body):
             raise ValueError("body truncated in ts/exp")
@@ -491,11 +509,12 @@ class HeartbeatRecord:
         except Exception:
             return None
         # magic + endpoint_len + operator_spk + version_len + capabilities
-        # + claim_provider_zone_len + ts + exp + signature. The
-        # smallest legal body has 0-byte endpoint, version, and
-        # claim_provider_zone; 2-byte capabilities; 16 bytes for
-        # ts/exp; plus the 64-byte sig.
-        if len(blob) < len(_MAGIC) + _SIG_LEN + 2 + _SPK_LEN + 1 + 2 + 1 + 16:
+        # [+ claim_provider_zone_len for DMPHB03] + ts + exp + signature.
+        # Smallest legal DMPHB02 body is 1 byte shorter than DMPHB03 (no
+        # zone_len byte); use the lower bound here so a legacy wire
+        # passes the size gate. ``from_body_bytes`` does the per-version
+        # structural validation downstream.
+        if len(blob) < len(_MAGIC) + _SIG_LEN + 2 + _SPK_LEN + 1 + 2 + 16:
             return None
         body = blob[:-_SIG_LEN]
         sig = blob[-_SIG_LEN:]

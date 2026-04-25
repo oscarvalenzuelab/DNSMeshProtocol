@@ -426,18 +426,19 @@ def _load_heartbeat_from_env(
     claim_zone = _load_claim_provider_zone()
     has_zone = bool(claim_zone)
     capabilities = CAP_CLAIM_PROVIDER if (claim_provider_on and has_zone) else 0
-    # M9: heartbeat wire carries claim_provider_zone too — peers
-    # discover it via DNS instead of /v1/info.
+    # Wire field: only populated when the node is actually acting as
+    # a claim provider. Empty signals "I don't host claims" to peers.
     advertised_zone = claim_zone if (claim_provider_on and has_zone) else ""
 
-    # M9: the worker publishes its own heartbeat into the local
-    # zone via the shared sqlite record store, and queries peer
-    # zones via the local DNS reader. The zone published under is
-    # the same `claim_zone` we just resolved — that's the node's
-    # primary served zone (DMP_CLAIM_PROVIDER_ZONE → DMP_CLUSTER_BASE_DOMAIN
-    # → DMP_DOMAIN). Without a zone the worker still ticks but
-    # publishes nothing (legitimate for nodes that exist purely as
-    # message readers).
+    # Codex round-3 P1: heartbeat publishing has to keep working when
+    # claim-provider is disabled. The zone the worker publishes UNDER
+    # is the served zone, which doesn't get cleared by
+    # ``DMP_CLAIM_PROVIDER=0``. The advertised claim-provider role
+    # IS still tied to the opt-out (above), so a non-claim-provider
+    # node still appears in DNS discovery but doesn't get picked up
+    # by ``select_providers``.
+    publish_zone = _load_served_zone()
+
     cfg = HeartbeatWorkerConfig(
         self_endpoint=self_endpoint,
         version=version,
@@ -446,7 +447,7 @@ def _load_heartbeat_from_env(
         max_peers=max_peers,
         capabilities=capabilities,
         claim_provider_zone=advertised_zone,
-        dns_zone=claim_zone,
+        dns_zone=publish_zone,
         seed_zones=seed_zones,
     )
     # The worker shares DMPNode's record store for publishes and
