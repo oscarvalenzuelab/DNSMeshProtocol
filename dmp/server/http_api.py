@@ -292,6 +292,76 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
         return 404
 
+    def _directory_rows(self) -> list:
+        """Build the rendered peer list including a synthetic self row.
+
+        The heartbeat worker posts its own signed heartbeat to peers but
+        does not ingest it into its own SeenStore — so a solo node with
+        no seeds configured would otherwise show an empty peer list
+        even though the operator clearly *does* know about themselves.
+
+        We synthesize a self row at render time. It carries the same
+        endpoint + operator pubkey as the JSON `self` block from
+        /v1/nodes/seen but lives in the table so visitors don't see an
+        empty page on a freshly-deployed solo node. Dedup by
+        (operator_spk, endpoint) so a peer that has gossiped self back
+        doesn't produce a double row; we keep the highest-ts copy.
+
+        Sorted by ts descending (most recent first), so on a steady-
+        state node the freshest heartbeat is always at the top.
+        """
+        from dmp.core.heartbeat import HeartbeatRecord
+        from dmp.server.heartbeat_html import DirectoryRow
+
+        store = self.server.heartbeat_store
+        if store is None:
+            return []
+        limit = int(getattr(self.server, "heartbeat_seen_limit", 500))
+        rows = store.list_recent(limit=limit)
+
+        # (operator_spk, endpoint) -> DirectoryRow, keeping the highest ts.
+        merged: dict = {}
+        for r in rows:
+            try:
+                rec = HeartbeatRecord.parse_and_verify(r.wire)
+            except Exception:
+                continue
+            if rec is None:
+                continue
+            key = (rec.operator_spk.hex(), rec.endpoint)
+            existing = merged.get(key)
+            if existing is None or int(rec.ts) > existing.ts:
+                merged[key] = DirectoryRow(
+                    endpoint=rec.endpoint,
+                    operator_spk_hex=rec.operator_spk.hex(),
+                    version=rec.version,
+                    ts=int(rec.ts),
+                    sources=1,
+                )
+
+        self_endpoint = getattr(self.server, "heartbeat_self_endpoint", None)
+        self_spk_hex = getattr(self.server, "heartbeat_self_spk_hex", None)
+        if self_endpoint and self_spk_hex:
+            key = (self_spk_hex, self_endpoint)
+            now = int(__import__("time").time())
+            # If a peer already gossiped self back, keep that row's ts;
+            # otherwise synthesize one with ts=now ("self-attested
+            # liveness") so a fresh solo node still has a row.
+            if key not in merged:
+                import os as _os
+
+                version = _os.environ.get("DMP_HEARTBEAT_VERSION", "").strip() or "dev"
+                merged[key] = DirectoryRow(
+                    endpoint=self_endpoint,
+                    operator_spk_hex=self_spk_hex,
+                    version=version,
+                    ts=now,
+                    sources=1,
+                )
+
+        # Newest first. Self typically wins this sort on solo nodes.
+        return sorted(merged.values(), key=lambda r: r.ts, reverse=True)
+
     def _handle_root(self) -> int:
         """GET /  -- friendly landing page.
 
@@ -328,35 +398,14 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         # Discovery block: a real peer table if heartbeat is on, an
         # operator-facing hint if it isn't.
         if heartbeat_on:
-            from dmp.core.heartbeat import HeartbeatRecord
-            from dmp.server.heartbeat_html import DirectoryRow
-
-            store_hb = self.server.heartbeat_store
-            limit = int(getattr(self.server, "heartbeat_seen_limit", 500))
-            rows = store_hb.list_recent(limit=limit)
-            directory_rows = []
-            for r in rows:
-                try:
-                    rec = HeartbeatRecord.parse_and_verify(r.wire)
-                except Exception:
-                    continue
-                if rec is None:
-                    continue
-                directory_rows.append(
-                    DirectoryRow(
-                        endpoint=rec.endpoint,
-                        operator_spk_hex=rec.operator_spk.hex(),
-                        version=rec.version,
-                        ts=int(rec.ts),
-                        sources=1,
-                    )
-                )
-
             from dmp.server.heartbeat_html import _row_html as _hb_row_html
 
+            directory_rows = self._directory_rows()
             now = int(__import__("time").time())
             peer_rows = "\n".join(_hb_row_html(r, now=now) for r in directory_rows)
             if not peer_rows:
+                # Should be unreachable when heartbeat_on (the synthetic
+                # self row guarantees at least one entry), but be defensive.
                 peer_rows = (
                     '<tr><td colspan="5">(no peers heard yet — '
                     "this node has not seen any heartbeats)</td></tr>"
@@ -850,33 +899,9 @@ No central directory, no phone numbers, no servers to trust.</p>
             self._send_json(429, {"error": "heartbeat rate limit exceeded"})
             return 429
 
-        from dmp.core.heartbeat import HeartbeatRecord
-        from dmp.server.heartbeat_html import DirectoryRow, render
+        from dmp.server.heartbeat_html import render
 
-        store = self.server.heartbeat_store
-        limit = int(getattr(self.server, "heartbeat_seen_limit", 500))
-        rows = store.list_recent(limit=limit)
-        directory_rows = []
-        for r in rows:
-            try:
-                rec = HeartbeatRecord.parse_and_verify(r.wire)
-            except Exception:
-                # Malformed/expired records are skipped silently — the
-                # store accepted them at write-time, so a verify failure
-                # here means clock drift or an in-flight rotation. Don't
-                # take down the directory page over it.
-                continue
-            if rec is None:
-                continue
-            directory_rows.append(
-                DirectoryRow(
-                    endpoint=rec.endpoint,
-                    operator_spk_hex=rec.operator_spk.hex(),
-                    version=rec.version,
-                    ts=int(rec.ts),
-                    sources=1,
-                )
-            )
+        directory_rows = self._directory_rows()
 
         self_endpoint = getattr(self.server, "heartbeat_self_endpoint", None) or ""
         self_spk_hex = getattr(self.server, "heartbeat_self_spk_hex", None) or ""
