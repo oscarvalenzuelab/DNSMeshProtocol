@@ -68,8 +68,12 @@ ok "current version: ${OLD_VERSION:-unknown}"
 # ──────────────────────────────────────────────────────────────────────
 
 step "Upgrading dnsmesh"
-"$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet --upgrade dnsmesh
+# --no-cache-dir forces pip to fetch fresh metadata from PyPI rather
+# than potentially settling on a cached older version when this script
+# is re-run shortly after a release. The download cost is one-shot;
+# correctness wins.
+"$VENV_DIR/bin/pip" install --quiet --no-cache-dir --upgrade pip
+"$VENV_DIR/bin/pip" install --quiet --no-cache-dir --upgrade dnsmesh
 NEW_VERSION=$("$VENV_DIR/bin/pip" show dnsmesh | awk '/^Version:/ {print $2}')
 ok "dnsmesh ${OLD_VERSION:-?} -> ${NEW_VERSION}"
 
