@@ -7,6 +7,25 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.1] — HEAD-method support + seed dnsmesh.io
+
+### Fixed
+
+- **`HEAD /` returned 501** instead of the expected 200. Python's
+  `BaseHTTPRequestHandler` 501s on any HTTP method without a
+  matching `do_<METHOD>` handler. We had `do_GET`, `do_POST`,
+  `do_DELETE` but not `do_HEAD`, so monitors, link-checkers, and
+  `curl -I` all saw "Not Implemented". The new `do_HEAD` reuses
+  the GET dispatcher; clients close the connection after reading
+  status + headers, and the unread body is harmless. Fixes
+  uptime monitoring and CDN preflight against any 0.3.x node.
+
+### Changed
+
+- **`directory/seeds.txt`** now lists `https://dnsmesh.io`. Next
+  scheduled aggregator run picks it up and the canonical directory
+  at `/DNSMeshProtocol/directory/` will list it.
+
 ## [0.3.0] — discovery surface, native install path, typo tripwire
 
 Additive release on top of 0.2.0. No breaking changes for clients;

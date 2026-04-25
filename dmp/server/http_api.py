@@ -218,6 +218,21 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         status = self._handle_get()
         self._record_request("GET", status)
 
+    def do_HEAD(self) -> None:
+        # Route HEAD through the same dispatcher as GET so monitors,
+        # link-checkers, and `curl -I` get a real status code (and the
+        # right Content-Type / Content-Length headers) instead of the
+        # 501 the BaseHTTPRequestHandler default returns when the
+        # handler is missing.
+        #
+        # The body still gets written to wfile by the GET handlers —
+        # HEAD clients close the connection after reading status +
+        # headers, so the unread body is harmless. Wasted bandwidth on
+        # the heaviest path (the rendered '/' landing page) is single-
+        # digit KB; not worth a refactor of every handler to suppress.
+        status = self._handle_get()
+        self._record_request("HEAD", status)
+
     def _handle_get(self) -> int:
         if self.path == "/" or self.path == "/index.html":
             return self._handle_root()
