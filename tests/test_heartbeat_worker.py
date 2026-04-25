@@ -28,6 +28,7 @@ from dmp.server.heartbeat_worker import (
     HeartbeatWorker,
     HeartbeatWorkerConfig,
     heartbeat_rrset_name,
+    seen_rrset_name,
 )
 
 
@@ -444,6 +445,199 @@ class TestOwnHeartbeatShape:
         assert parsed.capabilities == 1
         assert parsed.claim_provider_zone == "self.example"
         assert parsed.operator_spk == signer.get_signing_public_key_bytes()
+
+
+class TestSeenGraphPublish:
+    """M9.1.3 — node republishes recently-verified peer wires under
+    ``_dnsmesh-seen.<own-zone>`` as a multi-value TXT RRset so other
+    nodes can crawl the mesh through pure DNS reads.
+    """
+
+    def test_publishes_each_seen_peer_as_separate_txt_value(
+        self, store, transport, now
+    ) -> None:
+        """Two distinct peers in the SeenStore → two TXT values in
+        the published RRset, each independently verifiable."""
+        # Pre-populate two peer zones; harvest will ingest into store.
+        peer_a = _publish_peer_heartbeat(
+            transport,
+            _signer("peer-a", salt=b"A" * 32),
+            "peer-a.example",
+            endpoint="https://peer-a.example.com",
+            ts=now,
+        )
+        peer_b = _publish_peer_heartbeat(
+            transport,
+            _signer("peer-b", salt=b"B" * 32),
+            "peer-b.example",
+            endpoint="https://peer-b.example.com",
+            ts=now,
+        )
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.0",
+            dns_zone="self.example",
+            seed_zones=("peer-a.example", "peer-b.example"),
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+
+        published = transport.query_txt_record(seen_rrset_name("self.example"))
+        assert published is not None
+        assert peer_a in published
+        assert peer_b in published
+        # Multi-value RRset, one entry per peer.
+        assert len(published) == 2
+
+    def test_seen_graph_is_empty_when_store_is_empty(
+        self, store, transport, now
+    ) -> None:
+        """A node that has heard from no one publishes nothing under
+        _dnsmesh-seen.<zone> — the absence is meaningful (no peers
+        discovered yet)."""
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.0",
+            dns_zone="self.example",
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+        assert transport.query_txt_record(seen_rrset_name("self.example")) is None
+
+    def test_seen_graph_skipped_without_zone_or_writer(
+        self, store, transport, now
+    ) -> None:
+        """No dns_zone OR no record_writer → no seen-graph publish.
+        Read-only nodes don't expose a directory."""
+        # Inject a row directly so the SeenStore has content. We use
+        # the worker's own signer + endpoint so accept() verifies.
+        signer = _signer()
+        hb = HeartbeatRecord(
+            endpoint="https://x.example.com",
+            operator_spk=signer.get_signing_public_key_bytes(),
+            version="0.1.0",
+            ts=now,
+            exp=now + 3600,
+        )
+        wire = hb.sign(signer)
+        store.accept(wire, now=now)
+
+        # No zone configured → publish skipped.
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="",
+        )
+        worker = HeartbeatWorker(
+            cfg, _signer(), store, record_writer=transport, dns_reader=transport
+        )
+        worker.tick_once(now=now)
+        assert transport.list_names() == []  # nothing published anywhere
+
+        # Zone configured but no writer → publish skipped.
+        cfg2 = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+        )
+        worker2 = HeartbeatWorker(
+            cfg2, _signer(), store, record_writer=None, dns_reader=transport
+        )
+        worker2.tick_once(now=now)
+        assert transport.list_names() == []  # still nothing published
+
+    def test_seen_graph_capped_at_max_seen_publish(
+        self, store, transport, now
+    ) -> None:
+        """A flood of seen peers must not produce an unbounded RRset —
+        the worker caps at max_seen_publish."""
+        # Publish 5 peers; cap to 3.
+        for i in range(5):
+            _publish_peer_heartbeat(
+                transport,
+                _signer(f"peer-{i}", salt=bytes([0x10 + i]) * 32),
+                f"peer-{i}.example",
+                endpoint=f"https://peer-{i}.example.com",
+                ts=now,
+            )
+
+        seeds = tuple(f"peer-{i}.example" for i in range(5))
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.0",
+            dns_zone="self.example",
+            seed_zones=seeds,
+            max_seen_publish=3,
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+
+        published = transport.query_txt_record(seen_rrset_name("self.example"))
+        assert published is not None
+        assert len(published) == 3
+
+    def test_seen_graph_values_are_independently_verifiable(
+        self, store, transport, now
+    ) -> None:
+        """A consumer querying _dnsmesh-seen.<zone> can re-verify
+        every wire on its own — no trust in the publishing node
+        beyond DNS chain integrity."""
+        signers = [
+            _signer(f"peer-{i}", salt=bytes([0x20 + i]) * 32) for i in range(2)
+        ]
+        for i, signer in enumerate(signers):
+            _publish_peer_heartbeat(
+                transport,
+                signer,
+                f"peer-{i}.example",
+                endpoint=f"https://peer-{i}.example.com",
+                ts=now,
+            )
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.0",
+            dns_zone="self.example",
+            seed_zones=("peer-0.example", "peer-1.example"),
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+
+        published = transport.query_txt_record(seen_rrset_name("self.example"))
+        assert published and len(published) == 2
+        spk_seen = set()
+        for wire in published:
+            parsed = HeartbeatRecord.parse_and_verify(wire, now=now)
+            assert parsed is not None  # signature checks out
+            spk_seen.add(bytes(parsed.operator_spk).hex())
+        assert spk_seen == {
+            signers[0].get_signing_public_key_bytes().hex(),
+            signers[1].get_signing_public_key_bytes().hex(),
+        }
 
 
 class TestLifecycle:

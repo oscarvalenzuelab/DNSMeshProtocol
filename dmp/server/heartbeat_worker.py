@@ -60,6 +60,10 @@ DEFAULT_FAILURE_COOLDOWN_TICKS = 1
 # RRset; without a cap, the worker burns signature-verify + sqlite
 # cycles processing the flood. Same defense the M5.8 HTTP path had.
 DEFAULT_MAX_GOSSIP_PER_RESPONSE = 20
+# How many recently-seen peer wires this node republishes under
+# _dnsmesh-seen.<own-zone>. Bounded so the RRset stays tractable for
+# resolvers and doesn't grow unbounded when the directory does.
+DEFAULT_MAX_SEEN_PUBLISH = 50
 
 # DNS owner names the worker publishes / queries under.
 HEARTBEAT_RRSET_PREFIX = "_dnsmesh-heartbeat"
@@ -131,6 +135,7 @@ class HeartbeatWorkerConfig:
     max_peers: int = DEFAULT_MAX_PEERS
     failure_cooldown_ticks: int = DEFAULT_FAILURE_COOLDOWN_TICKS
     max_gossip_per_response: int = DEFAULT_MAX_GOSSIP_PER_RESPONSE
+    max_seen_publish: int = DEFAULT_MAX_SEEN_PUBLISH
     capabilities: int = 0
     claim_provider_zone: str = ""
     # M9 — DNS-native publish/discover.
@@ -244,9 +249,6 @@ class HeartbeatWorker:
 
         # 2. Harvest peer heartbeats by querying each seed zone.
         zones = self._build_seed_zones()
-        if not zones:
-            return 0
-
         successes = 0
         for zone in zones:
             cd = self._cooldown.get(zone, 0)
@@ -261,6 +263,13 @@ class HeartbeatWorker:
                 self._cooldown.pop(zone, None)
             else:
                 self._cooldown[zone] = self._cfg.failure_cooldown_ticks
+
+        # 3. Republish the recently-verified seen-graph at
+        #    _dnsmesh-seen.<own-zone>. Always runs after the harvest
+        #    so freshly-ingested peers from this tick can also be
+        #    crawled by other nodes through this zone. Multi-record
+        #    TXT publish — one TXT value per peer wire.
+        self._publish_seen_graph(tick_start)
         return successes
 
     # ------------------------------------------------------------------
@@ -294,6 +303,52 @@ class HeartbeatWorker:
         if not ok:
             log.info("heartbeat self-publish to %s returned False", name)
         return ok
+
+    def _publish_seen_graph(self, now_i: int) -> int:
+        """Republish recently-seen peer wires under
+        ``_dnsmesh-seen.<dns_zone>`` as a multi-value TXT RRset.
+
+        One TXT value per peer wire. The wire is what SeenStore.accept
+        already verified, so consumers re-verify each entry on their
+        side and never need to trust this node's claim that the wire
+        is authentic. Capped at ``max_seen_publish`` so a node with
+        thousands of seen peers doesn't try to push them all into
+        one RRset (resolvers MUST handle multi-value TXT, but real-
+        world authoritative APIs and recursors get unhappy past a
+        few KB).
+
+        Returns the number of TXT values published.
+        """
+        if self._record_writer is None or not self._cfg.dns_zone:
+            return 0
+        try:
+            name = seen_rrset_name(self._cfg.dns_zone)
+        except ValueError:
+            return 0
+        try:
+            rows = self._store.list_recent(
+                limit=self._cfg.max_seen_publish, now=now_i
+            )
+        except Exception:
+            log.exception("SeenStore.list_recent raised; skipping seen-graph publish")
+            return 0
+        published = 0
+        for row in rows:
+            wire = getattr(row, "wire", None)
+            if not isinstance(wire, str) or not wire:
+                continue
+            try:
+                ok = bool(
+                    self._record_writer.publish_txt_record(
+                        name, wire, ttl=self._cfg.ttl_seconds
+                    )
+                )
+            except Exception:
+                log.exception("seen-graph publish raised for %s", name)
+                continue
+            if ok:
+                published += 1
+        return published
 
     # ------------------------------------------------------------------
     # harvest

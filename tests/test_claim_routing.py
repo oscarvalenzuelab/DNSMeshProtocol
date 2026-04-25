@@ -151,6 +151,39 @@ class TestSelectProviders:
         ip_provider = next(p for p in out if p.endpoint.endswith(":8053"))
         assert ip_provider.zone == ""
 
+    def test_claim_provider_zone_overrides_host_derivation(self):
+        """M9.1.1 — when the operator advertises ``claim_provider_zone``
+        in the signed wire, it wins over the URL-host inference. Lets
+        a provider serve claims under a zone that doesn't match its
+        HTTP host (e.g. a CDN-fronted endpoint with operator-controlled
+        DNS for the claim records)."""
+        hb = _hb(endpoint="https://cdn-fronted.example.net")
+        # Splice in the operator-advertised zone (immutable dataclass —
+        # rebuild). A real wire would carry this from sign().
+        hb_with_zone = HeartbeatRecord(
+            endpoint=hb.endpoint,
+            operator_spk=hb.operator_spk,
+            version=hb.version,
+            ts=hb.ts,
+            exp=hb.exp,
+            capabilities=hb.capabilities,
+            claim_provider_zone="my-claims.example.com",
+        )
+        out = select_providers([hb_with_zone])
+        assert len(out) == 1
+        assert out[0].zone == "my-claims.example.com"
+        # Endpoint stays the URL — only the claim-record zone moves.
+        assert out[0].endpoint == "https://cdn-fronted.example.net"
+
+    def test_falls_back_to_host_when_advertised_zone_empty(self):
+        """Wires from older nodes (or providers that haven't enabled
+        the field) leave ``claim_provider_zone`` blank — host
+        derivation is the back-compat path."""
+        hb = _hb(endpoint="https://node.example.com")
+        # No claim_provider_zone splice — defaults to "".
+        out = select_providers([hb])
+        assert out[0].zone == "node.example.com"
+
     def test_default_k(self):
         # Generate K+2 fresh providers; only K come back.
         hbs = [

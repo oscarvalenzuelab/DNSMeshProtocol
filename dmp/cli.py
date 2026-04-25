@@ -29,7 +29,8 @@ import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -964,66 +965,67 @@ _BUILTIN_CLAIM_PROVIDER_SEEDS: List[Tuple[str, str]] = [
 ]
 
 
-def _resolve_provider_zone_via_info(endpoint: str) -> Optional[str]:
-    """Fetch ``GET {endpoint}/v1/info`` and return the advertised zone.
+def _zone_from_endpoint_url(url: str) -> str:
+    """Best-effort URL-host → DNS-zone projection.
 
-    Returns:
-      - the zone string when reachable + non-empty,
-      - ``""`` (explicitly empty) when reachable but provider opted
-        out — caller should skip the provider entirely,
-      - ``None`` when unreachable / malformed — caller falls back to
-        host-derived zone.
+    Same idea as ``dmp.client.claim_routing._zone_from_endpoint`` but
+    returns ``""`` on failure (callers want a string they can also
+    pass to ``DNSRecordReader.query_txt_record``). IP literals and
+    localhost variants come back empty — there's no plausible
+    authoritative DNS zone to query.
     """
-    import json
-    import urllib.error
-    import urllib.request
-
-    info_url = endpoint.rstrip("/") + "/v1/info"
+    if not isinstance(url, str) or not url:
+        return ""
     try:
-        with urllib.request.urlopen(info_url, timeout=2) as resp:
-            info = json.loads(resp.read())
-    except (urllib.error.URLError, json.JSONDecodeError, OSError):
-        return None
-    advertised = info.get("claim_provider_zone", None)
-    if not isinstance(advertised, str):
-        return None
-    return advertised
+        parts = urlsplit(url if "://" in url else "https://" + url)
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").strip().lower()
+    if not host:
+        return ""
+    if host.replace(".", "").isdigit() or ":" in host:
+        return ""
+    if host in ("localhost", "localhost.localdomain", "ip6-localhost"):
+        return ""
+    return host
 
 
-def _candidate_seen_endpoints(
+def _candidate_seen_zones(
     cfg: "CLIConfig", client: Optional[DMPClient] = None
 ) -> List[str]:
-    """Return the ordered list of HTTP endpoints to try for /v1/nodes/seen.
+    """Return the ordered list of DNS zones to query for the seen-graph.
 
-    Codex P1 round 6 fix: in cluster mode, the legacy ``cfg.endpoint``
-    can be unset, stale, or point at a different node than the active
-    cluster. Without consulting the cluster manifest we'd silently
-    fall back to the seed list and lose every locally-known provider.
+    M9.1.3 — replaces ``_candidate_seen_endpoints``. The CLI no
+    longer talks to ``/v1/nodes/seen``; instead it queries
+    ``_dnsmesh-seen.<zone>`` over the recursive DNS chain.
 
-    Resolution order (first-non-empty wins on the wire; we try them
-    in sequence inside ``_build_claim_providers``):
+    Resolution order:
 
-      1. Cluster-mode peers — when ``client._cluster_client`` is
-         attached AND the manifest has nodes, every node's
-         ``http_endpoint``. Picking the FIRST that responds wins.
-      2. ``cfg.endpoint`` — the legacy single-node hint, also used
+      1. ``cfg.cluster_base_domain`` — when cluster mode is pinned,
+         the operator publishes the cluster's seen-graph under the
+         cluster anchor zone. Most authoritative source.
+      2. Cluster manifest node endpoints — each node's URL host is
+         the zone that node publishes its own seen-graph under. Lets
+         a recipient discover providers from any node in the cluster
+         even when the cluster anchor is briefly unreachable.
+      3. ``cfg.endpoint`` — legacy single-node hint, also used
          outside cluster mode.
 
-    Empty list when neither is available; the caller falls back to
-    the built-in seeds.
+    Empty list when nothing is configured; caller falls back to the
+    built-in seeds.
     """
     out: List[str] = []
-    seen: set = set()
+    seen: Set[str] = set()
 
-    def _push(url: str) -> None:
-        if not url:
+    def _push(zone: str) -> None:
+        z = (zone or "").strip().lower()
+        if not z or z in seen:
             return
-        canon = url.rstrip("/").lower()
-        if canon in seen:
-            return
-        seen.add(canon)
-        out.append(url)
+        seen.add(z)
+        out.append(z)
 
+    if cfg.cluster_base_domain:
+        _push(cfg.cluster_base_domain)
     cluster_client = (
         getattr(client, "_cluster_client", None) if client is not None else None
     )
@@ -1031,77 +1033,110 @@ def _candidate_seen_endpoints(
     nodes = getattr(manifest, "nodes", None) if manifest is not None else None
     if nodes:
         for node in nodes:
-            ep = getattr(node, "http_endpoint", "")
-            _push(ep)
-    if cfg.endpoint:
-        _push(cfg.endpoint)
+            _push(_zone_from_endpoint_url(getattr(node, "http_endpoint", "")))
+    _push(_zone_from_endpoint_url(cfg.endpoint))
     return out
 
 
-def _fetch_seen_feed(endpoints: Sequence[str]) -> List[str]:
-    """Try each endpoint's ``/v1/nodes/seen`` in order; return the first
-    successful payload's wire list. Empty on total failure.
+def _fetch_seen_feed_dns(
+    reader: DNSRecordReader, zones: Sequence[str]
+) -> List[str]:
+    """Query ``_dnsmesh-seen.<zone>`` for each zone, return first hit.
 
-    Tolerates JSON / network errors per-candidate, since cluster
-    nodes go up and down.
+    First zone whose RRset has at least one TXT value wins. The
+    returned list is already the wire strings (multi-value TXT
+    publishes one wire per value); the caller hands them to
+    ``parse_seen_feed`` which re-verifies each signature.
     """
-    import json
-    import urllib.error
-    import urllib.request
+    from dmp.server.heartbeat_worker import seen_rrset_name
 
-    for endpoint in endpoints:
-        seen_url = endpoint.rstrip("/") + "/v1/nodes/seen"
+    for zone in zones:
+        if not zone:
+            continue
         try:
-            with urllib.request.urlopen(seen_url, timeout=5) as resp:
-                data = json.loads(resp.read())
-        except (urllib.error.URLError, json.JSONDecodeError, OSError):
+            name = seen_rrset_name(zone)
+        except ValueError:
             continue
-        if not isinstance(data, dict):
+        try:
+            values = reader.query_txt_record(name)
+        except Exception:
             continue
-        return [
-            entry.get("wire", "")
-            for entry in data.get("seen", [])
-            if isinstance(entry, dict)
-        ]
+        if values:
+            return [v for v in values if isinstance(v, str)]
     return []
+
+
+def _seed_provider_via_dns(
+    reader: DNSRecordReader, seed_zone: str, seed_endpoint: str
+) -> Optional[Tuple[str, str]]:
+    """Query a built-in seed's heartbeat over DNS.
+
+    Returns ``(zone, endpoint)`` from the verified wire when reachable,
+    or ``None`` when the seed has no heartbeat record / is opted out.
+    Falls back to the static (zone, endpoint) tuple when the DNS
+    query fails — keeps first-contact reach working before the
+    upgrade has propagated through public DNS caches.
+    """
+    from dmp.core.heartbeat import CAP_CLAIM_PROVIDER, HeartbeatRecord
+    from dmp.server.heartbeat_worker import heartbeat_rrset_name
+
+    try:
+        name = heartbeat_rrset_name(seed_zone)
+    except ValueError:
+        return (seed_zone, seed_endpoint)
+    try:
+        values = reader.query_txt_record(name)
+    except Exception:
+        return (seed_zone, seed_endpoint)
+    if not values:
+        return (seed_zone, seed_endpoint)
+    for wire in values:
+        if not isinstance(wire, str):
+            continue
+        rec = HeartbeatRecord.parse_and_verify(wire)
+        if rec is None:
+            continue
+        if not (rec.capabilities & CAP_CLAIM_PROVIDER):
+            # Operator is reachable but explicitly opted out.
+            return None
+        zone = (rec.claim_provider_zone or "").strip().lower() or seed_zone
+        return (zone, rec.endpoint or seed_endpoint)
+    return (seed_zone, seed_endpoint)
 
 
 def _build_claim_providers(
     cfg: "CLIConfig", client: Optional[DMPClient] = None
 ) -> List[Tuple[str, str]]:
-    """Build the ranked claim-provider list for send/recv (M8.3).
+    """Build the ranked claim-provider list for send/recv (M8.3, M9.1.3).
 
     Resolution order:
 
       1. ``cfg.claim_provider_override`` — explicit pin. Returned as
          a single ``(zone, endpoint)`` tuple; ``zone`` defaults to
          the URL host unless ``cfg.claim_provider_zone`` is also set.
-      2. Fetch the home node's ``/v1/nodes/seen`` over HTTP, rank by
-         SeenStore recency via
-         :mod:`dmp.client.claim_routing`, and for each candidate try
-         the provider's ``/v1/info`` to confirm the actual served
-         zone (codex round 1 P2: a provider whose claim zone differs
-         from its HTTP host would otherwise be unreachable). On
-         ``/v1/info`` failure, fall back to host-derived zone.
-      3. Always APPEND the built-in seeds (codex round 3 P1: without
-         a shared baseline, sender and recipient computing from
-         their own home nodes can land on disjoint provider sets
-         and drop first-contact claims entirely). Seeds are dedup'd
-         by endpoint so an operator who happens to be running their
-         own dnsmesh.io mirror doesn't see double-publish.
-      4. On any exception in steps 2, return whatever was built so
-         far + the seeds. Send/recv handle the empty case by
-         skipping claim publish/poll — first-contact reach degrades
-         gracefully to "pinned-only" mode.
+      2. Query the home node's seen-graph at
+         ``_dnsmesh-seen.<home-zone>`` over the recursive DNS chain.
+         The wires are signed HeartbeatRecords — :mod:`parse_seen_feed`
+         verifies each signature, :mod:`select_providers` ranks by
+         recency and reads the operator-advertised
+         ``claim_provider_zone`` straight off each wire (M9.1.1
+         absorbed the old ``GET /v1/info`` zone discovery).
+      3. Always APPEND the built-in seeds. Each seed's heartbeat is
+         re-checked over DNS; an opted-out seed is dropped, an
+         opted-in seed contributes its operator-advertised zone.
+      4. On any exception in steps 2-3, return whatever was built so
+         far + any seeds that resolved. Send/recv handle the empty
+         case by skipping claim publish/poll — first-contact reach
+         degrades gracefully to "pinned-only" mode.
+
+    The whole flow is now DNS-only — no HTTP between the CLI and any
+    peer node beyond the user's own home node (which the user already
+    talks HTTP to for register/send writes).
 
     Returns a list of ``(provider_zone, provider_endpoint)`` tuples
     suitable for passing into ``send_message(claim_providers=...)``
     or ``receive_messages(claim_providers=...)``.
     """
-    import json
-    import urllib.error
-    import urllib.request
-
     from dmp.client.claim_routing import (
         DEFAULT_K,
         parse_seen_feed,
@@ -1117,7 +1152,7 @@ def _build_claim_providers(
         return [(p.zone, p.endpoint) for p in out]
 
     out: List[Tuple[str, str]] = []
-    seen_endpoints: set = set()
+    seen_endpoints: Set[str] = set()
 
     def _add(zone: str, endpoint: str) -> None:
         if not zone or not endpoint:
@@ -1128,40 +1163,21 @@ def _build_claim_providers(
         seen_endpoints.add(canon)
         out.append((zone, endpoint))
 
-    # Codex P1 round 6 fix: in cluster mode, ``cfg.endpoint`` can be
-    # stale/unset; use the cluster manifest's nodes via the active
-    # client. Falls back to ``cfg.endpoint`` when no client given
-    # OR the cluster_client isn't attached.
-    candidate_endpoints = _candidate_seen_endpoints(cfg, client=client)
-    seen_wires = _fetch_seen_feed(candidate_endpoints)
+    reader = _make_reader(cfg)
+    candidate_zones = _candidate_seen_zones(cfg, client=client)
+    seen_wires = _fetch_seen_feed_dns(reader, candidate_zones)
     if seen_wires:
         heartbeats = parse_seen_feed(seen_wires)
-        providers = select_providers(heartbeats, k=DEFAULT_K)
-        for p in providers:
-            advertised = _resolve_provider_zone_via_info(p.endpoint)
-            if advertised == "":
-                # Provider explicitly opted out — skip even though
-                # heartbeat advertised the capability.
+        for p in select_providers(heartbeats, k=DEFAULT_K):
+            if not p.zone or not p.endpoint:
                 continue
-            zone = advertised if advertised else p.zone
-            # IP-literal endpoint with no resolved zone → drop.
-            if not zone:
-                continue
-            _add(zone, p.endpoint)
+            _add(p.zone, p.endpoint)
 
-    # Seeds: always on, always last in the list. Anti-entropy on
-    # claim records (M8.4) eventually converges the seen-graph view,
-    # but the seeds give us a cross-deployment overlap floor today.
     for seed_zone, seed_endpoint in _BUILTIN_CLAIM_PROVIDER_SEEDS:
-        # Trust /v1/info if reachable; otherwise use the seed's
-        # built-in zone.
-        advertised = _resolve_provider_zone_via_info(seed_endpoint)
-        if advertised == "":
-            # Seed operator has opted out of claim provider role —
-            # respect that. Surprising in practice, but correct.
+        resolved = _seed_provider_via_dns(reader, seed_zone, seed_endpoint)
+        if resolved is None:
             continue
-        zone = advertised if advertised else seed_zone
-        _add(zone, seed_endpoint)
+        _add(resolved[0], resolved[1])
     return out
 
 
@@ -3595,67 +3611,133 @@ def cmd_bootstrap_discover(args: argparse.Namespace) -> int:
 
 
 def cmd_peers(args: argparse.Namespace) -> int:
-    """Show the heartbeat-discovery view a node exposes at /v1/nodes/seen.
+    """Show the heartbeat-discovery view a node publishes at
+    ``_dnsmesh-seen.<zone>`` and ``_dnsmesh-heartbeat.<zone>``.
 
-    No config required: hits any node's public discovery endpoint and
-    formats the result. Useful for "I just spun up a node, what does
-    its directory look like?" and for surveying a peer before pinning
-    it. ``--json`` returns the raw payload for piping into jq.
+    No config required: queries DNS directly with the system resolver
+    (or whatever ``--dns-resolvers`` was last persisted in the user's
+    config, if one exists). Useful for "I just spun up a node, what
+    does its directory look like?" and for surveying a peer before
+    pinning it. ``--json`` emits a list of decoded heartbeat records
+    for piping into jq.
+
+    Argument is now a DNS zone (``dnsmesh.io``) — but a legacy URL
+    (``https://dnsmesh.io``) is accepted and the host is extracted,
+    so existing operator muscle memory keeps working through M9.
     """
     import json as _json
     import time as _time
 
-    import requests
+    from dmp.core.heartbeat import HeartbeatRecord
+    from dmp.server.heartbeat_worker import (
+        heartbeat_rrset_name,
+        seen_rrset_name,
+    )
 
-    endpoint = args.endpoint.rstrip("/")
-    url = f"{endpoint}/v1/nodes/seen"
-    timeout = float(args.timeout)
-    try:
-        r = requests.get(url, timeout=timeout)
-    except requests.RequestException as e:
-        _die(2, f"GET {url} failed: {e}")
-    if r.status_code == 404:
+    raw = (args.endpoint or "").strip()
+    if not raw:
+        _die(1, "missing zone argument")
+    zone = _zone_from_endpoint_url(raw) if "://" in raw else raw.lower()
+    if not zone:
         _die(
             1,
-            f"{endpoint} does not expose a discovery feed. The operator "
-            "has not enabled the heartbeat layer (DMP_HEARTBEAT_ENABLED=1).",
+            f"could not derive a DNS zone from {raw!r} — pass a zone like "
+            "`dnsmesh.io` or a URL with a non-IP hostname",
         )
-    if r.status_code != 200:
-        _die(2, f"{url} returned {r.status_code}: {r.text[:200]}")
 
-    payload = r.json()
+    # Build a reader. If a config exists we honor the user's resolver
+    # pool; otherwise fall back to a default `_DnsReader` (system DNS).
+    try:
+        cfg = CLIConfig.load(_config_path())
+        reader = _make_reader(cfg)
+    except FileNotFoundError:
+        reader = _DnsReader(host=None, port=53)
+
+    own_wire: Optional[str] = None
+    self_record: Optional[HeartbeatRecord] = None
+    try:
+        own_values = reader.query_txt_record(heartbeat_rrset_name(zone))
+    except Exception as exc:
+        _die(2, f"DNS query for _dnsmesh-heartbeat.{zone} failed: {exc}")
+    if own_values:
+        for v in own_values:
+            if not isinstance(v, str):
+                continue
+            rec = HeartbeatRecord.parse_and_verify(v)
+            if rec is not None:
+                own_wire = v
+                self_record = rec
+                break
+
+    try:
+        seen_values = reader.query_txt_record(seen_rrset_name(zone)) or []
+    except Exception as exc:
+        _die(2, f"DNS query for _dnsmesh-seen.{zone} failed: {exc}")
+
+    seen_records: List[HeartbeatRecord] = []
+    for v in seen_values:
+        if not isinstance(v, str):
+            continue
+        rec = HeartbeatRecord.parse_and_verify(v)
+        if rec is not None:
+            seen_records.append(rec)
+
     if args.json:
+        payload = {
+            "zone": zone,
+            "self": (
+                {
+                    "endpoint": self_record.endpoint,
+                    "operator_spk_hex": bytes(self_record.operator_spk).hex(),
+                    "claim_provider_zone": self_record.claim_provider_zone,
+                    "version": self_record.version,
+                    "ts": self_record.ts,
+                    "wire": own_wire or "",
+                }
+                if self_record is not None
+                else None
+            ),
+            "seen": [
+                {
+                    "endpoint": r.endpoint,
+                    "operator_spk_hex": bytes(r.operator_spk).hex(),
+                    "claim_provider_zone": r.claim_provider_zone,
+                    "version": r.version,
+                    "ts": r.ts,
+                }
+                for r in seen_records
+            ],
+        }
         print(_json.dumps(payload, indent=2))
         return 0
 
-    # Human-readable table.
-    self_block = payload.get("self") or {}
-    seen = payload.get("seen") or []
-    print(f"node:    {endpoint}")
-    print(f"  self endpoint: {self_block.get('endpoint', '?')}")
-    print(f"  operator spk:  {self_block.get('operator_spk_hex', '?')}")
-    print(f"  heartbeat:     {'on' if self_block.get('enabled') else 'off'}")
+    # Human-readable.
+    print(f"zone:    {zone}")
+    if self_record is None:
+        print("  (_dnsmesh-heartbeat.{zone} not published yet)".format(zone=zone))
+    else:
+        print(f"  self endpoint: {self_record.endpoint}")
+        print(f"  operator spk:  {bytes(self_record.operator_spk).hex()}")
+        print(f"  claim zone:    {self_record.claim_provider_zone or '-'}")
+        print(f"  version:       {self_record.version}")
     print()
-    if not seen:
+    if not seen_records:
         print("(no peers seen yet)")
         return 0
-
     now = int(_time.time())
-    print(f"peers ({len(seen)}):")
-    for entry in seen:
-        ep = entry.get("endpoint", "?")
-        spk = entry.get("operator_spk_hex", "")
+    print(f"peers ({len(seen_records)}):")
+    for r in seen_records:
+        spk = bytes(r.operator_spk).hex()
         spk_short = (spk[:8] + "..." + spk[-4:]) if len(spk) > 16 else spk
-        ts = int(entry.get("ts", 0))
-        age = max(0, now - ts)
+        age = max(0, now - int(r.ts))
         if age < 60:
             age_str = f"{age}s ago"
         elif age < 3600:
             age_str = f"{age // 60}m ago"
         else:
             age_str = f"{age // 3600}h ago"
-        version = entry.get("version") or "-"
-        print(f"  {ep}")
+        version = r.version or "-"
+        print(f"  {r.endpoint}")
         print(f"    spk={spk_short}  version={version}  last heard {age_str}")
     return 0
 
@@ -4094,25 +4176,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_bs_discover.set_defaults(func=cmd_bootstrap_discover)
 
-    # peers (discovery feed of a single node)
+    # peers (DNS-native discovery feed of a single zone)
     p_peers = sub.add_parser(
         "peers",
-        help="show the heartbeat directory a node exposes at /v1/nodes/seen",
+        help="show the heartbeat directory a node publishes at "
+        "_dnsmesh-seen.<zone>",
     )
     p_peers.add_argument(
         "endpoint",
-        help="HTTP base URL of the node to query (e.g. https://dmp.example.com)",
+        help="DNS zone of the node to query (e.g. dnsmesh.io). A legacy "
+        "URL like https://dnsmesh.io is accepted and the host is used.",
     )
     p_peers.add_argument(
         "--json",
         action="store_true",
-        help="emit the raw JSON payload instead of a human-readable table",
+        help="emit a JSON payload of decoded heartbeat records instead of a table",
     )
     p_peers.add_argument(
         "--timeout",
         type=float,
         default=5.0,
-        help="HTTP timeout in seconds (default: 5)",
+        help="(unused; kept for back-compat with the pre-M9 HTTP form)",
     )
     p_peers.set_defaults(func=cmd_peers)
 

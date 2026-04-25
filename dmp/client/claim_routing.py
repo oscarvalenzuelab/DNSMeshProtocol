@@ -184,12 +184,19 @@ def select_providers(
     for hb in heartbeats:
         if not (hb.capabilities & CAP_CLAIM_PROVIDER):
             continue
-        zone = _zone_from_endpoint(hb.endpoint)
-        # IP-literal endpoints don't expose a DNS zone via host
-        # derivation, but the caller's /v1/info upgrade pass can
-        # still discover the served zone. Keep with zone="".
-        if zone is None:
-            zone = ""
+        # M9.1.1: prefer the operator-advertised `claim_provider_zone`
+        # carried in the signed wire over zone-from-host inference.
+        # The wire is authoritative — it lets a provider serve claims
+        # under a zone that doesn't match its HTTP host (e.g. an HTTPS
+        # endpoint at a CDN-owned hostname while the claim records
+        # live on the operator's own zone). Falls back to host
+        # derivation when the wire's zone field is empty (older
+        # peers / legacy back-compat).
+        advertised = (hb.claim_provider_zone or "").strip().lower()
+        if advertised:
+            zone = advertised
+        else:
+            zone = _zone_from_endpoint(hb.endpoint) or ""
         raw.append(
             ClaimProvider(
                 endpoint=hb.endpoint,
