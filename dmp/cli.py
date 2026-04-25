@@ -875,13 +875,6 @@ def _make_client(
     # local effective domain — back-compat for pre-M5.4 configs.
     for name, entry in config.contacts.items():
         contact_domain = entry.get("domain", "") or effective_domain
-        # `remote_username` overrides the dict-key as the protocol-
-        # level username used for prekey + rotation lookups.
-        # Empty/absent falls back to the dict key (legacy behavior).
-        # Per M8.3 codex round 2 (P2): trusted-intro contacts have
-        # remote_username="" until `dnsmesh identity fetch` fills
-        # it in; downstream protocol code skips lookups gracefully
-        # when username is empty.
         remote_username = entry.get("remote_username", "")
         ok = client.add_contact(
             name,
@@ -889,10 +882,38 @@ def _make_client(
             domain=contact_domain,
             signing_key_hex=entry.get("spk", ""),
         )
-        # Override Contact.username if a remote_username was stored.
-        # add_contact uses `name` (the dict key / local label); the
-        # protocol layer wants the remote name when we have it.
-        if ok and remote_username and name in client.contacts:
+        if not ok or name not in client.contacts:
+            continue
+        # Codex P2 round 5 fix: a trusted-intro contact persisted
+        # WITHOUT a known remote username (the user ran
+        # `dnsmesh intro trust` without --username, and hasn't yet
+        # run identity-fetch to fill it in) needs Contact.username
+        # to remain empty so prekey + rotation-chain lookups skip
+        # gracefully — querying _prekey.<intro-XXX>.<zone> would
+        # always miss. add_contact defaults Contact.username to the
+        # dict key (`name`); for these intro-trust placeholders we
+        # explicitly OVERRIDE with the empty string.
+        #
+        # Detection: pub="" + spk!="" is the unambiguous marker for
+        # the intro-trust origin. Once identity-fetch upgrades the
+        # entry (pub gets filled in), this branch stops matching
+        # and the remote_username (now set) takes precedence below.
+        is_intro_placeholder = (
+            not entry.get("pub", "") and entry.get("spk", "")
+        )
+        if is_intro_placeholder:
+            existing = client.contacts[name]
+            client.contacts[name] = Contact(
+                username=remote_username,  # may be empty intentionally
+                public_key_bytes=existing.public_key_bytes,
+                signing_key_bytes=existing.signing_key_bytes,
+                domain=existing.domain,
+            )
+        elif remote_username:
+            # Normal contact with an explicit remote_username
+            # override (set by `dnsmesh identity fetch --add` after
+            # an intro-trust upgrade, OR by a future flow that
+            # diverges local label from remote name). Honor it.
             existing = client.contacts[name]
             client.contacts[name] = Contact(
                 username=remote_username,
@@ -2176,15 +2197,37 @@ def cmd_send(args: argparse.Namespace) -> int:
         # Empty list (no providers configured / fetchable) means we
         # skip the claim publish; the message itself still goes out.
         claim_providers = _build_claim_providers(cfg)
+        # Codex P2 round 5: collect each claim's success/failure so
+        # we can warn the user when first-contact reach silently
+        # breaks (every claim provider rejected or unreachable).
+        claim_outcomes: List[bool] = []
         ok = client.send_message(
-            args.recipient, args.message, claim_providers=claim_providers
+            args.recipient,
+            args.message,
+            claim_providers=claim_providers,
+            claim_outcomes=claim_outcomes,
         )
         if not ok:
             _die(2, f"send failed (see node logs for details)")
         suffix = ""
         if claim_providers:
-            suffix = f" (+ claim to {len(claim_providers)} provider(s))"
+            ok_count = sum(1 for r in claim_outcomes if r)
+            total = len(claim_outcomes)
+            suffix = f" (+ {ok_count}/{total} claim publishes)"
         print(f"sent → {args.recipient}{suffix}")
+        if claim_providers and not any(claim_outcomes):
+            # Every provider rejected or was unreachable. The
+            # message is still on our zone (cross-zone receivers
+            # who have us pinned will get it), but un-pinned
+            # recipients will never discover it.
+            print(
+                "  WARNING: no claim provider accepted the discovery "
+                "pointer — first-contact reach is unavailable. "
+                "Pin a known provider with `dnsmesh config set "
+                "claim-provider <url>` or check provider "
+                "reachability.",
+                file=sys.stderr,
+            )
         return 0
     finally:
         _close_client(client)

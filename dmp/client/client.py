@@ -431,20 +431,25 @@ class DMPClient:
         *,
         ttl: int = DEFAULT_TTL_SECONDS,
         claim_providers: Sequence[Tuple[str, str]] = (),
+        claim_outcomes: Optional[List[bool]] = None,
     ) -> bool:
         """Send an encrypted message to a pinned contact.
 
         ``claim_providers`` is the ranked list of ``(provider_zone,
         provider_endpoint)`` tuples — typically built by the CLI from
         the recipient's perspective via
-        ``dmp.client.claim_routing.select_providers``. When non-empty
-        AND the recipient's zone differs from ours (cross-zone) OR
-        the recipient's pinned signing key is unknown to us (the
-        recipient may not have us pinned either), we publish a claim
-        record at each provider so an unpinned recipient can still
-        discover the mail. Pure same-zone same-mesh sends (legacy
-        path) skip the claim publish even when providers are passed,
-        because the recipient's normal recv already covers them.
+        ``dmp.client.claim_routing.select_providers``. When non-empty,
+        we publish a claim record at each provider so an unpinned
+        recipient can still discover the mail. Always-on (codex
+        P1 round 2 dropped the same-zone optimization).
+
+        ``claim_outcomes`` is an optional out-parameter: when supplied
+        as a list, each provider's publish result is appended (True
+        on success, False otherwise). The CLI uses this to surface
+        partial-failure cases — codex P2 round 5 caught the bug where
+        send_message silently returned True even when every claim
+        attempt failed, so first-contact reach silently broke for
+        recipients who hadn't pinned the sender.
 
         Claim publish failures do NOT block the underlying message
         delivery: best-effort first-contact reach, not a delivery
@@ -594,7 +599,7 @@ class DMPClient:
         # acceptable for first-contact correctness.
         if claim_providers:
             for provider_zone, provider_endpoint in claim_providers:
-                self.publish_claim(
+                outcome = self.publish_claim(
                     recipient_id=recipient_id,
                     msg_id=msg_id,
                     slot=slot,
@@ -603,6 +608,8 @@ class DMPClient:
                     provider_zone=provider_zone,
                     provider_endpoint=provider_endpoint or "",
                 )
+                if claim_outcomes is not None:
+                    claim_outcomes.append(bool(outcome))
         return True
 
     # ---- receive -----------------------------------------------------------
