@@ -20,4 +20,4 @@
 # this repo just gives the project a public "first directory" so a
 # fresh operator has somewhere to look immediately.
 
-# (no canonical seeds yet; PRs welcome)
+https://dnsmesh.io
