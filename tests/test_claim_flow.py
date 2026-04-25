@@ -401,6 +401,116 @@ class TestIntroQueueCli:
         assert bob.intro_queue.is_blocked(sender_spk)
         assert bob.intro_queue.list_intros() == []
 
+    def test_send_with_claim_providers_publishes_claim(self):
+        """Codex P1 fix: send_message with claim_providers populates the
+        provider's claim namespace."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        ok = alice.send_message(
+            "bob",
+            "first-contact reach via send",
+            claim_providers=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)],
+        )
+        assert ok
+        # The claim is published — bob's recv discovers it without
+        # needing pre-pinned alice.
+        result = bob.receive_claims(
+            provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)]
+        )
+        # Bob hasn't pinned alice → lands in intro queue.
+        assert len(result.quarantined_intro_ids) == 1
+        intros = bob.intro_queue.list_intros()
+        assert intros[0].plaintext == b"first-contact reach via send"
+
+    def test_send_skips_claim_for_same_zone_and_pinned(self):
+        """Codex P1 follow-on: don't pollute providers when the recipient
+        will receive via the normal cross-zone path anyway."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="shared.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="shared.mesh", store=store)
+        # Both same-zone + alice has bob's signing key.
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="shared.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="shared.mesh",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        ok = alice.send_message(
+            "bob",
+            "same-zone, no claim needed",
+            claim_providers=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)],
+        )
+        assert ok
+        # No claim record landed at the provider zone.
+        import hashlib
+
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        bob_hash = hashlib.sha256(bob_recipient_id).hexdigest()[:12]
+        for slot in range(10):
+            name = f"claim-{slot}.mb-{bob_hash}.{PROVIDER_ZONE}"
+            assert not (store.query_txt_record(name) or [])
+
+    def test_receive_messages_picks_up_claim_intros(self):
+        """Codex P1 fix: receive_messages with claim_providers also polls
+        claims and lands un-pinned senders in the intro queue."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        # Alice sends with a claim — bob has not pinned her.
+        alice.send_message(
+            "bob",
+            "intro through receive_messages",
+            claim_providers=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)],
+        )
+        # Single-call recv: pinned mailboxes (none yet) + claim providers.
+        delivered = bob.receive_messages(
+            claim_providers=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)]
+        )
+        # Un-pinned → no inbox delivery, but the intro queue grows.
+        assert delivered == []
+        assert len(bob.intro_queue.list_intros()) == 1
+
+    def test_send_refuses_spk_only_contact(self):
+        """Codex P1 fix: a contact pinned via `intro trust` (spk only)
+        cannot be sent to until X25519 is filled in."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        # Manually pin a spk-only contact (mimics what trust_intro
+        # leaves behind before identity-fetch fills in pub).
+        ok = alice.add_contact(
+            "bob-spk-only",
+            public_key_hex="",
+            domain="bob.mesh",
+            signing_key_hex="aa" * 32,
+        )
+        assert ok
+        # send_message must refuse rather than encrypting to b''.
+        sent = alice.send_message("bob-spk-only", "should fail")
+        assert sent is False
+
     def test_block_then_repoll_drops(self):
         alice, bob, intro_id = self._setup_pending_intro()
         store = bob.reader  # InMemoryDNSStore

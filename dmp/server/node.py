@@ -131,17 +131,27 @@ def _load_claim_provider_zone() -> str:
 
     Resolution order:
 
-      1. ``DMP_CLAIM_PROVIDER_ZONE`` — explicit override.
-      2. ``DMP_CLUSTER_BASE_DOMAIN`` — same zone the cluster manifest
+      1. ``DMP_CLAIM_PROVIDER=0`` (or ``false`` / ``no`` / ``off``)
+         — explicit OPT-OUT. Returns empty string regardless of
+         what other env vars are set; the HTTP handler then 404s
+         POST ``/v1/claim/publish`` and the heartbeat advertises
+         capability 0. Without this check, an operator who set
+         ``DMP_CLUSTER_BASE_DOMAIN`` for the cluster manifest would
+         silently end up hosting claims for arbitrary recipients
+         even after disabling the capability bit.
+      2. ``DMP_CLAIM_PROVIDER_ZONE`` — explicit zone override.
+      3. ``DMP_CLUSTER_BASE_DOMAIN`` — same zone the cluster manifest
          is published under; the natural default for federated
          deployments where one node serves both mailbox and claim
          records under the cluster's public zone.
-      3. ``DMP_DOMAIN`` — single-zone deployments use the same name.
+      4. ``DMP_DOMAIN`` — single-zone deployments use the same name.
 
-    Returns the empty string when none is set; the HTTP handler
-    interprets that as "this node is not a claim provider" and
-    refuses POST /v1/claim/publish with a 404.
+    Returns the empty string when opt-out is in effect or none of
+    the above is set.
     """
+    claim_provider = os.environ.get("DMP_CLAIM_PROVIDER", "").strip().lower()
+    if claim_provider in ("0", "false", "no", "off"):
+        return ""
     for var in (
         "DMP_CLAIM_PROVIDER_ZONE",
         "DMP_CLUSTER_BASE_DOMAIN",

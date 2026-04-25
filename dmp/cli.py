@@ -139,6 +139,14 @@ class CLIConfig:
     # `_make_client` call. Updated by `dnsmesh identity rotate`.
     verify_pubkey: str = ""
 
+    # M8.3 — claim-provider override. When non-empty, send/recv use
+    # this single endpoint as the claim provider, skipping seen-feed
+    # ranking. Use case: pin all first-contact reach through a known
+    # node (e.g. dnsmesh.io). The zone is auto-derived from the URL
+    # host unless `claim_provider_zone` is also set.
+    claim_provider_override: str = ""
+    claim_provider_zone: str = ""
+
     @classmethod
     def load(cls, path: Path) -> "CLIConfig":
         if not path.exists():
@@ -195,6 +203,8 @@ class CLIConfig:
             bootstrap_user_domain=data.get("bootstrap_user_domain", "") or "",
             bootstrap_signer_spk=data.get("bootstrap_signer_spk", "") or "",
             contacts=contacts,
+            claim_provider_override=data.get("claim_provider_override", "") or "",
+            claim_provider_zone=data.get("claim_provider_zone", "") or "",
         )
 
     def save(self, path: Path) -> None:
@@ -866,6 +876,90 @@ def _make_client(
             signing_key_hex=entry.get("spk", ""),
         )
     return client
+
+
+def _build_claim_providers(cfg: "CLIConfig") -> List[Tuple[str, str]]:
+    """Build the ranked claim-provider list for send/recv (M8.3).
+
+    Resolution order:
+
+      1. ``cfg.claim_provider_override`` — explicit pin. Returned as
+         a single ``(zone, endpoint)`` tuple; ``zone`` defaults to
+         the URL host unless ``cfg.claim_provider_zone`` is also set.
+      2. Fetch the home node's ``/v1/nodes/seen`` over HTTP, rank by
+         SeenStore recency via
+         :mod:`dmp.client.claim_routing`, and for each candidate try
+         the provider's ``/v1/info`` to confirm the actual served
+         zone (codex P2: a provider whose claim zone differs from
+         its HTTP host would otherwise be unreachable). On
+         ``/v1/info`` failure, fall back to host-derived zone.
+      3. On any exception (no endpoint, network down, malformed
+         JSON), return ``[]``. Send/recv handle empty lists by
+         skipping claim publish/poll — first-contact reach degrades
+         gracefully to "pinned-only" mode.
+
+    Returns a list of ``(provider_zone, provider_endpoint)`` tuples
+    suitable for passing into ``send_message(claim_providers=...)``
+    or ``receive_messages(claim_providers=...)``.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    from dmp.client.claim_routing import (
+        DEFAULT_K,
+        parse_seen_feed,
+        select_providers,
+    )
+
+    if cfg.claim_provider_override:
+        out = select_providers(
+            [],
+            override=cfg.claim_provider_override,
+            override_zone=cfg.claim_provider_zone or None,
+        )
+        return [(p.zone, p.endpoint) for p in out]
+
+    if not cfg.endpoint:
+        return []
+    seen_url = cfg.endpoint.rstrip("/") + "/v1/nodes/seen"
+    try:
+        with urllib.request.urlopen(seen_url, timeout=5) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+        return []
+    seen_wires = [
+        entry.get("wire", "") for entry in data.get("seen", []) if isinstance(entry, dict)
+    ]
+    heartbeats = parse_seen_feed(seen_wires)
+    providers = select_providers(heartbeats, k=DEFAULT_K)
+
+    # /v1/info upgrade pass: ask each provider what zone it actually
+    # serves under, override the host-derived zone when the response
+    # is well-formed. Drop providers whose /v1/info advertises an
+    # empty claim_provider_zone (operator opted out).
+    out: List[Tuple[str, str]] = []
+    for p in providers:
+        info_url = p.endpoint.rstrip("/") + "/v1/info"
+        zone = p.zone
+        try:
+            with urllib.request.urlopen(info_url, timeout=2) as resp:
+                info = json.loads(resp.read())
+            advertised = info.get("claim_provider_zone", "")
+            if advertised == "":
+                # Provider explicitly opted out (DMP_CLAIM_PROVIDER=0)
+                # — skip even though their heartbeat advertised the
+                # capability. Heartbeat staleness can lag opt-out.
+                continue
+            zone = advertised
+        except (urllib.error.URLError, json.JSONDecodeError, OSError):
+            # /v1/info unreachable — fall back to host-derived zone.
+            # That's only correct when the provider serves claims
+            # under their HTTP hostname; for legacy / single-zone
+            # deployments this is true.
+            pass
+        out.append((zone, p.endpoint))
+    return out
 
 
 def _close_client(client: DMPClient) -> None:
@@ -1954,10 +2048,19 @@ def cmd_send(args: argparse.Namespace) -> int:
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
     try:
-        ok = client.send_message(args.recipient, args.message)
+        # M8.3 — build the claim-provider list once per CLI invocation.
+        # Empty list (no providers configured / fetchable) means we
+        # skip the claim publish; the message itself still goes out.
+        claim_providers = _build_claim_providers(cfg)
+        ok = client.send_message(
+            args.recipient, args.message, claim_providers=claim_providers
+        )
         if not ok:
             _die(2, f"send failed (see node logs for details)")
-        print(f"sent → {args.recipient}")
+        suffix = ""
+        if claim_providers:
+            suffix = f" (+ claim to {len(claim_providers)} provider(s))"
+        print(f"sent → {args.recipient}{suffix}")
         return 0
     finally:
         _close_client(client)
@@ -2081,8 +2184,15 @@ def cmd_recv(args: argparse.Namespace) -> int:
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
     try:
-        inbox = client.receive_messages()
-        if not inbox:
+        # M8.3 — also poll claim providers in the same recv pass.
+        # Pinned-sender claims roll into `inbox`; un-pinned ones land
+        # in the intro queue (`dnsmesh intro list` to review).
+        claim_providers = _build_claim_providers(cfg)
+        intro_queue_size_before = len(client.intro_queue.list_intros())
+        inbox = client.receive_messages(claim_providers=claim_providers)
+        intro_queue_size_after = len(client.intro_queue.list_intros())
+        new_intros = intro_queue_size_after - intro_queue_size_before
+        if not inbox and new_intros == 0:
             print("(no new messages)")
             return 0
 
@@ -2112,6 +2222,11 @@ def cmd_recv(args: argparse.Namespace) -> int:
             except UnicodeDecodeError:
                 print(f"  (binary, {len(msg.plaintext)} bytes)")
             print()
+        if new_intros > 0:
+            print(
+                f"({new_intros} new intro(s) from un-pinned senders — "
+                "review with `dnsmesh intro list`)"
+            )
         return 0
     finally:
         _close_client(client)

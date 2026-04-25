@@ -623,6 +623,73 @@ class TestSendReceive:
         assert bob.receive_messages() == []
 
 
+class TestSpkOnlyContact:
+    """Codex M8.3 P1 fix: a contact pinned via intro_trust may have spk
+    but no X25519 pub yet. add_contact must accept it; send_message
+    must refuse it; receive walks its zone."""
+
+    def test_add_contact_accepts_spk_only(self):
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        ok = alice.add_contact(
+            "spk-only-friend",
+            public_key_hex="",
+            domain="friend.mesh",
+            signing_key_hex="bb" * 32,
+        )
+        assert ok
+        contact = alice.contacts["spk-only-friend"]
+        assert contact.public_key_bytes == b""
+        assert contact.signing_key_bytes == bytes.fromhex("bb" * 32)
+        assert contact.domain == "friend.mesh"
+
+    def test_add_contact_rejects_no_keys_at_all(self):
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        # Empty pub AND empty spk — nothing useful to pin.
+        assert (
+            alice.add_contact("ghost", public_key_hex="", domain="g.mesh")
+            is False
+        )
+
+    def test_recv_walks_spk_only_contact_zone(self):
+        """An spk-only pinned contact still gets their zone polled."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+
+        # Bob pins alice with full keys.
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.mesh",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        # Now bob ALSO has an spk-only contact at a different zone —
+        # this would happen after `intro trust` before `identity fetch`.
+        bob.add_contact(
+            "future-friend",
+            public_key_hex="",
+            domain="future.mesh",
+            signing_key_hex="cc" * 32,
+        )
+
+        # Alice sends; bob receives. Bob's _zones_to_poll now includes
+        # alice.mesh, future.mesh, and bob.mesh (own). Test that recv
+        # still works on the alice path despite the spk-only entry.
+        alice.send_message("bob", "still works")
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"still works"
+
+
 class TestCrossZoneReceive:
     """M8.1 — receive walks pinned contacts' zones, not just self.domain.
 

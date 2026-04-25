@@ -198,17 +198,36 @@ class DMPClient:
     ) -> bool:
         """Pin a contact.
 
+        `public_key_hex` is the X25519 encryption key (32 bytes hex).
+        Empty string is permitted ONLY when `signing_key_hex` is set —
+        the M8.3 ``dnsmesh intro trust`` flow pins a sender's Ed25519
+        identity from an intro queue entry without yet knowing their
+        X25519 pubkey; the user fills it in later via
+        ``dnsmesh identity fetch user@host --add``. With pub empty,
+        the contact is "spk-pin only": receive accepts manifests
+        signed by `signing_key_bytes` (so cross-zone walks pull from
+        their zone), but ``send_message`` refuses (no ECDH target).
+
         `signing_key_hex` is optional for back-compat with configs that
         predate Ed25519 pinning. When empty, incoming manifests from any
         signer will be accepted on first delivery (TOFU); when present,
         only manifests whose `sender_spk` matches are delivered.
         """
-        try:
-            public_key_bytes = bytes.fromhex(public_key_hex)
-        except ValueError:
+        # Allow an empty `public_key_hex` only when the caller has at
+        # least pinned a signing key — otherwise this is just a name
+        # with no cryptographic content and we have nothing useful
+        # to do with it.
+        if not public_key_hex and not signing_key_hex:
             return False
-        if len(public_key_bytes) != 32:
-            return False
+        if public_key_hex:
+            try:
+                public_key_bytes = bytes.fromhex(public_key_hex)
+            except ValueError:
+                return False
+            if len(public_key_bytes) != 32:
+                return False
+        else:
+            public_key_bytes = b""
 
         if signing_key_hex:
             try:
@@ -411,9 +430,35 @@ class DMPClient:
         message: str,
         *,
         ttl: int = DEFAULT_TTL_SECONDS,
+        claim_providers: Sequence[Tuple[str, str]] = (),
     ) -> bool:
+        """Send an encrypted message to a pinned contact.
+
+        ``claim_providers`` is the ranked list of ``(provider_zone,
+        provider_endpoint)`` tuples — typically built by the CLI from
+        the recipient's perspective via
+        ``dmp.client.claim_routing.select_providers``. When non-empty
+        AND the recipient's zone differs from ours (cross-zone) OR
+        the recipient's pinned signing key is unknown to us (the
+        recipient may not have us pinned either), we publish a claim
+        record at each provider so an unpinned recipient can still
+        discover the mail. Pure same-zone same-mesh sends (legacy
+        path) skip the claim publish even when providers are passed,
+        because the recipient's normal recv already covers them.
+
+        Claim publish failures do NOT block the underlying message
+        delivery: best-effort first-contact reach, not a delivery
+        guarantee.
+        """
         contact = self.contacts.get(recipient_username)
         if contact is None:
+            return False
+        if not contact.public_key_bytes:
+            # M8.3 — a contact pinned via `dnsmesh intro trust` may
+            # carry only the Ed25519 spk (recv-pin) until the user
+            # runs `identity fetch` to populate the X25519 pubkey.
+            # Refuse to send rather than silently encrypting to a
+            # zero key.
             return False
 
         recipient_id = hashlib.sha256(contact.public_key_bytes).digest()
@@ -529,11 +574,35 @@ class DMPClient:
         # msg_id so recipients see a roughly-even RRset distribution instead
         # of a single crowded slot.
         slot = int.from_bytes(msg_id[:4], "big") % SLOT_COUNT
-        return self.writer.publish_txt_record(
+        ok = self.writer.publish_txt_record(
             self._slot_domain(recipient_id, slot),
             slot_record,
             ttl=ttl,
         )
+        if not ok:
+            return False
+
+        # M8.3 — first-contact reach. If the recipient may not have us
+        # pinned (different zone, or no signing-key match in our
+        # contacts so they probably don't have ours pinned either),
+        # publish a claim to each provider so their recv can discover
+        # this message. Same-zone + mutually-pinned pairs skip — the
+        # normal recv path (M8.1) already covers them, and dropping a
+        # claim there would just inflate the namespace pointlessly.
+        if claim_providers:
+            cross_zone = bool(contact.domain) and contact.domain != self.domain
+            unpinned_by_them = not bool(contact.signing_key_bytes)
+            if cross_zone or unpinned_by_them:
+                for provider_zone, _provider_endpoint in claim_providers:
+                    self.publish_claim(
+                        recipient_id=recipient_id,
+                        msg_id=msg_id,
+                        slot=slot,
+                        sender_mailbox_domain=self.domain,
+                        ttl=ttl,
+                        provider_zone=provider_zone,
+                    )
+        return True
 
     # ---- receive -----------------------------------------------------------
 
@@ -569,7 +638,11 @@ class DMPClient:
             zones.append(self.domain)
         return zones
 
-    def receive_messages(self) -> List[InboxMessage]:
+    def receive_messages(
+        self,
+        *,
+        claim_providers: Sequence[Tuple[str, str]] = (),
+    ) -> List[InboxMessage]:
         """Poll all mailbox slots; verify and decrypt any fresh messages.
 
         Walks each zone in `_zones_to_poll()` — pinned contacts' zones plus
@@ -653,6 +726,15 @@ class DMPClient:
                             msg_id=msg_id,
                         )
                     )
+        # M8.3 — poll claim providers for first-contact pointers in
+        # the same pass. Pinned-sender claims roll into `results`;
+        # un-pinned ones land in the intro queue (visible via
+        # `dnsmesh intro list`). Caller-provided empty providers list
+        # skips claim polling entirely — preserves the legacy
+        # behavior for callers that haven't migrated.
+        if claim_providers:
+            claim_result = self.receive_claims(provider_zones=claim_providers)
+            results.extend(claim_result.delivered)
         return results
 
     # ---- claims (M8.3) -----------------------------------------------------
