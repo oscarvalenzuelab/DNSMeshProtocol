@@ -98,25 +98,25 @@ class TestInitAndIdentity:
         self, config_home, tmp_path, monkeypatch
     ):
         """Two independent `dnsmesh init` runs must produce distinct salts."""
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         first = yaml.safe_load((config_home / "config.yaml").read_text())["kdf_salt"]
 
         other_home = tmp_path / "dmp-other"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(other_home))
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         second = yaml.safe_load((other_home / "config.yaml").read_text())["kdf_salt"]
 
         assert first != second
 
     def test_init_refuses_overwrite_without_force(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://a"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://a"])
         with pytest.raises(SystemExit) as exc:
-            cli.main(["init", "bob", "--endpoint", "http://b"])
+            cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://b"])
         assert exc.value.code == 1
 
     def test_init_force_overwrites(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://a"])
-        rc = cli.main(["init", "bob", "--endpoint", "http://b", "--force"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://a"])
+        rc = cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://b", "--force"])
         assert rc == 0
         cfg = yaml.safe_load((config_home / "config.yaml").read_text())
         assert cfg["username"] == "bob"
@@ -124,7 +124,7 @@ class TestInitAndIdentity:
     def test_identity_show_prints_keys(
         self, config_home, shared_store, monkeypatch, capsys
     ):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "pw")
         rc = cli.main(["identity", "show"])
         assert rc == 0
@@ -134,7 +134,7 @@ class TestInitAndIdentity:
         assert "signing_public_key:" in out
 
     def test_identity_show_json(self, config_home, shared_store, monkeypatch, capsys):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()  # flush init output
         monkeypatch.setenv("DMP_PASSPHRASE", "pw")
         cli.main(["identity", "show", "--json"])
@@ -154,7 +154,7 @@ class TestIdentityPublishFetch:
     ):
         """alice publishes, a second invocation as bob can fetch and add her."""
         # Alice sets up + publishes.
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         cli.main(["identity", "publish"])
@@ -164,7 +164,7 @@ class TestIdentityPublishFetch:
         # fetches alice's record and verifies it.
         bob_home = config_home.parent / "bob-home"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
-        cli.main(["init", "bob", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         cli.main(["identity", "fetch", "alice", "--json"])
@@ -177,14 +177,14 @@ class TestIdentityPublishFetch:
     def test_fetch_add_stores_contact(
         self, config_home, shared_store, monkeypatch, capsys
     ):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         cli.main(["identity", "publish"])
         capsys.readouterr()
 
         bob_home = config_home.parent / "bob-home-2"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
-        cli.main(["init", "bob", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         capsys.readouterr()
 
@@ -198,7 +198,7 @@ class TestIdentityPublishFetch:
     def test_fetch_missing_identity_errors(
         self, config_home, shared_store, monkeypatch
     ):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         with pytest.raises(SystemExit) as exc:
             cli.main(["identity", "fetch", "nobody"])
@@ -230,7 +230,7 @@ class TestIdentityPublishFetch:
         # Bob fetches via the zone-anchored address.
         bob_home = config_home.parent / "bob-zone"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
-        cli.main(["init", "bob", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         capsys.readouterr()
 
@@ -271,7 +271,7 @@ class TestIdentityPublishFetch:
         # Bob (different local domain) fetches + adds.
         bob_home = config_home.parent / "bob-cross-zone"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
-        cli.main(["init", "bob", "--endpoint", "http://x", "--domain", "bob.local"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x", "--domain", "bob.local"])
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         capsys.readouterr()
 
@@ -309,7 +309,7 @@ class TestIdentityPublishFetch:
         )
 
         # carol tries `dmp identity fetch alice@alice.example.com --add`.
-        cli.main(["init", "carol", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "carol", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "carol-pass")
         capsys.readouterr()
 
@@ -331,7 +331,7 @@ class TestIdentityPublishFetch:
         from dmp.core.identity import identity_domain, make_record
 
         # Real alice publishes her identity.
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         cli.main(["identity", "publish"])
@@ -347,7 +347,7 @@ class TestIdentityPublishFetch:
         # Bob tries to fetch alice. Two records; auto-pick refused.
         bob_home = config_home.parent / "bob-squat-home"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
-        cli.main(["init", "bob", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         capsys.readouterr()
 
@@ -370,7 +370,7 @@ class TestIdentityRotateExperimental:
     def test_rotate_without_flag_errors(
         self, config_home, shared_store, monkeypatch, capsys
     ):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
         with pytest.raises(SystemExit) as exc:
@@ -389,7 +389,7 @@ class TestIdentityRotateExperimental:
         auto-follow workflow. Routine = rotation only; contacts pick
         up the new key via chain walk.
         """
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
@@ -423,7 +423,7 @@ class TestIdentityRotateExperimental:
         is compromised, auto-follow would be unsafe) and makes
         non-rotation-aware fetchers filter the old IdentityRecord.
         """
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
@@ -467,7 +467,7 @@ class TestIdentityRotateExperimental:
             rotation_rrset_name_user_identity,
         )
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
 
         pp1 = tmp_path / "pp1.pp"
@@ -551,7 +551,7 @@ class TestIdentityRotateExperimental:
     def test_rotate_rejects_same_passphrase(
         self, config_home, shared_store, monkeypatch, capsys
     ):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-pass")
         with pytest.raises(SystemExit) as exc:
@@ -561,7 +561,7 @@ class TestIdentityRotateExperimental:
     def test_rotate_warning_banner_emitted(
         self, config_home, shared_store, monkeypatch, capsys
     ):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
@@ -587,7 +587,7 @@ class TestIdentityRotateExperimental:
             rotation_rrset_name_user_identity,
         )
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
 
         # Seed the old passphrase via file (so we drive the full
@@ -663,7 +663,7 @@ class TestIdentityRotateExperimental:
         identity. The warning text names the culprit env var so the
         fix is obvious.
         """
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
 
         old_pp_file = tmp_path / "old.pp"
@@ -711,7 +711,7 @@ class TestIdentityRotateExperimental:
         """DMP_PASSPHRASE unset: --yes --new-passphrase-file exits 0
         with no env-mismatch warning (the only other path to
         `_load_passphrase` is the file, which we've already rewritten)."""
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
 
         old_pp_file = tmp_path / "old.pp"
@@ -754,7 +754,7 @@ class TestIdentityRotateExperimental:
             rotation_rrset_name_user_identity,
         )
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         monkeypatch.setenv("DMP_NEW_PASSPHRASE", "alice-new-pass")
@@ -793,7 +793,7 @@ class TestIdentityRotateExperimental:
         from dmp.core.crypto import DMPCrypto
         from dmp.core.identity import identity_domain, make_record
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
 
         # Derive the OLD identity with the salt that `cmd_identity_rotate`
@@ -835,7 +835,7 @@ class TestIdentityRotateExperimental:
         # With the revocation filter the OLD one is dropped.
         bob_home = config_home.parent / "bob-revoke-filter"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
-        cli.main(["init", "bob", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
 
@@ -869,7 +869,7 @@ class TestIdentityRotateExperimental:
         from dmp.core.crypto import DMPCrypto
         from dmp.core.identity import identity_domain, make_record
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
 
         # Publish the OLD IdentityRecord under the SAME salt rotate uses
@@ -897,7 +897,7 @@ class TestIdentityRotateExperimental:
         # old_spk. A correct fetch picks the new key.
         bob_home = config_home.parent / "bob-routine-chain"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
-        cli.main(["init", "bob", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
 
@@ -923,7 +923,7 @@ class TestIdentityRotateExperimental:
         from dmp.core.identity import identity_domain, make_record
 
         # Real alice publishes.
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         cli.main(["identity", "publish"])
@@ -937,7 +937,7 @@ class TestIdentityRotateExperimental:
 
         bob_home = config_home.parent / "bob-concurrent"
         monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
-        cli.main(["init", "bob", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         capsys.readouterr()
 
@@ -950,7 +950,7 @@ class TestIdentityRotateExperimental:
 
 class TestContacts:
     def test_add_and_list(self, config_home, capsys):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         pubkey = "a" * 64
         rc = cli.main(["contacts", "add", "bob", pubkey])
         assert rc == 0
@@ -958,13 +958,13 @@ class TestContacts:
         assert "bob" in capsys.readouterr().out
 
     def test_add_rejects_short_key(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         with pytest.raises(SystemExit) as exc:
             cli.main(["contacts", "add", "bob", "aabb"])
         assert exc.value.code == 1
 
     def test_list_empty(self, config_home, capsys):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         cli.main(["contacts", "list"])
         assert "no contacts" in capsys.readouterr().out
 
@@ -974,7 +974,7 @@ class TestSendRecv:
         self, config_home, shared_store, monkeypatch, capsys
     ):
         # Set up alice's config.
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
 
         # Discover bob's pubkey by spinning up a client in the same store.
@@ -986,7 +986,7 @@ class TestSendRecv:
         assert "sent" in capsys.readouterr().out
 
         # Switch "identity" to bob and read.
-        cli.main(["init", "bob", "--endpoint", "http://x", "--force"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x", "--force"])
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         cli.main(["recv"])
         out = capsys.readouterr().out
@@ -995,14 +995,14 @@ class TestSendRecv:
     def test_send_unknown_recipient_errors(
         self, config_home, shared_store, monkeypatch
     ):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "pw")
         with pytest.raises(SystemExit) as exc:
             cli.main(["send", "ghost", "hi"])
         assert exc.value.code == 1
 
     def test_recv_empty_inbox(self, config_home, shared_store, monkeypatch, capsys):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         monkeypatch.setenv("DMP_PASSPHRASE", "pw")
         cli.main(["recv"])
         assert "no new messages" in capsys.readouterr().out
@@ -1012,7 +1012,7 @@ class TestSendRecv:
     ):
         """Persistent replay cache: second `dmp recv` in a fresh process
         doesn't re-deliver what was already delivered."""
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
 
@@ -1025,7 +1025,7 @@ class TestSendRecv:
         capsys.readouterr()
 
         # bob's CLI reads once
-        cli.main(["init", "bob", "--endpoint", "http://x", "--force"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x", "--force"])
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         capsys.readouterr()
         cli.main(["recv"])
@@ -1169,7 +1169,7 @@ class TestDnsResolvers:
         up front so the loader treats it as a one-element list.
         """
         # Init a valid config first so the file exists.
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         cfg_path = config_home / "config.yaml"
         data = yaml.safe_load(cfg_path.read_text())
         # Simulate the hand-edit: YAML scalar, not a list.
@@ -1278,6 +1278,7 @@ class TestDnsResolvers:
         cli.main(
             [
                 "init",
+                "--no-default-resolvers",
                 "alice",
                 "--endpoint",
                 "http://x",
@@ -1320,7 +1321,7 @@ class TestDnsResolvers:
         cli.main(["send", "bob", "legacy hi"])
         assert "sent" in capsys.readouterr().out
 
-        cli.main(["init", "bob", "--endpoint", "http://x", "--force"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x", "--force"])
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
         cli.main(["recv"])
         assert "legacy hi" in capsys.readouterr().out
@@ -1382,7 +1383,7 @@ class TestResolversCommand:
         monkeypatch.setattr(cli.ResolverPool, "discover", staticmethod(fake_discover))
 
     def test_discover_prints_working_list(self, config_home, monkeypatch, capsys):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9"])
 
@@ -1396,7 +1397,7 @@ class TestResolversCommand:
     def test_discover_without_save_does_not_touch_config(
         self, config_home, monkeypatch, capsys
     ):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         cfg_path = config_home / "config.yaml"
         before = yaml.safe_load(cfg_path.read_text())
@@ -1409,7 +1410,7 @@ class TestResolversCommand:
         assert after.get("dns_resolvers", []) == []
 
     def test_discover_with_save_writes_config(self, config_home, monkeypatch, capsys):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9", "8.8.8.8"])
 
@@ -1422,7 +1423,7 @@ class TestResolversCommand:
         assert cfg["dns_resolvers"] == ["1.1.1.1", "9.9.9.9", "8.8.8.8"]
 
     def test_discover_save_then_list_shows_them(self, config_home, monkeypatch, capsys):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         self._stub_discover(monkeypatch, ["1.1.1.1", "9.9.9.9"])
         cli.main(["resolvers", "discover", "--save"])
@@ -1434,7 +1435,7 @@ class TestResolversCommand:
         assert "9.9.9.9" in out
 
     def test_list_without_saved_resolvers_prints_hint(self, config_home, capsys):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         cli.main(["resolvers", "list"])
         out = capsys.readouterr().out
@@ -1454,7 +1455,7 @@ class TestResolversCommand:
     ):
         """Every probe failed -> ResolverPool.discover raises ValueError,
         CLI surfaces it as exit code 2 (network/backend error)."""
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         self._stub_discover(monkeypatch, [])
         with pytest.raises(SystemExit) as exc:
             cli.main(["resolvers", "discover"])
@@ -1507,7 +1508,7 @@ class TestClusterCommand:
         return op, manifest.sign(op), manifest
 
     def test_cluster_pin_writes_config(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         rc = cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1517,13 +1518,13 @@ class TestClusterCommand:
         assert cfg["cluster_base_domain"] == "mesh.example.com"
 
     def test_cluster_pin_rejects_bad_hex(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         with pytest.raises(SystemExit) as exc:
             cli.main(["cluster", "pin", "not-hex", "mesh.example.com"])
         assert exc.value.code == 1
 
     def test_cluster_pin_rejects_wrong_length(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         # 16-byte hex (too short for Ed25519)
         with pytest.raises(SystemExit) as exc:
             cli.main(["cluster", "pin", "aa" * 16, "mesh.example.com"])
@@ -1533,7 +1534,7 @@ class TestClusterCommand:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
 
         op, wire, manifest = self._build_signed_manifest(n_nodes=2)
@@ -1555,7 +1556,7 @@ class TestClusterCommand:
         assert "n02" in out
 
     def test_cluster_fetch_without_pin_errors(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         with pytest.raises(SystemExit) as exc:
             cli.main(["cluster", "fetch"])
         assert exc.value.code == 1
@@ -1563,7 +1564,7 @@ class TestClusterCommand:
     def test_cluster_fetch_nothing_published_exits_2(self, config_home, monkeypatch):
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1581,7 +1582,7 @@ class TestClusterCommand:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1599,7 +1600,7 @@ class TestClusterCommand:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         capsys.readouterr()
         op, wire, manifest = self._build_signed_manifest(n_nodes=3)
         hex_spk = op.get_signing_public_key_bytes().hex()
@@ -1669,7 +1670,7 @@ class TestClusterEnableDisable:
         """Bare `cluster pin` leaves cluster_enabled=False even with both
         anchors set; `_cluster_mode_enabled` returns False; a subsequent
         `_make_client` uses the legacy single-endpoint path."""
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1707,7 +1708,7 @@ class TestClusterEnableDisable:
     def test_enable_requires_both_anchors(self, config_home, capsys):
         """`cluster enable` with no anchors pinned exits 1 with a clear
         error and does NOT flip cluster_enabled."""
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         with pytest.raises(SystemExit) as exc:
             cli.main(["cluster", "enable"])
         assert exc.value.code == 1
@@ -1724,7 +1725,7 @@ class TestClusterEnableDisable:
         tells the operator how to diagnose."""
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1750,7 +1751,7 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         op, wire, manifest = self._build_signed_manifest(n_nodes=2)
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1798,7 +1799,7 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1840,7 +1841,7 @@ class TestClusterEnableDisable:
     def test_disable_idempotent_when_already_disabled(self, config_home, capsys):
         """Running `cluster disable` on a never-enabled config is a
         no-op that exits 0 and reports current state."""
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         capsys.readouterr()
         rc = cli.main(["cluster", "disable"])
         assert rc == 0
@@ -1855,7 +1856,7 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1890,7 +1891,7 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1913,7 +1914,7 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1945,7 +1946,7 @@ class TestClusterEnableDisable:
         from dmp.core.cluster import cluster_rrset_name
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://legacy.example"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://legacy.example"])
         op, wire, manifest = self._build_signed_manifest()
         hex_spk = op.get_signing_public_key_bytes().hex()
         cli.main(["cluster", "pin", hex_spk, "mesh.example.com"])
@@ -1968,7 +1969,7 @@ class TestClusterConfigPersistence:
     """CLIConfig round-trips the new cluster_* fields."""
 
     def test_defaults_present_on_fresh_init(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         cfg = yaml.safe_load((config_home / "config.yaml").read_text())
         # Empty / default values should be present in the serialized
         # config so post-upgrade loads don't KeyError.
@@ -2076,7 +2077,7 @@ class TestClusterModeInMakeClient:
 
         monkeypatch.setattr(cli, "_make_reader", lambda cfg: _StoreReader())
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         cli.main(
             [
                 "cluster",
@@ -2124,7 +2125,7 @@ class TestClusterModeInMakeClient:
 
     def test_make_client_legacy_path_unchanged(self, config_home, monkeypatch):
         """A config WITHOUT cluster_base_domain still uses single-endpoint mode."""
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         cfg = cli.CLIConfig.load(config_home / "config.yaml")
         assert cfg.cluster_base_domain == ""
         # Build a client — should not attempt cluster fetch.
@@ -2300,7 +2301,7 @@ class TestLocalOnlyClusterBootstrap:
         from dmp.core.crypto import DMPCrypto
 
         # Pin a cluster (both anchors set -> cluster mode on after enable).
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         op = DMPCrypto()
         cli.main(
             [
@@ -2334,7 +2335,7 @@ class TestLocalOnlyClusterBootstrap:
 
         from dmp.core.crypto import DMPCrypto
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         op = DMPCrypto()
         cli.main(
             [
@@ -2364,7 +2365,7 @@ class TestLocalOnlyClusterBootstrap:
         would hide real breakage."""
         from dmp.core.crypto import DMPCrypto
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         op = DMPCrypto()
         cli.main(
             [
@@ -2418,7 +2419,7 @@ class TestLocalOnlyClusterBootstrap:
         import dmp.cli as cli_mod
         from dmp.core.crypto import DMPCrypto
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         op = DMPCrypto()
         cli.main(
             [
@@ -2526,7 +2527,7 @@ class TestBootstrapCommand:
     def test_bootstrap_pin_writes_config(self, config_home):
         from dmp.core.crypto import DMPCrypto
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
         hex_spk = signer.get_signing_public_key_bytes().hex()
         rc = cli.main(["bootstrap", "pin", "example.com", hex_spk])
@@ -2541,7 +2542,7 @@ class TestBootstrapCommand:
         import dmp.cli as cli_mod
         from dmp.core.crypto import DMPCrypto
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
 
         def boom_fetch(*args, **kwargs):  # pragma: no cover
@@ -2561,7 +2562,7 @@ class TestBootstrapCommand:
     def test_bootstrap_pin_rejects_malformed_user_domain(self, config_home):
         from dmp.core.crypto import DMPCrypto
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
         hex_spk = signer.get_signing_public_key_bytes().hex()
         # Leading dot — _validate_dns_name rejects.
@@ -2570,13 +2571,13 @@ class TestBootstrapCommand:
         assert exc.value.code == 1
 
     def test_bootstrap_pin_rejects_bad_hex(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         with pytest.raises(SystemExit) as exc:
             cli.main(["bootstrap", "pin", "example.com", "not-hex"])
         assert exc.value.code == 1
 
     def test_bootstrap_pin_rejects_wrong_length(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         # 16-byte hex (too short for Ed25519).
         with pytest.raises(SystemExit) as exc:
             cli.main(["bootstrap", "pin", "example.com", "aa" * 16])
@@ -2589,7 +2590,7 @@ class TestBootstrapCommand:
         from dmp.core.crypto import DMPCrypto
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
         hex_spk = signer.get_signing_public_key_bytes().hex()
         cli.main(["bootstrap", "pin", "example.com", hex_spk])
@@ -2628,7 +2629,7 @@ class TestBootstrapCommand:
         assert "backup.example.com" in out
 
     def test_bootstrap_fetch_without_pin_errors(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         with pytest.raises(SystemExit) as exc:
             cli.main(["bootstrap", "fetch"])
         assert exc.value.code == 1
@@ -2637,7 +2638,7 @@ class TestBootstrapCommand:
         from dmp.core.crypto import DMPCrypto
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
         cli.main(
             [
@@ -2659,7 +2660,7 @@ class TestBootstrapCommand:
         """Reader that raises on query → treated as unreachable → exit 2."""
         from dmp.core.crypto import DMPCrypto
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
         cli.main(
             [
@@ -2687,7 +2688,7 @@ class TestBootstrapCommand:
         from dmp.core.crypto import DMPCrypto
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
         hex_spk = signer.get_signing_public_key_bytes().hex()
         store = InMemoryDNSStore()
@@ -2729,7 +2730,7 @@ class TestBootstrapCommand:
         from dmp.core.crypto import DMPCrypto
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
         hex_spk = signer.get_signing_public_key_bytes().hex()
         cli.main(["bootstrap", "pin", "example.com", hex_spk])
@@ -2771,7 +2772,7 @@ class TestBootstrapCommand:
     ):
         """discover without a pin for the host AND without --signer-spk
         must exit 1 with a clear error."""
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         with pytest.raises(SystemExit) as exc:
             cli.main(["bootstrap", "discover", "alice@example.com"])
         assert exc.value.code == 1
@@ -2785,7 +2786,7 @@ class TestBootstrapCommand:
         from dmp.core.crypto import DMPCrypto
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
         hex_spk = signer.get_signing_public_key_bytes().hex()
         cli.main(["bootstrap", "pin", "example.com", hex_spk])
@@ -2837,7 +2838,7 @@ class TestBootstrapCommand:
         from dmp.core.crypto import DMPCrypto
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         signer = DMPCrypto()
         hex_spk = signer.get_signing_public_key_bytes().hex()
         cli.main(["bootstrap", "pin", "example.com", hex_spk])
@@ -2878,7 +2879,7 @@ class TestBootstrapCommand:
         assert cfg.bootstrap_signer_spk == hex_spk
 
     def test_bootstrap_discover_rejects_bad_address(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         with pytest.raises(SystemExit) as exc:
             cli.main(["bootstrap", "discover", "no-at-sign"])
         assert exc.value.code == 1
@@ -2886,7 +2887,7 @@ class TestBootstrapCommand:
     # ----------------------------------------------------------- config persistence
 
     def test_config_defaults_include_bootstrap_fields(self, config_home):
-        cli.main(["init", "alice", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         cfg = yaml.safe_load((config_home / "config.yaml").read_text())
         assert cfg.get("bootstrap_user_domain", "") == ""
         assert cfg.get("bootstrap_signer_spk", "") == ""
@@ -2929,7 +2930,7 @@ class TestBootstrapCommand:
         )
         from dmp.network.memory import InMemoryDNSStore
 
-        cli.main(["init", "bob", "--endpoint", "http://x"])
+        cli.main(["init", "--no-default-resolvers", "bob", "--endpoint", "http://x"])
         signer = DMPCrypto()  # zone operator for example.com
         cluster_op = DMPCrypto()  # cluster operator
         cli.main(

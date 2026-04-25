@@ -7,6 +7,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.5] — `dnsmesh init` defaults dns_resolvers to 1.1.1.1 + 8.8.8.8
+
+### Changed
+
+- **`dnsmesh init` now writes `dns_resolvers: [1.1.1.1, 8.8.8.8]`** to
+  the generated config by default. Previously it left the list empty
+  and the CLI fell back to the system resolver, which often has stale
+  negative caches (e.g. NXDOMAIN cached from before a delegation
+  existed). Cloudflare first because their stated privacy posture is
+  tighter than Google's; Google second for failover.
+- New `--no-default-resolvers` flag on `dnsmesh init` to opt out —
+  use it if you want every DMP query to go through your local /
+  corporate / privacy resolver instead of public DNS.
+- Existing configs are untouched. The default only kicks in for
+  fresh `init` runs.
+
 ## [0.3.4] — upgrade scripts backfill DMP_HEARTBEAT_SEEDS
 
 ### Added

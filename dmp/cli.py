@@ -911,6 +911,17 @@ def cmd_init(args: argparse.Namespace) -> int:
                 dns_resolvers.append(f"[{host}]:{port}")
             else:
                 dns_resolvers.append(f"{host}:{port}")
+    elif not args.no_default_resolvers:
+        # Default to a small pool of well-known public resolvers so a
+        # fresh install can fetch records the moment delegation lands,
+        # without depending on whatever the system resolver happens to
+        # have cached (or NXDOMAIN'd before the delegation existed).
+        # Cloudflare first because their stated privacy posture is
+        # tighter than Google's; Google second for failover.
+        # Operators who care about routing every DMP query through
+        # their own resolver can pass --no-default-resolvers at init,
+        # or edit the field in config.yaml afterward.
+        dns_resolvers = ["1.1.1.1", "8.8.8.8"]
 
     cfg = CLIConfig(
         username=args.username,
@@ -3023,7 +3034,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated list of resolver IP literals with optional "
         "ports, e.g. `8.8.8.8,1.1.1.1` or `8.8.8.8:53,[2001:4860:4860::8888]:53`. "
         "When set, the CLI builds a ResolverPool with automatic failover; "
-        "--dns-host / --dns-port are ignored. Hostnames are rejected.",
+        "--dns-host / --dns-port are ignored. Hostnames are rejected. "
+        "Default when unset: 1.1.1.1, 8.8.8.8 (Cloudflare + Google).",
+    )
+    p_init.add_argument(
+        "--no-default-resolvers",
+        action="store_true",
+        help="Skip the default 1.1.1.1 + 8.8.8.8 pool. Falls back to the "
+        "system resolver. Use when you want every DMP query to go through "
+        "your local / corporate / privacy resolver instead of public DNS.",
     )
     p_init.add_argument(
         "--identity-domain",
