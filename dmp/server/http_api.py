@@ -219,6 +219,8 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         self._record_request("GET", status)
 
     def _handle_get(self) -> int:
+        if self.path == "/" or self.path == "/index.html":
+            return self._handle_root()
         if self.path == "/health":
             return self._handle_health()
         if self.path == "/metrics":
@@ -274,6 +276,172 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             return 200
         self._send_json(404, {"error": "not found"})
         return 404
+
+    def _handle_root(self) -> int:
+        """GET /  -- friendly landing page.
+
+        First-time visitors who hit https://<node>/ shouldn't see a
+        404. They should see (a) that the node is up, (b) what the
+        node is, (c) where to look for peers if the operator opted
+        into the discovery layer. The page degrades gracefully when
+        heartbeat is disabled — it tells the operator how to enable
+        it instead of leaving the page empty.
+        """
+        import html as _html
+
+        store = self.server.store
+        record_count: Optional[int] = None
+        getter = getattr(store, "record_count", None)
+        if callable(getter):
+            try:
+                record_count = getter()
+            except Exception:
+                record_count = None
+
+        heartbeat_on = self._heartbeat_enabled()
+        self_endpoint = getattr(self.server, "heartbeat_self_endpoint", None) or ""
+        self_spk_hex = getattr(self.server, "heartbeat_self_spk_hex", None) or ""
+
+        # Identity block: show heartbeat self_endpoint when set, fall
+        # back to the Host: header so visitors hitting this from a
+        # browser at least see the address they came in on.
+        host_header = self.headers.get("Host", "") or ""
+        identity = self_endpoint or (
+            f"https://{host_header}" if host_header else "this node"
+        )
+
+        # Discovery block: a real peer table if heartbeat is on, an
+        # operator-facing hint if it isn't.
+        if heartbeat_on:
+            from dmp.core.heartbeat import HeartbeatRecord
+            from dmp.server.heartbeat_html import DirectoryRow
+
+            store_hb = self.server.heartbeat_store
+            limit = int(getattr(self.server, "heartbeat_seen_limit", 500))
+            rows = store_hb.list_recent(limit=limit)
+            directory_rows = []
+            for r in rows:
+                try:
+                    rec = HeartbeatRecord.parse_and_verify(r.wire)
+                except Exception:
+                    continue
+                if rec is None:
+                    continue
+                directory_rows.append(
+                    DirectoryRow(
+                        endpoint=rec.endpoint,
+                        operator_spk_hex=rec.operator_spk.hex(),
+                        version=rec.version,
+                        ts=int(rec.ts),
+                        sources=1,
+                    )
+                )
+
+            from dmp.server.heartbeat_html import _row_html as _hb_row_html
+
+            now = int(__import__("time").time())
+            peer_rows = "\n".join(_hb_row_html(r, now=now) for r in directory_rows)
+            if not peer_rows:
+                peer_rows = (
+                    '<tr><td colspan="5">(no peers heard yet — '
+                    "this node has not seen any heartbeats)</td></tr>"
+                )
+            discovery_block = (
+                f"<h2>Recent peers ({len(directory_rows)})</h2>"
+                "<table>"
+                "<thead><tr>"
+                "<th>Endpoint</th><th>Operator pubkey</th><th>Version</th>"
+                "<th>Last heard</th><th>Sources</th>"
+                "</tr></thead>"
+                f"<tbody>{peer_rows}</tbody>"
+                "</table>"
+                '<p><small><a href="/v1/nodes/seen">Raw signed feed</a> '
+                ' &middot; <a href="/nodes">/nodes view</a></small></p>'
+            )
+        else:
+            discovery_block = (
+                "<h2>Discovery</h2>"
+                "<p>Discovery is <strong>off</strong> on this node. To make "
+                "this node discoverable and to surface peers it has heard "
+                "from, the operator can set the following env vars and "
+                "restart the service:</p>"
+                "<pre>DMP_HEARTBEAT_ENABLED=1\n"
+                "DMP_HEARTBEAT_SELF_ENDPOINT=https://your-public-host\n"
+                "DMP_HEARTBEAT_OPERATOR_KEY_PATH=/path/to/operator-ed25519.hex</pre>"
+                "<p><small>See the "
+                '<a href="https://ovalenzuela.com/DNSMeshProtocol/deployment/heartbeat">'
+                "heartbeat deployment guide</a> "
+                "for a full walkthrough.</small></p>"
+            )
+
+        records_line = (
+            f"<li><strong>Records served:</strong> {record_count}</li>"
+            if record_count is not None
+            else ""
+        )
+        spk_line = (
+            f"<li><strong>Operator pubkey:</strong> "
+            f"<code>{_html.escape(self_spk_hex)}</code></li>"
+            if self_spk_hex
+            else ""
+        )
+
+        body = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{_html.escape(identity)} — dnsmesh-node</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ font: 14px/1.5 system-ui, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; color: #1f2328; }}
+h1 {{ margin-bottom: 0.2em; }}
+h1 small {{ font: normal 14px/1 system-ui, sans-serif; color: #59636e; }}
+h2 {{ margin-top: 2em; border-bottom: 1px solid #d1d9e0; padding-bottom: 0.3em; }}
+table {{ border-collapse: collapse; width: 100%; margin-top: 0.6em; }}
+th, td {{ border: 1px solid #ccc; padding: 0.4em 0.6em; text-align: left; }}
+th {{ background: #f5f5f5; }}
+td.fresh {{ color: #0a0; }}
+td.stale {{ color: #a60; }}
+small {{ color: #59636e; }}
+code {{ font: 12px/1 ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }}
+ul {{ padding-left: 1.2em; }}
+pre {{ background: #f6f8fa; border: 1px solid #d1d9e0; padding: 0.6em 0.8em; border-radius: 4px; overflow-x: auto; }}
+.status {{ display: inline-block; padding: 0.1em 0.6em; background: #e6ffec; color: #1a7f37; border-radius: 4px; font-size: 12px; }}
+</style>
+</head>
+<body>
+<h1>{_html.escape(identity)} <small>dnsmesh-node</small></h1>
+<p><span class="status">healthy</span></p>
+
+<h2>About this node</h2>
+<ul>
+<li><strong>Endpoint:</strong> <code>{_html.escape(identity)}</code></li>
+{records_line}
+{spk_line}
+<li><strong>API:</strong> <a href="/health">/health</a> &middot; <a href="/stats">/stats</a></li>
+</ul>
+
+{discovery_block}
+
+<h2>About DNS Mesh Protocol</h2>
+<p>Federated end-to-end encrypted messaging delivered over DNS. Identity = DNS name.
+No central directory, no phone numbers, no servers to trust.</p>
+<ul>
+<li><a href="https://ovalenzuela.com/DNSMeshProtocol/">Documentation</a></li>
+<li><a href="https://github.com/oscarvalenzuelab/DNSMeshProtocol">Source on GitHub</a></li>
+<li><a href="https://pypi.org/project/dnsmesh/">Python client (<code>pip install dnsmesh</code>)</a></li>
+</ul>
+</body>
+</html>
+"""
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=30")
+        self.end_headers()
+        self.wfile.write(data)
+        return 200
 
     def _handle_health(self) -> int:
         store = self.server.store
