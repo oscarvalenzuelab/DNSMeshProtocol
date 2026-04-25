@@ -141,8 +141,8 @@
   <pre class="mermaid">
 sequenceDiagram
     participant You as Your laptop
-    participant DNS as A DNS server<br>(e.g. 1.1.1.1)
-    participant Auth as The owner of<br>example.com
+    participant DNS as A DNS server<br/>(e.g. 1.1.1.1)
+    participant Auth as The owner of<br/>example.com
     You->>DNS: "What is example.com?"
     DNS->>Auth: "What is example.com?"
     Auth-->>DNS: "It's at 93.184.216.34"
@@ -168,9 +168,9 @@ sequenceDiagram
   <p>Even the company hosting the message can't read it.</p>
   <pre class="mermaid">
 flowchart LR
-    Alice["Alice<br>writes 'hello'"]
-    Server["Storage<br>(sees only<br>encrypted bytes)"]
-    Bob["Bob<br>reads 'hello'"]
+    Alice["Alice<br/>writes 'hello'"]
+    Server["Storage<br/>(sees only<br/>encrypted bytes)"]
+    Bob["Bob<br/>reads 'hello'"]
     Alice -- "encrypts" --> Server
     Server -- "decrypts" --> Bob
   </pre>
@@ -231,8 +231,8 @@ flowchart LR
   <h2>Two channels: HTTPS for writes (to your own node), DNS for reads</h2>
   <pre class="mermaid">
 flowchart LR
-    A["Alice's CLI"] -- "HTTPS POST<br>(token-authenticated)" --> ANode["Alice's home node<br>(serves alice.example)"]
-    B["Bob's CLI"] -- "DNS query<br>(no auth)" --> Resolvers["public DNS<br>resolvers"]
+    A["Alice's CLI"] -- "HTTPS POST<br/>(token-authenticated)" --> ANode["Alice's home node<br/>(serves alice.example)"]
+    B["Bob's CLI"] -- "DNS query<br/>(no auth)" --> Resolvers["public DNS<br/>resolvers"]
     Resolvers -- "recursive chain" --> ANode
   </pre>
   <ul style="text-align: left;">
@@ -252,13 +252,13 @@ flowchart LR
   <pre class="mermaid">
 sequenceDiagram
     participant A as Alice CLI
-    participant ANode as Alice's home node<br>(serves alice.example)
+    participant ANode as Alice's home node<br/>(serves alice.example)
     participant DNS as DNS (any resolver)
     participant B as Bob CLI
-    A->>ANode: HTTPS POST<br>slot-N.mb-{hash(bob)}.alice.example
-    Note over ANode: stored in sqlite<br>served on UDP 53
+    A->>ANode: HTTPS POST<br/>slot-N.mb-{hash(bob)}.alice.example
+    Note over ANode: stored in sqlite<br/>served on UDP 53
     B->>DNS: TXT? slot-N.mb-{hash(bob)}.alice.example
-    DNS->>ANode: walks the chain<br>to Alice's authoritative
+    DNS->>ANode: walks the chain<br/>to Alice's authoritative
     ANode-->>DNS: ciphertext
     DNS-->>B: ciphertext
     B->>B: decrypt + verify Alice's signature
@@ -361,11 +361,11 @@ sequenceDiagram
   <h2>The pieces</h2>
   <pre class="mermaid">
 flowchart LR
-    CLI["dnsmesh CLI<br>your laptop / phone<br>(holds private keys)"]
-    HTTP["HTTP API<br>port 443"]
-    DNS["DNS server<br>UDP port 53"]
-    Store[("sqlite<br>store")]
-    World["any DNS resolver<br>anywhere"]
+    CLI["dnsmesh CLI<br/>your laptop / phone<br/>(holds private keys)"]
+    HTTP["HTTP API<br/>port 443"]
+    DNS["DNS server<br/>UDP port 53"]
+    Store[("sqlite<br/>store")]
+    World["any DNS resolver<br/>anywhere"]
     CLI -- POST /v1/records --> HTTP
     HTTP --> Store
     DNS --> Store
@@ -383,13 +383,13 @@ sequenceDiagram
     participant ANode as Alice's home node
     participant DNS as DNS (anywhere)
     participant B as Bob
-    A->>ANode: POST /v1/records (HTTPS)<br>signed identity record
-    Note right of ANode: stored in sqlite<br>served on UDP 53
-    B->>DNS: TXT? dmp.alice.example<br>(zone-anchored) or<br>id-{hash16}.shared.mesh<br>(shared-domain TOFU)
+    A->>ANode: POST /v1/records (HTTPS)<br/>signed identity record
+    Note right of ANode: stored in sqlite<br/>served on UDP 53
+    B->>DNS: TXT? dmp.alice.example<br/>(zone-anchored) or<br/>id-{hash16}.shared.mesh<br/>(shared-domain TOFU)
     DNS->>ANode: forwards query
     ANode->>DNS: signed record
     DNS->>B: signed record
-    B->>B: verify Ed25519 signature<br>pin Alice's pubkey
+    B->>B: verify Ed25519 signature<br/>pin Alice's pubkey
   </pre>
 </section>
 
@@ -399,9 +399,9 @@ sequenceDiagram
   <pre class="mermaid">
 sequenceDiagram
     participant Bob as Bob
-    participant R as 1.1.1.1<br>(public resolver)
-    participant DO as DigitalOcean<br>(owns gnu.cl)
-    participant Node as dnsmesh.io<br>(authoritative for mesh.gnu.cl)
+    participant R as 1.1.1.1<br/>(public resolver)
+    participant DO as DigitalOcean<br/>(owns gnu.cl)
+    participant Node as dnsmesh.io<br/>(authoritative for mesh.gnu.cl)
     Bob->>R: TXT? id-xxx.mesh.gnu.cl
     alt cached at resolver
       R-->>Bob: cached value
@@ -486,7 +486,7 @@ sequenceDiagram
     participant Node as Node (down)
     Alice->>Node: POST /v1/records
     Node--xAlice: timeout
-    Note right of Alice: send fails<br>no built-in retry<br>operator handles it
+    Note right of Alice: send fails<br/>no built-in retry<br/>operator handles it
   </pre>
   <p class="small">No retry queue. Pending sends do not survive. Records already published are persisted on disk and come back when the node restarts.</p>
 </section>
@@ -548,13 +548,13 @@ On the node:
   <pre class="mermaid">
 flowchart LR
     Client["sender's CLI"]
-    Client -- "HTTPS POST<br>fan to majority" --> A
-    Client -- "HTTPS POST<br>fan to majority" --> C
+    Client -- "HTTPS POST<br/>fan to majority" --> A
+    Client -- "HTTPS POST<br/>fan to majority" --> C
     subgraph Cluster
       A["node-a"]
-      B["node-b<br>(down)"]
+      B["node-b<br/>(down)"]
       C["node-c"]
-      A <-- "HTTPS<br>anti-entropy" --> C
+      A <-- "HTTPS<br/>anti-entropy" --> C
     end
   </pre>
   <p class="small">Three nodes anti-entropy-sync the same record set every ~30s, <strong>over HTTPS</strong> (<code>/v1/sync/digest</code> + <code>/v1/sync/pull</code>) — never over DNS. Writes from senders fan to a majority of cluster nodes for durability. Reads from the world union across all nodes. When the dead node returns, it pulls everything it missed since its last sync watermark.</p>
