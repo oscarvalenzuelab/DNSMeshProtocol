@@ -246,6 +246,24 @@ class _HttpWriter(DNSRecordWriter):
         if not token:
             token = bearer_for_endpoint(self._endpoint)
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
+        # Diagnostics from the most recent call. The DNSRecordWriter
+        # interface returns bool, which collapsed every failure mode
+        # (auth scope, rate limit, backend down) into the same opaque
+        # "publish failed" message. Stashing status + parsed error here
+        # lets cmd_identity_publish surface the actual reason without
+        # changing the abstract interface used by other backends.
+        self.last_status: Optional[int] = None
+        self.last_error: Optional[str] = None
+
+    def _capture(self, r) -> None:
+        self.last_status = r.status_code
+        try:
+            body = r.json()
+            self.last_error = (
+                body.get("error") if isinstance(body, dict) else None
+            ) or r.text[:200]
+        except ValueError:
+            self.last_error = r.text[:200] if r.text else None
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
         r = self._requests.post(
@@ -254,6 +272,7 @@ class _HttpWriter(DNSRecordWriter):
             headers=self._headers,
             timeout=10,
         )
+        self._capture(r)
         return r.status_code == 201
 
     def delete_txt_record(self, name: str, value: Optional[str] = None) -> bool:
@@ -264,7 +283,27 @@ class _HttpWriter(DNSRecordWriter):
             headers=self._headers,
             timeout=10,
         )
+        self._capture(r)
         return r.status_code == 204
+
+
+def _publish_failure_msg(writer: "_HttpWriter", name: str) -> str:
+    """Build a one-line failure message that surfaces the actual HTTP
+    status + server-side reason instead of "see node logs"."""
+    status = writer.last_status
+    err = writer.last_error or ""
+    base = f"publish to {name} failed"
+    if status is None:
+        return f"{base} — no response captured"
+    msg = f"{base}: HTTP {status}"
+    if err:
+        msg = f"{msg} — {err}"
+    if status == 403:
+        msg += (
+            " (per-user token may not own this record namespace; "
+            "if you are the operator, retry with DMP_HTTP_TOKEN=<operator-token>)"
+        )
+    return msg
 
 
 class _DnsReader(DNSRecordReader):
@@ -954,7 +993,7 @@ def cmd_identity_publish(args: argparse.Namespace) -> int:
 
         ok = client.writer.publish_txt_record(name, wire, ttl=args.ttl)
         if not ok:
-            _die(2, "publish failed — see node logs")
+            _die(2, _publish_failure_msg(client.writer, name))
         print(f"published identity to {name}")
         print(f"  others can resolve you with: {resolve_hint}")
         return 0
@@ -982,8 +1021,11 @@ def cmd_identity_refresh_prekeys(args: argparse.Namespace) -> int:
         print(f"published {published}/{args.count} prekeys to {name}")
         print(f"  local live prekey count: {client.prekey_store.count_live()}")
         if published < args.count:
+            hint = ""
+            if isinstance(client.writer, _HttpWriter) and client.writer.last_status:
+                hint = f" — last response: {_publish_failure_msg(client.writer, name)}"
             print(
-                "  (note: some publishes were rejected — check node rate limits and caps)"
+                f"  (note: some publishes were rejected — check node rate limits and caps){hint}"
             )
         return 0
     finally:

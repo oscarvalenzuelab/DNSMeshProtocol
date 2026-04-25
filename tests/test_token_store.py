@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 import time
@@ -387,6 +388,89 @@ class TestAuthorizeOwnerExclusive:
         token, _ = store.issue("Alice@Example.Com")
         r = store.authorize_write(token, "dmp.alice.example.com")
         assert r.ok
+
+
+class TestClassifyHashedNames:
+    """The CLI's default unanchored flow publishes identity at
+    ``id-<hash16>.<domain>`` and prekeys at ``prekeys.id-<hash12>.<domain>``.
+    Both must classify as OWNER_EXCLUSIVE so per-user tokens can write
+    them; otherwise the multi-tenant flow only works for zone-anchored
+    deployments (the much rarer case)."""
+
+    def test_hashed_identity_is_owner_exclusive(self) -> None:
+        s = classify_name("id-abcdef0123456789.example.com")
+        assert s.kind == ScopeClass.OWNER_EXCLUSIVE
+        assert s.subject == "#id16:abcdef0123456789@example.com"
+
+    def test_hashed_identity_multi_label_domain(self) -> None:
+        s = classify_name("id-abcdef0123456789.sub.example.co.uk")
+        assert s.kind == ScopeClass.OWNER_EXCLUSIVE
+        assert s.subject == "#id16:abcdef0123456789@sub.example.co.uk"
+
+    def test_hashed_identity_wrong_length_is_operator_only(self) -> None:
+        # 12 hex chars where 16 are expected — fail closed.
+        s = classify_name("id-abcdef012345.example.com")
+        assert s.kind == ScopeClass.OPERATOR_ONLY
+
+    def test_prekey_pool_is_owner_exclusive(self) -> None:
+        s = classify_name("prekeys.id-abcdef012345.example.com")
+        assert s.kind == ScopeClass.OWNER_EXCLUSIVE
+        assert s.subject == "#prekeys:abcdef012345@example.com"
+
+    def test_prekey_pool_wrong_length_is_operator_only(self) -> None:
+        s = classify_name("prekeys.id-abcdef0123456789.example.com")
+        assert s.kind == ScopeClass.OPERATOR_ONLY
+
+
+class TestAuthorizeHashedIdentityAndPrekeys:
+    """Per-user token must be able to write its own hashed identity +
+    prekey pool, but not someone else's, and not its own under a
+    different domain."""
+
+    @staticmethod
+    def _h(s: str, n: int) -> str:
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:n]
+
+    def test_owner_publishes_own_hashed_identity(self, store: TokenStore) -> None:
+        token, _ = store.issue("alice@example.com")
+        name = f"id-{self._h('alice', 16)}.example.com"
+        r = store.authorize_write(token, name)
+        assert r.ok
+        assert r.scope.kind == ScopeClass.OWNER_EXCLUSIVE
+
+    def test_owner_blocked_from_other_users_hashed_identity(
+        self, store: TokenStore
+    ) -> None:
+        token, _ = store.issue("alice@example.com")
+        name = f"id-{self._h('bob', 16)}.example.com"
+        r = store.authorize_write(token, name)
+        assert not r.ok
+        assert "hashed" in r.reason.lower()
+
+    def test_owner_blocked_from_own_hash_in_other_domain(
+        self, store: TokenStore
+    ) -> None:
+        # alice@example.com cannot publish id-<h(alice)>.evil.com even
+        # though the hash matches — the domain half of the sentinel
+        # binds the record to the token's home zone.
+        token, _ = store.issue("alice@example.com")
+        name = f"id-{self._h('alice', 16)}.evil.com"
+        r = store.authorize_write(token, name)
+        assert not r.ok
+
+    def test_owner_publishes_own_prekey_pool(self, store: TokenStore) -> None:
+        token, _ = store.issue("alice@example.com")
+        name = f"prekeys.id-{self._h('alice', 12)}.example.com"
+        r = store.authorize_write(token, name)
+        assert r.ok
+
+    def test_owner_blocked_from_other_users_prekey_pool(
+        self, store: TokenStore
+    ) -> None:
+        token, _ = store.issue("alice@example.com")
+        name = f"prekeys.id-{self._h('bob', 12)}.example.com"
+        r = store.authorize_write(token, name)
+        assert not r.ok
 
 
 class TestAuthorizeSharedPool:
