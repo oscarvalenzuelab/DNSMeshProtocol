@@ -163,7 +163,11 @@ def _load_claim_provider_zone() -> str:
     return ""
 
 
-def _load_heartbeat_from_env(record_db_path: str):
+def _load_heartbeat_from_env(
+    record_db_path: str,
+    record_writer=None,
+    dns_reader=None,
+):
     """Return a ``_HeartbeatBundle`` if opt-in-enabled, else None.
 
     Prerequisites when enabled:
@@ -261,7 +265,17 @@ def _load_heartbeat_from_env(record_db_path: str):
     )
 
     seed_peers_raw = os.environ.get("DMP_HEARTBEAT_SEEDS", "")
-    seed_peers = tuple(s.strip() for s in seed_peers_raw.split(",") if s.strip())
+    # M9: parse seeds as DNS zones, accepting either bare hostnames
+    # (the new format) or full URLs (legacy 0.4.x and earlier). Each
+    # entry is normalized via _zone_from_seed so an upgrade from the
+    # URL form doesn't require operators to rewrite node.env.
+    from dmp.server.heartbeat_worker import _zone_from_seed
+
+    seed_zones = tuple(
+        z
+        for s in seed_peers_raw.split(",")
+        if (z := _zone_from_seed(s.strip()))
+    )
     interval = int(os.environ.get("DMP_HEARTBEAT_INTERVAL_SECONDS", "300"))
     ttl = int(os.environ.get("DMP_HEARTBEAT_TTL_SECONDS", "86400"))
     max_peers = int(os.environ.get("DMP_HEARTBEAT_MAX_PEERS", "25"))
@@ -306,17 +320,35 @@ def _load_heartbeat_from_env(record_db_path: str):
     # discover it via DNS instead of /v1/info.
     advertised_zone = claim_zone if (claim_provider_on and has_zone) else ""
 
+    # M9: the worker publishes its own heartbeat into the local
+    # zone via the shared sqlite record store, and queries peer
+    # zones via the local DNS reader. The zone published under is
+    # the same `claim_zone` we just resolved — that's the node's
+    # primary served zone (DMP_CLAIM_PROVIDER_ZONE → DMP_CLUSTER_BASE_DOMAIN
+    # → DMP_DOMAIN). Without a zone the worker still ticks but
+    # publishes nothing (legitimate for nodes that exist purely as
+    # message readers).
     cfg = HeartbeatWorkerConfig(
         self_endpoint=self_endpoint,
         version=version,
-        seed_peers=seed_peers,
         interval_seconds=interval,
         ttl_seconds=ttl,
         max_peers=max_peers,
         capabilities=capabilities,
         claim_provider_zone=advertised_zone,
+        dns_zone=claim_zone,
+        seed_zones=seed_zones,
     )
-    worker = HeartbeatWorker(cfg, crypto, store)
+    # The worker shares DMPNode's record store for publishes and
+    # uses the caller-provided DNS reader for peer queries. The
+    # caller wires both in — this loader doesn't open new resources.
+    worker = HeartbeatWorker(
+        cfg,
+        crypto,
+        store,
+        record_writer=record_writer,
+        dns_reader=dns_reader,
+    )
 
     # Rate limits on the HTTP endpoints — independent submit / seen
     # buckets per codex phase-3 P2.
@@ -707,7 +739,27 @@ class DMPNode:
         # when DMP_HEARTBEAT_ENABLED=1 AND the operator has provided
         # the signing-key material + public hostname. Solo-node
         # deployments and pre-M5.8 configs see no wiring at all.
-        heartbeat_bundle = _load_heartbeat_from_env(self.config.db_path)
+        #
+        # M9.1.2: pass the local record store + a DNS reader so the
+        # worker can publish into the served zone and query peer
+        # zones — the M5.8 HTTP-gossip exchange path is gone.
+        heartbeat_dns_reader = None
+        try:
+            from dmp.network.resolver_pool import ResolverPool
+
+            heartbeat_dns_reader = ResolverPool(
+                hosts=[("1.1.1.1", 53), ("8.8.8.8", 53)]
+            )
+        except Exception:
+            log.exception(
+                "could not build heartbeat-worker resolver pool; "
+                "peer harvest disabled"
+            )
+        heartbeat_bundle = _load_heartbeat_from_env(
+            self.config.db_path,
+            record_writer=self.store,
+            dns_reader=heartbeat_dns_reader,
+        )
 
         self.http = DMPHttpApi(
             self.store,

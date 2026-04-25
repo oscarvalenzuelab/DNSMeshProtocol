@@ -1,4 +1,17 @@
-"""Tests for dmp.server.heartbeat_worker — M5.8 phase 4."""
+"""Tests for dmp.server.heartbeat_worker — M9.1.2 DNS-native model.
+
+The worker no longer POSTs to peers' /v1/heartbeat. Each tick:
+
+  - Publishes its own signed heartbeat at
+    ``_dnsmesh-heartbeat.<dns_zone>`` through the local record store.
+  - Queries each configured seed zone's
+    ``_dnsmesh-heartbeat.<seed_zone>`` through the supplied DNS
+    reader, verifies, and feeds the wire into the SeenStore.
+
+Tests use ``InMemoryDNSStore`` for both the writer and the reader —
+in production they're separate (sqlite-backed authoritative store +
+recursive resolver pool), but the abstract interface is the same.
+"""
 
 from __future__ import annotations
 
@@ -9,10 +22,12 @@ import pytest
 
 from dmp.core.crypto import DMPCrypto
 from dmp.core.heartbeat import HeartbeatRecord
+from dmp.network.memory import InMemoryDNSStore
 from dmp.server.heartbeat_store import SeenStore
 from dmp.server.heartbeat_worker import (
     HeartbeatWorker,
     HeartbeatWorkerConfig,
+    heartbeat_rrset_name,
 )
 
 
@@ -32,13 +47,24 @@ def now() -> int:
     return 1_750_000_000
 
 
-def _heartbeat(
+@pytest.fixture
+def transport() -> InMemoryDNSStore:
+    """Shared DNS reader/writer used by both the worker-under-test and
+    test fixtures populating peer zones."""
+    return InMemoryDNSStore()
+
+
+def _publish_peer_heartbeat(
+    transport: InMemoryDNSStore,
     signer: DMPCrypto,
-    endpoint: str = "https://peer.example.com",
+    zone: str,
     *,
+    endpoint: str,
     ts: int,
     version: str = "0.1.0",
 ) -> str:
+    """Helper: a peer at `zone` has its heartbeat record live at
+    `_dnsmesh-heartbeat.<zone>`. Returns the wire."""
     hb = HeartbeatRecord(
         endpoint=endpoint,
         operator_spk=signer.get_signing_public_key_bytes(),
@@ -46,484 +72,395 @@ def _heartbeat(
         ts=ts,
         exp=ts + 86400,
     )
-    return hb.sign(signer)
-
-
-class _StubPoster:
-    """Capture POSTs; optionally return canned responses keyed by URL."""
-
-    def __init__(self, responses=None):
-        self.responses = responses or {}
-        self.calls = []
-
-    def __call__(self, url: str, body: dict, timeout: float):
-        self.calls.append((url, body, timeout))
-        return self.responses.get(url)
+    wire = hb.sign(signer)
+    transport.publish_txt_record(heartbeat_rrset_name(zone), wire)
+    return wire
 
 
 # ---------------------------------------------------------------------------
-# Tick mechanics
+# Tick mechanics — publish + harvest
 # ---------------------------------------------------------------------------
 
 
-class TestTickBasics:
-    def test_solo_node_no_seeds_no_calls(self, store: SeenStore, now: int) -> None:
-        """A freshly-started node with no seeds and no cluster peers
-        has nothing to ping. tick_once returns 0 and does not raise."""
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=(),
-        )
-        poster = _StubPoster()
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        assert worker.tick_once(now=now) == 0
-        assert poster.calls == []
-
-    def test_seeds_are_pinged(self, store: SeenStore, now: int) -> None:
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=("https://seed1.example.com", "https://seed2.example.com"),
-        )
-        poster = _StubPoster(
-            responses={
-                "https://seed1.example.com/v1/heartbeat": {"ok": True, "seen": []},
-                "https://seed2.example.com/v1/heartbeat": {"ok": True, "seen": []},
-            }
-        )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        assert worker.tick_once(now=now) == 2
-        urls = [c[0] for c in poster.calls]
-        assert urls == [
-            "https://seed1.example.com/v1/heartbeat",
-            "https://seed2.example.com/v1/heartbeat",
-        ]
-
-    def test_gossip_response_written_to_store(self, store: SeenStore, now: int) -> None:
-        """A seed responds with {"seen": [wire1, wire2]} — those
-        wires get verified and stored."""
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=("https://seed.example.com",),
-        )
-        # Build two independent peer heartbeats the seed would gossip.
-        peer_a = _signer("a", b"A" * 32)
-        peer_b = _signer("b", b"B" * 32)
-        wire_a = _heartbeat(peer_a, "https://a.example.com", ts=now)
-        wire_b = _heartbeat(peer_b, "https://b.example.com", ts=now)
-
-        poster = _StubPoster(
-            responses={
-                "https://seed.example.com/v1/heartbeat": {
-                    "ok": True,
-                    "seen": [wire_a, wire_b],
-                }
-            }
-        )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        worker.tick_once(now=now)
-
-        rows = store.list_recent(now=now)
-        endpoints = sorted(r.endpoint for r in rows)
-        assert endpoints == ["https://a.example.com", "https://b.example.com"]
-
-    def test_gossip_with_tampered_wire_is_dropped(
-        self, store: SeenStore, now: int
+class TestPublishOwn:
+    def test_solo_node_publishes_into_zone(
+        self, store, transport, now
     ) -> None:
-        """A hostile seed returns a junk wire — accept() verifies
-        internally and discards it. The store stays empty."""
+        """A node with a configured zone publishes its own heartbeat
+        regardless of whether it has seeds — peers will discover it
+        by querying the zone."""
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
-            seed_peers=("https://hostile.example.com",),
-        )
-        poster = _StubPoster(
-            responses={
-                "https://hostile.example.com/v1/heartbeat": {
-                    "ok": True,
-                    "seen": ["not-a-valid-wire", "v=dmp1;t=heartbeat;garbage"],
-                }
-            }
-        )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        worker.tick_once(now=now)
-        assert store.count() == 0
-
-
-class TestPeerList:
-    def test_self_is_filtered(self, store: SeenStore, now: int) -> None:
-        """If the seed list includes our own endpoint, we must not
-        ping ourselves (infinite-loop guard)."""
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=(
-                "https://self.example.com",
-                "https://self.example.com/",  # trailing slash variant
-                "https://real-seed.example.com",
-            ),
-        )
-        poster = _StubPoster(
-            responses={
-                "https://real-seed.example.com/v1/heartbeat": {
-                    "ok": True,
-                    "seen": [],
-                }
-            }
-        )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        worker.tick_once(now=now)
-        urls = [c[0] for c in poster.calls]
-        assert urls == ["https://real-seed.example.com/v1/heartbeat"]
-
-    def test_gossip_learned_peers_expand_set(self, store: SeenStore, now: int) -> None:
-        """Seeding the store with known peers should cause them to
-        appear in the ping list on the next tick."""
-        # Pre-seed the store with two known peers.
-        for name in ("a", "b"):
-            s = _signer(name, name.encode() * 32)
-            store.accept(
-                _heartbeat(s, f"https://{name}.example.com", ts=now),
-                now=now,
-            )
-
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=(),  # no explicit seeds — rely on gossip
-        )
-        poster = _StubPoster(
-            responses={
-                "https://a.example.com/v1/heartbeat": {"ok": True, "seen": []},
-                "https://b.example.com/v1/heartbeat": {"ok": True, "seen": []},
-            }
-        )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        worker.tick_once(now=now)
-        urls = sorted(c[0] for c in poster.calls)
-        assert urls == [
-            "https://a.example.com/v1/heartbeat",
-            "https://b.example.com/v1/heartbeat",
-        ]
-
-    def test_max_peers_cap_applies(self, store: SeenStore, now: int) -> None:
-        """max_peers caps the outbound fan-out per tick."""
-        seeds = tuple(f"https://s{i}.example.com" for i in range(10))
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=seeds,
-            max_peers=3,
-        )
-        poster = _StubPoster()
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        worker.tick_once(now=now)
-        assert len(poster.calls) == 3
-
-    def test_cluster_peers_included(self, store: SeenStore, now: int) -> None:
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=(),
-        )
-        poster = _StubPoster(
-            responses={
-                "https://cluster-b.example.com/v1/heartbeat": {
-                    "ok": True,
-                    "seen": [],
-                }
-            }
+            dns_zone="self.example",
         )
         worker = HeartbeatWorker(
             cfg,
             _signer(),
             store,
-            cluster_peers_provider=lambda: [
-                "https://cluster-b.example.com",
-            ],
-            http_poster=poster,
+            record_writer=transport,
+            dns_reader=transport,
         )
         worker.tick_once(now=now)
-        urls = [c[0] for c in poster.calls]
-        assert urls == ["https://cluster-b.example.com/v1/heartbeat"]
-
-
-class TestCooldown:
-    def test_failing_peer_cools_down(self, store: SeenStore, now: int) -> None:
-        """A peer that returns None (network / non-200) gets skipped
-        on the next tick, not hammered."""
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=("https://broken.example.com",),
-            failure_cooldown_ticks=2,
+        records = transport.query_txt_record(
+            heartbeat_rrset_name("self.example")
         )
-        poster = _StubPoster(
-            responses={"https://broken.example.com/v1/heartbeat": None}
-        )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        # Tick 1: try broken, fail, cooldown=2.
-        worker.tick_once(now=now)
-        assert len(poster.calls) == 1
-        # Tick 2: cooldown skips.
-        worker.tick_once(now=now + 60)
-        assert len(poster.calls) == 1  # unchanged
-        # Tick 3: cooldown still running (2-1-1=0 but we decrement
-        # each tick, so tick 2 sets cd=2 -> 1; tick 3 sets 1 -> 0;
-        # skip happens when cd>0 BEFORE decrement).
-        worker.tick_once(now=now + 120)
-        assert len(poster.calls) == 1  # still skipped
-        # Tick 4: cooldown elapsed; try again.
-        worker.tick_once(now=now + 180)
-        assert len(poster.calls) == 2  # retried
-
-    def test_successful_peer_clears_cooldown(self, store: SeenStore, now: int) -> None:
-        """A peer transitions from failing to working — cooldown clears."""
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=("https://flaky.example.com",),
-            failure_cooldown_ticks=1,
-        )
-        poster = _StubPoster()
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-
-        # Tick 1: fail.
-        poster.responses = {"https://flaky.example.com/v1/heartbeat": None}
-        worker.tick_once(now=now)
-        # Tick 2: cooldown skip.
-        worker.tick_once(now=now + 60)
-        assert len(poster.calls) == 1
-        # Tick 3: retry succeeds.
-        poster.responses = {
-            "https://flaky.example.com/v1/heartbeat": {"ok": True, "seen": []}
-        }
-        worker.tick_once(now=now + 120)
-        assert len(poster.calls) == 2
-        # Tick 4: no cooldown now (cleared on success), pings again.
-        worker.tick_once(now=now + 180)
-        assert len(poster.calls) == 3
-
-
-class TestOwnHeartbeatShape:
-    def test_own_wire_is_valid_heartbeat(self, store: SeenStore, now: int) -> None:
-        """The wire the worker posts to peers must parse + verify
-        cleanly on the receiving side."""
-        cfg = HeartbeatWorkerConfig(
-            self_endpoint="https://self.example.com",
-            version="0.1.0",
-            seed_peers=("https://seed.example.com",),
-        )
-        signer = _signer()
-        poster = _StubPoster(
-            responses={
-                "https://seed.example.com/v1/heartbeat": {"ok": True, "seen": []}
-            }
-        )
-        worker = HeartbeatWorker(cfg, signer, store, http_poster=poster)
-        worker.tick_once(now=now)
-        url, body, _ = poster.calls[0]
-        wire = body["wire"]
-        parsed = HeartbeatRecord.parse_and_verify(wire, now=now)
+        assert records and len(records) == 1
+        parsed = HeartbeatRecord.parse_and_verify(records[0], now=now)
         assert parsed is not None
         assert parsed.endpoint == "https://self.example.com"
         assert parsed.version == "0.1.0"
-        assert parsed.operator_spk == signer.get_signing_public_key_bytes()
 
-
-class TestFreshnessPerPeer:
-    """Codex phase-4 P2: frozen-clock regression.
-
-    The old worker signed ``own_wire`` ONCE at tick start and used
-    the same ``now`` across every POST. With max_peers=25 ×
-    http_timeout=10s the tail peer could receive a 250s-old wire,
-    eating into the receiver's 5-min ts-skew budget. Now each POST
-    refreshes ``now`` + re-signs.
-    """
-
-    def test_clock_refreshed_per_peer(self, store: SeenStore, now: int) -> None:
-        """Inject a poster that captures the `ts` field in each
-        posted wire; assert ts increases across consecutive peers."""
+    def test_no_zone_no_publish(self, store, transport, now) -> None:
+        """Without a configured zone the worker still ticks but
+        publishes nothing — useful for read-only / disposable nodes."""
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
-            seed_peers=(
-                "https://a.example.com",
-                "https://b.example.com",
-                "https://c.example.com",
-            ),
+            dns_zone="",  # no zone configured
         )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+        # Nothing was published anywhere.
+        assert transport.list_names() == []
 
-        captured_ts = []
-        call_count = [0]
-
-        def _stub(url, body, timeout):
-            # Advance the virtual clock by 60 seconds per call so a
-            # second-resolution per-peer ts MUST differ.
-            parsed = HeartbeatRecord.parse_and_verify(
-                body["wire"], now=now + call_count[0] * 60 + 1
-            )
-            assert parsed is not None
-            captured_ts.append(parsed.ts)
-            call_count[0] += 1
-            return {"ok": True, "seen": []}
-
-        class _ClockingWorker(HeartbeatWorker):
-            """Subclass that advances clock 60s per POST to simulate
-            a slow network where each peer takes a minute to respond."""
-
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self._fake_now = now
-
-            def _current_time(self) -> int:
-                t = self._fake_now
-                self._fake_now += 60
-                return t
-
-        # Instead of a subclass we override time.time indirectly by
-        # passing explicit `now` to tick_once — but tick_once's
-        # per-peer refresh only fires when `now is None`. So the
-        # simpler test: don't pass `now`, and monkeypatch time.time
-        # to a counter.
-        import dmp.server.heartbeat_worker as hb_mod
-
-        orig_time = hb_mod.time.time
-        counter = [now]
-
-        def _fake_time():
-            counter[0] += 60
-            return counter[0]
-
-        hb_mod.time.time = _fake_time
-        try:
-            worker = HeartbeatWorker(cfg, _signer(), store, http_poster=_stub)
-            worker.tick_once()  # no `now`, so each peer uses live time
-            assert len(captured_ts) == 3
-            # ts values strictly increase per POST (60s apart).
-            assert captured_ts[0] < captured_ts[1] < captured_ts[2]
-        finally:
-            hb_mod.time.time = orig_time
-
-
-class TestGossipIngestBounded:
-    """Codex phase-4 P2: cap on per-response gossip ingest."""
-
-    def test_oversized_gossip_is_truncated(self, store: SeenStore, now: int) -> None:
-        """A hostile seed returns `seen` with far more wires than
-        the configured cap. The worker must only process up to
-        max_gossip_per_response of them.
-        """
+    def test_no_writer_no_publish(self, store, transport, now) -> None:
+        """A worker built without a record_writer still ticks but
+        publishes nothing (test-fixture mode)."""
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
-            seed_peers=("https://hostile.example.com",),
-            max_gossip_per_response=3,
+            dns_zone="self.example",
         )
-        # Build 10 valid heartbeats from distinct signers.
-        many = []
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=None,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+        assert transport.list_names() == []
+
+
+class TestHarvestPeers:
+    def test_seed_zone_heartbeat_ingested(
+        self, store, transport, now
+    ) -> None:
+        """A configured seed zone's heartbeat is queried, verified,
+        and stored in the seen-store."""
+        peer = _signer("peer-a", b"A" * 32)
+        _publish_peer_heartbeat(
+            transport, peer, "peer.example",
+            endpoint="https://peer.example.com", ts=now,
+        )
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            seed_zones=("peer.example",),
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        assert worker.tick_once(now=now) == 1
+        rows = store.list_recent(now=now)
+        endpoints = [r.endpoint for r in rows]
+        assert endpoints == ["https://peer.example.com"]
+
+    def test_garbage_at_zone_silently_dropped(
+        self, store, transport, now
+    ) -> None:
+        """A zone serving a malformed record at the heartbeat name —
+        SeenStore.accept verifies and rejects, store stays empty."""
+        transport.publish_txt_record(
+            heartbeat_rrset_name("hostile.example"),
+            "v=dmp1;t=heartbeat;not-real-base64",
+        )
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            seed_zones=("hostile.example",),
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+        assert store.count() == 0
+
+    def test_self_zone_filtered_from_harvest(
+        self, store, transport, now
+    ) -> None:
+        """If the worker's own zone appears in the seed list, the
+        worker doesn't query itself (would re-ingest its own
+        heartbeat with the wrong remote-addr provenance)."""
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            seed_zones=("self.example", "peer.example"),
+        )
+        peer = _signer("peer-b", b"B" * 32)
+        _publish_peer_heartbeat(
+            transport, peer, "peer.example",
+            endpoint="https://peer.example.com", ts=now,
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+        # Self-publish lands at our own _dnsmesh-heartbeat name. The
+        # worker's filter prevents the harvest pass from re-ingesting
+        # it. Only the peer's heartbeat ends up in the seen store.
+        rows = store.list_recent(now=now)
+        assert [r.endpoint for r in rows] == ["https://peer.example.com"]
+
+    def test_oversized_gossip_truncated(
+        self, store, transport, now
+    ) -> None:
+        """A zone serving more heartbeats than max_gossip_per_response
+        only contributes that many to the seen-store. Defends against
+        a hostile zone forcing unbounded crypto work."""
+        # Multi-record TXT at one name with 10 distinct heartbeats.
         for i in range(10):
             s = _signer(f"peer{i}", bytes([i + 10]) * 32)
-            many.append(_heartbeat(s, f"https://p{i}.example.com", ts=now))
-
-        poster = _StubPoster(
-            responses={
-                "https://hostile.example.com/v1/heartbeat": {
-                    "ok": True,
-                    "seen": many,
-                }
-            }
+            wire = HeartbeatRecord(
+                endpoint=f"https://p{i}.example.com",
+                operator_spk=s.get_signing_public_key_bytes(),
+                version="0.1.0",
+                ts=now,
+                exp=now + 86400,
+            ).sign(s)
+            transport.publish_txt_record(
+                heartbeat_rrset_name("hostile.example"), wire
+            )
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            seed_zones=("hostile.example",),
+            max_gossip_per_response=3,
         )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
         worker.tick_once(now=now)
-        # Only the first 3 of the 10 wires should have been accepted.
         assert store.count() == 3
 
 
-class TestSelfFilterCanonicalization:
-    """Codex phase-4 P2: self-filter must canonicalize URLs."""
-
-    def test_uppercase_host_filtered(self, store: SeenStore, now: int) -> None:
+class TestSeedZoneList:
+    def test_max_peers_caps_harvest_set(
+        self, store, transport, now
+    ) -> None:
+        """max_peers caps the per-tick harvest fan-out."""
+        seeds = tuple(f"s{i}.example" for i in range(10))
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
-            seed_peers=(
-                "https://SELF.example.com",
-                "https://other.example.com",
-            ),
+            dns_zone="self.example",
+            seed_zones=seeds,
+            max_peers=3,
         )
-        poster = _StubPoster(
-            responses={
-                "https://other.example.com/v1/heartbeat": {
-                    "ok": True,
-                    "seen": [],
-                }
-            }
-        )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        worker.tick_once(now=now)
-        urls = [c[0] for c in poster.calls]
-        assert urls == ["https://other.example.com/v1/heartbeat"]
+        # Track which zones got queried.
+        queried = []
+        original = transport.query_txt_record
 
-    def test_uppercase_scheme_filtered(self, store: SeenStore, now: int) -> None:
+        def tracking_query(name):
+            queried.append(name)
+            return original(name)
+
+        transport.query_txt_record = tracking_query
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+        # 3 seed zones queried for heartbeats (max_peers cap).
+        heartbeat_queries = [
+            q for q in queried if q.startswith("_dnsmesh-heartbeat.")
+        ]
+        assert len(heartbeat_queries) == 3
+
+    def test_legacy_url_seed_normalized_to_zone(
+        self, store, transport, now
+    ) -> None:
+        """A 0.4.x operator's DMP_HEARTBEAT_SEEDS entry was a URL
+        like `https://dnsmesh.io`. node.py's _zone_from_seed strips
+        the scheme; verify the worker accepts a zone-formatted seed
+        without further translation."""
+        peer = _signer("peer-c", b"C" * 32)
+        _publish_peer_heartbeat(
+            transport, peer, "dnsmesh.io",
+            endpoint="https://dnsmesh.io", ts=now,
+        )
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
-            seed_peers=(
-                "HTTPS://self.example.com",
-                "https://other.example.com",
-            ),
+            dns_zone="self.example",
+            seed_zones=("dnsmesh.io",),
         )
-        poster = _StubPoster(
-            responses={
-                "https://other.example.com/v1/heartbeat": {
-                    "ok": True,
-                    "seen": [],
-                }
-            }
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
         )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
-        worker.tick_once(now=now)
-        urls = [c[0] for c in poster.calls]
-        assert urls == ["https://other.example.com/v1/heartbeat"]
+        assert worker.tick_once(now=now) == 1
 
-    def test_default_port_filtered(self, store: SeenStore, now: int) -> None:
+
+class TestCooldown:
+    def test_failing_zone_cools_down(
+        self, store, transport, now
+    ) -> None:
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
-            seed_peers=(
-                "https://self.example.com:443",  # default-port variant
-                "https://other.example.com",
-            ),
+            dns_zone="self.example",
+            seed_zones=("broken.example",),
+            failure_cooldown_ticks=2,
         )
-        poster = _StubPoster(
-            responses={
-                "https://other.example.com/v1/heartbeat": {
-                    "ok": True,
-                    "seen": [],
-                }
-            }
+        # broken.example has no _dnsmesh-heartbeat record published.
+        # Track query attempts to assert cooldown skips them.
+        original = transport.query_txt_record
+        attempts = {"broken": 0}
+
+        def tracking(name):
+            if name == heartbeat_rrset_name("broken.example"):
+                attempts["broken"] += 1
+            return original(name)
+
+        transport.query_txt_record = tracking
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
         )
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
+        # Tick 1: query broken, fail, cooldown=2.
         worker.tick_once(now=now)
-        urls = [c[0] for c in poster.calls]
-        assert urls == ["https://other.example.com/v1/heartbeat"]
+        assert attempts["broken"] == 1
+        # Tick 2 + 3: cooldown skips.
+        worker.tick_once(now=now + 60)
+        assert attempts["broken"] == 1
+        worker.tick_once(now=now + 120)
+        assert attempts["broken"] == 1
+        # Tick 4: cooldown elapsed; retry.
+        worker.tick_once(now=now + 180)
+        assert attempts["broken"] == 2
+
+    def test_recovering_zone_clears_cooldown(
+        self, store, transport, now
+    ) -> None:
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            seed_zones=("flaky.example",),
+            failure_cooldown_ticks=1,
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        # Tick 1: nothing published at flaky.example yet — fail.
+        worker.tick_once(now=now)
+        # Tick 2: cooldown skip.
+        worker.tick_once(now=now + 60)
+        # Now publish a real heartbeat at flaky.example.
+        peer = _signer("flake", b"F" * 32)
+        _publish_peer_heartbeat(
+            transport, peer, "flaky.example",
+            endpoint="https://flaky.example.com", ts=now + 119,
+        )
+        # Tick 3: cooldown elapsed, retry, succeeds.
+        result = worker.tick_once(now=now + 120)
+        assert result == 1
+        # Tick 4: still queryable, succeeds again.
+        result2 = worker.tick_once(now=now + 180)
+        assert result2 == 1
+
+
+class TestOwnHeartbeatShape:
+    def test_published_wire_round_trips(
+        self, store, transport, now
+    ) -> None:
+        """The wire we publish at _dnsmesh-heartbeat.<zone> is a
+        verifiable HeartbeatRecord."""
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.4.4",
+            dns_zone="self.example",
+            capabilities=1,  # CAP_CLAIM_PROVIDER
+            claim_provider_zone="self.example",
+        )
+        signer = _signer()
+        worker = HeartbeatWorker(
+            cfg,
+            signer,
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+        records = transport.query_txt_record(
+            heartbeat_rrset_name("self.example")
+        )
+        assert records
+        parsed = HeartbeatRecord.parse_and_verify(records[0], now=now)
+        assert parsed is not None
+        assert parsed.endpoint == "https://self.example.com"
+        assert parsed.version == "0.4.4"
+        assert parsed.capabilities == 1
+        assert parsed.claim_provider_zone == "self.example"
+        assert parsed.operator_spk == signer.get_signing_public_key_bytes()
 
 
 class TestLifecycle:
-    def test_start_stop(self, store: SeenStore) -> None:
-        """Daemon thread lifecycle: start -> stop returns cleanly even
-        if no tick has fired yet."""
+    def test_start_stop(self, store, transport) -> None:
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
-            interval_seconds=10,  # never actually fires during the test
+            interval_seconds=10,
+            dns_zone="self.example",
         )
-        poster = _StubPoster()
-        worker = HeartbeatWorker(cfg, _signer(), store, http_poster=poster)
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
         worker.start()
-        # Give the thread a brief moment to hit its wait().
         time.sleep(0.05)
         worker.stop(timeout=2.0)

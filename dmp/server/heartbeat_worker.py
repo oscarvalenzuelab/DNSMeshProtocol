@@ -1,21 +1,34 @@
-"""Heartbeat worker — periodically emits this node's heartbeat + gossip.
+"""Heartbeat worker — DNS-native publish/discover (M9.1.2).
 
-M5.8 phase 4. Runs as a daemon thread inside the node process when
-``DMP_HEARTBEAT_ENABLED=1``. Each tick (default every 5 minutes):
+Each tick (default every 5 minutes):
 
 1. Build + sign the node's own ``HeartbeatRecord`` using the operator
    Ed25519 key loaded at startup.
-2. Build the outbound ping list: seeds ∪ cluster peers ∪
-   ``SeenStore.list_for_ping`` (gossip-learned), de-duplicated and
-   capped at ``max_peers``.
-3. POST ``{"wire": own_wire}`` to each peer's ``/v1/heartbeat``.
-4. On 200, parse the response's ``seen`` array and hand each wire to
-   ``SeenStore.accept`` (which verifies + dedupes — a hostile peer
-   cannot poison the store because signatures gate every row).
+2. Publish the wire as a TXT record at ``_dnsmesh-heartbeat.<own-zone>``
+   via the local DNSRecordWriter — the same writer the cluster
+   manifest publisher uses. After publish the record is queryable
+   via the recursive DNS chain by anyone in the world.
+3. For each configured seed zone, query
+   ``_dnsmesh-heartbeat.<seed-zone>`` via the local DNSRecordReader
+   to learn that peer's current state. Each verified wire is fed to
+   ``SeenStore.accept`` (which checks signature + freshness + low-
+   order pubkey before storing — a hostile peer cannot poison the
+   store because every row is a verifiable Ed25519 signature).
+4. Optionally also harvest the peer's transitive seen-graph by
+   querying ``_dnsmesh-seen.<seed-zone>`` (M9.1.3, multi-record
+   TXT). Implemented in this module but feature-flagged on the
+   record-writer being present so legacy in-memory tests can
+   exercise just step 2 + 3 without the gossip layer.
 
-Failures are logged at INFO and don't stop the worker. A peer that
-returns 4xx/5xx stays in the list but gets a cooldown on the next
-tick so a consistently-broken URL doesn't hog budget.
+Failures are logged at INFO and don't stop the worker. A peer zone
+that fails to resolve stays in the list but gets a cooldown on the
+next tick so a consistently-broken zone doesn't hog budget.
+
+This is a clean break from the M5.8 HTTP-gossip model. The worker
+no longer POSTs to peers' ``/v1/heartbeat`` endpoint; that whole HTTP
+exchange path is gone in 0.5.0. Anti-entropy between cluster peers
+remains HTTP-based (it's an HA implementation detail, not a federation
+primitive — see M9 design notes).
 """
 
 from __future__ import annotations
@@ -25,10 +38,11 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Set
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 from dmp.core.crypto import DMPCrypto
 from dmp.core.heartbeat import HeartbeatRecord
+from dmp.network.base import DNSRecordReader, DNSRecordWriter
 from dmp.server.heartbeat_store import SeenStore
 
 log = logging.getLogger(__name__)
@@ -38,53 +52,59 @@ log = logging.getLogger(__name__)
 DEFAULT_INTERVAL_SECONDS = 300  # 5 minutes
 DEFAULT_TTL_SECONDS = 86_400  # 24 hours
 DEFAULT_MAX_PEERS = 25
-DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 # Cooldown applied to a peer that fails a single tick. Next tick we
 # skip it. Counter resets on successful contact.
 DEFAULT_FAILURE_COOLDOWN_TICKS = 1
 # Cap on how many gossip wires the worker will ingest from ONE peer
-# per POST. A hostile seed can answer with an unbounded `seen` list;
-# without a cap, the worker burns signature-verify + sqlite cycles
-# processing the flood. Design doc said "up to N recent heartbeats";
-# this is the enforcement.
+# per response. A hostile seed can answer with an unbounded `seen`
+# RRset; without a cap, the worker burns signature-verify + sqlite
+# cycles processing the flood. Same defense the M5.8 HTTP path had.
 DEFAULT_MAX_GOSSIP_PER_RESPONSE = 20
-# Schemes whose default ports should be elided when canonicalizing
-# URLs for self-identity comparison. Anything not in this map keeps
-# its port literal.
-_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+# DNS owner names the worker publishes / queries under.
+HEARTBEAT_RRSET_PREFIX = "_dnsmesh-heartbeat"
+SEEN_RRSET_PREFIX = "_dnsmesh-seen"
 
 
-def _canonicalize_url(url: str) -> str:
-    """Return a canonical form suitable for self-identity comparison.
+def _zone_from_seed(seed: str) -> str:
+    """Normalize a heartbeat seed into a DNS zone label.
 
-    Rules:
-      - lowercase scheme
-      - lowercase hostname (ASCII; IDN hostnames arrive punycoded
-        upstream so case-folding their label here is safe)
-      - elide the port if it matches the scheme default
-      - strip trailing slash
-      - drop path/query/fragment (endpoints have none by contract)
-
-    An empty / malformed URL returns the empty string so it can't
-    accidentally match the node's real endpoint.
+    M9 transition: pre-0.5.0 operators populated ``DMP_HEARTBEAT_SEEDS``
+    with URLs (``https://dnsmesh.io``). The new format wants bare
+    zones (``dnsmesh.io``). To avoid asking every operator to
+    rewrite ``node.env`` on the upgrade, accept either. Strip a
+    leading ``<scheme>://`` and any trailing ``:port`` / path.
+    Empty / unparseable input returns the empty string so the
+    caller can drop it.
     """
-    if not isinstance(url, str) or not url:
+    if not isinstance(seed, str) or not seed:
         return ""
-    try:
-        parts = urlsplit(url.strip())
-    except ValueError:
-        return ""
-    scheme = (parts.scheme or "").lower()
-    host = (parts.hostname or "").lower()
-    if not scheme or not host:
-        return ""
-    port = parts.port
-    default = _DEFAULT_PORTS.get(scheme)
-    if port is None or port == default:
-        netloc = host
-    else:
-        netloc = f"{host}:{port}"
-    return urlunsplit((scheme, netloc, "", "", "")).rstrip("/")
+    s = seed.strip()
+    if "://" in s:
+        try:
+            parts = urlsplit(s)
+            host = (parts.hostname or "").strip().lower()
+        except ValueError:
+            return ""
+        return host
+    # Already a bare hostname — strip an explicit port if present.
+    if ":" in s and not s.startswith("["):
+        s = s.split(":", 1)[0]
+    return s.lower()
+
+
+def heartbeat_rrset_name(zone: str) -> str:
+    """Owner name a node publishes its heartbeat under."""
+    if not isinstance(zone, str) or not zone:
+        raise ValueError("zone must be a non-empty string")
+    return f"{HEARTBEAT_RRSET_PREFIX}.{zone}"
+
+
+def seen_rrset_name(zone: str) -> str:
+    """Owner name a node publishes its seen-graph under (M9.1.3)."""
+    if not isinstance(zone, str) or not zone:
+        raise ValueError("zone must be a non-empty string")
+    return f"{SEEN_RRSET_PREFIX}.{zone}"
 
 
 @dataclass(frozen=True)
@@ -93,36 +113,33 @@ class HeartbeatWorkerConfig:
 
     The worker owns no mutable config — a re-config requires a
     restart, matching the pattern the rest of DMPNode uses.
+
+    M9 fields:
+      - ``dns_zone`` is the zone the worker publishes its own
+        heartbeat under. Required when ``record_writer`` is wired in.
+      - ``seed_zones`` are the DNS zones the worker queries for peer
+        heartbeats. Replaces the URL-based ``seed_peers`` from M5.8.
+        ``DMPNode`` reads ``DMP_HEARTBEAT_SEEDS`` and parses each
+        entry through ``_zone_from_seed`` so legacy URL configs keep
+        working.
     """
 
     self_endpoint: str
     version: str
-    seed_peers: tuple = ()
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS
     ttl_seconds: int = DEFAULT_TTL_SECONDS
     max_peers: int = DEFAULT_MAX_PEERS
-    http_timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS
     failure_cooldown_ticks: int = DEFAULT_FAILURE_COOLDOWN_TICKS
-    # Upper bound on the number of gossip wires ingested from ONE
-    # peer response. See codex phase-4 P2: otherwise a hostile peer
-    # can force O(N) sig-verify + sqlite work by returning a
-    # very-long `seen` array.
     max_gossip_per_response: int = DEFAULT_MAX_GOSSIP_PER_RESPONSE
-    # Capability bitfield advertised in this node's heartbeat
-    # (M8.2). Bit 0 = CAP_CLAIM_PROVIDER. Defaults to 0 here so the
-    # dataclass remains pure-data; DMPNode wiring populates it from
-    # ``DMP_CLAIM_PROVIDER`` env (default ON unless explicitly
-    # disabled).
     capabilities: int = 0
-    # M9: claim_provider_zone advertised in the heartbeat wire. Same
-    # data the legacy /v1/info JSON used to expose; now travels in the
-    # signed record so peers can discover it via DNS only. Empty when
-    # the node isn't acting as a claim provider.
     claim_provider_zone: str = ""
+    # M9 — DNS-native publish/discover.
+    dns_zone: str = ""
+    seed_zones: tuple = ()
 
 
 class HeartbeatWorker:
-    """Background heartbeat emitter + gossip ingester.
+    """Background DNS-native heartbeat publisher + seen-graph harvester.
 
     Not thread-safe from the outside — call start() / stop() from
     the main thread (DMPNode does this). Internally the worker
@@ -136,28 +153,37 @@ class HeartbeatWorker:
         operator_crypto: DMPCrypto,
         seen_store: SeenStore,
         *,
+        record_writer: Optional[DNSRecordWriter] = None,
+        dns_reader: Optional[DNSRecordReader] = None,
         cluster_peers_provider: Optional[Callable[[], Iterable[str]]] = None,
-        http_poster: Optional[Callable[[str, dict, float], Optional[dict]]] = None,
     ) -> None:
         """Construct the worker.
 
-        ``cluster_peers_provider`` is an optional zero-arg callable
-        that returns the current set of cluster peer endpoints
-        (typically reads from the same cluster manifest the
-        anti-entropy worker uses). None in solo-node mode.
+        ``record_writer`` is the local store the node uses to publish
+        its own zone records. When None, the worker still ticks but
+        publishes nothing — useful for tests that only want to
+        exercise the gossip-ingest side.
 
-        ``http_poster`` is the HTTP transport. Default is a thin
-        requests wrapper; tests inject a stub.
+        ``dns_reader`` is the resolver the worker uses to fetch peer
+        heartbeat records. When None, the worker skips the harvest
+        step. Tests pass an in-memory store implementing the same
+        interface.
+
+        ``cluster_peers_provider`` is an optional zero-arg callable
+        that returns cluster peer endpoints (for clustered nodes
+        that want to harvest each peer's zone). Each entry is
+        normalized via ``_zone_from_seed``. None in solo-node mode.
         """
         self._cfg = config
         self._crypto = operator_crypto
         self._store = seen_store
+        self._record_writer = record_writer
+        self._dns_reader = dns_reader
         self._cluster_peers_provider = cluster_peers_provider or (lambda: ())
-        self._http_poster = http_poster or _default_http_poster
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # Cooldown map: peer URL -> ticks-until-retry. A peer that
+        # Cooldown map: peer zone -> ticks-until-retry. A peer that
         # failed on the last tick waits at least one tick before we
         # try again, so a persistent error doesn't monopolize budget.
         self._cooldown: dict = {}
@@ -176,10 +202,10 @@ class HeartbeatWorker:
         )
         self._thread.start()
         log.info(
-            "heartbeat worker started: self=%s interval=%ds max_peers=%d",
-            self._cfg.self_endpoint,
+            "heartbeat worker started: zone=%s interval=%ds seeds=%d",
+            self._cfg.dns_zone or "(none)",
             self._cfg.interval_seconds,
-            self._cfg.max_peers,
+            len(self._cfg.seed_zones),
         )
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -201,84 +227,110 @@ class HeartbeatWorker:
                 self.tick_once()
             except Exception:
                 log.exception("heartbeat tick raised; continuing")
-            # Sleep respecting the stop event so shutdown is prompt.
             self._stop_event.wait(self._cfg.interval_seconds)
 
     def tick_once(self, *, now: Optional[int] = None) -> int:
-        """Run one tick synchronously. Returns count of successful
-        POSTs. Exposed for tests.
-
-        Clock handling: the peer list is assembled once at tick
-        start (uses ``now`` for the freshness filter on
-        ``SeenStore.list_for_ping``), but the heartbeat wire is
-        RE-SIGNED with a fresh ``now`` immediately before each POST,
-        and ``SeenStore.accept`` receives a fresh ``now`` too.
-        Sequential POSTs at ~10s timeout each can span a few minutes
-        — freezing ``now`` at tick start would put a late-POSTed
-        wire dangerously close to the receiver's 5-min ts-skew
-        guard, and would evaluate late gossip against an early
-        clock. Codex phase-4 P2 fix.
+        """Run one tick synchronously. Returns the number of peer zones
+        that produced a successfully-verified heartbeat ingest. Exposed
+        for tests.
         """
         tick_start = int(now) if now is not None else int(time.time())
 
-        # Assemble the ping list once using the tick-start `now`
-        # for the gossip-learned filter. Peer set doesn't change
-        # mid-tick even if the clock advances.
-        peers = self._build_peer_list(tick_start)
-        if not peers:
-            # Solo node with no seeds — still valid, just nothing
-            # to send yet. A peer pushing to us will populate the
-            # store and future ticks will gossip outward.
+        # 1. Publish own heartbeat into our zone (if writer + zone
+        #    are both configured). A standalone node with no zone
+        #    config still ticks; it just doesn't expose itself in
+        #    DNS this round.
+        self._publish_own(tick_start)
+
+        # 2. Harvest peer heartbeats by querying each seed zone.
+        zones = self._build_seed_zones()
+        if not zones:
             return 0
 
         successes = 0
-        for peer in peers:
-            # Cooldown.
-            cd = self._cooldown.get(peer, 0)
+        for zone in zones:
+            cd = self._cooldown.get(zone, 0)
             if cd > 0:
-                self._cooldown[peer] = cd - 1
+                self._cooldown[zone] = cd - 1
                 continue
 
-            # Refresh clock + re-sign per peer (P2 fix). Uses `now`
-            # override when the test passed one; otherwise wall
-            # clock so late peers get an ~up-to-the-second wire.
             per_peer_now = int(now) if now is not None else int(time.time())
-            try:
-                own_wire = self._build_own_wire(per_peer_now)
-            except ValueError:
-                log.exception(
-                    "heartbeat self-wire build failed mid-tick; "
-                    "skipping remaining peers"
-                )
-                return successes
-
-            response = self._http_poster(
-                peer + "/v1/heartbeat",
-                {"wire": own_wire},
-                self._cfg.http_timeout_seconds,
-            )
-            if response is None or not isinstance(response, dict):
-                self._cooldown[peer] = self._cfg.failure_cooldown_ticks
-                log.info("heartbeat post to %s failed", peer)
-                continue
-            # Success path: ingest any gossip response.
-            self._cooldown.pop(peer, None)
-            successes += 1
-            seen_wires = response.get("seen") or []
-            if isinstance(seen_wires, list):
-                # Bound per-response work — a hostile peer cannot
-                # force unbounded signature verification + sqlite
-                # writes by handing us an oversized `seen` array.
-                # Truncate at max_gossip_per_response. Codex
-                # phase-4 P2 fix.
-                for w in seen_wires[: self._cfg.max_gossip_per_response]:
-                    if isinstance(w, str):
-                        self._store.accept(
-                            w,
-                            remote_addr=peer,
-                            now=per_peer_now,
-                        )
+            ingested = self._fetch_and_ingest(zone, per_peer_now)
+            if ingested:
+                successes += 1
+                self._cooldown.pop(zone, None)
+            else:
+                self._cooldown[zone] = self._cfg.failure_cooldown_ticks
         return successes
+
+    # ------------------------------------------------------------------
+    # publish
+    # ------------------------------------------------------------------
+
+    def _publish_own(self, now_i: int) -> bool:
+        """Publish this node's signed heartbeat at
+        ``_dnsmesh-heartbeat.<dns_zone>``. Returns True on success.
+        """
+        if self._record_writer is None or not self._cfg.dns_zone:
+            return False
+        try:
+            wire = self._build_own_wire(now_i)
+        except ValueError:
+            log.exception("heartbeat self-wire build failed; skipping publish")
+            return False
+        try:
+            name = heartbeat_rrset_name(self._cfg.dns_zone)
+        except ValueError:
+            return False
+        try:
+            ok = bool(
+                self._record_writer.publish_txt_record(
+                    name, wire, ttl=self._cfg.ttl_seconds
+                )
+            )
+        except Exception:
+            log.exception("heartbeat self-publish raised")
+            return False
+        if not ok:
+            log.info("heartbeat self-publish to %s returned False", name)
+        return ok
+
+    # ------------------------------------------------------------------
+    # harvest
+    # ------------------------------------------------------------------
+
+    def _fetch_and_ingest(self, zone: str, now_i: int) -> bool:
+        """Query ``_dnsmesh-heartbeat.<zone>`` and ingest verified wires.
+
+        Returns True if at least one wire was accepted. Truncates the
+        ingest set at ``max_gossip_per_response`` so a hostile zone
+        can't force unbounded crypto work by returning a giant RRset.
+        """
+        if self._dns_reader is None:
+            return False
+        try:
+            name = heartbeat_rrset_name(zone)
+        except ValueError:
+            return False
+        try:
+            records = self._dns_reader.query_txt_record(name)
+        except Exception:
+            log.info("heartbeat DNS query to %s failed", name)
+            return False
+        if not records:
+            return False
+        accepted = 0
+        for wire in records[: self._cfg.max_gossip_per_response]:
+            if not isinstance(wire, str):
+                continue
+            try:
+                if self._store.accept(wire, remote_addr=zone, now=now_i):
+                    accepted += 1
+            except Exception:
+                log.exception(
+                    "SeenStore.accept raised for wire from %s", zone
+                )
+        return accepted > 0
 
     # ------------------------------------------------------------------
     # helpers
@@ -296,40 +348,28 @@ class HeartbeatWorker:
         )
         return hb.sign(self._crypto)
 
-    def _build_peer_list(self, now_i: int) -> List[str]:
-        """Assemble the outbound ping list for this tick.
+    def _build_seed_zones(self) -> List[str]:
+        """Assemble the per-tick zone list to harvest.
 
-        Order = seeds first (known-good starting points), then
-        cluster peers (already trusted via the signed manifest), then
-        gossip-learned from the seen store. De-duped preserving
-        order, cap at max_peers. The node's own endpoint is filtered
-        out so we never ping ourselves.
-
-        URLs are canonicalized for self-compare + dedup:
-        scheme/host lowercased, default ports elided, trailing
-        slash stripped. This closes the codex phase-4 P2 where
-        ``HTTPS://self.example.com`` or ``https://self.example.com:443``
-        would bypass the self-filter.
+        Order = configured seeds first, then cluster peers (already
+        trusted via the signed manifest), then gossip-learned peers
+        from the seen-store. De-duped preserving order, capped at
+        ``max_peers``. The node's own zone is filtered out so we
+        never query ourselves.
         """
-        self_canon = _canonicalize_url(self._cfg.self_endpoint)
+        self_zone = (self._cfg.dns_zone or "").lower()
         seen: Set[str] = set()
         out: List[str] = []
 
-        def _add(url: str) -> None:
-            if not isinstance(url, str):
+        def _add(raw: str) -> None:
+            zone = _zone_from_seed(raw)
+            if not zone or zone == self_zone or zone in seen:
                 return
-            canon = _canonicalize_url(url)
-            if not canon or canon == self_canon:
-                return
-            if canon in seen:
-                return
-            seen.add(canon)
-            # Append the canonical form, not the raw input, so
-            # downstream HTTP posts use a predictable URL.
-            out.append(canon)
+            seen.add(zone)
+            out.append(zone)
 
-        for u in self._cfg.seed_peers:
-            _add(u)
+        for seed in self._cfg.seed_zones:
+            _add(seed)
         try:
             for u in self._cluster_peers_provider():
                 _add(u)
@@ -337,39 +377,15 @@ class HeartbeatWorker:
             log.exception(
                 "cluster_peers_provider raised; continuing with seeds + gossip"
             )
-        # Gossip-learned: pull twice the cap so we still have
-        # candidates after self + dup elimination.
+        # Gossip-learned: pull endpoints from seen-store and project
+        # to zones. Pull twice the cap so we still have candidates
+        # after self + dup elimination.
         try:
             for u in self._store.list_for_ping(
-                limit=self._cfg.max_peers * 2, now=now_i
+                limit=self._cfg.max_peers * 2, now=None
             ):
                 _add(u)
         except Exception:
             log.exception("SeenStore.list_for_ping raised; continuing")
 
         return out[: self._cfg.max_peers]
-
-
-# ---------------------------------------------------------------------------
-
-
-def _default_http_poster(url: str, body: dict, timeout: float) -> Optional[dict]:
-    """Default HTTP POST. Returns decoded JSON on 200, None otherwise.
-
-    Deferred requests import so importing this module in a minimal
-    test environment doesn't pull the whole requests dependency tree
-    just for type-checking.
-    """
-    import requests
-
-    try:
-        r = requests.post(url, json=body, timeout=timeout)
-    except requests.RequestException:
-        return None
-    if r.status_code != 200:
-        return None
-    try:
-        parsed = r.json()
-    except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
