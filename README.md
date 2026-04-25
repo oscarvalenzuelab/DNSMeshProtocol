@@ -134,6 +134,25 @@ curl -fsSL https://raw.githubusercontent.com/oscarvalenzuelab/DNSMeshProtocol/ma
     | sudo DMP_NODE_HOSTNAME=dmp.example.com bash
 ```
 
+**Then delegate a DNS subdomain to the node** so clients on the public
+internet can resolve records served by the node. Without this step,
+`dig @1.1.1.1 id-XXX.example.com TXT` returns nothing even though the
+node has the record — the registrar's nameservers don't know about
+DMP records. The fix is one `NS` record at the registrar plus one env
+var on the node:
+
+```
+At the registrar (DigitalOcean / Cloudflare / etc.):
+  mesh.example.com.   IN NS   example.com.
+
+On the node:
+  DMP_DOMAIN=mesh.example.com
+  sudo systemctl restart dnsmesh-node
+```
+
+Full walk-through with screenshots and verification steps:
+[Deployment → DNS subdomain delegation](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/dns-delegation).
+
 Once your node is up, point the CLI at it via the **public hostname**,
 not loopback — the saved registration token is keyed by hostname, so
 `--endpoint http://127.0.0.1:8053` won't auto-attach a token registered

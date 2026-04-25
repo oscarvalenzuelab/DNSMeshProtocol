@@ -479,6 +479,42 @@ sequenceDiagram
   </table>
 </section>
 
+<!-- 14b. DNS subdomain delegation (operator gotcha) -->
+<section>
+  <h2>One step to make your node reachable from any network</h2>
+  <p style="text-align: left;">
+    A DMP node serves records on UDP 53. But your domain's
+    <code>NS</code> records at the registrar point at the
+    <em>registrar's</em> nameservers, not your node. So
+    <code>dig @1.1.1.1 id-XXX.example.com TXT</code> returns
+    nothing — even though the record IS on your node.
+  </p>
+  <p style="text-align: left;">
+    Fix: <strong>delegate a subdomain</strong> at the registrar.
+    Single <code>NS</code> record + single env var on the node:
+  </p>
+  <pre><code class="language-text">At your registrar:
+  mesh.example.com.   IN NS   example.com.
+
+On the node:
+  DMP_DOMAIN=mesh.example.com
+  systemctl restart dnsmesh-node</code></pre>
+  <p class="small">
+    The website at <code>example.com</code> keeps working untouched;
+    only <code>mesh.example.com</code> traffic flows through your
+    DMP node. After this, every recursive resolver on the public
+    internet finds your records normally.
+  </p>
+  <div class="takeaway">
+    <strong>Without delegation</strong>, clients have to override
+    their DNS resolver to your node's IP (the
+    <code>dnsmesh init --dns-resolvers</code> flag). It works but
+    isn't operator-friendly. Delegation is a one-time setup.
+    Walk-through:
+    <a href="/DNSMeshProtocol/deployment/dns-delegation">deployment/dns-delegation</a>.
+  </div>
+</section>
+
 <!-- 15. Cluster -->
 <section>
   <h2>Federated cluster: surviving a node failure</h2>

@@ -7,6 +7,41 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.4] — operator UX from live dnsmesh.io / dnsmesh.pro deployment
+
+Three issues caught while validating the M8 stack on the public
+reference deployments:
+
+### Fixed
+
+- **Heartbeat wire reports the real package version** instead of the
+  literal `"dev"` fallback. The 0.4.1 patch fixed only the synthesized
+  self-row in the directory UI; the SIGNED heartbeat record still went
+  out as `version="dev"` whenever `DMP_HEARTBEAT_VERSION` wasn't
+  explicitly set in the operator's env file. Result: every node showed
+  "dev" for every other node's row in the `/nodes` UI even when both
+  ran a real release. Now both code paths fall back to
+  `dmp.__version__`.
+- **Node landing page (`GET /`) registration example** now uses bare
+  hostnames matching the 0.4.2 CLI ergonomics: `--endpoint dnsmesh.io`,
+  `--node dnsmesh.io`, plus `dnsmesh init alice@<your-zone>` for
+  consistency with the auto-parse fix. Operator-reported regression
+  from the live dnsmesh.io landing page that still prompted users to
+  paste the broken `--endpoint https://dnsmesh.io` form.
+
+### Added
+
+- **`docs/deployment/dns-delegation.md`** — step-by-step on the
+  subdomain-delegation pattern that makes a DMP node's records
+  reachable from the public DNS chain. Covers DigitalOcean,
+  generic-registrar instructions, glue-record edge cases, troubleshooting
+  table, and the io-vs-pro reference deployment status. Cross-linked
+  from README ("Self-host" section), `docs/deployment/index.md`, and
+  the training-guide presentation deck.
+- **Presentation slide** "One step to make your node reachable from any
+  network" — explains why operators hit the silent
+  `dig @1.1.1.1 id-XXX TXT → empty` failure and the one-line fix.
+
 ## [0.4.3] — final pre-release codex sweep on the M8 path
 
 Two P2 fixes from a release-readiness codex review of the cumulative

@@ -265,7 +265,23 @@ def _load_heartbeat_from_env(record_db_path: str):
     interval = int(os.environ.get("DMP_HEARTBEAT_INTERVAL_SECONDS", "300"))
     ttl = int(os.environ.get("DMP_HEARTBEAT_TTL_SECONDS", "86400"))
     max_peers = int(os.environ.get("DMP_HEARTBEAT_MAX_PEERS", "25"))
-    version = os.environ.get("DMP_HEARTBEAT_VERSION", "").strip() or "dev"
+    # Heartbeat wire's `version` field is what peers see in their
+    # /v1/nodes/seen + /nodes UI. Operator-reported regression: prior
+    # default of literal "dev" meant every heartbeat-enabled node
+    # gossiped "dev" to peers regardless of installed package version,
+    # so the directory page showed "dev" for everyone except the local
+    # synthesized self-row (which 0.4.1 fixed via the same fallback
+    # below). Mirror that fix here so the SIGNED wire reports the real
+    # version too. Operators who want a build-number / git-sha string
+    # still override via DMP_HEARTBEAT_VERSION.
+    version = os.environ.get("DMP_HEARTBEAT_VERSION", "").strip()
+    if not version:
+        try:
+            from dmp import __version__ as _pkg_version
+
+            version = _pkg_version or "dev"
+        except Exception:
+            version = "dev"
 
     # M8.2 — claim-provider capability defaults ON for every node that
     # has heartbeat enabled. Operators who don't want to host claims

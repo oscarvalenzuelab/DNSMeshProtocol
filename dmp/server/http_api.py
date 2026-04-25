@@ -477,6 +477,21 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         reg_endpoint = self_endpoint or (
             f"https://{host_header}" if host_header else "https://<this-host>"
         )
+        # Bare hostname for the CLI quick-start example. From 0.4.2 the
+        # CLI auto-prepends https:// to bare hostnames; showing
+        # `https://dnsmesh.io` in the example caused users to copy-paste
+        # `--node https://dnsmesh.io` which earlier versions concatenated
+        # to `https://https://dnsmesh.io` and failed name resolution.
+        # Operator-reported regression on dnsmesh.io's own landing page.
+        try:
+            from urllib.parse import urlsplit as _urlsplit
+
+            _parts = _urlsplit(reg_endpoint)
+            reg_host = _parts.hostname or reg_endpoint.replace("https://", "").replace(
+                "http://", ""
+            )
+        except Exception:
+            reg_host = reg_endpoint.replace("https://", "").replace("http://", "")
 
         if reg_self_service:
             allowlist = reg_cfg.allowlist if reg_cfg else ()
@@ -498,9 +513,9 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
                 "Anyone with the <code>dnsmesh</code> CLI can mint a "
                 f"per-user publish token here (default expiry: {expiry_days} days).</p>"
                 f"<pre>pip install dnsmesh\n"
-                f"dnsmesh init alice --domain &lt;your-domain&gt; --endpoint {_html.escape(reg_endpoint)}\n"
-                f"dnsmesh register --node {_html.escape(reg_endpoint)}</pre>"
-                + allow_html
+                f"dnsmesh init alice@&lt;your-zone&gt; --endpoint {_html.escape(reg_host)}\n"
+                f"dnsmesh register --node {_html.escape(reg_host)}\n"
+                f"dnsmesh identity publish</pre>" + allow_html
             )
         elif auth_mode == "multi-tenant":
             registration_block = (

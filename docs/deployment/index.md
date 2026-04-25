@@ -25,6 +25,11 @@ an item here is the most common way a DMP node gets owned.
   directly via apt + pip + systemd, no Docker. ~50 MB idle RAM
   footprint vs ~150 MB for the Docker recipe. Fronted by Caddy for
   auto-TLS.
+- [DNS subdomain delegation]({{ site.baseurl }}/deployment/dns-delegation) —
+  the step that makes your node's records reachable from the public DNS
+  chain. Without it, clients can only fetch records by overriding
+  `--dns-resolvers` to your node IP. Required reading for any operator
+  who wants their node to "just work" for users on arbitrary networks.
 - [Production]({{ site.baseurl }}/deployment/production) — TLS via Caddy,
   rate limiting, per-name RRset caps, metrics scraping, env-var reference.
 - [Clustered deployment]({{ site.baseurl }}/deployment/cluster) — 3-node
