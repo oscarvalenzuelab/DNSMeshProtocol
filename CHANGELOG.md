@@ -7,6 +7,42 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.2] — operator UX from a real deploy trace
+
+Two follow-on fixes from a `dnsmesh.pro` install trace where the
+operator hit confusing CLI behavior:
+
+### Fixed
+
+- **`dnsmesh register --node`** now strips a `<scheme>://` prefix
+  before composing the registration URL. The natural copy-paste
+  `--node https://dnsmesh.pro` previously produced
+  `https://https://dnsmesh.pro` and a name-resolution error. The
+  saved-token filename now uses the normalized hostname so the
+  per-node bearer auto-attaches at publish time regardless of how
+  the operator typed the `--node` arg.
+- **`dnsmesh init alice@dnsmesh.pro`** now auto-splits the @-form
+  into `username=alice` + `domain=dnsmesh.pro`. Previously the @
+  form landed verbatim in the `username` field and the user had
+  to remember to also pass `--domain dnsmesh.pro` (caught from a
+  real install where the operator didn't, then chased the
+  resulting passphrase-tripwire mismatches with multiple
+  `--force` re-inits).
+- **Presentation title** updated to "DNS Mesh Protocol — a
+  training guide" so the browser tab matches the new
+  business-oriented framing.
+
+### Added
+
+- **README** now documents the public-server endpoint convention:
+  on a node fronted by Caddy at `dmp.example.com`, point
+  `--endpoint dmp.example.com` (not `http://127.0.0.1:8053`) so
+  the registration token saved at
+  `~/.dmp/tokens/dmp.example.com.json` auto-attaches at publish
+  time. The auto-attach is keyed by hostname; loopback endpoints
+  produce a 401 even after a successful `register` because the
+  hostname doesn't match.
+
 ## [0.4.1] — install/upgrade hardening + UX polish
 
 ### Fixed

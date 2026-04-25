@@ -1193,6 +1193,28 @@ def cmd_init(args: argparse.Namespace) -> int:
     if path.exists() and not args.force:
         _die(1, f"config already exists at {path} (use --force to overwrite)")
 
+    # Operator-friendly: accept `dnsmesh init alice@dnsmesh.pro` and
+    # split into username + domain. Without this, the @-form lands in
+    # the username field verbatim and the user has to remember to
+    # also pass `--domain dnsmesh.pro` (real bug from a dnsmesh.pro
+    # install where the operator typed `dnsmesh init alice@dnsmesh.pro`
+    # and ended up with username="alice@dnsmesh.pro" + the default
+    # mesh.local domain).  An explicit `--domain` still wins so
+    # operators can override.
+    if "@" in args.username:
+        try:
+            user_part, host_part = args.username.split("@", 1)
+        except ValueError:
+            _die(1, f"could not parse {args.username!r} as user@host")
+        if not user_part or not host_part:
+            _die(1, f"both user and host must be non-empty in {args.username!r}")
+        args.username = user_part
+        # Only auto-fill --domain when the caller didn't pass one
+        # AND the parser default was still in place. The --domain
+        # default is "mesh.local"; treat that as "unset by user".
+        if not args.domain or args.domain == "mesh.local":
+            args.domain = host_part
+
     # Parse --dns-resolvers eagerly so a malformed value fails init (non-
     # zero exit) rather than silently landing in config and exploding on
     # the first read. When set, the multi-resolver pool takes precedence
@@ -2626,7 +2648,18 @@ def cmd_register(args: argparse.Namespace) -> int:
     crypto = DMPCrypto.from_passphrase(passphrase, salt=kdf_salt)
     spk_hex = crypto.get_signing_public_key_bytes().hex()
 
-    base = f"{args.scheme}://{args.node}"
+    # Codex-style nit (operator-reported, dnsmesh.pro install): users
+    # naturally pass `--node https://dnsmesh.pro` because that's the
+    # URL they see in the address bar; the old code concatenated the
+    # scheme onto whatever they passed, producing
+    # `https://https://dnsmesh.pro` and a name-resolution error. Strip
+    # any `<scheme>://` prefix from `args.node` before composing the
+    # URL so both bare hostnames AND copy-pasted full URLs work.
+    node_host = args.node.strip()
+    if "://" in node_host:
+        node_host = node_host.split("://", 1)[1]
+    node_host = node_host.rstrip("/")
+    base = f"{args.scheme}://{node_host}"
     try:
         r = requests.get(f"{base}/v1/registration/challenge", timeout=10)
     except requests.RequestException as exc:
@@ -2707,14 +2740,18 @@ def cmd_register(args: argparse.Namespace) -> int:
     if not isinstance(token, str) or not token:
         _die(2, f"confirm returned no token: {body!r}")
 
+    # Use the normalized hostname for the saved-token filename so a
+    # copy-pasted `--node https://dnsmesh.pro` saves to the same path
+    # as a bare `--node dnsmesh.pro` — and both match what the
+    # _HttpWriter looks up at publish time via bearer_for_endpoint().
     path = save_token(
-        args.node,
+        node_host,
         token=token,
         subject=body.get("subject", subject),
         expires_at=body.get("expires_at"),
         registered_spk=spk_hex,
     )
-    print(f"registered {subject} on {args.node}")
+    print(f"registered {subject} on {node_host}")
     print(f"  token saved to {path} (mode 0600)")
     if body.get("expires_at"):
         import time

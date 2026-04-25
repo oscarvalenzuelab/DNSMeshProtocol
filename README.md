@@ -134,6 +134,17 @@ curl -fsSL https://raw.githubusercontent.com/oscarvalenzuelab/DNSMeshProtocol/ma
     | sudo DMP_NODE_HOSTNAME=dmp.example.com bash
 ```
 
+Once your node is up, point the CLI at it via the **public hostname**,
+not loopback — the saved registration token is keyed by hostname, so
+`--endpoint http://127.0.0.1:8053` won't auto-attach a token registered
+against `dmp.example.com`.
+
+```bash
+dnsmesh init alice@dmp.example.com               # auto-splits user + zone
+dnsmesh register --node dmp.example.com           # mints + saves a token
+dnsmesh identity publish                          # token attaches automatically
+```
+
 Full walk-through with two users:
 [Getting Started](https://oscarvalenzuelab.github.io/DNSMeshProtocol/getting-started).
 
