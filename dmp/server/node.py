@@ -112,6 +112,76 @@ def _default_heartbeat_db_path(record_db_path: str) -> str:
     return str(p.with_name(p.stem + "_heartbeats" + p.suffix))
 
 
+def _build_heartbeat_dns_reader():
+    """Resolver pool the heartbeat worker uses to harvest peer zones.
+
+    Resolution order:
+
+      1. ``DMP_HEARTBEAT_DNS_RESOLVERS`` — comma-separated IP literals
+         (with optional ``:port``). Operator override for split-horizon
+         or private-DNS deployments.
+      2. System resolver (``dns.resolver.Resolver()``) — honors the
+         platform's ``/etc/resolv.conf`` (or equivalent). The DMP node
+         itself is on the resolution path for its own zone in many
+         deployments, so the system resolver is the right default.
+      3. Returns None when neither is available; the worker tolerates
+         this and just doesn't harvest peers.
+    """
+    raw = os.environ.get("DMP_HEARTBEAT_DNS_RESOLVERS", "").strip()
+    if raw:
+        try:
+            from dmp.network.resolver_pool import ResolverPool
+
+            hosts = []
+            for entry in raw.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                if ":" in entry and not entry.startswith("["):
+                    host, _, port = entry.partition(":")
+                    hosts.append((host, int(port)))
+                else:
+                    hosts.append(entry)
+            if hosts:
+                return ResolverPool(hosts=hosts)
+        except Exception:
+            log.exception(
+                "DMP_HEARTBEAT_DNS_RESOLVERS unparseable; falling back to system resolver"
+            )
+
+    # Default: system resolver. Picks up /etc/resolv.conf — node
+    # operators who run dnsmesh-node ON the same host that resolves
+    # their served zone (a common cluster pattern) get peer harvest
+    # for free, and split-horizon deployments don't have to override.
+    try:
+        import dns.resolver
+
+        from dmp.network.base import DNSRecordReader
+
+        class _SystemResolver(DNSRecordReader):
+            def __init__(self) -> None:
+                self._resolver = dns.resolver.Resolver()
+                self._resolver.timeout = 3.0
+                self._resolver.lifetime = 6.0
+
+            def query_txt_record(self, name: str):
+                try:
+                    answers = self._resolver.resolve(name, "TXT")
+                except Exception:
+                    return None
+                values = []
+                for rdata in answers:
+                    values.append(b"".join(rdata.strings).decode("utf-8"))
+                return values or None
+
+        return _SystemResolver()
+    except Exception:
+        log.exception(
+            "could not build heartbeat-worker resolver; peer harvest disabled"
+        )
+        return None
+
+
 def _default_tsig_db_path(record_db_path: str) -> str:
     """``dmp.db`` -> ``dmp_tsig.db`` alongside the record DB. Holds the
     M9.2.2 keystore powering DNS UPDATE auth + the M9.2.3 registration
@@ -162,6 +232,24 @@ def _load_claim_provider_zone() -> str:
     claim_provider = os.environ.get("DMP_CLAIM_PROVIDER", "").strip().lower()
     if claim_provider in ("0", "false", "no", "off"):
         return ""
+    return _load_served_zone()
+
+
+def _load_served_zone() -> str:
+    """Return the DNS zone this node is authoritative for.
+
+    Distinct from ``_load_claim_provider_zone`` because the served zone
+    governs what owner names the DNS server accepts UPDATE for and what
+    suffix scope minted TSIG keys are anchored under. An operator can
+    legitimately disable claim-provider capability (``DMP_CLAIM_PROVIDER=0``)
+    while still wanting their node to accept DNS UPDATEs from registered
+    users — those are independent decisions. The previous coupling sent
+    every UPDATE to REFUSED on a non-claim-provider node.
+
+    Resolution order matches the claim-provider zone fallback minus the
+    opt-out check: explicit zone override, then cluster base, then
+    DMP_DOMAIN.
+    """
     for var in (
         "DMP_CLAIM_PROVIDER_ZONE",
         "DMP_CLUSTER_BASE_DOMAIN",
@@ -169,7 +257,7 @@ def _load_claim_provider_zone() -> str:
     ):
         v = os.environ.get(var, "").strip()
         if v:
-            return v
+            return v.lower().rstrip(".")
     return ""
 
 
@@ -726,7 +814,15 @@ class DMPNode:
         # UPDATE.
         update_kwargs: dict = {}
         if self.tsig_keystore is not None:
-            update_zone = _load_claim_provider_zone()
+            # The DNS server's authority is decoupled from claim-provider
+            # capability. ``_load_served_zone`` skips the
+            # ``DMP_CLAIM_PROVIDER=0`` opt-out so an operator who wants to
+            # accept DNS UPDATEs WITHOUT advertising claim-provider role
+            # still gets a usable allowed_zones list. (Codex P1: the
+            # original code derived allowed_zones from the claim-provider
+            # helper, which returns "" on opt-out, and the DNS server
+            # then REFUSED every UPDATE.)
+            update_zone = _load_served_zone()
             allowed_zones = (update_zone,) if update_zone else ()
             update_kwargs = {
                 "writer": self.store,
@@ -800,18 +896,15 @@ class DMPNode:
         # M9.1.2: pass the local record store + a DNS reader so the
         # worker can publish into the served zone and query peer
         # zones — the M5.8 HTTP-gossip exchange path is gone.
-        heartbeat_dns_reader = None
-        try:
-            from dmp.network.resolver_pool import ResolverPool
-
-            heartbeat_dns_reader = ResolverPool(
-                hosts=[("1.1.1.1", 53), ("8.8.8.8", 53)]
-            )
-        except Exception:
-            log.exception(
-                "could not build heartbeat-worker resolver pool; "
-                "peer harvest disabled"
-            )
+        #
+        # Resolver source: ``DMP_HEARTBEAT_DNS_RESOLVERS`` (comma-separated
+        # IP literals or ``ip:port``) for explicit operator control;
+        # otherwise fall back to dnspython's system resolver (honors
+        # /etc/resolv.conf or platform equivalent). Codex P2: the prior
+        # hardcode of 1.1.1.1/8.8.8.8 broke split-horizon, private-DNS,
+        # and offline deployments where public resolvers can't see the
+        # node's own zone records.
+        heartbeat_dns_reader = _build_heartbeat_dns_reader()
         heartbeat_bundle = _load_heartbeat_from_env(
             self.config.db_path,
             record_writer=self.store,

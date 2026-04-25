@@ -332,6 +332,20 @@ class HeartbeatWorker:
         except Exception:
             log.exception("SeenStore.list_recent raised; skipping seen-graph publish")
             return 0
+
+        # Replace-the-RRset semantic: clear the existing TXT values at
+        # this name before publishing the current snapshot. The
+        # ``DNSRecordWriter.publish_txt_record`` contract is APPEND, so
+        # without an explicit delete the old wires linger until TTL
+        # expiry and consumers see stale + fresh peers mixed (codex P1
+        # — discovery convergence stalls after a few ticks). The
+        # snapshot we just pulled from SeenStore already reflects the
+        # current top-N by recency.
+        try:
+            self._record_writer.delete_txt_record(name, value=None)
+        except Exception:
+            log.exception("seen-graph wipe raised for %s; continuing", name)
+
         published = 0
         for row in rows:
             wire = getattr(row, "wire", None)

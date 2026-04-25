@@ -186,6 +186,65 @@ class TestMintTsigViaRegistration:
                 body=body,
             )
 
+    def test_scope_anchors_to_served_zone_not_node_hostname(
+        self, keystore, challenges
+    ):
+        """Codex P1 regression: when DMP_NODE_HOSTNAME is a host BENEATH
+        the served zone (api.example.com under example.com), the minted
+        TSIG scope must anchor to the served zone. Otherwise every
+        normal write to alice.example.com bounces as REFUSED because
+        the suffix incorrectly reads alice.api.example.com."""
+        cfg = RegistrationConfig(
+            enabled=True,
+            node_hostname="api.example.com",
+            served_zone="example.com",
+            allowlist=(),
+            expires_in_seconds=3600,
+        )
+        pc = challenges.issue(cfg.node_hostname)
+        body, spk_hex = _signed_body(
+            subject="alice@example.com",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        minted = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=cfg,
+            body=body,
+        )
+        # Anchored under the served zone, not the hostname.
+        assert minted.zone == "example.com"
+        assert "alice.example.com" in minted.allowed_suffixes
+        # And NOT the broken hostname-anchored form.
+        assert "alice.api.example.com" not in minted.allowed_suffixes
+
+    def test_served_zone_falls_back_to_node_hostname(
+        self, keystore, challenges
+    ):
+        """When served_zone isn't set explicitly we still want a
+        usable scope — back-compat for single-host deployments where
+        node_hostname IS the zone apex."""
+        cfg = RegistrationConfig(
+            enabled=True,
+            node_hostname="solo.example",
+            served_zone="",
+            allowlist=(),
+        )
+        pc = challenges.issue(cfg.node_hostname)
+        body, _ = _signed_body(
+            subject="alice@solo.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        minted = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=cfg,
+            body=body,
+        )
+        assert minted.zone == "solo.example"
+
     def test_remint_rotates_secret(self, keystore, config, challenges):
         """Re-registration replaces the secret. The user's old secret
         is unrecoverable; a new UPDATE must use the freshly-issued one.

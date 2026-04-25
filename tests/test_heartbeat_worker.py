@@ -595,6 +595,68 @@ class TestSeenGraphPublish:
         assert published is not None
         assert len(published) == 3
 
+    def test_seen_graph_replaces_rrset_each_tick(
+        self, store, transport, now
+    ) -> None:
+        """Codex P1 regression: seen-graph publish must REPLACE the
+        existing RRset, not APPEND to it. publish_txt_record's append
+        semantics meant stale wires lingered for ttl_seconds and
+        consumers saw newly-departed peers indefinitely."""
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.0",
+            dns_zone="self.example",
+            seed_zones=("peer-a.example",),
+        )
+        signer = _signer()
+        worker = HeartbeatWorker(
+            cfg, signer, store, record_writer=transport, dns_reader=transport
+        )
+
+        # Tick 1: peer-a is alive.
+        _publish_peer_heartbeat(
+            transport,
+            _signer("peer-a", salt=b"A" * 32),
+            "peer-a.example",
+            endpoint="https://peer-a.example.com",
+            ts=now,
+        )
+        worker.tick_once(now=now)
+        first = transport.query_txt_record(seen_rrset_name("self.example")) or []
+        assert len(first) == 1
+
+        # Tick 2: peer-a's wire in the local SeenStore expires; peer-b
+        # arrives. The published RRset must reflect ONLY peer-b.
+        # Force expiry by jumping past peer-a's exp window.
+        future = now + 86400 * 2  # past the default 24h heartbeat window
+        _publish_peer_heartbeat(
+            transport,
+            _signer("peer-b", salt=b"B" * 32),
+            "peer-b.example",
+            endpoint="https://peer-b.example.com",
+            ts=future,
+        )
+        worker = HeartbeatWorker(
+            HeartbeatWorkerConfig(
+                self_endpoint="https://self.example.com",
+                version="0.5.0",
+                dns_zone="self.example",
+                seed_zones=("peer-b.example",),
+            ),
+            signer,
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=future)
+        second = transport.query_txt_record(seen_rrset_name("self.example")) or []
+        # Only the live peer (peer-b) should appear; peer-a's stale
+        # wire from tick 1 must be evicted.
+        assert len(second) == 1
+        parsed = HeartbeatRecord.parse_and_verify(second[0], now=future)
+        assert parsed is not None
+        assert parsed.endpoint == "https://peer-b.example.com"
+
     def test_seen_graph_values_are_independently_verifiable(
         self, store, transport, now
     ) -> None:

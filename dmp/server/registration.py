@@ -248,6 +248,13 @@ def _domain_allowed(subject: str, allowlist: Iterable[str]) -> bool:
 class RegistrationConfig:
     enabled: bool = False
     node_hostname: str = ""
+    # M9.2.3 — DNS zone the node is authoritative for. Distinct from
+    # ``node_hostname`` because the node's HTTP hostname may sit BENEATH
+    # the served zone (e.g. ``api.example.com`` serving records in
+    # ``example.com``). Minted TSIG keys are scoped to subtrees of this
+    # zone, not the hostname. Empty falls back to ``node_hostname`` for
+    # back-compat with single-host deployments where the two match.
+    served_zone: str = ""
     allowlist: Tuple[str, ...] = ()
     # Lifetime of tokens MINTED via self-service. Admin-issued tokens
     # get their own --expires CLI flag and ignore this.
@@ -271,6 +278,18 @@ class RegistrationConfig:
             "on",
         )
         hostname = os.environ.get("DMP_NODE_HOSTNAME", "").strip()
+        # ``DMP_SERVED_ZONE`` overrides; otherwise fall back through the
+        # zone-discovery chain (cluster base, DMP_DOMAIN), and finally
+        # to ``node_hostname`` so the existing single-host setups keep
+        # working without touching their env.
+        served = (
+            os.environ.get("DMP_SERVED_ZONE", "").strip()
+            or os.environ.get("DMP_CLAIM_PROVIDER_ZONE", "").strip()
+            or os.environ.get("DMP_CLUSTER_BASE_DOMAIN", "").strip()
+            or os.environ.get("DMP_DOMAIN", "").strip()
+            or hostname
+        )
+        served = served.lower().rstrip(".")
         allow_raw = os.environ.get("DMP_REGISTRATION_ALLOWLIST", "")
         allowlist = tuple(
             a.strip().lower().rstrip(".") for a in allow_raw.split(",") if a.strip()
@@ -305,6 +324,7 @@ class RegistrationConfig:
         return cls(
             enabled=enabled,
             node_hostname=hostname,
+            served_zone=served,
             allowlist=allowlist,
             expires_in_seconds=expiry,
             issued_rate_per_sec=issued_rate,
@@ -594,14 +614,17 @@ def mint_tsig_via_registration(
         raise SubjectNotAllowed()
 
     # Subject has already passed canonicalize_subject, which guarantees
-    # exactly one '@'. Use the registered hostname's zone — the operator
-    # is authoritative for that, and the user's records live beneath it.
+    # exactly one '@'. The user's records live under the zone the node
+    # is authoritative for — NOT under the node's hostname, which can be
+    # a subdomain. (Codex P1: deriving from node_hostname produced
+    # scopes like ``alice.api.example.com`` that the DNS server then
+    # rejected because every normal write targets ``alice.example.com``.)
     try:
         local_part, _ = subject.rsplit("@", 1)
     except ValueError as exc:
         raise RegistrationError("subject missing local part") from exc
 
-    zone = config.node_hostname.strip().lower().rstrip(".")
+    zone = (config.served_zone or config.node_hostname).strip().lower().rstrip(".")
     suffixes = _suffixes_for(local_part, spk_hex, zone)
     if not suffixes:
         raise RegistrationError(
