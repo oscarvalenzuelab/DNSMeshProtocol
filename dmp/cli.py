@@ -1041,13 +1041,22 @@ def _candidate_seen_zones(
 def _fetch_seen_feed_dns(
     reader: DNSRecordReader, zones: Sequence[str]
 ) -> List[str]:
-    """Query ``_dnsmesh-seen.<zone>`` for each zone, return first hit.
+    """Query ``_dnsmesh-seen.<zone>`` for each zone, return first hit
+    that yields at least one verifiable wire.
 
-    First zone whose RRset has at least one TXT value wins. The
-    returned list is already the wire strings (multi-value TXT
-    publishes one wire per value); the caller hands them to
-    ``parse_seen_feed`` which re-verifies each signature.
+    Codex round-7 P2: stopping at the first non-empty RRset broke
+    discovery whenever the cluster anchor's seen-graph contained
+    only malformed / unverifiable wires — ``parse_seen_feed`` would
+    drop everything and the caller never moved on to the next
+    candidate zone. Now we re-verify here too and only return the
+    first zone that actually produced a usable record.
+
+    The returned list is the raw wire strings (multi-value TXT
+    publishes one wire per value); the caller still re-verifies via
+    ``parse_seen_feed``. Re-verifying twice is cheap relative to the
+    DNS round-trip we'd otherwise miss.
     """
+    from dmp.client.claim_routing import parse_seen_feed
     from dmp.server.heartbeat_worker import seen_rrset_name
 
     for zone in zones:
@@ -1061,8 +1070,16 @@ def _fetch_seen_feed_dns(
             values = reader.query_txt_record(name)
         except Exception:
             continue
-        if values:
-            return [v for v in values if isinstance(v, str)]
+        if not values:
+            continue
+        wires = [v for v in values if isinstance(v, str)]
+        if not wires:
+            continue
+        # Quick verification pass — if every wire is bad, fall through
+        # so a sibling zone still gets a chance to contribute.
+        if not parse_seen_feed(wires):
+            continue
+        return wires
     return []
 
 
@@ -1076,13 +1093,15 @@ def _seed_provider_via_dns(
     when the seed has no record OR has explicitly opted out of the
     claim-provider role; the caller drops the seed.
 
-    Codex round-3 P2: an empty / absent ``_dnsmesh-heartbeat.<seed>``
-    RRset is treated as "operator stopped publishing", not as a
-    transient transport hiccup. We only fall back to the static
-    ``(seed_zone, seed_endpoint)`` tuple if the reader RAISED, which
-    is the unambiguous "I couldn't talk to DNS" signal — otherwise
-    a removed seed would keep claiming routes after intentional
-    decommissioning.
+    Codex round-7 P2: ``DNSRecordReader.query_txt_record`` collapses
+    NXDOMAIN, NoAnswer, and any transient transport error to ``None``,
+    so we cannot distinguish "operator stopped publishing" from "my
+    resolver timed out" at this layer. To avoid splitting sender and
+    recipient onto disjoint provider sets after a single transient
+    DNS hiccup, ``None`` and exceptions BOTH fall back to the static
+    seed tuple. An explicit opted-out signal still drops the seed —
+    that's the path where a verified wire arrives without
+    CAP_CLAIM_PROVIDER set, which IS unambiguous operator intent.
     """
     from dmp.core.heartbeat import CAP_CLAIM_PROVIDER, HeartbeatRecord
     from dmp.server.heartbeat_worker import heartbeat_rrset_name
@@ -1094,13 +1113,12 @@ def _seed_provider_via_dns(
     try:
         values = reader.query_txt_record(name)
     except Exception:
-        # Transport-level failure: fall back to the static tuple so a
-        # split-horizon / outage doesn't drop first-contact reach.
         return (seed_zone, seed_endpoint)
     if not values:
-        # Reachable, no record. Operator intent is "I'm not in this
-        # role" — drop the seed entirely.
-        return None
+        # Could be NXDOMAIN, NoAnswer, or a transient resolver miss.
+        # Static fallback preserves baseline reach.
+        return (seed_zone, seed_endpoint)
+    saw_verified_optout = False
     for wire in values:
         if not isinstance(wire, str):
             continue
@@ -1108,11 +1126,18 @@ def _seed_provider_via_dns(
         if rec is None:
             continue
         if not (rec.capabilities & CAP_CLAIM_PROVIDER):
-            return None
+            # Verified wire WITHOUT the cap bit = operator advertised
+            # they aren't a claim provider anymore. Drop the seed.
+            saw_verified_optout = True
+            continue
         zone = (rec.claim_provider_zone or "").strip().lower() or seed_zone
         return (zone, rec.endpoint or seed_endpoint)
-    # Records existed but none verified — same disposition as no records.
-    return None
+    if saw_verified_optout:
+        return None
+    # Records existed but none verified — likely a malformed RRset.
+    # Static fallback so a single bad publisher doesn't disable the
+    # baseline.
+    return (seed_zone, seed_endpoint)
 
 
 def _build_claim_providers(

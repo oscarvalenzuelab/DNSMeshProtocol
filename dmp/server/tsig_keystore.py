@@ -53,6 +53,21 @@ import dns.tsig
 DEFAULT_ALGORITHM = "hmac-sha256"
 DEFAULT_SECRET_BYTES = 32
 
+
+class SubjectAlreadyOwnedError(Exception):
+    """Raised by ``TSIGKeyStore.mint_for_subject`` when the subject
+    already has an active key under a different ``registered_spk``.
+
+    Surfaces the anti-takeover decision atomically with the mint so
+    callers don't have to do a separate non-atomic existence check.
+    Translated to ``SubjectAlreadyOwned`` (and HTTP 409) in the
+    registration layer.
+    """
+
+    def __init__(self, subject: str) -> None:
+        super().__init__(f"subject already owned: {subject}")
+        self.subject = subject
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tsig_keys (
     name             TEXT PRIMARY KEY,
@@ -279,6 +294,96 @@ class TSIGKeyStore:
             subject=subject,
             registered_spk=registered_spk,
             now=now,
+        )
+
+    def mint_for_subject(
+        self,
+        *,
+        name: str,
+        allowed_suffixes: Iterable[str],
+        subject: str,
+        registered_spk: str,
+        algorithm: str = DEFAULT_ALGORITHM,
+        secret_bytes: int = DEFAULT_SECRET_BYTES,
+        expires_at: int = 0,
+        now: Optional[int] = None,
+    ) -> TSIGKey:
+        """Atomic anti-takeover mint: under the store lock, check for
+        an existing live key bound to the same ``subject`` under a
+        DIFFERENT ``registered_spk``; raise ``SubjectAlreadyOwnedError``
+        if found. Otherwise mint a fresh secret and persist.
+
+        Codex round-7 P1: a separate ``get_active_for_subject`` +
+        ``mint`` flow has a TOCTOU race — two concurrent
+        ``POST /v1/registration/tsig-confirm`` requests with different
+        SPKs for the same subject both pass the existence check, then
+        both insert (different key names because spk-derived), and
+        the subject ends up with parallel live credentials. The atomic
+        version closes the race by serializing the existence check
+        and insert through the same lock.
+        """
+        canonical = _normalize_name(name)
+        if not isinstance(registered_spk, str) or not registered_spk:
+            raise ValueError("registered_spk must be a non-empty hex string")
+        suffixes = tuple(
+            sorted({_normalize_suffix(s) for s in allowed_suffixes if s})
+        )
+        if not suffixes:
+            raise ValueError("at least one non-empty allowed suffix is required")
+        subject_norm = (subject or "").strip().lower()
+        spk_norm = registered_spk.strip().lower()
+        if not subject_norm:
+            raise ValueError("subject must be non-empty for atomic mint")
+        secret = secrets.token_bytes(int(secret_bytes))
+        created_at = int(time.time() if now is None else now)
+        with self._lock:
+            existing = self._conn.execute(
+                """SELECT registered_spk
+                   FROM tsig_keys
+                   WHERE subject = ?
+                     AND revoked = 0
+                     AND (expires_at = 0 OR expires_at > ?)""",
+                (subject_norm, created_at),
+            ).fetchall()
+            for (existing_spk,) in existing:
+                if existing_spk and existing_spk != spk_norm:
+                    raise SubjectAlreadyOwnedError(subject_norm)
+            self._conn.execute(
+                """INSERT INTO tsig_keys
+                   (name, algorithm, secret, allowed_suffixes,
+                    created_at, expires_at, revoked, subject, registered_spk)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     algorithm = excluded.algorithm,
+                     secret = excluded.secret,
+                     allowed_suffixes = excluded.allowed_suffixes,
+                     created_at = excluded.created_at,
+                     expires_at = excluded.expires_at,
+                     revoked = 0,
+                     subject = excluded.subject,
+                     registered_spk = excluded.registered_spk""",
+                (
+                    canonical,
+                    algorithm,
+                    secret,
+                    "\n".join(suffixes),
+                    created_at,
+                    int(expires_at),
+                    subject_norm,
+                    spk_norm,
+                ),
+            )
+            self._conn.commit()
+        return TSIGKey(
+            name=canonical,
+            algorithm=algorithm,
+            secret=secret,
+            allowed_suffixes=suffixes,
+            created_at=created_at,
+            expires_at=int(expires_at),
+            revoked=False,
+            subject=subject_norm,
+            registered_spk=spk_norm,
         )
 
     # ------------------------------------------------------------------
