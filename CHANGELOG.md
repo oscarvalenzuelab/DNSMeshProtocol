@@ -7,6 +7,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.6] — `@-style fetch` falls back from zone-anchored to TOFU
+
+### Fixed
+
+- **`dnsmesh identity fetch alice@example.com`** used to query
+  `dmp.example.com` only. If the publisher used the TOFU layout
+  (record at `id-<hash16(alice)>.example.com`), the fetch returned
+  "no identity record at dmp.example.com" with no fallback. Users on
+  the same node who picked TOFU mode were unreachable through the
+  @-style address — the bare-username form (`fetch alice`) still
+  worked but only for the local user's own contacts list.
+- New behavior: try zone-anchored first (squat-resistant), then fall
+  back to the TOFU hash name on miss. Error message now names both
+  candidates so operators can see which layouts were probed. Bare-
+  username form is unchanged.
+
 ## [0.3.5] — `dnsmesh init` defaults dns_resolvers to 1.1.1.1 + 8.8.8.8
 
 ### Changed
