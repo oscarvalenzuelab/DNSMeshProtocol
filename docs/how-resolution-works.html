@@ -613,38 +613,74 @@ mermaid.initialize({
     }
 });
 
+// ────────────────────────────────────────────────────────────────────
+// Mermaid lazy rendering — snapshot source first, render per visible
+// slide.
+//
+// Mermaid 10.9 flowchart diagrams that render while their container
+// is `display:none` (Reveal hides every off-screen slide that way)
+// crash silently with "translate(undefined, NaN)" and emit an SVG
+// with the 16×16 fallback viewBox. The pre is then marked
+// `data-processed="true"`, so any naive re-render becomes a no-op.
+//
+// Approach: BEFORE mermaid runs the first time, snapshot every
+// `pre.mermaid`'s textContent. Defer the initial render. On every
+// slide-change (and on Reveal `ready` for slide 0), restore the
+// source for any pre that still has a fallback / missing SVG, clear
+// the data-processed marker, and re-run mermaid on those nodes only.
+// Mermaid sees the source, the slide is visible, layout works.
+
+const _mermaidSource = new Map();
+document.querySelectorAll('pre.mermaid').forEach(el => {
+    _mermaidSource.set(el, el.textContent);
+});
+
+const FALLBACK_VIEWBOX = '-8 -8 16 16';
+
+function _needsRender(pre) {
+    const svg = pre.querySelector('svg');
+    if (!svg) return true;
+    if (svg.getAttribute('viewBox') === FALLBACK_VIEWBOX) return true;
+    return false;
+}
+
+async function _renderVisibleMermaid() {
+    const targets = Array.from(document.querySelectorAll('pre.mermaid'))
+        .filter(_needsRender);
+    if (!targets.length) return;
+    targets.forEach(el => {
+        const src = _mermaidSource.get(el);
+        if (src !== undefined) el.textContent = src;
+        el.removeAttribute('data-processed');
+    });
+    try {
+        await mermaid.run({ nodes: targets });
+    } catch (err) {
+        console.warn('mermaid render:', err);
+    }
+}
+
 Reveal.initialize({
     hash: true,
     slideNumber: 'c/t',
     transition: 'slide',
-    plugins: [RevealHighlight, RevealNotes]
+    plugins: [RevealHighlight, RevealNotes],
 }).then(() => {
-    // Run mermaid only AFTER Reveal lays out the DOM, so each <pre class="mermaid">
-    // gets a real bounding box. Otherwise diagrams in non-active slides render
-    // at 0×0 and never recover when the slide becomes visible.
-    return mermaid.run({ querySelector: 'pre.mermaid' });
-}).then(() => {
-    // Some browsers won't lay out an SVG that was rendered while its
-    // container was display:none (Reveal hides off-screen slides this
-    // way depending on transitions). Mermaid 10.9 sometimes marks the
-    // pre `data-processed="true"` even when its layout pass crashed
-    // with "translate(undefined, NaN)" — the resulting block has no
-    // <svg> child. Filter on "missing svg", not on the data-processed
-    // marker, so we recover those blocks on every slide-change. The
-    // `removeAttribute` resets mermaid's idempotency guard so it
-    // actually re-renders instead of returning early.
-    function _rerunBrokenMermaid() {
-        const broken = Array.from(document.querySelectorAll('pre.mermaid'))
-            .filter(el => !el.querySelector('svg'));
-        if (!broken.length) return;
-        broken.forEach(el => el.removeAttribute('data-processed'));
-        mermaid.run({ nodes: broken }).catch(err => console.warn('mermaid:', err));
-    }
-    Reveal.on('slidechanged', _rerunBrokenMermaid);
-    // Also re-check on `ready` and after a short delay — some
-    // browsers emit slidechanged BEFORE the layout settles, so the
-    // first re-run can still hit a 0x0 box.
-    Reveal.on('ready', () => setTimeout(_rerunBrokenMermaid, 100));
+    // Initial render — only the visible slide's diagrams will lay
+    // out correctly here; off-screen ones get the fallback viewBox
+    // and are repaired on slidechanged.
+    _renderVisibleMermaid();
+    // Reveal sometimes emits `ready` before initial layout settles;
+    // run again after a short delay.
+    setTimeout(_renderVisibleMermaid, 200);
+    Reveal.on('slidechanged', () => {
+        // Run twice — once immediately for fast browsers, once after
+        // layout settles for the slow ones. Idempotent: a healthy
+        // SVG isn't re-rendered.
+        _renderVisibleMermaid();
+        setTimeout(_renderVisibleMermaid, 200);
+    });
+    Reveal.on('ready', _renderVisibleMermaid);
 });
 </script>
 
