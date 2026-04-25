@@ -15,6 +15,11 @@ remote_theme: just-the-docs/just-the-docs
 
 color_scheme: dark
 
+# Just-the-Docs Mermaid integration. Adds a per-page <pre><code class="language-mermaid"></code></pre>
+# renderer so ```mermaid fences in markdown produce diagrams.
+mermaid:
+  version: "10.6.0"
+
 # Sidebar / search configuration.
 search_enabled: true
 search:
