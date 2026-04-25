@@ -40,9 +40,38 @@ Plus, to enable self-service registration (users running
 DMP_REGISTRATION_ENABLED=1
 ```
 
-All config via environment; no file to edit. On startup, the node
-creates (or opens) `tokens.db` alongside the main record DB.
-Override the path via `DMP_TOKEN_DB_PATH`.
+On startup, the node creates (or opens) `tokens.db` alongside the
+main record DB. Override the path via `DMP_TOKEN_DB_PATH`.
+
+### Where these env vars actually live
+
+The node binary reads env vars only — there's no config file
+format of its own. *But* every real deployment puts those vars
+in a file somewhere and the supervisor (systemd / docker) loads
+them. Which file depends on how you installed:
+
+| Install method | File to edit | Apply with |
+|---|---|---|
+| `install-ubuntu.sh` (systemd, native) | `/etc/dnsmesh/node.env` | `sudo systemctl restart dnsmesh-node` |
+| `install-digitalocean.sh` (docker compose) | `/opt/dnsmesh/.env` | `cd /opt/dnsmesh && docker compose up -d` |
+| Hand-rolled `docker-compose.yml` | the `environment:` block of the `dnsmesh-node` service (or an `env_file:` you point at) | `docker compose up -d` |
+| `docker run` directly | `-e DMP_AUTH_MODE=multi-tenant` flags on the command line | re-run the container |
+| Running `dnsmesh-node` from the shell (dev) | `export DMP_AUTH_MODE=...` in your shell, or a `.env` you `source` | restart the process |
+
+Example, for the systemd install:
+
+```bash
+sudo nano /etc/dnsmesh/node.env
+# add the lines from "Enabling multi-tenant mode" above, save
+sudo systemctl restart dnsmesh-node
+sudo systemctl status dnsmesh-node    # confirm it came back up
+journalctl -u dnsmesh-node -n 50      # check for "auth_mode=multi-tenant"
+```
+
+If you don't know which install you have: `systemctl status
+dnsmesh-node` succeeds → systemd; `docker ps | grep dnsmesh` shows
+a container → docker compose. The two are mutually exclusive on
+the same host.
 
 ## Admin CLI cheatsheet
 
