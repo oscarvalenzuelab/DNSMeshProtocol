@@ -76,3 +76,6 @@ venv
 # M8 test fixtures — local-only operator keys, never commit
 docker/m8-test/*.key
 docker/m8-test/*operator*
+
+# Playwright MCP browser snapshots — local-only, never commit
+.playwright-mcp/
