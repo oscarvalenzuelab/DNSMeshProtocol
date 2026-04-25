@@ -68,26 +68,31 @@ Concretely:
 
 - Alice's send writes records like
   `slot-N.mb-{hash(bob)}.<alice's mesh_domain>` to **Alice's home node**.
-- Bob's receive queries `slot-N.mb-{hash(bob)}.<bob's mesh_domain>` via
-  DNS.
+- Bob's receive walks each of his **pinned contacts' zones** and
+  queries each one via DNS. Alice's zone is in that walk because
+  Bob has pinned her as a contact, so Bob's recv asks for
+  `slot-N.mb-{hash(bob)}.<alice's mesh_domain>` over the public
+  recursive chain.
 
-For these names to match, **both clients must share the same
-`mesh_domain`**. This is the load-bearing fact about current
-end-to-end messaging:
+This is what M8.1 (shipped in 0.4.0) restored: the original DMP
+property that records live under the sender's zone and the recipient
+walks senders' zones via the DNS chain. End-to-end works in every
+realistic configuration:
 
 | Setup | End-to-end works? |
 |---|---|
 | Alice + Bob both register at the same node, share `domain: mesh.gnu.cl` | ✅ |
 | Alice + Bob in a federated 3-node cluster (anti-entropy syncs records between cluster members over HTTPS) | ✅ |
-| Alice on `dnsmesh.io`, Bob on `dnsmesh.pro` with different `mesh_domain`s, no cluster | ❌ |
+| Alice on `dnsmesh.io`, Bob on `dnsmesh.pro` with different `mesh_domain`s, **pinned contacts on each side** | ✅ via M8.1 cross-zone receive |
+| Alice on `dnsmesh.io`, Bob on `dnsmesh.pro`, **unpinned stranger** reaches Bob for the first time | ✅ via M8.3 claim layer (requires a reachable claim provider both sides discover) |
 
-The third row is a real gap in current implementation. A future
-"DNS-only federation" model — where Bob's `recv` walks his pinned
-contacts' domains and polls each via the recursive DNS chain — would
-let Alice and Bob each only need HTTPS to their own home, with
-"node-to-node" being whatever path the resolver takes (typically
-`Bob's CLI → public resolver → roots → Alice's domain's authoritative
-node → record`). That's not in the code today.
+Each user only ever needs HTTPS to their own home node. "Node-to-node"
+delivery is the recursive DNS resolver chain doing what it already
+does for every other lookup on the internet — typically
+`Bob's CLI → public resolver → roots → Alice's authoritative node
+→ record`. The only HTTPS hop in the cross-zone path is when an
+M8 claim is published to a discovery provider, which is best-effort
+(the underlying message still ships under the sender's zone).
 
 ### What HTTP and DNS each do
 

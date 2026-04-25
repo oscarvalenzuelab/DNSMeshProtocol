@@ -287,7 +287,7 @@ sequenceDiagram
       <tr><td>Both users registered at the same node, same zone</td><td class="ok">✓</td></tr>
       <tr><td>Both users in a federated 3-node cluster (anti-entropy sync)</td><td class="ok">✓</td></tr>
       <tr><td>Different nodes, different zones, no cluster — pinned contacts on each side</td><td class="ok">✓</td></tr>
-      <tr><td>Different nodes, different zones, an unpinned stranger reaches you for the first time</td><td class="ok">✓ (M8 claim layer)</td></tr>
+      <tr><td>Different nodes, different zones, an unpinned stranger reaches you for the first time</td><td class="warn">✓ via M8 claim layer<br><small>(requires a reachable claim provider that both sides discover)</small></td></tr>
     </tbody>
   </table>
   <p class="small">
@@ -321,12 +321,12 @@ sequenceDiagram
       <tr>
         <td><code>dnsmesh identity publish</code><br><code>dnsmesh send</code></td>
         <td><strong>HTTPS</strong></td>
-        <td>outbound 443 to <em>your home</em> (and recipient's node, for sends)</td>
+        <td>outbound 443 to <em>your own home node only</em>. Records sit on your zone; recipients pull them via DNS. (Optional: HTTPS to claim providers for first-contact reach — best-effort, send still succeeds without it.)</td>
       </tr>
       <tr>
         <td><code>dnsmesh identity fetch</code><br><code>dnsmesh recv</code></td>
         <td><strong>DNS</strong></td>
-        <td>UDP 53 (or 1.1.1.1 / 8.8.8.8 — almost always reachable)</td>
+        <td>UDP 53 outbound to a recursive resolver (the CLI defaults to 1.1.1.1 / 8.8.8.8). No HTTPS needed for reads.</td>
       </tr>
     </tbody>
   </table>
@@ -340,12 +340,20 @@ sequenceDiagram
     <tbody>
       <tr><td>Home / coffee shop wifi</td><td class="ok">✓</td><td class="ok">✓</td></tr>
       <tr><td>Hotel captive portal (after login)</td><td class="ok">✓</td><td class="ok">✓</td></tr>
-      <tr><td>Corporate firewall, HTTPS allowed, DNS blocked outbound</td><td class="warn">via DoH</td><td class="ok">✓</td></tr>
-      <tr><td>Network blocking port 53 entirely</td><td class="warn">use DNS-over-HTTPS at 1.1.1.1</td><td class="ok">✓</td></tr>
+      <tr><td>Corporate firewall, HTTPS allowed, DNS blocked outbound</td><td class="err">✗ today<br><small>(DoH is on the roadmap)</small></td><td class="ok">✓</td></tr>
+      <tr><td>Network blocking port 53 entirely</td><td class="err">✗ today<br><small>(DoH is on the roadmap)</small></td><td class="ok">✓</td></tr>
       <tr><td>Air-gapped (no internet at all)</td><td class="err">✗</td><td class="err">✗</td></tr>
     </tbody>
   </table>
-  <div class="takeaway"><strong>Reading is the easy half.</strong> Even when DNS port 53 is blocked, public resolvers like Cloudflare offer DNS-over-HTTPS at 1.1.1.1. <strong>Sending requires reaching the destination's HTTPS port</strong> — same as accessing any normal website.</div>
+  <div class="takeaway">
+    <strong>Sending only needs HTTPS to your own home node.</strong>
+    Reads need outbound UDP 53 to <em>some</em> resolver — the CLI's
+    current resolver pool is plain DNS over UDP/TCP, NOT DNS-over-HTTPS.
+    Adding DoH support to the resolver pool is tracked as future work
+    so reads survive networks that block port 53. Most networks
+    (home wifi, hotel captive portals after login, mobile data)
+    pass UDP 53.
+  </div>
 </section>
 
 <!-- 7. The pieces -->
@@ -377,7 +385,7 @@ sequenceDiagram
     participant B as Bob
     A->>ANode: POST /v1/records (HTTPS)<br>signed identity record
     Note right of ANode: stored in sqlite<br>served on UDP 53
-    B->>DNS: TXT? alice@her-domain
+    B->>DNS: TXT? dmp.alice.example<br>(zone-anchored) or<br>id-{hash16}.shared.mesh<br>(shared-domain TOFU)
     DNS->>ANode: forwards query
     ANode->>DNS: signed record
     DNS->>B: signed record
@@ -417,7 +425,7 @@ sequenceDiagram
   <ul>
     <li><strong>Skip stale negative cache.</strong> Your ISP might still cache "name doesn't exist" from before a delegation was set up.</li>
     <li><strong>Failover.</strong> If one resolver stops responding, the other catches it.</li>
-    <li><strong>It works on networks blocking port 53.</strong> 1.1.1.1 also speaks DNS-over-HTTPS on port 443.</li>
+    <li><strong>Public resolvers speak DoH on port 443</strong> — but the CLI's resolver pool today only does plain DNS. DoH support inside the CLI is future work for networks that block UDP 53.</li>
   </ul>
   <p class="small">Privacy-first deploys: <code>dnsmesh init --no-default-resolvers</code>, then point at your own resolver in <code>~/.dmp/config.yaml</code>.</p>
 </section>
@@ -429,13 +437,13 @@ sequenceDiagram
     <div>
       <h3>Through a public resolver</h3>
       <pre><code class="language-bash">dig @1.1.1.1 \
-  alice@her-domain TXT</code></pre>
-      <p class="small">What everyone else sees. Goes through caching.</p>
+  dmp.alice.example TXT</code></pre>
+      <p class="small">What everyone else sees. Goes through caching. Real owner names are <code>dmp.&lt;zone&gt;</code> for zone-anchored identities or <code>id-&lt;hash16(user)&gt;.&lt;shared-zone&gt;</code> for shared-domain TOFU.</p>
     </div>
     <div>
       <h3>Direct to the node</h3>
       <pre><code class="language-bash">dig @her-node.example \
-  alice@her-domain TXT</code></pre>
+  dmp.alice.example TXT</code></pre>
       <p class="small">Source of truth. No caching. Use this when something looks stale.</p>
     </div>
   </div>
@@ -459,7 +467,14 @@ sequenceDiagram
       R-->>Bob: no answer
     end
   </pre>
-  <p class="small">Cached reads survive for one TTL window (default 60s). Cold reads start failing as caches expire. Visible outage = one TTL plus a few minutes of negative-cache lag.</p>
+  <p class="small">
+    Cached reads survive for one TTL window. Cold reads start failing
+    as caches expire. Visible outage = one TTL plus a few minutes of
+    negative-cache lag. <strong>TTL defaults vary by record type:</strong>
+    DMP DNS server fallback is 60s; client message publishes default
+    to 300s; identity / heartbeat publishes default to 86400s.
+    Operators tune these via <code>--ttl</code> or env vars.
+  </p>
 </section>
 
 <!-- 13. Node offline — write -->
