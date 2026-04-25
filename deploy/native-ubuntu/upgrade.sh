@@ -131,6 +131,40 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────
+# M8 (0.4.0+): claim-provider role awareness
+# ──────────────────────────────────────────────────────────────────────
+
+step "Checking node.env for DMP_CLAIM_PROVIDER role hint"
+if [[ -f "$ENV_FILE" ]] && ! grep -qE '^[[:space:]]*#?[[:space:]]*DMP_CLAIM_PROVIDER' "$ENV_FILE"; then
+    # M8 (0.4.0) introduced a "claim provider" role: nodes with
+    # heartbeat enabled AND a DMP_DOMAIN/DMP_CLUSTER_BASE_DOMAIN
+    # set automatically advertise CAP_CLAIM_PROVIDER and accept
+    # POST /v1/claim/publish writes from arbitrary senders. The
+    # records hosted are tiny signed pointers (no ciphertext) — the
+    # cost is small but operators should know it's happening. Drop
+    # a commented line into the env file so the next operator who
+    # opens it sees the option without us silently changing
+    # behavior.
+    cat >> "$ENV_FILE" <<EOF
+
+# Added by upgrade.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ) — M8 (0.4.0).
+# DMP_CLAIM_PROVIDER controls whether this node advertises the
+# claim-provider capability bit in its heartbeat AND accepts
+# POST /v1/claim/publish from arbitrary senders. Defaults ON when
+# heartbeat + DMP_DOMAIN are configured. Set to "0" to opt out:
+#   DMP_CLAIM_PROVIDER=0
+# Optional override of the served zone (defaults to
+# DMP_CLUSTER_BASE_DOMAIN, then DMP_DOMAIN):
+#   DMP_CLAIM_PROVIDER_ZONE=claims.example.com
+EOF
+    chown root:"$DNSMESH_USER" "$ENV_FILE"
+    chmod 0640 "$ENV_FILE"
+    ok "added DMP_CLAIM_PROVIDER hint to $ENV_FILE"
+else
+    ok "DMP_CLAIM_PROVIDER hint already in $ENV_FILE (left alone)"
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # Restart and wait for health
 # ──────────────────────────────────────────────────────────────────────
 
@@ -159,6 +193,24 @@ ${BOLD}Service:${RESET}  $(systemctl is-active "$SERVICE_NAME" 2>/dev/null || ec
 ${BOLD}Health:${RESET}   $([[ $HEALTH_OK -eq 1 ]] && echo "${GREEN}ok${RESET}" || echo "${YELLOW}pending — check 'journalctl -u $SERVICE_NAME'${RESET}")
 
 ${DIM}Operator config + Caddyfile + sqlite state were not touched.${RESET}
+
+${BOLD}New in 0.4.0 — M8 first-contact reach:${RESET}
+  ${DIM}# Cross-zone delivery is now correct out of the box. A pinned${RESET}
+  ${DIM}# contact's manifest + chunks are pulled from THEIR zone via${RESET}
+  ${DIM}# the recursive DNS chain — no shared mesh required.${RESET}
+
+  ${DIM}# Claim layer for first-message reach: every heartbeat-enabled${RESET}
+  ${DIM}# node with a DMP_DOMAIN configured automatically advertises${RESET}
+  ${DIM}# CAP_CLAIM_PROVIDER and accepts POST /v1/claim/publish.${RESET}
+  ${DIM}# Records hosted are tiny signed pointers (no ciphertext).${RESET}
+  ${DIM}# Opt out by adding to node.env:${RESET}
+  DMP_CLAIM_PROVIDER=0
+
+  ${DIM}# CLI: review first-contact intros from un-pinned senders:${RESET}
+  dnsmesh intro list
+  dnsmesh intro accept <id>     # deliver, don't pin
+  dnsmesh intro trust  <id>     # deliver + pin sender
+  dnsmesh intro block  <id>     # drop + denylist
 
 ${BOLD}New in 0.3.x worth knowing:${RESET}
   ${DIM}# A friendly landing page now serves at the node root:${RESET}

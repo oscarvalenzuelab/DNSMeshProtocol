@@ -7,6 +7,94 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.0] — M8 cross-zone receive + first-message claim layer
+
+### Fixed
+
+- **Cross-zone receive bug.** The original DMP spec puts a sender's
+  records under the sender's zone (Alice publishes to
+  `slot-N.mb-{hash(bob)}.{alice-zone}`); recipient pulls from the same
+  name via the recursive DNS chain. The receive path was hard-bound
+  to the recipient's `self.domain`, silently restricting end-to-end
+  delivery to same-mesh pairs (or same-cluster federated peers). M8.1
+  walks each pinned contact's zone in addition to the local one, and
+  hard-binds chunk fetches to the manifest's source zone (manifest-
+  zone integrity — the load-bearing security property).
+
+### Added
+
+- **First-contact reach via signed claims.** Senders publish a tiny
+  signed pointer (`v=dmp1;t=claim;...`) to one or more claim-provider
+  nodes; recipients poll the providers via DNS and find pointers
+  addressed to them by `hash12(recipient_id)`. The actual
+  manifest+chunks stay in the sender's zone — claims are pointers,
+  not ciphertext — so a malicious provider can drop or reorder but
+  cannot forge or read. Anti-entropy gossip on the claim namespace
+  (M8.4, hooked into the existing `/v1/sync/digest` + `/v1/sync/pull`
+  machinery) closes drop-by-single-provider.
+
+- **Claim-provider role.** Every DMP node with heartbeat enabled
+  AND a `DMP_DOMAIN` configured automatically advertises
+  `CAP_CLAIM_PROVIDER` (bit 0 of the new `capabilities` field in
+  `HeartbeatRecord`, magic bumped `DMPHB01` → `DMPHB02`) and accepts
+  `POST /v1/claim/publish`. Operators who don't want to host claims
+  for arbitrary recipients opt out with `DMP_CLAIM_PROVIDER=0`. The
+  served zone defaults to `DMP_CLAIM_PROVIDER_ZONE`, then
+  `DMP_CLUSTER_BASE_DOMAIN`, then `DMP_DOMAIN`.
+
+- **Provider discovery via SeenStore recency.** "Proximity" =
+  recency-weighted gossip-reachability. Sender + recipient gossip
+  through the same heartbeat fabric, so their SeenStore views
+  overlap heavily and they pick the same providers most of the
+  time. A built-in seed list (`https://dnsmesh.io`) is appended to
+  every client's provider set so an empty / sparse seen-graph
+  still has guaranteed cross-deployment overlap.
+
+- **Pin-fence bypass with quarantine.** Claim-discovered messages
+  from unknown senders no longer fall on the floor at the receive
+  pin fence — they land in a sqlite-backed pending-intro queue
+  (0600-permission DB) for user review. CLI surface:
+
+  ```
+  dnsmesh intro list
+  dnsmesh intro accept <id>     # deliver this one, do NOT pin
+  dnsmesh intro trust  <id>     # deliver + pin sender + (optionally)
+                                #   record their remote username
+  dnsmesh intro block  <id>     # drop + add sender_spk to denylist
+  ```
+
+  Intro commands are local-only — they do not touch DNS and work
+  on a host with no network.
+
+- **`GET /v1/info` discovery endpoint.** Returns each node's
+  endpoint, operator pubkey, served claim zone, and capabilities
+  bitfield. The CLI consults it during provider selection so a
+  node that serves claims under a zone different from its HTTP
+  host is still reachable.
+
+### Changed
+
+- **`HeartbeatRecord` wire format**: new uint16 `capabilities`
+  bitfield, magic bumped to `DMPHB02`. Pre-0.4.0 nodes can't parse
+  v02 records and vice versa — this is acceptable for the alpha
+  (no production deployments rely on v01).
+
+- **`identity fetch <user>@<zone> --add`** now upgrades a
+  spk-only placeholder created by `intro trust` (matches by spk
+  + empty pub regardless of label) instead of refusing to overwrite.
+
+- **`send_message`** publishes claims to all configured providers
+  whenever `claim_providers` is non-empty (no same-zone
+  optimization). Reports per-provider success/failure via the
+  optional `claim_outcomes` out-parameter; the CLI surfaces
+  partial-failure as a `WARNING` on stderr.
+
+- **Native-Ubuntu upgrade path** (`deploy/native-ubuntu/upgrade.sh`
+  and the equivalent DigitalOcean flow) automatically backfills a
+  commented `DMP_CLAIM_PROVIDER` hint in the existing `node.env`
+  so operators see the new option without silent-behavior-change
+  surprise.
+
 ## [0.3.7] — `identity fetch` shows the full address
 
 ### Changed
