@@ -447,6 +447,56 @@ class TestOwnHeartbeatShape:
         assert parsed.operator_spk == signer.get_signing_public_key_bytes()
 
 
+class TestTransitiveDiscovery:
+    """M9.1.3 P2 regression: a node seeded with B must also harvest
+    B's seen-graph at ``_dnsmesh-seen.<B>``, not just B's own
+    heartbeat. Otherwise C is invisible to A unless A directly
+    seeds C."""
+
+    def test_a_learns_about_c_through_b(self, store, transport, now) -> None:
+        # B has its own heartbeat published.
+        b_signer = _signer("peer-b", salt=b"B" * 32)
+        b_wire = _publish_peer_heartbeat(
+            transport,
+            b_signer,
+            "peer-b.example",
+            endpoint="https://peer-b.example.com",
+            ts=now,
+        )
+        # B has ALSO observed C and republished C's heartbeat in
+        # its seen-graph RRset. C's wire is signed by C's own key.
+        c_signer = _signer("peer-c", salt=b"C" * 32)
+        c_hb = HeartbeatRecord(
+            endpoint="https://peer-c.example.com",
+            operator_spk=c_signer.get_signing_public_key_bytes(),
+            version="0.5.0",
+            ts=now,
+            exp=now + 86400,
+        )
+        c_wire = c_hb.sign(c_signer)
+        transport.publish_txt_record(seen_rrset_name("peer-b.example"), c_wire)
+
+        # A is seeded with B only. A ticks once and should pick up
+        # both B (from heartbeat) AND C (from B's seen-graph).
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://a.example.com",
+            version="0.5.0",
+            dns_zone="a.example",
+            seed_zones=("peer-b.example",),
+        )
+        worker = HeartbeatWorker(
+            cfg, _signer(), store, record_writer=transport, dns_reader=transport
+        )
+        worker.tick_once(now=now)
+        # Both peers landed in A's local SeenStore. Pass ``now=now``
+        # so list_recent uses the same clock the test stamps records
+        # with — the default uses real time and would filter our
+        # past-stamped fixtures as expired.
+        endpoints = {row.endpoint for row in store.list_recent(now=now)}
+        assert "https://peer-b.example.com" in endpoints
+        assert "https://peer-c.example.com" in endpoints
+
+
 class TestSeenGraphPublish:
     """M9.1.3 — node republishes recently-verified peer wires under
     ``_dnsmesh-seen.<own-zone>`` as a multi-value TXT RRset so other

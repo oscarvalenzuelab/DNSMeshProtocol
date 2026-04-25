@@ -369,36 +369,54 @@ class HeartbeatWorker:
     # ------------------------------------------------------------------
 
     def _fetch_and_ingest(self, zone: str, now_i: int) -> bool:
-        """Query ``_dnsmesh-heartbeat.<zone>`` and ingest verified wires.
+        """Query ``_dnsmesh-heartbeat.<zone>`` AND ``_dnsmesh-seen.<zone>``,
+        ingest verified wires from both into the local SeenStore.
 
-        Returns True if at least one wire was accepted. Truncates the
-        ingest set at ``max_gossip_per_response`` so a hostile zone
-        can't force unbounded crypto work by returning a giant RRset.
+        The two RRsets carry distinct populations:
+          - heartbeat: the peer's own signed liveness record.
+          - seen: the peer's republished view of OTHER nodes it has
+            seen recently (M9.1.3 transitive discovery).
+
+        Without harvesting the seen-graph, ``A`` seeded with ``B``
+        never learns about ``C`` even when ``B`` has been talking to
+        ``C``. Codex P2 — restores the transitive convergence M9.1.3
+        was supposed to deliver.
+
+        Truncates the ingest set at ``max_gossip_per_response`` PER
+        RRset so a hostile zone can't force unbounded crypto work by
+        returning a giant batch.
         """
         if self._dns_reader is None:
             return False
+        names: List[str] = []
         try:
-            name = heartbeat_rrset_name(zone)
+            names.append(heartbeat_rrset_name(zone))
         except ValueError:
             return False
         try:
-            records = self._dns_reader.query_txt_record(name)
-        except Exception:
-            log.info("heartbeat DNS query to %s failed", name)
-            return False
-        if not records:
-            return False
+            names.append(seen_rrset_name(zone))
+        except ValueError:
+            pass
+
         accepted = 0
-        for wire in records[: self._cfg.max_gossip_per_response]:
-            if not isinstance(wire, str):
-                continue
+        for name in names:
             try:
-                if self._store.accept(wire, remote_addr=zone, now=now_i):
-                    accepted += 1
+                records = self._dns_reader.query_txt_record(name)
             except Exception:
-                log.exception(
-                    "SeenStore.accept raised for wire from %s", zone
-                )
+                log.info("heartbeat DNS query to %s failed", name)
+                continue
+            if not records:
+                continue
+            for wire in records[: self._cfg.max_gossip_per_response]:
+                if not isinstance(wire, str):
+                    continue
+                try:
+                    if self._store.accept(wire, remote_addr=zone, now=now_i):
+                        accepted += 1
+                except Exception:
+                    log.exception(
+                        "SeenStore.accept raised for wire from %s", name
+                    )
         return accepted > 0
 
     # ------------------------------------------------------------------

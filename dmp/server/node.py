@@ -247,13 +247,18 @@ def _load_served_zone() -> str:
     every UPDATE to REFUSED on a non-claim-provider node.
 
     Resolution order matches the claim-provider zone fallback minus the
-    opt-out check: explicit zone override, then cluster base, then
-    DMP_DOMAIN.
+    opt-out check, plus a final fallback to ``DMP_NODE_HOSTNAME`` so
+    single-host deployments where the node hostname IS the zone apex
+    keep working without duplicating env config (codex P1: a node that
+    set only DMP_NODE_HOSTNAME got allowed_zones=() and refused every
+    UPDATE even though the registration flow happily issued keys
+    scoped to that same hostname).
     """
     for var in (
         "DMP_CLAIM_PROVIDER_ZONE",
         "DMP_CLUSTER_BASE_DOMAIN",
         "DMP_DOMAIN",
+        "DMP_NODE_HOSTNAME",
     ):
         v = os.environ.get(var, "").strip()
         if v:

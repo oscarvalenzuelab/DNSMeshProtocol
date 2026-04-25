@@ -263,33 +263,43 @@ class TSIGKeyStore:
 
     def get(self, name: str) -> Optional[TSIGKey]:
         canonical = _normalize_name(name)
-        row = self._conn.execute(
-            """SELECT name, algorithm, secret, allowed_suffixes,
-                      created_at, expires_at, revoked
-               FROM tsig_keys WHERE name = ?""",
-            (canonical,),
-        ).fetchone()
+        # Hold the lock around reads even though sqlite is technically
+        # safe with check_same_thread=False — concurrent put/revoke
+        # from the HTTP thread can interleave with build_keyring /
+        # build_authorizer calls from DNS-server packet threads, and
+        # a single shared connection raises ProgrammingError or
+        # OperationalError under that contention. Codex P2 — every
+        # public method now serializes through the same lock.
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT name, algorithm, secret, allowed_suffixes,
+                          created_at, expires_at, revoked
+                   FROM tsig_keys WHERE name = ?""",
+                (canonical,),
+            ).fetchone()
         return _row_to_key(row) if row else None
 
     def list_active(self, now: Optional[int] = None) -> List[TSIGKey]:
         now_i = int(time.time() if now is None else now)
-        rows = self._conn.execute(
-            """SELECT name, algorithm, secret, allowed_suffixes,
-                      created_at, expires_at, revoked
-               FROM tsig_keys
-               WHERE revoked = 0
-                 AND (expires_at = 0 OR expires_at > ?)
-               ORDER BY created_at ASC""",
-            (now_i,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT name, algorithm, secret, allowed_suffixes,
+                          created_at, expires_at, revoked
+                   FROM tsig_keys
+                   WHERE revoked = 0
+                     AND (expires_at = 0 OR expires_at > ?)
+                   ORDER BY created_at ASC""",
+                (now_i,),
+            ).fetchall()
         return [_row_to_key(r) for r in rows]
 
     def list_all(self) -> List[TSIGKey]:
-        rows = self._conn.execute(
-            """SELECT name, algorithm, secret, allowed_suffixes,
-                      created_at, expires_at, revoked
-               FROM tsig_keys ORDER BY created_at ASC"""
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT name, algorithm, secret, allowed_suffixes,
+                          created_at, expires_at, revoked
+                   FROM tsig_keys ORDER BY created_at ASC"""
+            ).fetchall()
         return [_row_to_key(r) for r in rows]
 
     # ------------------------------------------------------------------
