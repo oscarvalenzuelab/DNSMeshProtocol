@@ -1568,10 +1568,24 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
     if parsed_addr is not None:
         user, host = parsed_addr
         resolved_username = user
-        name = zone_anchored_identity_name(host)
+        # @-style address: try the squat-resistant zone-anchored
+        # name first (dmp.<host>); if no record there, fall back to
+        # the TOFU hash name (id-<hash16(user)>.<host>). The
+        # publisher chose ONE of these layouts at init time —
+        # without an out-of-band hint about which, the fetcher tries
+        # both. Zone-anchored first because it's the more secure
+        # shape; the operator of <host> can squat the TOFU name
+        # under append semantics, but the zone-anchored name is
+        # M5.5-token-scoped to a specific subject.
+        candidate_names = [
+            zone_anchored_identity_name(host),
+            identity_domain(user, host),
+        ]
     else:
         resolved_username = args.username
-        name = identity_domain(args.username, args.domain or _effective_domain(cfg))
+        candidate_names = [
+            identity_domain(args.username, args.domain or _effective_domain(cfg)),
+        ]
 
     # Keep cluster_handle OPEN across both the identity lookup AND the
     # subsequent rotation-RRset revocation filter. Closing after only
@@ -1579,10 +1593,22 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
     # UnionReader (which returns None), silently disabling the filter
     # in cluster mode. The broader try/finally closes after the full
     # revocation filter completes below.
+    name = candidate_names[0]
     records = reader.query_txt_record(name)
+    for fallback_name in candidate_names[1:]:
+        if records:
+            break
+        name = fallback_name
+        records = reader.query_txt_record(name)
     if not records:
         if cluster_handle is not None:
             cluster_handle.close()
+        if len(candidate_names) > 1:
+            _die(
+                2,
+                f"no identity record at {candidate_names[0]} "
+                f"or {candidate_names[1]}",
+            )
         _die(2, f"no identity record at {name}")
 
     # Append-semantics mailbox means the identity domain can hold multiple
