@@ -244,6 +244,28 @@ def _load_passphrase(config: CLIConfig) -> str:
 # ----------------------------- transport adapters ----------------------------
 
 
+def _normalize_endpoint(endpoint: str) -> str:
+    """Return ``endpoint`` with a scheme prefix and no trailing slash.
+
+    The CLI accepts bare hostnames (e.g. ``dnsmesh.io``) for ergonomic
+    parity with the website's recommended example — prepend ``https://``
+    when there's no scheme so downstream code (``requests.post(url +
+    "/v1/...")``) doesn't choke. Existing fully-qualified URLs pass
+    through untouched, including ``http://`` for local-dev addresses
+    like ``http://127.0.0.1:8053``.
+
+    Heuristic: a leading ``<word>://`` is treated as a scheme; anything
+    else is bare. We do NOT normalize the host case or strip ports —
+    that's the resolver's / requests' responsibility.
+    """
+    if not endpoint:
+        return ""
+    s = endpoint.strip().rstrip("/")
+    if "://" not in s:
+        s = f"https://{s}"
+    return s
+
+
 class _HttpWriter(DNSRecordWriter):
     """Publishes records via the node's HTTP API.
 
@@ -258,7 +280,10 @@ class _HttpWriter(DNSRecordWriter):
         from dmp.client.node_tokens import bearer_for_endpoint
 
         self._requests = requests
-        self._endpoint = endpoint.rstrip("/")
+        # Normalize bare hostnames to https:// so old configs and
+        # users who pass `--endpoint dnsmesh.io` (without scheme)
+        # both work. cmd_init also normalizes at save time.
+        self._endpoint = _normalize_endpoint(endpoint)
         if not token:
             token = bearer_for_endpoint(self._endpoint)
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -1204,7 +1229,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     cfg = CLIConfig(
         username=args.username,
         domain=args.domain,
-        endpoint=args.endpoint or "",
+        # Normalize bare hostnames (e.g. `dnsmesh.io`) into full URLs
+        # so the website example `dnsmesh init alice --endpoint
+        # dnsmesh.io` works without users having to remember the
+        # scheme. http://127.0.0.1:8053 + https://dmp.example.com
+        # pass through untouched.
+        endpoint=_normalize_endpoint(args.endpoint or ""),
         http_token=args.http_token,
         dns_host=args.dns_host,
         dns_port=args.dns_port,

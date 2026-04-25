@@ -352,7 +352,23 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             if key not in merged:
                 import os as _os
 
-                version = _os.environ.get("DMP_HEARTBEAT_VERSION", "").strip() or "dev"
+                # Fall back to the installed package version when
+                # DMP_HEARTBEAT_VERSION isn't set in the env. Without
+                # this, the synthesized self-row in the directory UI
+                # (and the JSON feed at /v1/nodes/seen) hard-codes
+                # "dev" as the version, which is what dnsmesh.io
+                # surfaced on its own /nodes page until 0.4.1 — even
+                # though the node was running a real release. Operator
+                # override via DMP_HEARTBEAT_VERSION still wins for
+                # ops who want a build-number / git-sha.
+                version = _os.environ.get("DMP_HEARTBEAT_VERSION", "").strip()
+                if not version:
+                    try:
+                        from dmp import __version__ as _pkg_version
+
+                        version = _pkg_version or "dev"
+                    except Exception:
+                        version = "dev"
                 merged[key] = DirectoryRow(
                     endpoint=self_endpoint,
                     operator_spk_hex=self_spk_hex,

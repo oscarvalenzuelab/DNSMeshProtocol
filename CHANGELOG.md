@@ -7,6 +7,45 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.1] — install/upgrade hardening + UX polish
+
+### Fixed
+
+- **`install.sh` now writes `DMP_DOMAIN=$DMP_NODE_HOSTNAME` into
+  `node.env` at install time.** Without this, the M8 claim-provider
+  zone-resolution chain (`DMP_CLAIM_PROVIDER_ZONE` →
+  `DMP_CLUSTER_BASE_DOMAIN` → `DMP_DOMAIN`) returned empty on a
+  fresh install, the heartbeat advertised `capabilities=0`, and
+  `POST /v1/claim/publish` 404'd — silently disabling the
+  claim-provider role even when the operator wanted it. This is
+  what was happening on the public reference node at `dnsmesh.io`
+  until the fix shipped.
+- **`upgrade.sh` backfills `DMP_DOMAIN`** for pre-0.4.1 installs
+  that never had it. Derived from `DMP_HEARTBEAT_SELF_ENDPOINT` (host
+  part) or `DMP_NODE_HOSTNAME`, with a clear warning when neither is
+  available.
+- **`dnsmesh init --endpoint`** now accepts bare hostnames (e.g.
+  `--endpoint dnsmesh.io`) and auto-prepends `https://`. Previously
+  the docs showed `--endpoint https://dnsmesh.io`, but the bare form
+  is more ergonomic and matches what the public site recommends.
+  Existing fully-qualified URLs (including `http://127.0.0.1:8053`
+  for local dev) pass through untouched.
+- **Synthesized self-row in `/v1/nodes/seen` + `/nodes` UI** now
+  shows the installed package version (`dmp.__version__`) instead of
+  the hard-coded `"dev"` fallback, so a node running 0.4.x reports
+  `0.4.x` in its directory entry. Operator override via
+  `DMP_HEARTBEAT_VERSION` still wins for ops who want a build-number
+  / git-sha string.
+
+### Added
+
+- **Website surfacing** of the public reference node's capabilities.
+  `docs/index.md` now has a "Use dnsmesh.io as your starting point"
+  section spelling out what the open public node actually offers
+  (registration, claim-provider role, bootstrap seed, federation
+  source) so users discover the path that doesn't require
+  self-hosting first.
+
 ## [0.4.0] — M8 cross-zone receive + first-message claim layer
 
 ### Fixed

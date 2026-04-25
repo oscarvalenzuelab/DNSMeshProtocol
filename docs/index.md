@@ -20,6 +20,43 @@ internet already runs on.
 
 ---
 
+## Use dnsmesh.io as your starting point
+
+You don't need to run your own node to try DMP. The reference public
+node at **`https://dnsmesh.io`** is open to anyone:
+
+```bash
+pip install dnsmesh
+dnsmesh init alice --domain <your-zone> --endpoint dnsmesh.io
+dnsmesh register --node dnsmesh.io
+dnsmesh identity publish
+```
+
+What that node currently advertises (`curl https://dnsmesh.io/v1/info`):
+
+- **Open registration.** Anyone can mint a per-user publish token via
+  `dnsmesh register --node dnsmesh.io` — no operator approval, no
+  account, no email. The token is the only thing gating writes; the
+  protocol's signature checks gate everything else.
+- **Claim-provider role.** Strangers who know your address can reach
+  you on a first message even before you've pinned them as a contact
+  (M8 first-contact layer). Your CLI quarantines them in an `intro`
+  queue that you review with `dnsmesh intro list / accept / trust /
+  block`. Records hosted are tiny signed pointers — the ciphertext
+  stays in the sender's zone.
+- **Canonical bootstrap seed.** Other DMP nodes use `dnsmesh.io` as
+  their default heartbeat-discovery seed, so federation works out of
+  the box without operators having to coordinate.
+- **Multi-node federation source.** Clients that pin `dnsmesh.io`'s
+  `_dmp.<your-zone>` bootstrap record can resolve a cluster manifest
+  via the two-hop trust chain.
+
+If you'd rather self-host, the same capabilities are one
+`deploy/native-ubuntu/install.sh` away — the public node is a
+reference, not a dependency. **Both modes interoperate over DNS.**
+
+---
+
 ## What it is
 
 DNS Mesh Protocol (DMP) is an **open-source, end-to-end encrypted
@@ -181,6 +218,16 @@ Actively shipping:
   --auto-pin` resolves the cluster from a user domain via a signed
   `_dmp.<user_domain>` TXT record, verifies the two-hop trust chain
   (bootstrap signer → cluster operator), and cuts over atomically.
+- **Cross-zone receive + first-message claim layer (M8 / 0.4.0).**
+  Restores the original DMP property that a sender publishes to
+  *their own* DNS zone and the recipient pulls via the recursive
+  resolver chain — no shared mesh required, just pin a contact's
+  zone. For unpinned strangers, signed claim records hosted on
+  capability-advertising nodes (`CAP_CLAIM_PROVIDER` bit in the
+  heartbeat) give a working first-contact path without putting the
+  recipient's home node on the open-write hot path. Claim records
+  are tiny signed pointers; ciphertext stays in the sender's zone.
+  Quarantined intros land in `dnsmesh intro list` for review.
 - **Formal protocol specification** at
   [`docs/protocol/`]({{ site.baseurl }}/protocol/) — wire format,
   routing, end-to-end flows, and threat model, designed so an
@@ -191,9 +238,7 @@ Certification backlog — work on the path to `v1.0`, tracked in [`ROADMAP.md`](
 - **External cryptographic audit** (M4.2–M4.4). The gate for tagging
   `v0.2.0-beta` and for treating DMP as anything other than alpha
   software.
-- **PyPI release** (M5.1).
-- **Mobile client** (M5.2), **web/WASM client** (M5.3), **key rotation
-  and revocation records** (M5.4).
+- **Mobile client** (M5.2), **web/WASM client** (M5.3).
 - **Traffic-analysis resistance** (M6) — random publish delays, dummy
   chunks, chunk-order randomization. Best-effort research track.
 

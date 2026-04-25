@@ -131,6 +131,69 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────
+# M8 (0.4.1+): backfill DMP_DOMAIN if missing
+# ──────────────────────────────────────────────────────────────────────
+#
+# Pre-0.4.1 install.sh never wrote DMP_DOMAIN into node.env. M8's
+# claim-provider role reads its zone from
+#   DMP_CLAIM_PROVIDER_ZONE → DMP_CLUSTER_BASE_DOMAIN → DMP_DOMAIN
+# so an old install upgrades to 0.4.x with capabilities=0 and a 404
+# on POST /v1/claim/publish — silently broken even though the bit
+# DEFAULTS on. See dnsmesh.io's pre-fix config: DMP_NODE_HOSTNAME
+# was set, but no zone resolution chain entry was, so the node
+# never advertised the role despite serving as the canonical
+# bootstrap.
+#
+# Fix on upgrade: if NONE of the zone vars are set AND we can derive
+# a sensible zone from DMP_HEARTBEAT_SELF_ENDPOINT (host part) OR
+# DMP_NODE_HOSTNAME, write DMP_DOMAIN. Otherwise warn the operator.
+
+step "Checking node.env for a configured DNS zone (DMP_DOMAIN)"
+if [[ -f "$ENV_FILE" ]] && \
+        ! grep -qE '^[[:space:]]*DMP_DOMAIN=' "$ENV_FILE" && \
+        ! grep -qE '^[[:space:]]*DMP_CLAIM_PROVIDER_ZONE=' "$ENV_FILE" && \
+        ! grep -qE '^[[:space:]]*DMP_CLUSTER_BASE_DOMAIN=' "$ENV_FILE"; then
+    # Derive zone from heartbeat endpoint host first (it's the
+    # public hostname the node already advertises). Fall back to
+    # DMP_NODE_HOSTNAME when present in the env file.
+    derived_zone=""
+    hb_endpoint=$(grep -E '^[[:space:]]*DMP_HEARTBEAT_SELF_ENDPOINT=' "$ENV_FILE" \
+        | head -n1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+    if [[ -n "$hb_endpoint" ]]; then
+        # Strip scheme + port + path. https://dnsmesh.io → dnsmesh.io
+        derived_zone=$(echo "$hb_endpoint" \
+            | sed -E 's|^[a-zA-Z]+://||; s|:[0-9]+||; s|/.*$||')
+    fi
+    if [[ -z "$derived_zone" ]]; then
+        node_hostname=$(grep -E '^[[:space:]]*DMP_NODE_HOSTNAME=' "$ENV_FILE" \
+            | head -n1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+        derived_zone="$node_hostname"
+    fi
+    if [[ -n "$derived_zone" ]]; then
+        cat >> "$ENV_FILE" <<EOF
+
+# Added by upgrade.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ) — M8 (0.4.1).
+# Pre-0.4.1 install.sh never wrote this. Derived from the existing
+# heartbeat endpoint / node hostname so the M8 claim-provider role
+# (CAP_CLAIM_PROVIDER + /v1/claim/publish) activates correctly.
+# Without this line, /v1/info would report claim_provider_zone=""
+# and other clients would skip this node as a claim seed.
+DMP_DOMAIN=${derived_zone}
+EOF
+        chown root:"$DNSMESH_USER" "$ENV_FILE"
+        chmod 0640 "$ENV_FILE"
+        ok "added DMP_DOMAIN=${derived_zone} to $ENV_FILE"
+    else
+        warn "no DMP_DOMAIN configured AND no heartbeat endpoint or"
+        warn "DMP_NODE_HOSTNAME to derive one from. The M8 claim-"
+        warn "provider role will stay disabled until you set"
+        warn "DMP_DOMAIN=<your-zone> in $ENV_FILE."
+    fi
+else
+    ok "DNS zone already configured (DMP_DOMAIN / claim-provider-zone / cluster-base-domain set)"
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # M8 (0.4.0+): claim-provider role awareness
 # ──────────────────────────────────────────────────────────────────────
 

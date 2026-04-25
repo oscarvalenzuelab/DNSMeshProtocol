@@ -104,9 +104,12 @@ Install the CLI and point it at the node:
 
 ```bash
 pip install dnsmesh
-dnsmesh init alice --domain dmp.example.com --endpoint https://dmp.example.com
+dnsmesh init alice --domain dmp.example.com --endpoint dmp.example.com
 dnsmesh identity show
 ```
+
+The CLI auto-prepends `https://` to bare hostnames. Pass a full
+`http://host:port` URL when pointing at a local-dev node.
 
 If multi-tenant auth is enabled (recommended for any node serving
 people you don't personally run), users register for a per-user
