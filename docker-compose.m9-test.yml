@@ -1,0 +1,165 @@
+# docker-compose.m9-test.yml — multi-node DNS-only federation e2e (M9).
+#
+# Three independent dnsmesh-node containers, each authoritative for a
+# different DNS zone:
+#
+#   - alice.test    on alice-node:8053  HTTP / 5353 UDP    static IP 10.42.0.11
+#   - bob.test      on bob-node:8053    HTTP / 5353 UDP    static IP 10.42.0.12
+#   - claims.test   on provider-node:8053 / 5353 UDP        static IP 10.42.0.13
+#
+# Each node:
+#   - publishes its own heartbeat at _dnsmesh-heartbeat.<own-zone>
+#     into its local sqlite store (M9.1.2).
+#   - publishes its seen-graph at _dnsmesh-seen.<own-zone> as a
+#     multi-value TXT RRset (M9.1.3).
+#   - queries the OTHER nodes' zones via DMP_HEARTBEAT_DNS_RESOLVERS
+#     set to the other two nodes' static IPs on UDP 5353 — no public
+#     DNS, no HTTP gossip.
+#   - opts into DNS UPDATE (DMP_DNS_UPDATE_ENABLED=1) + multi-tenant
+#     auth so users can register via /v1/registration/tsig-confirm
+#     and then publish their records over RFC 2136 UPDATE + TSIG.
+#
+# Bring up:
+#
+#     docker compose -f docker-compose.m9-test.yml up -d --build
+#
+# Smoke test:
+#
+#     curl -s http://127.0.0.1:8071/v1/info | jq .
+#     dig @127.0.0.1 -p 5371 _dnsmesh-heartbeat.alice.test TXT +short
+#     dig @127.0.0.1 -p 5371 _dnsmesh-seen.alice.test TXT +short
+#
+# Tear down:
+#
+#     docker compose -f docker-compose.m9-test.yml down -v
+
+services:
+  alice-node:
+    image: dnsmesh-node:latest
+    container_name: m9-alice-node
+    restart: unless-stopped
+    environment:
+      DMP_DOMAIN: alice.test
+      DMP_NODE_HOSTNAME: alice.test
+      DMP_SERVED_ZONE: alice.test
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_CLEANUP_INTERVAL: "30"
+      DMP_LOG_LEVEL: INFO
+      # DNS-only federation: heartbeat seeds are zone names, harvest
+      # resolves through the other nodes' DNS endpoints directly.
+      DMP_HEARTBEAT_ENABLED: "1"
+      DMP_HEARTBEAT_SELF_ENDPOINT: "http://alice-node:8053"
+      DMP_HEARTBEAT_OPERATOR_KEY_PATH: /etc/dmp/operator.key
+      DMP_HEARTBEAT_INTERVAL_SECONDS: "5"
+      DMP_HEARTBEAT_TTL_SECONDS: "300"
+      DMP_HEARTBEAT_SEEDS: "bob.test,claims.test"
+      DMP_HEARTBEAT_DNS_RESOLVERS: "10.42.0.12:5353,10.42.0.13:5353"
+      DMP_CLAIM_PROVIDER: "1"
+      # M9.2.x — DNS UPDATE + TSIG + self-service registration.
+      DMP_DNS_UPDATE_ENABLED: "1"
+      DMP_AUTH_MODE: "multi-tenant"
+      DMP_OPERATOR_TOKEN: "alice-operator-token-for-tests"
+      DMP_REGISTRATION_ENABLED: "1"
+    volumes:
+      - alice-data:/var/lib/dmp
+      - ./docker/m9-test/alice-operator.key:/etc/dmp/operator.key:ro
+    ports:
+      - "127.0.0.1:5371:5353/udp"
+      - "127.0.0.1:8071:8053/tcp"
+    networks:
+      m9-test:
+        ipv4_address: 10.42.0.11
+
+  bob-node:
+    image: dnsmesh-node:latest
+    container_name: m9-bob-node
+    restart: unless-stopped
+    environment:
+      DMP_DOMAIN: bob.test
+      DMP_NODE_HOSTNAME: bob.test
+      DMP_SERVED_ZONE: bob.test
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_CLEANUP_INTERVAL: "30"
+      DMP_LOG_LEVEL: INFO
+      DMP_HEARTBEAT_ENABLED: "1"
+      DMP_HEARTBEAT_SELF_ENDPOINT: "http://bob-node:8053"
+      DMP_HEARTBEAT_OPERATOR_KEY_PATH: /etc/dmp/operator.key
+      DMP_HEARTBEAT_INTERVAL_SECONDS: "5"
+      DMP_HEARTBEAT_TTL_SECONDS: "300"
+      DMP_HEARTBEAT_SEEDS: "alice.test,claims.test"
+      DMP_HEARTBEAT_DNS_RESOLVERS: "10.42.0.11:5353,10.42.0.13:5353"
+      DMP_CLAIM_PROVIDER: "1"
+      DMP_DNS_UPDATE_ENABLED: "1"
+      DMP_AUTH_MODE: "multi-tenant"
+      DMP_OPERATOR_TOKEN: "bob-operator-token-for-tests"
+      DMP_REGISTRATION_ENABLED: "1"
+    volumes:
+      - bob-data:/var/lib/dmp
+      - ./docker/m9-test/bob-operator.key:/etc/dmp/operator.key:ro
+    ports:
+      - "127.0.0.1:5372:5353/udp"
+      - "127.0.0.1:8072:8053/tcp"
+    networks:
+      m9-test:
+        ipv4_address: 10.42.0.12
+
+  provider-node:
+    image: dnsmesh-node:latest
+    container_name: m9-provider-node
+    restart: unless-stopped
+    environment:
+      DMP_DOMAIN: claims.test
+      DMP_NODE_HOSTNAME: claims.test
+      DMP_SERVED_ZONE: claims.test
+      DMP_CLAIM_PROVIDER_ZONE: claims.test
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_CLEANUP_INTERVAL: "30"
+      DMP_LOG_LEVEL: INFO
+      DMP_HEARTBEAT_ENABLED: "1"
+      DMP_HEARTBEAT_SELF_ENDPOINT: "http://provider-node:8053"
+      DMP_HEARTBEAT_OPERATOR_KEY_PATH: /etc/dmp/operator.key
+      DMP_HEARTBEAT_INTERVAL_SECONDS: "5"
+      DMP_HEARTBEAT_TTL_SECONDS: "300"
+      DMP_HEARTBEAT_SEEDS: "alice.test,bob.test"
+      DMP_HEARTBEAT_DNS_RESOLVERS: "10.42.0.11:5353,10.42.0.12:5353"
+      DMP_CLAIM_PROVIDER: "1"
+      DMP_DNS_UPDATE_ENABLED: "1"
+      DMP_AUTH_MODE: "multi-tenant"
+      DMP_OPERATOR_TOKEN: "provider-operator-token-for-tests"
+      DMP_REGISTRATION_ENABLED: "1"
+    volumes:
+      - provider-data:/var/lib/dmp
+      - ./docker/m9-test/provider-operator.key:/etc/dmp/operator.key:ro
+    ports:
+      - "127.0.0.1:5373:5353/udp"
+      - "127.0.0.1:8073:8053/tcp"
+    networks:
+      m9-test:
+        ipv4_address: 10.42.0.13
+
+networks:
+  m9-test:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.42.0.0/24
+
+volumes:
+  alice-data:
+  bob-data:
+  provider-data:
