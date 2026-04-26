@@ -148,6 +148,23 @@ class CLIConfig:
     claim_provider_override: str = ""
     claim_provider_zone: str = ""
 
+    # M9.2.5 — TSIG block for the DNS UPDATE write path. When all four
+    # required fields are populated, ``_make_client`` constructs a
+    # ``_DnsUpdateWriter`` instead of ``_HttpWriter`` and every
+    # subsequent publish goes over RFC 2136 UPDATE + RFC 8945 TSIG
+    # to the user's home node's DNS port. Empty values fall back to
+    # the legacy HTTP path so older configs upgrade transparently.
+    # Populated by ``dnsmesh tsig register``.
+    tsig_key_name: str = ""  # dnspython key name, with trailing dot
+    tsig_secret_hex: str = ""  # raw secret bytes, hex-encoded
+    tsig_algorithm: str = "hmac-sha256"
+    tsig_zone: str = ""  # zone the key is authoritative for
+    # DNS server + port to send the UPDATE to. Default 53; dev nodes
+    # often use 5353. Empty server falls back to the host parsed out
+    # of ``endpoint`` so single-host setups don't have to repeat it.
+    tsig_dns_server: str = ""
+    tsig_dns_port: int = 53
+
     @classmethod
     def load(cls, path: Path) -> "CLIConfig":
         if not path.exists():
@@ -212,6 +229,12 @@ class CLIConfig:
             contacts=contacts,
             claim_provider_override=data.get("claim_provider_override", "") or "",
             claim_provider_zone=data.get("claim_provider_zone", "") or "",
+            tsig_key_name=data.get("tsig_key_name", "") or "",
+            tsig_secret_hex=data.get("tsig_secret_hex", "") or "",
+            tsig_algorithm=data.get("tsig_algorithm", "hmac-sha256") or "hmac-sha256",
+            tsig_zone=data.get("tsig_zone", "") or "",
+            tsig_dns_server=data.get("tsig_dns_server", "") or "",
+            tsig_dns_port=int(data.get("tsig_dns_port", 53)),
         )
 
     def save(self, path: Path) -> None:
@@ -474,6 +497,53 @@ def _effective_domain(config: CLIConfig) -> str:
     if config.cluster_base_domain and config.cluster_operator_spk:
         return config.cluster_base_domain
     return config.domain
+
+
+def _build_writer(config: "CLIConfig") -> DNSRecordWriter:
+    """Pick the right writer for ``config``.
+
+    M9.2.5: when the TSIG block in ``config`` is populated, every
+    publish goes over RFC 2136 UPDATE + RFC 8945 TSIG to the user's
+    home node's DNS port. Empty TSIG fields fall back to the legacy
+    HTTP path, so an existing config without ``dnsmesh tsig register``
+    keeps working.
+
+    The DNS server defaults to the host parsed out of ``config.endpoint``
+    so a single-host setup doesn't have to repeat itself; an explicit
+    ``tsig_dns_server`` overrides that.
+    """
+    if config.tsig_key_name and config.tsig_secret_hex:
+        from dmp.network.dns_update_writer import _DnsUpdateWriter
+
+        try:
+            secret = bytes.fromhex(config.tsig_secret_hex)
+        except ValueError:
+            _die(1, "tsig_secret_hex in config is not valid hex")
+        zone = (config.tsig_zone or "").strip()
+        if not zone:
+            _die(
+                1,
+                "tsig_zone in config is empty — re-run `dnsmesh tsig register` "
+                "to repopulate the TSIG block",
+            )
+        server = (config.tsig_dns_server or "").strip()
+        if not server:
+            server = _zone_from_endpoint_url(config.endpoint or "")
+        if not server:
+            _die(
+                1,
+                "could not resolve a DNS server for the TSIG writer — set "
+                "`tsig_dns_server` in config or pass --endpoint with a hostname",
+            )
+        return _DnsUpdateWriter(
+            zone=zone,
+            server=server,
+            tsig_key_name=config.tsig_key_name,
+            tsig_secret=secret,
+            tsig_algorithm=config.tsig_algorithm or "hmac-sha256",
+            port=int(config.tsig_dns_port) or 53,
+        )
+    return _HttpWriter(config.endpoint, config.http_token)
 
 
 def _make_reader(config: CLIConfig) -> DNSRecordReader:
@@ -806,7 +876,7 @@ def _make_client(
                     f"{_config_path()}",
                 )
         else:
-            writer = _HttpWriter(config.endpoint, config.http_token)
+            writer = _build_writer(config)
             reader = _make_reader(config)
     # Persist the replay cache next to the config so repeated `dnsmesh recv` calls
     # across separate CLI processes don't re-deliver the same message.
@@ -2817,6 +2887,157 @@ def cmd_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tsig_register(args: argparse.Namespace) -> int:
+    """M9.2.5: register for a TSIG key on a multi-tenant node and
+    persist it into the local config.
+
+    Walks the same Ed25519 challenge/confirm dance as ``dnsmesh
+    register``, but POSTs to ``/v1/registration/tsig-confirm``.
+    The minted TSIG key block (name, secret, algorithm, scope zone)
+    lands in ``~/.dmp/config.yaml`` so subsequent ``dnsmesh send`` /
+    ``dnsmesh identity publish`` go over RFC 2136 UPDATE through
+    the node's DNS port instead of HTTP.
+
+    Default DNS port for the writer is 53; pass ``--dns-port 5353``
+    against a dev node that runs DNS on a high port.
+    """
+    import requests
+
+    cfg = CLIConfig.load(_config_path())
+    if not cfg.username:
+        _die(
+            1,
+            "no local config — run `dnsmesh init <username>` before `dnsmesh tsig register`",
+        )
+
+    subject = args.subject or f"{cfg.username}@{_effective_domain(cfg)}"
+
+    passphrase = _load_passphrase(cfg)
+    kdf_salt = bytes.fromhex(cfg.kdf_salt) if cfg.kdf_salt else None
+    from dmp.core.crypto import DMPCrypto
+
+    crypto = DMPCrypto.from_passphrase(passphrase, salt=kdf_salt)
+    spk_hex = crypto.get_signing_public_key_bytes().hex()
+    x25519_pub_hex = crypto.get_public_key_bytes().hex()
+
+    node_host = args.node.strip()
+    if "://" in node_host:
+        node_host = node_host.split("://", 1)[1]
+    node_host = node_host.rstrip("/")
+    base = f"{args.scheme}://{node_host}"
+    try:
+        r = requests.get(f"{base}/v1/registration/challenge", timeout=10)
+    except requests.RequestException as exc:
+        _die(2, f"cannot reach {base}: {exc}")
+    if r.status_code == 404:
+        _die(
+            1,
+            f"{args.node} does not expose /v1/registration/challenge (404). "
+            "Operator must set DMP_REGISTRATION_ENABLED=1 + DMP_AUTH_MODE=multi-tenant.",
+        )
+    if r.status_code == 429:
+        _die(2, "registration rate-limited (429). Try again later.")
+    if r.status_code != 200:
+        _die(2, f"challenge request failed: HTTP {r.status_code}: {r.text}")
+    try:
+        ch = r.json()
+    except ValueError:
+        _die(2, f"challenge response is not JSON: {r.text!r}")
+
+    challenge_hex = ch.get("challenge")
+    node_hostname = ch.get("node")
+    if not challenge_hex or not node_hostname:
+        _die(2, f"malformed challenge response: {ch!r}")
+
+    payload = (
+        bytes.fromhex(challenge_hex)
+        + subject.encode("utf-8")
+        + node_hostname.encode("utf-8")
+        + b"\x01"
+    )
+    signature_hex = crypto.sign_data(payload).hex()
+
+    try:
+        r2 = requests.post(
+            f"{base}/v1/registration/tsig-confirm",
+            json={
+                "subject": subject,
+                "ed25519_spk": spk_hex,
+                "challenge": challenge_hex,
+                "signature": signature_hex,
+                # M9.2.3 + M9.2.5: shipping the X25519 public key extends
+                # the minted scope to mailbox / claim records.
+                "x25519_pub": x25519_pub_hex,
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        _die(2, f"tsig-confirm request failed: {exc}")
+    if r2.status_code == 401:
+        _die(1, "node rejected the signature (401). Re-check the passphrase.")
+    if r2.status_code == 403:
+        _die(1, f"subject {subject!r} not in the node's allowlist (403).")
+    if r2.status_code == 409:
+        _die(
+            1,
+            f"subject {subject!r} already owned by a different key (409). "
+            "Use the same passphrase you registered with, or have the "
+            "operator revoke the prior key.",
+        )
+    if r2.status_code == 404:
+        _die(
+            1,
+            f"{args.node} does not expose /v1/registration/tsig-confirm (404). "
+            "Operator must set DMP_DNS_UPDATE_ENABLED=1 to mint TSIG keys.",
+        )
+    if r2.status_code != 200:
+        _die(2, f"tsig-confirm failed: HTTP {r2.status_code}: {r2.text}")
+    body = r2.json()
+
+    name = body.get("tsig_key_name")
+    secret_hex = body.get("tsig_secret_hex")
+    algorithm = body.get("tsig_algorithm", "hmac-sha256")
+    zone = body.get("zone")
+    suffixes = body.get("allowed_suffixes") or []
+    expires_at = body.get("expires_at")
+    if not (isinstance(name, str) and isinstance(secret_hex, str) and zone):
+        _die(2, f"tsig-confirm returned malformed body: {body!r}")
+
+    cfg.tsig_key_name = name
+    cfg.tsig_secret_hex = secret_hex
+    cfg.tsig_algorithm = algorithm or "hmac-sha256"
+    cfg.tsig_zone = zone
+    # Resolve the DNS server: --dns-server > --node host > endpoint host.
+    dns_server = (args.dns_server or "").strip()
+    if not dns_server:
+        dns_server = node_host
+    cfg.tsig_dns_server = dns_server
+    cfg.tsig_dns_port = int(args.dns_port) if args.dns_port else 53
+    cfg.save(_config_path())
+
+    print(f"registered {subject} on {node_host}")
+    print(f"  TSIG key:  {name}")
+    print(f"  algorithm: {algorithm}")
+    print(f"  zone:      {zone}")
+    print(f"  DNS:       {dns_server}:{cfg.tsig_dns_port}/udp")
+    if suffixes:
+        print("  scope:")
+        for s in suffixes:
+            print(f"    - {s}")
+    if isinstance(expires_at, int) and expires_at > 0:
+        import time as _time
+
+        print(
+            "  expires:   "
+            + _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(expires_at))
+        )
+    print(
+        "  subsequent `dnsmesh identity publish` / `dnsmesh send` will "
+        "go over DNS UPDATE through the node's DNS port."
+    )
+    return 0
+
+
 def cmd_token_list(args: argparse.Namespace) -> int:
     import json
 
@@ -4064,6 +4285,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="URL scheme for the node (default: https; http only for local dev)",
     )
     p_reg.set_defaults(func=cmd_register)
+
+    # tsig — DNS UPDATE credential management. ``tsig register`` walks
+    # /v1/registration/tsig-confirm and persists the minted key into
+    # the local config, after which _make_client builds a
+    # _DnsUpdateWriter for every publish.
+    p_tsig = sub.add_parser(
+        "tsig",
+        help="DNS UPDATE credential management (M9.2.5)",
+    )
+    p_tsig_sub = p_tsig.add_subparsers(dest="tsig_cmd", required=True)
+    p_tsig_reg = p_tsig_sub.add_parser(
+        "register",
+        help="register for a TSIG key on a multi-tenant node",
+    )
+    p_tsig_reg.add_argument(
+        "--node",
+        required=True,
+        help="node hostname (e.g. dmp.example.com)",
+    )
+    p_tsig_reg.add_argument(
+        "--subject",
+        help="subject to register (default: <username>@<effective-domain>)",
+    )
+    p_tsig_reg.add_argument(
+        "--scheme",
+        choices=("https", "http"),
+        default="https",
+        help="URL scheme for the registration call (default: https)",
+    )
+    p_tsig_reg.add_argument(
+        "--dns-server",
+        default="",
+        help="DNS server to send UPDATEs to (default: --node host)",
+    )
+    p_tsig_reg.add_argument(
+        "--dns-port",
+        type=int,
+        default=53,
+        help="DNS port (default: 53; use 5353 for dev)",
+    )
+    p_tsig_reg.set_defaults(func=cmd_tsig_register)
 
     # token — inspect / manage locally-stored per-node tokens.
     p_tok = sub.add_parser(
