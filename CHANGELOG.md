@@ -7,6 +7,57 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.5.3] — CLI fixes: full-address contact keys + --config-home flag
+
+CLI-only release. No node-side changes; existing 0.5.x nodes stay
+compatible. Two bugs surfaced during a real human↔assistant cross-
+node test on the live federation; both broke the canonical M9 happy
+path enough to warrant a patch release so users on PyPI / pipx /
+the standalone binary pick up the fix.
+
+### Fixed
+
+- **Contacts now stored under the full canonical address**
+  (codex round-23 P1). `dnsmesh identity fetch user@host --add`
+  used to store the contact under the bare username, but
+  `dnsmesh send user@host` looked up by the full address as the
+  dict key — so a freshly-pinned cross-zone contact would fail
+  with "unknown contact" on the next send. Workaround was to send
+  by bare name. Real fix: store under the full canonical address
+  when the fetch arrives via the `user@host` form. Bare-name keying
+  stays for shared-mesh / TOFU fetches without `@host`. The send
+  path now does a two-step lookup (full address first, fall back
+  to bare name) so legacy contacts keep working after upgrade.
+  Two contacts with the same left-half on different zones (e.g.
+  `alice@dmp.dnsmesh.io` vs `alice@dmp.dnsmesh.pro`) are now
+  correctly distinguishable; previously they collided silently.
+- **Reliable config isolation via `--config-home` CLI flag**
+  (codex round-23 P1). The pre-fix only knob was the
+  `DMP_CONFIG_HOME` env var, which proved leaky during a
+  `pipx upgrade dnsmesh` upgrade scenario — a stale `~/.dmp/`
+  config could shadow the env-var path and silently produce the
+  wrong subject on `dnsmesh tsig register`. New top-level
+  `--config-home PATH` flag wins over the env var and is the
+  recommended way to isolate per-identity / per-tenant configs.
+  Bonus: a single `--config-home` flag also defaults
+  `DMP_TOKENS_HOME=<config-home>/tokens` so per-tenant isolation
+  is one-knob (operator workflow).
+
+### Added
+
+- `--config-home PATH` top-level CLI flag.
+- `--tokens-home PATH` top-level CLI flag.
+
+### Tests
+
+- 4 new `TestContactKeyByFullAddress` cases covering the fetch /
+  send / back-compat matrix.
+- 3 new `TestConfigHomeFlag` cases covering flag-vs-env-var
+  precedence and the auto-derived `tokens-home` path.
+- 1 existing test updated for the new full-address key shape.
+
+1364 tests passing.
+
 ## [0.5.2] — Post-M9 patch: heartbeat RRset orphan sweep + self-row preference
 
 Surfaced during the 0.5.1 deployment validation: the operator's own
