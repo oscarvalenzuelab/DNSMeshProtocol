@@ -88,11 +88,15 @@ class TestMintTsigViaRegistration:
         assert minted.zone == "ops.example"
         assert minted.name.startswith("alice-" + spk_hex[:8])
         assert minted.name.endswith(".ops.example.")
-        # Default loose-scope mode (M9.2.6 round-13 P1): the minted
-        # key authorizes any owner under the served zone, since DMP
-        # send_message publishes content-addressed records that the
-        # tight-suffix scope can't enumerate.
-        assert minted.allowed_suffixes == ("ops.example",)
+        # Default scope (M9.2.6 round-14): per-user pattern set
+        # covering identity, mailbox slots, chunks, and claim records
+        # via wildcard suffixes. NOT a full-zone grant.
+        suffixes = set(minted.allowed_suffixes)
+        assert "id-" in next(s for s in suffixes if s.startswith("id-"))
+        assert "slot-*.mb-*.ops.example" in suffixes
+        assert "chunk-*-*.ops.example" in suffixes
+        assert "_dnsmesh-claim-*.ops.example" in suffixes
+        assert "ops.example" not in suffixes  # NOT full-zone
         # Secret is fresh random bytes (32) and survives a re-read.
         assert len(bytes.fromhex(minted.secret_hex)) == 32
         stored = keystore.get(minted.name)
@@ -286,10 +290,12 @@ class TestMintTsigViaRegistration:
         )
         # Anchored under the served zone, not the hostname.
         assert minted.zone == "example.com"
-        # Loose-scope default: scope is the served zone itself.
-        assert "example.com" in minted.allowed_suffixes
+        # Pattern suffixes anchor to the served zone.
+        suffixes = set(minted.allowed_suffixes)
+        assert "slot-*.mb-*.example.com" in suffixes
+        assert "chunk-*-*.example.com" in suffixes
         # And NOT under the hostname.
-        for suffix in minted.allowed_suffixes:
+        for suffix in suffixes:
             assert ".api.example.com" not in suffix
             assert "api.example.com" != suffix
 

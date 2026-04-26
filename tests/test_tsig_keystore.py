@@ -47,6 +47,30 @@ class TestSuffixMatch:
     def test_empty_suffix_matches_nothing(self):
         assert not _suffix_match("alice.example.com", "")
 
+    def test_wildcard_label_matches_any_value_within_label(self):
+        """M9.2.6 round-14: ``slot-*.mb-*.alice.test`` matches the
+        content-addressed mailbox slot names DMPClient.send_message
+        publishes."""
+        assert _suffix_match(
+            "slot-3.mb-abc123def456.alice.test", "slot-*.mb-*.alice.test"
+        )
+
+    def test_wildcard_does_not_cross_label_boundary(self):
+        """``mb-*.alice.test`` matches ``mb-abc.alice.test`` but NOT
+        ``mb-abc.bob.alice.test`` — the wildcard stays in one label."""
+        assert _suffix_match("mb-abc.alice.test", "mb-*.alice.test")
+        # Subdomain extension still works (suffix tail-match preserved).
+        assert _suffix_match(
+            "extra.mb-abc.alice.test", "mb-*.alice.test"
+        )
+        # Different zone — NOT in scope.
+        assert not _suffix_match("mb-abc.bob.test", "mb-*.alice.test")
+
+    def test_wildcard_owner_too_short_rejected(self):
+        """A pattern with N labels rejects owners that have fewer
+        than N labels — no implicit zero-label match."""
+        assert not _suffix_match("alice.test", "slot-*.mb-*.alice.test")
+
 
 class TestPutAndGet:
     def test_round_trip(self, store):

@@ -277,6 +277,7 @@ def _load_heartbeat_from_env(
     record_db_path: str,
     record_writer=None,
     dns_reader=None,
+    dns_update_enabled: bool = False,
 ):
     """Return a ``_HeartbeatBundle`` if opt-in-enabled, else None.
 
@@ -425,7 +426,17 @@ def _load_heartbeat_from_env(
     claim_provider_on = claim_provider_raw not in ("0", "false", "no", "off")
     claim_zone = _load_claim_provider_zone()
     has_zone = bool(claim_zone)
-    capabilities = CAP_CLAIM_PROVIDER if (claim_provider_on and has_zone) else 0
+    # Codex round-14 P1: only advertise CAP_CLAIM_PROVIDER when the
+    # node can actually accept claim publishes — that requires DNS
+    # UPDATE to be enabled (M9.2.6 un-TSIG'd claim path lives there).
+    # An upgraded node that kept its M5.8 heartbeat config but never
+    # set DMP_DNS_UPDATE_ENABLED=1 must NOT be selected as a claim
+    # provider, since every first-contact publish would bounce.
+    capabilities = (
+        CAP_CLAIM_PROVIDER
+        if (claim_provider_on and has_zone and dns_update_enabled)
+        else 0
+    )
 
     # Codex round-3 P1: heartbeat publishing has to keep working when
     # claim-provider is disabled. The zone the worker publishes UNDER
@@ -956,6 +967,7 @@ class DMPNode:
             self.config.db_path,
             record_writer=self.store,
             dns_reader=heartbeat_dns_reader,
+            dns_update_enabled=bool(self.config.dns_update_enabled),
         )
 
         self.http = DMPHttpApi(

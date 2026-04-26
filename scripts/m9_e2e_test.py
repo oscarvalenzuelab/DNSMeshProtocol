@@ -151,8 +151,9 @@ def main():
     print(f"  minted key name: {minted['tsig_key_name']}")
     print(f"  scope: {minted['allowed_suffixes']}")
     assert_step(
-        "alice gets a TSIG key scoped to her served zone",
-        "alice.test" in minted["allowed_suffixes"],
+        "alice gets a TSIG key with per-user pattern scope",
+        any(s.startswith("slot-*.mb-*.") for s in minted["allowed_suffixes"]),
+        f"got {minted['allowed_suffixes']}",
     )
 
     step("4. Publish alice's identity via DNS UPDATE (no HTTP)")
@@ -215,6 +216,47 @@ def main():
         "Cross-zone UPDATE bounces with NOTAUTH",
         bad_response.rcode() == dns.rcode.NOTAUTH,
         f"rcode={dns.rcode.to_text(bad_response.rcode())}",
+    )
+
+    step("7b. In-zone DMP-shape UPDATE within scope — must be NOERROR")
+    # The minted scope covers slot-*.mb-*.<zone> and chunk-*-*.<zone>.
+    # Publish a fake mailbox slot owner under alice's zone — should
+    # land. This proves a real DNS-only send_message would too.
+    upd_in_pattern = dns.update.UpdateMessage("alice.test")
+    upd_in_pattern.add(
+        dns.name.from_text("slot-3.mb-abc123def456.alice.test."),
+        300,
+        "TXT",
+        '"v=dmp1;t=manifest;e2e-test"',
+    )
+    upd_in_pattern.use_tsig(
+        keyring, keyname=dns.name.from_text(minted["tsig_key_name"])
+    )
+    in_pattern_resp = dns.query.udp(
+        upd_in_pattern, ALICE_DNS[0], port=ALICE_DNS[1], timeout=3.0
+    )
+    assert_step(
+        "Per-user pattern scope authorizes slot-*.mb-*.<zone>",
+        in_pattern_resp.rcode() == dns.rcode.NOERROR,
+        f"rcode={dns.rcode.to_text(in_pattern_resp.rcode())}",
+    )
+
+    step("7c. In-zone owner OUTSIDE pattern scope — must be REFUSED")
+    # Same zone but an owner that doesn't match any of the minted
+    # patterns. With tight per-user scope this bounces.
+    upd_oop = dns.update.UpdateMessage("alice.test")
+    upd_oop.add(
+        dns.name.from_text("bob.alice.test."),
+        300,
+        "TXT",
+        '"impostor"',
+    )
+    upd_oop.use_tsig(keyring, keyname=dns.name.from_text(minted["tsig_key_name"]))
+    oop_resp = dns.query.udp(upd_oop, ALICE_DNS[0], port=ALICE_DNS[1], timeout=3.0)
+    assert_step(
+        "Out-of-pattern in-zone UPDATE is REFUSED",
+        oop_resp.rcode() == dns.rcode.REFUSED,
+        f"rcode={dns.rcode.to_text(oop_resp.rcode())}",
     )
 
     step("8. Cross-zone claim publish via un-TSIG'd DNS UPDATE")

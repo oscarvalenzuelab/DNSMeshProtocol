@@ -547,33 +547,33 @@ def _suffixes_for(
     spk16 = _spk_short(spk_hex, length=16)
     if not z or not subj or not spk16:
         return ()
-    # Codex round-13 P1: a registered user has to publish under owner
-    # names that aren't anchored on their identity hash —
-    # ``slot-N.mb-{hash(recipient)}.{sender_zone}`` and
-    # ``chunk-XXXX-{msg_key}.{sender_zone}`` are content-addressed by
-    # the RECIPIENT and the message, not the sender. Scoping the key
-    # to ``id-<sender_hash>.<zone>`` therefore REFUSES every normal
-    # send_message UPDATE.
+    # Codex round-14 P1: default scope is the per-user pattern set,
+    # NOT the full served zone. Loose-scope (``DMP_TSIG_LOOSE_SCOPE=1``)
+    # remains as an explicit opt-in for solo-deployment cases where
+    # the served zone IS the user's personal zone, but a multi-tenant
+    # deployment must not let Alice overwrite Bob's records.
     #
-    # The pragmatic fix is to grant the registered user write access
-    # to anything under the served zone. In single-user-per-zone
-    # deployments (the shape M9 actually targets — each user runs
-    # their own node, the served zone IS their personal zone) this is
-    # correct. Multi-tenant deployments where a single zone hosts
-    # many users would need per-user prefix matching that goes beyond
-    # the current suffix-tail check; that's tracked as a known
-    # limitation for any future multi-tenant work and gated on the
-    # ``DMP_TSIG_LOOSE_SCOPE=0`` env override below.
-    if os.environ.get("DMP_TSIG_LOOSE_SCOPE", "1").strip().lower() not in (
-        "0", "false", "no", "off",
+    # The patterns below use the M9.2.6 wildcard suffix matcher
+    # (``_label_glob``) to cover the content-addressed record names
+    # ``DMPClient.send_message`` actually writes to:
+    #   - identity / prekeys → ``id-<username_hash16>.<zone>`` (tail
+    #     match also covers ``prekeys.id-...`` siblings)
+    #   - mailbox slots → ``slot-*.mb-*.<zone>`` (any slot, any
+    #     recipient hash, anchored under the user's own zone)
+    #   - chunks → ``chunk-*-*.<zone>`` (any chunk index, any msg key)
+    #   - claim records (legacy + new) → ``_dnsmesh-claim-*.<zone>``
+    #     and the per-user spk-prefixed form
+    if os.environ.get("DMP_TSIG_LOOSE_SCOPE", "0").strip().lower() in (
+        "1", "true", "yes", "on",
     ):
         return (z,)
-    # Tight-scope mode (multi-tenant deployments): keep the narrower
-    # set, accepting that send_message UPDATEs WILL be REFUSED.
     suffixes = []
     username_hash = hashlib.sha256(subj.encode("utf-8")).hexdigest()[:16]
     suffixes.append(f"id-{username_hash}.{z}")
     suffixes.append(f"_dnsmesh-claim-{spk16}.{z}")
+    suffixes.append(f"_dnsmesh-claim-*.{z}")
+    suffixes.append(f"slot-*.mb-*.{z}")
+    suffixes.append(f"chunk-*-*.{z}")
     x_norm = (x25519_pub_hex or "").strip().lower()
     if x_norm:
         try:

@@ -118,12 +118,75 @@ def _suffix_match(owner: str, suffix: str) -> bool:
     """Owner is in scope iff it equals the suffix or is a strict
     subdomain of it. Exact-match guards a key scoped to a single
     owner; subdomain match supports wildcard-style scopes like
-    ``alice.example.com`` granting everything beneath."""
+    ``alice.example.com`` granting everything beneath.
+
+    Codex round-14: ``suffix`` may also contain ``*`` wildcards in
+    label positions to match content-addressed DMP record names. A
+    suffix like ``slot-*.mb-*.alice.test`` matches
+    ``slot-3.mb-abcdef012345.alice.test`` but NOT
+    ``slot-3.mb-abcdef012345.bob.test``. This lets a TSIG key
+    authorize the per-recipient and per-message names that
+    ``DMPClient.send_message`` writes without granting full-zone
+    authority. ``*`` only matches within a single label (no dots).
+    """
     if not suffix:
         return False
-    o = (owner or "").strip().lower().rstrip(".")
     s = _normalize_suffix(suffix)
+    o = (owner or "").strip().lower().rstrip(".")
+    if "*" in s:
+        return _glob_suffix_match(o, s)
     return o == s or o.endswith("." + s)
+
+
+def _glob_suffix_match(owner: str, pattern: str) -> bool:
+    """Per-label glob match. ``*`` matches one or more chars within a
+    single label; dots are label separators and never matched by ``*``.
+
+    The pattern is treated as a SUFFIX — ``slot-*.mb-*.alice.test``
+    matches owner ``slot-3.mb-abc.alice.test`` AND
+    ``foo.slot-3.mb-abc.alice.test`` (subdomain extension), so the
+    same "covers everything beneath" semantic as plain suffixes is
+    preserved. Pattern labels are right-aligned with owner labels.
+    """
+    pattern_labels = pattern.split(".")
+    owner_labels = owner.split(".")
+    if len(owner_labels) < len(pattern_labels):
+        return False
+    # Right-align: compare last len(pattern_labels) owner labels.
+    aligned = owner_labels[-len(pattern_labels):]
+    for pl, ol in zip(pattern_labels, aligned):
+        if not _label_glob(pl, ol):
+            return False
+    return True
+
+
+def _label_glob(pattern_label: str, owner_label: str) -> bool:
+    """Match one label with a single ``*`` wildcard at most. Order
+    keeps complexity O(label length); we don't support ``**`` or
+    multi-wildcard patterns yet — the DMP record names we need
+    (``slot-N``, ``mb-<hash>``, ``chunk-N-<hash>``) all have at
+    most one variable segment per label."""
+    if "*" not in pattern_label:
+        return pattern_label == owner_label
+    parts = pattern_label.split("*")
+    # Reconstruct: parts[0] + <wildcard> + parts[1] + <wildcard> + ...
+    pos = 0
+    for i, part in enumerate(parts):
+        if i == 0:
+            if not owner_label.startswith(part):
+                return False
+            pos = len(part)
+        elif i == len(parts) - 1:
+            if not owner_label.endswith(part):
+                return False
+            if pos > len(owner_label) - len(part):
+                return False
+        else:
+            idx = owner_label.find(part, pos)
+            if idx < 0:
+                return False
+            pos = idx + len(part)
+    return True
 
 
 @dataclass(frozen=True)
