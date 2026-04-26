@@ -568,8 +568,15 @@ def _suffixes_for(
     ):
         return (z,)
     suffixes = []
-    username_hash = hashlib.sha256(subj.encode("utf-8")).hexdigest()[:16]
-    suffixes.append(f"id-{username_hash}.{z}")
+    username_hash16 = hashlib.sha256(subj.encode("utf-8")).hexdigest()[:16]
+    suffixes.append(f"id-{username_hash16}.{z}")
+    # Prekey records use sha256(subject)[:12], not [:16] — different
+    # truncation, different label content (codex round-16 P1). The
+    # prekey RRset name is ``prekeys.id-<hash12>.<zone>``, which
+    # tail-matches ``id-<hash12>.<zone>``, so we add the 12-char form
+    # explicitly so refresh-prekeys UPDATEs authorize.
+    username_hash12 = hashlib.sha256(subj.encode("utf-8")).hexdigest()[:12]
+    suffixes.append(f"id-{username_hash12}.{z}")
     suffixes.append(f"_dnsmesh-claim-{spk16}.{z}")
     suffixes.append(f"_dnsmesh-claim-*.{z}")
     suffixes.append(f"slot-*.mb-*.{z}")

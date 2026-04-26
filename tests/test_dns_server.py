@@ -448,6 +448,65 @@ class TestDnsUpdate:
         assert response.rcode() == dns.rcode.REFUSED
         assert store.query_txt_record(owner.rstrip(".")) is None
 
+    def test_oversized_value_refused(self):
+        """Codex round-16 P1: max_value_bytes must apply to TSIG UPDATEs
+        too. A 600-byte value with the cap at 256 bytes bounces.
+        DNS TXT values >255 octets are split into multi-string rdata
+        so dnspython accepts them; the server still measures the
+        decoded total and enforces the cap."""
+        store = InMemoryDNSStore()
+        server, port = self._server(store, update_max_value_bytes=256)
+        # Three quoted 200-byte strings = 600 bytes when concatenated.
+        long_rdata = " ".join(
+            ['"' + ("a" * 200) + '"' for _ in range(3)]
+        )
+        with server:
+            upd = dns.update.UpdateMessage("example.com")
+            upd.add(
+                dns.name.from_text("foo.example.com."),
+                300,
+                "TXT",
+                long_rdata,
+            )
+            upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED
+        assert store.query_txt_record("foo.example.com") is None
+
+    def test_overlong_ttl_refused(self):
+        """update_max_ttl caps the requested DNS RR TTL on UPDATEs."""
+        store = InMemoryDNSStore()
+        server, port = self._server(store, update_max_ttl=300)
+        with server:
+            upd = dns.update.UpdateMessage("example.com")
+            upd.add(
+                dns.name.from_text("foo.example.com."),
+                86400,  # 1 day, > cap
+                "TXT",
+                '"v"',
+            )
+            upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED
+
+    def test_too_many_values_for_owner_refused(self):
+        """update_max_values_per_name caps the multi-value RRset size
+        per UPDATE message."""
+        store = InMemoryDNSStore()
+        server, port = self._server(store, update_max_values_per_name=2)
+        with server:
+            upd = dns.update.UpdateMessage("example.com")
+            for i in range(3):
+                upd.add(
+                    dns.name.from_text("foo.example.com."),
+                    300,
+                    "TXT",
+                    f'"v{i}"',
+                )
+            upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED
+
     def test_no_writer_means_refused(self):
         """A server constructed without a writer (read-only) refuses
         any UPDATE regardless of TSIG."""

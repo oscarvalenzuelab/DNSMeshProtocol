@@ -886,6 +886,12 @@ class DMPNode:
                 "allowed_zones": allowed_zones,
                 "claim_publish_enabled": claim_publish_enabled,
                 "claim_max_ttl": claim_max_ttl,
+                # Resource caps mirror the HTTP /v1/records publish
+                # path so a TSIG'd DNS UPDATE can't bypass operator
+                # storage policy (codex round-16 P1).
+                "update_max_ttl": int(self.config.max_ttl),
+                "update_max_value_bytes": int(self.config.max_value_bytes),
+                "update_max_values_per_name": int(self.config.max_values_per_name),
             }
         self.dns = DMPDnsServer(
             self.store,

@@ -67,6 +67,13 @@ DEFAULT_TTL = 60
 # a sender can't write a far-future ``exp`` and have the provider host
 # the record indefinitely. Operator override via DMP_CLAIM_MAX_TTL.
 DEFAULT_CLAIM_MAX_TTL = 86_400
+# Resource caps applied to TSIG-authorized UPDATE writes — same
+# defaults the HTTP /v1/records publish path uses (M5.5 history).
+# Codex round-16 P1: without these, a registered user could bypass
+# operator storage policy via DNS UPDATE.
+DEFAULT_UPDATE_MAX_TTL = 86_400 * 7
+DEFAULT_UPDATE_MAX_VALUE_BYTES = 16_384
+DEFAULT_UPDATE_MAX_VALUES_PER_NAME = 256
 
 
 def _split_for_txt_strings(value: str, max_len: int = MAX_TXT_STRING) -> list[bytes]:
@@ -409,6 +416,43 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                 response.set_rcode(dns.rcode.FORMERR)
                 return response
 
+        # Resource limits — apply to ADD ops on every UPDATE path
+        # (TSIG'd or not). Codex round-16 P1: an authenticated user
+        # could otherwise bypass operator storage policy
+        # (max_ttl, max_value_bytes, max_values_per_name) via the
+        # DNS UPDATE write surface.
+        max_ttl = int(getattr(self.server, "update_max_ttl", DEFAULT_UPDATE_MAX_TTL))
+        max_value_bytes = int(
+            getattr(
+                self.server,
+                "update_max_value_bytes",
+                DEFAULT_UPDATE_MAX_VALUE_BYTES,
+            )
+        )
+        max_values_per_name = int(
+            getattr(
+                self.server,
+                "update_max_values_per_name",
+                DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
+            )
+        )
+        adds_per_owner: dict = {}
+        for op, owner, value, ttl in ops:
+            if op != "add":
+                continue
+            if max_value_bytes > 0 and value is not None:
+                if len(value.encode("utf-8")) > max_value_bytes:
+                    response.set_rcode(dns.rcode.REFUSED)
+                    return response
+            if max_ttl > 0 and ttl > max_ttl:
+                response.set_rcode(dns.rcode.REFUSED)
+                return response
+            if max_values_per_name > 0:
+                adds_per_owner[owner] = adds_per_owner.get(owner, 0) + 1
+                if adds_per_owner[owner] > max_values_per_name:
+                    response.set_rcode(dns.rcode.REFUSED)
+                    return response
+
         # Auth disposition.
         had_tsig = bool(getattr(query, "had_tsig", False))
         key_name = getattr(query, "keyname", None)
@@ -487,18 +531,25 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                 log.exception("writer raised during UPDATE apply; SERVFAIL")
                 response.set_rcode(dns.rcode.SERVFAIL)
                 return response
-            # Codex round-12 P1: a writer that returns False (e.g. the
-            # cluster fanout missing quorum) means the record DID NOT
-            # persist. Returning NOERROR would silently lose the
-            # write — the sender treats the UPDATE as committed and
-            # never retries. Surface the failure as SERVFAIL so the
-            # caller can fall back / retry. Delete-of-missing-name is
-            # the one false positive (writer returns False because
-            # nothing matched), which we accept as benign noise.
-            if not ok and op == "add":
+            # Codex round-12 P1 + round-16 P2: a writer that returns
+            # False (e.g. cluster fanout missing quorum, transport
+            # error against a peer) means the record DID NOT persist.
+            # Returning NOERROR would silently lose the write — the
+            # sender treats the UPDATE as committed and never retries.
+            # Surface the failure as SERVFAIL on BOTH adds and deletes
+            # so the caller can fall back / retry.
+            #
+            # The InMemoryDNSStore returns False on
+            # ``delete_txt_record`` for "no record matched" (a benign
+            # no-op), but the SqliteMailboxStore + FanoutWriter return
+            # False only on real failures — the conservative choice
+            # is SERVFAIL across the board and let the writer
+            # implementation distinguish if needed.
+            if not ok:
                 log.info(
-                    "writer.publish_txt_record returned False for %s — "
-                    "answering SERVFAIL so the client can retry",
+                    "writer.%s returned False for %s — answering "
+                    "SERVFAIL so the client can retry",
+                    "publish_txt_record" if op == "add" else "delete_txt_record",
                     owner,
                 )
                 response.set_rcode(dns.rcode.SERVFAIL)
@@ -538,6 +589,9 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         update_authorizer=None,
         claim_publish_enabled=False,
         claim_max_ttl=DEFAULT_CLAIM_MAX_TTL,
+        update_max_ttl=DEFAULT_UPDATE_MAX_TTL,
+        update_max_value_bytes=DEFAULT_UPDATE_MAX_VALUE_BYTES,
+        update_max_values_per_name=DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
     ):
         super().__init__(server_address, handler_cls)
         self.reader = reader
@@ -551,6 +605,9 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         self.update_authorizer = update_authorizer
         self.claim_publish_enabled = bool(claim_publish_enabled)
         self.claim_max_ttl = int(claim_max_ttl)
+        self.update_max_ttl = int(update_max_ttl)
+        self.update_max_value_bytes = int(update_max_value_bytes)
+        self.update_max_values_per_name = int(update_max_values_per_name)
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -594,6 +651,9 @@ class DMPDnsServer:
         update_authorizer: Optional[UpdateAuthorizer] = None,
         claim_publish_enabled: bool = False,
         claim_max_ttl: int = DEFAULT_CLAIM_MAX_TTL,
+        update_max_ttl: int = DEFAULT_UPDATE_MAX_TTL,
+        update_max_value_bytes: int = DEFAULT_UPDATE_MAX_VALUE_BYTES,
+        update_max_values_per_name: int = DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
     ):
         """``writer``, a TSIG source, and ``allowed_zones`` together
         switch on RFC 2136 UPDATE handling. With any of them missing
@@ -634,6 +694,9 @@ class DMPDnsServer:
         # this False and the un-TSIG'd path stays REFUSED.
         self.claim_publish_enabled = bool(claim_publish_enabled)
         self.claim_max_ttl = int(claim_max_ttl)
+        self.update_max_ttl = int(update_max_ttl)
+        self.update_max_value_bytes = int(update_max_value_bytes)
+        self.update_max_values_per_name = int(update_max_values_per_name)
         self._server: Optional[_ThreadingUDPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -660,6 +723,9 @@ class DMPDnsServer:
             update_authorizer=self.update_authorizer,
             claim_publish_enabled=self.claim_publish_enabled,
             claim_max_ttl=self.claim_max_ttl,
+            update_max_ttl=self.update_max_ttl,
+            update_max_value_bytes=self.update_max_value_bytes,
+            update_max_values_per_name=self.update_max_values_per_name,
         )
         # If the caller asked for port 0, pick up the actual bound port.
         self.port = self._server.server_address[1]
