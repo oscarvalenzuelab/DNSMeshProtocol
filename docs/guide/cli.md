@@ -11,6 +11,29 @@ nav_order: 1
 1. TOC
 {:toc}
 
+## Quick reference — happy path in 6 commands
+
+If you just want to send a message to someone, this is the whole flow.
+For new users, work through [Getting Started]({{ site.baseurl }}/getting-started)
+once, then come back here when you need a specific subcommand.
+
+```bash
+dnsmesh init alice --domain dmp.dnsmesh.io --endpoint https://dnsmesh.io
+dnsmesh tsig register --node dnsmesh.io        # one-time, mints a TSIG key
+dnsmesh identity publish                       # publish your record to DNS
+dnsmesh identity refresh-prekeys               # forward-secret first messages
+dnsmesh identity fetch bob@dmp.dnsmesh.io --add  # pin a contact
+dnsmesh send bob@dmp.dnsmesh.io "hi bob"
+dnsmesh recv                                   # poll for inbound
+```
+
+Jump to [`dnsmesh init`](#dnsmesh-init) for the config it writes,
+[`dnsmesh tsig`](#dnsmesh-tsig) for the one-time registration that
+mints your DNS UPDATE credential, [`dnsmesh identity`](#dnsmesh-identity)
+for publish / fetch / prekey mechanics, and
+[`dnsmesh send` / `dnsmesh recv`](#dnsmesh-send--dnsmesh-recv) for
+delivery internals.
+
 ## Config and passphrase
 
 The CLI stores its per-identity config at `$DMP_CONFIG_HOME/config.yaml`
@@ -181,6 +204,74 @@ Pool-port caveat: `ResolverPool` today takes a single port for every
 upstream. If the parsed entries carry mixed ports, the first explicit
 port wins and the rest of the pool inherits it. Pools of same-port
 resolvers (all `:53`, or all default) are unaffected.
+
+### `dnsmesh tsig`
+
+Mint and inspect the per-user TSIG key the CLI uses for DNS UPDATE
+under M9. One subcommand today:
+
+| Subcommand | Purpose |
+|---|---|
+| `dnsmesh tsig register --node <host> [--subject S] [--scheme {https,http}] [--dns-server IP] [--dns-port P]` | Mint a TSIG key + scope, save to config |
+
+This is the one HTTPS hop in the M9 send/receive flow. The CLI
+generates a challenge with the node's `/v1/registration/challenge`
+endpoint, signs it with your local Ed25519 key, posts the signature
+to `/v1/registration/tsig-confirm`, and the node returns a freshly-
+minted symmetric TSIG key whose authorization is **scoped to your
+identity's owner names only**. Every subsequent `dnsmesh identity
+publish`, `dnsmesh send`, and `dnsmesh identity refresh-prekeys`
+goes over RFC 2136 DNS UPDATE under that key — no further HTTPS.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--node` | — | Node hostname (e.g. `dnsmesh.io`) — copy-pasted full URLs are accepted, the scheme is stripped |
+| `--subject` | `<username>@<effective-domain>` | The address you're claiming; override for zone-anchored addresses |
+| `--scheme` | `https` | Use `http` only against a local-dev node |
+| `--dns-server` | `--node` host | Where DNS UPDATEs will be sent. Override when the zone apex doesn't run the DNS endpoint |
+| `--dns-port` | 53 | Override for dev nodes that bind 5353 |
+
+On success the CLI prints the minted key, its zone, the DNS
+destination it'll write to, and the **scope** — the set of DNS owner
+patterns the key is allowed to write. Example for `alice@dmp.dnsmesh.io`:
+
+```
+TSIG key:  alice-1777184189-a262a3ab-3db9bc.dmp.dnsmesh.io.
+algorithm: hmac-sha256
+zone:      dmp.dnsmesh.io
+DNS:       dnsmesh.io:53/udp
+scope:
+  - _dnsmesh-claim-*.dmp.dnsmesh.io
+  - _dnsmesh-claim-a262a3ab6ca74bba.dmp.dnsmesh.io
+  - chunk-*-*.dmp.dnsmesh.io
+  - claim-*.mb-*.dmp.dnsmesh.io
+  - id-4f898cf018ed.dmp.dnsmesh.io
+  - id-4f898cf018ed3de2.dmp.dnsmesh.io
+  - mb-4e968b4cfb6b.dmp.dnsmesh.io
+  - slot-*.mb-*.dmp.dnsmesh.io
+expires:   2026-07-25T06:38:18Z
+```
+
+The scope is **enforced at the DNS server**, not advertised. Even
+holding the key, an UPDATE for an owner name outside the scope
+bounces with `REFUSED`. The wildcard suffixes `*.<zone>` cover
+patterns whose left-half varies per message (mailbox slots, chunk
+records); the literal `id-<hash>` entries pin your identity record
+to the hash of your username.
+
+Default key lifetime is **90 days**. Re-running `dnsmesh tsig register`
+on the same machine with the same passphrase rotates the key — the
+node revokes the old one and issues a new one in one transaction.
+
+#### What can go wrong
+
+| CLI error | What happened | Fix |
+|---|---|---|
+| `cannot reach <node>` | Network or TLS issue. | `curl -v https://<node>/v1/registration/challenge` to narrow down. |
+| `does not expose /v1/registration/tsig-confirm (404)` | Node isn't in multi-tenant mode, or registration is off. | Ask the operator to set `DMP_REGISTRATION_ENABLED=1` and `DMP_AUTH_MODE=multi-tenant`. |
+| `registration rate-limited (429)` | Hit the per-IP throttle. | Wait a minute, or ask the operator to bump `DMP_REGISTRATION_ENDPOINT_RATE_BURST`. |
+| `subject already held by a different key (409)` | That subject is taken on this node. Either someone else registered it, or you registered before from a different machine without the matching passphrase. | Pick another subject, restore the original passphrase, or ask the operator to revoke. |
+| `node rejected the signature (401)` | Your local Ed25519 key doesn't match what the node expects — usually a wrong passphrase. | `dnsmesh identity show` and confirm the signing pubkey matches what you intended. |
 
 ### `dnsmesh identity`
 

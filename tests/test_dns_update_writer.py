@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from dmp.network.dns_update_writer import _DnsUpdateWriter
+from dmp.network.dns_update_writer import _DnsUpdateWriter, _resolve_to_ip
 from dmp.network.memory import InMemoryDNSStore
 from dmp.server.dns_server import DMPDnsServer
 from dmp.server.tsig_keystore import TSIGKeyStore
@@ -252,3 +252,126 @@ class TestConstructorValidation:
                 tsig_secret=b"\x01" * 32,
                 tsig_algorithm="not-a-real-algorithm",
             )
+
+
+class TestResolveToIp:
+    """``_resolve_to_ip`` shields callers from dnspython's IP-only
+    destination requirement — every UPDATE path resolves once at
+    construction so operators can configure a hostname."""
+
+    def test_ipv4_literal_passes_through(self):
+        assert _resolve_to_ip("127.0.0.1") == "127.0.0.1"
+        assert _resolve_to_ip("8.8.8.8") == "8.8.8.8"
+
+    def test_ipv6_literal_passes_through(self):
+        assert _resolve_to_ip("::1") == "::1"
+        assert _resolve_to_ip("2001:4860:4860::8888") == "2001:4860:4860::8888"
+
+    def test_localhost_resolves_to_loopback(self):
+        # ``localhost`` is the one hostname every test environment
+        # resolves the same way (loopback, AF_INET preferred).
+        out = _resolve_to_ip("localhost")
+        assert out in {"127.0.0.1", "::1"}
+
+    def test_unresolvable_returns_none(self):
+        # Codex round-21 P2 fix: returning the original hostname on
+        # gaierror would leak it through to dns.query.udp(), which
+        # raises ValueError that _send() doesn't catch. Returning
+        # None lets _send return False per the writer contract.
+        out = _resolve_to_ip("this-host-does-not-exist.invalid")
+        assert out is None
+
+    def test_none_input_returns_none(self):
+        # Defensive: callers shouldn't pass None, but if they do
+        # we shouldn't crash inside dns.inet.af_for_address.
+        assert _resolve_to_ip(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert _resolve_to_ip("") is None
+
+    def test_nul_byte_rejected(self):
+        # NUL bytes confuse downstream socket/DNS calls; reject so a
+        # typo can't produce inconsistent failure modes across paths.
+        assert _resolve_to_ip("dns\x00mesh.io") is None
+
+    def test_resolver_pool_preferred_over_system(self):
+        """When a pool is passed, resolve via it first — that's the
+        codex round-21 P1 fix. The pool's view is what governs DNS
+        reads (DMP_HEARTBEAT_DNS_RESOLVERS); UDP-destination lookups
+        must agree, otherwise a stale system-resolver NXDOMAIN
+        breaks writes during a delegation move."""
+
+        class _StubPool:
+            def __init__(self, ip):
+                self._ip = ip
+                self.calls = []
+
+            def resolve_address(self, host):
+                self.calls.append(host)
+                return self._ip
+
+        pool = _StubPool("203.0.113.7")
+        out = _resolve_to_ip("anything.example", resolver_pool=pool)
+        assert out == "203.0.113.7"
+        assert pool.calls == ["anything.example"]
+
+    def test_resolver_pool_failure_falls_back_to_system(self):
+        """Pool returning None doesn't permanently fail — system
+        resolver is the last-resort fallback so a misconfigured pool
+        doesn't lock us out entirely."""
+
+        class _DeadPool:
+            def resolve_address(self, host):
+                return None
+
+        # ``localhost`` resolves via the system resolver in any test
+        # environment, so this exercises the fallback cleanly.
+        out = _resolve_to_ip("localhost", resolver_pool=_DeadPool())
+        assert out in {"127.0.0.1", "::1"}
+
+    def test_resolver_pool_exception_does_not_propagate(self):
+        """A resolver pool that raises (e.g. all upstreams down)
+        falls back to the system resolver instead of crashing the
+        publish path."""
+
+        class _BadPool:
+            def resolve_address(self, host):
+                raise RuntimeError("simulated transport storm")
+
+        out = _resolve_to_ip("localhost", resolver_pool=_BadPool())
+        assert out in {"127.0.0.1", "::1"}
+
+    def test_writer_construction_resolves_hostname(self):
+        """End-to-end: passing a hostname to the writer no longer
+        produces an IP-literal-required error at publish time."""
+        writer = _DnsUpdateWriter(
+            zone="example.com",
+            server="localhost",
+            tsig_key_name="x.",
+            tsig_secret=b"\x01" * 32,
+        )
+        import dns.inet
+
+        dns.inet.af_for_address(writer._server)  # no exception
+
+    def test_writer_with_unresolvable_server_returns_false_not_raises(self):
+        """Codex round-21 P2: previously a hostname with no A/AAAA
+        record left ``_server`` as the original string, which made
+        ``dns.query.udp`` raise ValueError that ``_send`` didn't
+        catch. ``publish_txt_record`` MUST return False instead of
+        bubbling — that's the DNSRecordWriter contract every other
+        writer honors."""
+        writer = _DnsUpdateWriter(
+            zone="example.com",
+            server="this-host-does-not-exist.invalid",
+            tsig_key_name="x.",
+            tsig_secret=b"\x01" * 32,
+        )
+        assert writer._server is None
+        # publish_txt_record returns False without raising — even
+        # though _send would have hit dns.query.udp with a non-
+        # literal under the old behavior.
+        ok = writer.publish_txt_record("foo.example.com", "v=dmp1;t=identity")
+        assert ok is False
+        ok = writer.delete_txt_record("foo.example.com")
+        assert ok is False

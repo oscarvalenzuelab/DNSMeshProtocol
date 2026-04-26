@@ -237,17 +237,33 @@ flowchart LR
     Resolvers -- "recursive chain" --> ANode
   </pre>
   <ul style="text-align: left;">
-    <li><strong>One HTTPS hop, ever:</strong> Alice runs <code>dnsmesh tsig register</code> once to get a TSIG key from her home node. That's the only HTTPS connection in the protocol.</li>
+    <li><strong>Normal user flow:</strong> Alice runs <code>dnsmesh tsig register</code> once to get a TSIG key from her home node. After that, her client writes with DNS UPDATE.</li>
     <li><strong>Writes (after register):</strong> Alice's CLI sends RFC 2136 DNS UPDATE messages signed with her TSIG key. Identity, prekeys, mailbox slots, chunks — all DNS UPDATE.</li>
     <li><strong>Reads:</strong> Bob queries DNS for the record. Public resolvers walk the standard chain to Alice's authoritative node and pull it back.</li>
     <li><strong>Inter-node:</strong> heartbeat, peer discovery, claim publishes between strangers — also DNS. No HTTPS between independent nodes.</li>
   </ul>
   <div class="takeaway">
-    <strong>The protocol speaks DNS.</strong> HTTPS is only used once,
-    for the user-to-own-node onboarding step. Every record publish,
-    every cross-node coordination is RFC 2136 + RFC 8945 DNS UPDATE
-    or a plain DNS TXT query.
+    <strong>The protocol speaks DNS.</strong> In the preferred M9 path,
+    HTTPS is only the one-time user-to-own-node onboarding step.
+    After that, record publishes are RFC 2136 + RFC 8945 DNS UPDATE
+    and reads are plain DNS TXT queries. The only remaining inter-node
+    HTTP path is cluster anti-entropy inside one operator's HA domain.
   </div>
+</section>
+
+<!-- 4a. Glossary -->
+<section>
+  <h2>Four terms you need before the rest makes sense</h2>
+  <table>
+    <thead><tr><th>Term</th><th>Plain-English meaning</th></tr></thead>
+    <tbody>
+      <tr><td><strong>TSIG key</strong></td><td>A per-user DNS write credential. It proves "this client is allowed to publish records under this part of the zone."</td></tr>
+      <tr><td><strong>Authoritative node</strong></td><td>The DNS server that is the source of truth for a zone like <code>alice.example</code>. Public resolvers eventually ask it for the real answer.</td></tr>
+      <tr><td><strong>Pinned contact</strong></td><td>A contact whose signing key you have already verified and saved. After pinning, recv trusts records from that sender's zone.</td></tr>
+      <tr><td><strong>Claim provider</strong></td><td>A DNS-visible directory node that stores tiny signed pointers so an unpinned stranger can be discovered for the first message.</td></tr>
+    </tbody>
+  </table>
+  <p class="small">If you remember one thing: pinned contacts are the normal path; claim providers are only for first-contact discovery.</p>
 </section>
 
 <!-- 4b. Where messages actually go (the deep dive) -->
@@ -312,7 +328,7 @@ sequenceDiagram
 <!-- 5. Where the user usually trips -->
 <section>
   <h2 class="big-q">"Does the CLI need HTTP?"</h2>
-  <p style="text-align: left;">Almost never — only the one-time register step.</p>
+  <p style="text-align: left;">In the preferred M9 flow, almost never — only the one-time register step.</p>
   <table>
     <thead><tr><th>You're doing...</th><th>Channel</th><th>Network requirements</th></tr></thead>
     <tbody>
@@ -324,12 +340,12 @@ sequenceDiagram
       <tr>
         <td><code>dnsmesh tsig register</code><br>onboarding at a node, getting a TSIG key</td>
         <td><strong>HTTPS once</strong></td>
-        <td>outbound 443 to your home node. The only HTTPS exchange in the protocol.</td>
+        <td>outbound 443 to your home node. For normal user onboarding, this is the only HTTPS exchange.</td>
       </tr>
       <tr>
         <td><code>dnsmesh identity publish</code><br><code>dnsmesh send</code><br><code>dnsmesh identity refresh-prekeys</code></td>
         <td><strong>DNS UPDATE</strong></td>
-        <td>outbound UDP 53 (or TCP 53) to your home node, signed with your TSIG key. RFC 2136 + RFC 8945. No HTTPS after register.</td>
+        <td>outbound UDP 53 (or TCP 53) to your home node, signed with your TSIG key. RFC 2136 + RFC 8945. Legacy configs can still fall back to HTTPS writes until the user registers for TSIG.</td>
       </tr>
       <tr>
         <td><code>dnsmesh identity fetch</code><br><code>dnsmesh recv</code><br><code>dnsmesh peers &lt;zone&gt;</code></td>
@@ -399,7 +415,7 @@ sequenceDiagram
     participant B as Bob
     A->>ANode: DNS UPDATE + TSIG\nsigned identity record
     Note right of ANode: stored in sqlite\nserved on UDP 53
-    B->>DNS: TXT? dmp.alice.example\n(zone-anchored) or\nid-{hash16}.shared.mesh\n(shared-domain TOFU)
+    B->>DNS: TXT? dmp.alice.example\n(zone-anchored) or\nid-{hash16}.shared.mesh\n(shared-domain fallback)
     DNS->>ANode: forwards query
     ANode->>DNS: signed record
     DNS->>B: signed record
@@ -427,7 +443,7 @@ sequenceDiagram
       R-->>Bob: signed record
     end
   </pre>
-  <p class="small">Most queries hit a cache. Cold queries walk the chain. Either way, Bob's CLI verifies the signature locally — no trust in resolvers or paths required.</p>
+  <p class="small">Most queries hit a cache. Cold queries walk the chain. Either way, Bob's CLI verifies the signature locally — no trust in resolvers or paths required. "Authoritative" just means "the server that owns the real answer for that zone."</p>
 </section>
 
 <!-- 10. Why default to public resolver -->
@@ -498,11 +514,11 @@ sequenceDiagram
 sequenceDiagram
     participant Alice
     participant Node as Node (down)
-    Alice->>Node: POST /v1/records
+    Alice->>Node: DNS UPDATE + TSIG
     Node--xAlice: timeout
     Note right of Alice: send fails\nno built-in retry\noperator handles it
   </pre>
-  <p class="small">No retry queue. Pending sends do not survive. Records already published are persisted on disk and come back when the node restarts.</p>
+  <p class="small">No retry queue. Pending sends do not survive. Records already published are persisted on disk and come back when the node restarts. Legacy HTTP-write configs fail the same way; the transport changed, the failure mode did not.</p>
 </section>
 
 <!-- 14. What survives -->

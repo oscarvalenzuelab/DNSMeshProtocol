@@ -499,7 +499,9 @@ def _effective_domain(config: CLIConfig) -> str:
     return config.domain
 
 
-def _build_writer(config: "CLIConfig") -> DNSRecordWriter:
+def _build_writer(
+    config: "CLIConfig", reader: Optional[DNSRecordReader] = None
+) -> DNSRecordWriter:
     """Pick the right writer for ``config``.
 
     M9.2.5: when the TSIG block in ``config`` is populated, every
@@ -542,6 +544,11 @@ def _build_writer(config: "CLIConfig") -> DNSRecordWriter:
             tsig_secret=secret,
             tsig_algorithm=config.tsig_algorithm or "hmac-sha256",
             port=int(config.tsig_dns_port) or 53,
+            # Pass the configured resolver pool through so UDP-target
+            # resolution uses the same pinned recursors as record
+            # reads (codex round-21 P1: prevents stale system-resolver
+            # NXDOMAIN from breaking writes during a delegation move).
+            resolver_pool=reader,
         )
     return _HttpWriter(config.endpoint, config.http_token)
 
@@ -866,7 +873,11 @@ def _make_client(
             # Effect: a registered user's writes always go DNS-only
             # over the network, regardless of cluster_enabled.
             if config.tsig_key_name and config.tsig_secret_hex:
-                writer = _build_writer(config)
+                # Hand the bootstrap_reader through — it's the
+                # ResolverPool that holds DMP_HEARTBEAT_DNS_RESOLVERS,
+                # which is what we want governing UDP-destination
+                # lookups for the TSIG writer (codex round-21 P1).
+                writer = _build_writer(config, reader=bootstrap_reader)
             else:
                 writer = cluster_client.writer
             # Cross-domain reads (e.g. `dnsmesh identity fetch
@@ -896,8 +907,12 @@ def _make_client(
                     f"{_config_path()}",
                 )
         else:
-            writer = _build_writer(config)
+            # Build the reader first so the writer can borrow its
+            # ResolverPool for UDP-destination lookups (codex round-21
+            # P1: DMP_HEARTBEAT_DNS_RESOLVERS now governs both reads
+            # and the TSIG/claim UPDATE target IPs).
             reader = _make_reader(config)
+            writer = _build_writer(config, reader=reader)
     # Persist the replay cache next to the config so repeated `dnsmesh recv` calls
     # across separate CLI processes don't re-deliver the same message.
     replay_path = str(_config_path().parent / "replay_cache.json")
@@ -1051,7 +1066,7 @@ def _make_client(
 # Operators who want a different default fleet override via
 # `claim_provider_override` in their config.
 _BUILTIN_CLAIM_PROVIDER_SEEDS: List[Tuple[str, str]] = [
-    ("dnsmesh.io", "https://dnsmesh.io"),
+    ("dmp.dnsmesh.io", "https://dnsmesh.io"),
 ]
 
 

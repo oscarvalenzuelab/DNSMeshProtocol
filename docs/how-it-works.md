@@ -60,9 +60,11 @@ keep your secrets.
 ## Where bytes actually go
 
 A common confusion: when Alice sends a message to Bob, does her
-client talk to Bob's home node directly? **No.** The CLI POSTs records
-to its own configured endpoint — Alice's home node — over HTTPS. Bob
-later polls his own mailbox via DNS.
+client talk to Bob's home node directly? **No.** Alice publishes to
+her own home node. In the preferred M9 path, those writes are RFC 2136
+DNS UPDATE messages signed with her TSIG key; older configs can still
+fall back to HTTPS writes to the same home node. Bob later polls his
+mailbox via DNS.
 
 Concretely:
 
@@ -86,26 +88,33 @@ realistic configuration:
 | Alice on `dnsmesh.io`, Bob on `dnsmesh.pro` with different `mesh_domain`s, **pinned contacts on each side** | ✅ via M8.1 cross-zone receive |
 | Alice on `dnsmesh.io`, Bob on `dnsmesh.pro`, **unpinned stranger** reaches Bob for the first time | ✅ via M8.3 claim layer (requires a reachable claim provider both sides discover) |
 
-Each user only ever needs HTTPS to their own home node. "Node-to-node"
+Each user only ever needs to reach their own home node. In the
+preferred M9 flow that means one HTTPS onboarding step, then DNS
+UPDATE for writes. "Node-to-node"
 delivery is the recursive DNS resolver chain doing what it already
 does for every other lookup on the internet — typically
 `Bob's CLI → public resolver → roots → Alice's authoritative node
-→ record`. The only HTTPS hop in the cross-zone path is when an
-M8 claim is published to a discovery provider, which is best-effort
-(the underlying message still ships under the sender's zone).
+→ record`. First-contact claims are now published with DNS UPDATE too;
+the only remaining inter-node HTTP path is cluster anti-entropy inside
+one operator's HA domain.
 
-### What HTTP and DNS each do
+### What HTTP and DNS each do today
 
-- **HTTPS, client-to-own-node:** every write goes here. Publishing
-  identity, sending messages, refreshing prekeys, registering for a
-  token. Each user only ever needs HTTPS to **one** node — their own.
+- **HTTPS, client-to-own-node:** onboarding and legacy fallback.
+  `dnsmesh tsig register` uses HTTPS once to mint the per-user TSIG
+  key. Older configs without TSIG can still fall back to HTTPS writes
+  to the user's own node.
+- **DNS UPDATE, client-to-own-node:** the preferred M9 write path.
+  Publishing identity, sending messages, refreshing prekeys, and
+  normal mailbox writes all go here once the user has a TSIG key.
 - **DNS, anywhere-to-any-node:** every read goes here. Fetching
   identities, polling mailboxes, looking up cluster manifests. No
-  auth. Survives port 53 blocks via DNS-over-HTTPS at public
-  resolvers like 1.1.1.1.
+  auth. Networks that block port 53 entirely still block DMP today;
+  the CLI does not yet speak DoH itself.
 - **HTTPS, node-to-node (cluster only):** anti-entropy at
-  `/v1/sync/digest` + `/v1/sync/pull`. Required only when the
-  recipient's mesh is hosted on a cluster.
+  `/v1/sync/digest` + `/v1/sync/pull`. This is the documented HA-only
+  exception: cluster peers share one operator-signed manifest and live
+  in one administrative trust domain.
 
 Visual walkthrough in the
 [How resolution works]({{ site.baseurl }}/how-resolution-works.html)
@@ -161,16 +170,18 @@ For users who don't want to operate infrastructure.
 ```bash
 pip install dnsmeshprotocol     # (once published; today: pip install -e .)
 dnsmesh init alice --domain dmp.yournode.com
+dnsmesh tsig register --node dmp.yournode.com
 dnsmesh identity publish
 ```
 
-The `dnsmesh` CLI reaches out to `dmp.yournode.com` over the HTTPS publish
-API, hands it a signed `IdentityRecord`, and the node stores it as a
-TXT record. The user shares their address (`alice@dmp.yournode.com`)
-with contacts. Done.
+The `dnsmesh` CLI talks to `dmp.yournode.com` over HTTPS once for the
+TSIG registration ceremony, then publishes signed records with DNS
+UPDATE to that node's DNS service. The user shares their address
+(`alice@dmp.yournode.com`) with contacts. Done.
 
-Operator hands users a bearer token if the node has publish auth
-enabled (recommended). That's the only secret they need.
+Operator can still hand users a bearer token for legacy / fallback
+publish paths, but the preferred M9 user flow is TSIG-backed DNS
+UPDATE.
 
 ### Path 2 — Run your own single node
 

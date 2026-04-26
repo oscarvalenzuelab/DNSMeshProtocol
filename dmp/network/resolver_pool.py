@@ -378,6 +378,41 @@ class ResolverPool(DNSRecordReader):
             self._mark_success(healthy_state)
         return None
 
+    def resolve_address(self, host: str) -> Optional[str]:
+        """Resolve ``host`` to an IPv4 (preferred) or IPv6 literal.
+
+        Used by the DNS UPDATE writer to find a usable destination IP
+        for dnspython without falling back to the host's system
+        resolver. The pool already knows which upstreams the operator
+        trusts (via ``DMP_HEARTBEAT_DNS_RESOLVERS``); routing the A /
+        AAAA lookup through them keeps writes consistent with reads
+        during a delegation move (system resolver may still hold a
+        stale NXDOMAIN while the pinned recursors have refreshed).
+
+        Tries A first, then AAAA. Returns ``None`` if no upstream
+        produces an answer for either rdtype.
+
+        Health bookkeeping is intentionally lighter than
+        ``query_txt_record``: a transport error demotes the resolver,
+        but NXDOMAIN does not (we'd need an oracle, which we don't
+        have for a single A/AAAA lookup).
+        """
+        for rdtype in ("A", "AAAA"):
+            for state in self._iter_ordered():
+                try:
+                    answers = state.resolver.resolve(host, rdtype)
+                except self._NAME_NOT_FOUND_ERRORS:
+                    continue
+                except self._TRANSPORT_ERRORS:
+                    self._mark_failure(state)
+                    continue
+                for rdata in answers:
+                    self._mark_success(state)
+                    addr = getattr(rdata, "address", None)
+                    if addr:
+                        return str(addr)
+        return None
+
     # ---------------------------------------------------------------
     # Introspection helpers (not part of DNSRecordReader)
     # ---------------------------------------------------------------

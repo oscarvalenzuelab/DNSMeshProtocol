@@ -7,6 +7,98 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.5.1] — Post-M9 patch: hostname-aware DNS UPDATE + zone migration
+
+Follow-up to 0.5.0. Two CLI bugs surfaced during the live cross-zone
+test against `dnsmesh.io` <-> `dnsmesh.pro`, and the canonical
+bootstrap zone moved from the apex to a delegated subzone
+(`dmp.dnsmesh.io`). Wire format and crypto are unchanged — every
+0.5.0 record stays valid.
+
+### Fixed
+
+- **DNS UPDATE writer accepts hostnames** (codex round-21 P1).
+  `_DnsUpdateWriter` and `_publish_claim_via_dns_update` previously
+  passed the operator's configured hostname straight to
+  `dns.query.udp()`, which only accepts IP literals — every operator
+  who set `tsig_dns_server: dnsmesh.io` or pinned a hostname-form
+  `claim_provider_override` hit a `ValueError` deep in `dns.inet`.
+  The new `_resolve_to_ip` helper resolves the hostname once at
+  writer construction (per-call for claims, since target varies) and
+  routes the lookup through the configured `ResolverPool` first
+  (i.e. `DMP_HEARTBEAT_DNS_RESOLVERS`), falling back to
+  `socket.getaddrinfo` only when no pool is configured. Routing
+  UDP-destination resolution through the same pinned recursors as
+  record reads avoids the system-resolver NXDOMAIN-cache stall that
+  silently broke writes during the live zone-delegation move.
+- **Resolution failure surfaces as `False`, not an uncaught exception**
+  (codex round-21 P2). `_resolve_to_ip` now returns `None` on lookup
+  failure (was: original hostname); `_DnsUpdateWriter._send` checks
+  for that and surfaces `False` per the `DNSRecordWriter` contract.
+  Hostile inputs (`None`, empty string, NUL byte, `UnicodeError`) all
+  collapse to `None` defensively. New `TestResolveToIp` covers IPv4
+  / IPv6 literal pass-through, localhost resolution, unresolvable
+  `.invalid`, NUL-injected, pool-preferred, pool-failure-falls-back,
+  pool-exception-doesn't-propagate, and end-to-end writer-with-no-A-
+  record returns False without raising.
+- **`upgrade.sh` rewrites stale apex seeds**, not just backfills
+  (codex round-21 P1). Previously the migration only added
+  `DMP_HEARTBEAT_SEEDS` when absent; existing 0.5.0 nodes already
+  had `DMP_HEARTBEAT_SEEDS=https://dnsmesh.io` (apex), which after
+  the subzone-delegation move would silently lose federation when
+  the stale heartbeats expired (~24h). Both `deploy/native-ubuntu/`
+  and `deploy/digitalocean/` `upgrade.sh` now detect the apex /
+  scheme'd-apex / first-entry-of-comma-list patterns and rewrite to
+  `dmp.dnsmesh.io` in place via `sed -i -E`, with a timestamped
+  backup file. Regex doesn't false-match commented-out, already-
+  migrated, or empty values.
+
+### Changed
+
+- **Built-in canonical bootstrap zone**: `dnsmesh.io` apex →
+  `dmp.dnsmesh.io`. The dnsmesh-node DNS server is TXT-only, so the
+  apex zone can't be self-served without losing the `https://dnsmesh.io`
+  website's A record. Subzone delegation (DigitalOcean DNS publishes
+  `dmp.dnsmesh.io NS ns1.dnsmesh.io` + glue) lets the node serve DMP
+  records authoritatively while the apex stays on managed DNS for
+  the website. `_BUILTIN_CLAIM_PROVIDER_SEEDS` in `dmp/cli.py`
+  updated; `install.sh` and `quickstart.sh` write the new seed for
+  fresh installs; `upgrade.sh` migrates existing ones.
+- **`DMP_HEARTBEAT_DNS_RESOLVERS=1.1.1.1,9.9.9.9` is now a default**
+  in `install.sh` / `upgrade.sh` / `quickstart.sh`. Previously unset,
+  meaning the heartbeat worker fell through to the host's system
+  resolver — fine on a healthy network, fragile during a federation-
+  wide zone migration where one cached NXDOMAIN at the upstream
+  recursor stalls discovery for the SOA negative-cache TTL (often
+  30+ minutes). Pinning two known-good public recursors makes peer
+  discovery deterministic.
+
+### Added
+
+- `ResolverPool.resolve_address(host)` — resolve a hostname to an
+  IPv4 (preferred) or IPv6 literal through the pinned upstreams.
+  Used internally by `_resolve_to_ip` so UDP-destination lookups
+  follow the same path as record reads.
+- `dnsmesh tsig` reference section in
+  [User Guide → CLI reference](docs/guide/cli.md). The M9 happy-path
+  command (`dnsmesh tsig register`) didn't have its own section
+  alongside `init`, `identity`, `send`, etc. Now does, with flag
+  table, scope-output example, and a "what can go wrong" table.
+- Quick-reference "happy path in 6 commands" at the top of
+  [User Guide → CLI reference](docs/guide/cli.md).
+
+### Docs
+
+- [Getting Started](docs/getting-started.md) rewritten as a focused
+  7-step tutorial against the public node (286 → 202 lines). Drops
+  the "run a node locally" detour, the three-options passphrase
+  matrix, and the cluster section (those live elsewhere). New
+  troubleshooting section covers the 4 errors a new user is likely
+  to hit on first try.
+- `docs/how-it-works.md` and `docs/how-resolution-works.html`
+  refreshed for M9 (preferred path is DNS UPDATE; HTTPS fallback
+  for older configs is documented but no longer the default).
+
 ## [0.5.0] — M9 DNS-native federation
 
 The protocol speaks DNS both directions now. The only HTTPS exchange

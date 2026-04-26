@@ -82,6 +82,7 @@ def _publish_claim_via_dns_update(
     name: str,
     wire: str,
     ttl: int,
+    resolver_pool=None,
 ) -> bool:
     """Build + send an un-TSIG'd DNS UPDATE for one claim record.
 
@@ -91,6 +92,13 @@ def _publish_claim_via_dns_update(
     signature in the wire IS the on-zone authentication; TSIG on top
     would gate only the network path, which the senders generally
     can't be authenticated on.
+
+    ``resolver_pool`` is the caller's configured :class:`ResolverPool`
+    (typically the CLI's ``DMP_HEARTBEAT_DNS_RESOLVERS``). When given,
+    UDP-destination resolution goes through it; otherwise we fall back
+    to the host's system resolver. Routing both reads AND writes
+    through the same pinned recursors avoids the NXDOMAIN-cache stall
+    that breaks a federation-wide zone migration.
     """
     try:
         import dns.exception
@@ -103,6 +111,15 @@ def _publish_claim_via_dns_update(
     except Exception:
         return False
     host, port = target
+    # dnspython's UDP/TCP destination must be an IP literal. The
+    # provider host comes from a heartbeat-advertised endpoint URL or
+    # a CLI override — both routinely hostnames. Resolve here so the
+    # caller doesn't have to pre-resolve.
+    from dmp.network.dns_update_writer import _resolve_to_ip
+
+    host = _resolve_to_ip(host, resolver_pool=resolver_pool)
+    if host is None:
+        return False
     upd = dns.update.UpdateMessage(zone)
     try:
         upd.add(
@@ -958,6 +975,7 @@ class DMPClient:
                 name=name,
                 wire=wire,
                 ttl=int(ttl),
+                resolver_pool=self.reader,
             )
 
         # Same-zone / colocated path: sender IS the provider (test

@@ -7,280 +7,196 @@ nav_order: 3
 # Getting Started
 {: .no_toc }
 
+End-to-end in seven steps: install the CLI, register on a public node,
+publish your identity, add a friend, send a message. ~5 minutes.
+
 1. TOC
 {:toc}
 
-## Prerequisites
+## What you need
 
-- Python 3.10 or newer (for the PyPI install or source install)
-- Docker (for running a node locally; not needed if you only use the
-  CLI against someone else's node)
+- Python 3.10+ (or use the standalone binary, no Python required)
+- A passphrase you'll remember — it's the only thing protecting your keys
 
-## Install the CLI
+You **don't** need to run a node. This guide uses the public reference
+node at `dnsmesh.io`. Run your own later if you want to —
+see [Deployment]({{ site.baseurl }}/deployment).
 
-Pick one. The PyPI wheel is the fastest path; source install is for
-contributors and people pinning to an unreleased commit.
+## 1. Install the CLI
 
-### From PyPI (recommended)
+Pick one:
 
 ```bash
+# PyPI (recommended)
 pip install dnsmesh
+
+# or single-file binary, no Python:
+#   https://github.com/oscarvalenzuelab/DNSMeshProtocol/releases
 ```
 
-### Standalone binary (no Python required)
-
-Single-file executables are attached to every release on GitHub. Pick
-the asset for your platform from the latest
-[`cli-vX.Y.Z` release](https://github.com/oscarvalenzuelab/DNSMeshProtocol/releases).
-Available for Linux x86_64, macOS arm64, and Windows x86_64.
-
-```bash
-# example: macOS arm64
-curl -fsSL -o ~/.local/bin/dnsmesh \
-    https://github.com/oscarvalenzuelab/DNSMeshProtocol/releases/latest/download/dnsmesh-macos-arm64
-chmod +x ~/.local/bin/dnsmesh
-```
-
-### From source (contributors)
-
-```bash
-git clone https://github.com/oscarvalenzuelab/DNSMeshProtocol.git
-cd DNSMeshProtocol
-pip install -e ".[dev]"
-```
-
-Verify any of the above:
+Verify:
 
 ```bash
 dnsmesh --help
 ```
 
-## Run a node (local)
+## 2. Set a passphrase
 
-The pre-built image on Docker Hub is the easiest way:
+The passphrase derives your identity keys (Argon2id). The CLI reads
+it from `DMP_PASSPHRASE` first, then a file you point at, then an
+interactive prompt.
 
-```bash
-docker run -d --name dnsmesh-node \
-  -p 5353:5353/udp -p 8053:8053/tcp \
-  -v dnsmesh-data:/var/lib/dmp \
-  ovalenzuela/dnsmesh-node:latest
-
-# Health check
-curl http://127.0.0.1:8053/health
-```
-
-To put a node on the public internet (with auto TLS, hardening, etc.),
-follow [Deployment → DigitalOcean]({{ site.baseurl }}/deployment/digitalocean)
-or any of the other deployment guides — the same Docker recipe runs
-on any UDP-capable VPS.
-
-If you'd rather build from source instead of pulling the published
-image:
+The simplest persistent setup is a passphrase file:
 
 ```bash
-docker build -t dnsmesh-node:latest .
-docker run -d --name dnsmesh-node \
-  -p 5353:5353/udp -p 8053:8053/tcp \
-  -v dnsmesh-data:/var/lib/dmp \
-  dnsmesh-node:latest
-```
-
-Ports:
-
-- **5353/udp** — DNS server (map to `:53` in production; see
-  [Deployment]({{ site.baseurl }}/deployment))
-- **8053/tcp** — HTTP publish / metrics API
-
-## Set your passphrase
-
-Identity keys are derived from a passphrase + a per-identity random
-salt (Argon2id). The CLI looks for the passphrase in three places, in
-order:
-
-1. The `DMP_PASSPHRASE` environment variable.
-2. A file path named in your config's `passphrase_file` field.
-3. An interactive `getpass` prompt as a last resort.
-
-Pick the one that fits how you'll use the CLI.
-
-{: .warning }
-**The passphrase is the only thing protecting your keys.** Lose it →
-identity unrecoverable (the salt is useless without it). Leak it →
-full account compromise. Treat it like a password-manager entry: long,
-random, and backed up.
-
-### Option A — environment variable (quick, ephemeral)
-
-Good for a quick test on a dev box. The shell prompts you silently
-(no echo, no shell history):
-
-```bash
-read -rs DMP_PASSPHRASE
-export DMP_PASSPHRASE
-dnsmesh identity show
-```
-
-The passphrase lives in the shell's environment until you close the
-shell, then it's gone. You'll re-enter it next session.
-
-Avoid `export DMP_PASSPHRASE='hunter2'` directly — that lands in
-`~/.zsh_history` (or `~/.bash_history`).
-
-### Option B — passphrase file (durable, recommended)
-
-What you want for a long-running setup or a server. The file is
-read on every `dnsmesh` invocation; trailing whitespace is stripped.
-
-```bash
-umask 077                                   # new files default 0600
+umask 077
 mkdir -p ~/.dmp
-
-# Generate a strong random passphrase (or paste from a password manager):
 openssl rand -base64 32 > ~/.dmp/passphrase
 chmod 400 ~/.dmp/passphrase
+```
 
-# Tell the CLI where to find it:
+You'll point the config at it in step 3. Back this file up to a
+password manager — **losing it loses your identity.**
+
+{: .warning }
+Don't `export DMP_PASSPHRASE='hunter2'` directly: that lands in
+your shell history. Use `read -rs DMP_PASSPHRASE` if you really
+want an env var.
+
+## 3. Create your config
+
+Pick a username. Addresses look like `<username>@dmp.dnsmesh.io`.
+
+```bash
+dnsmesh init alice \
+    --domain dmp.dnsmesh.io \
+    --endpoint https://dnsmesh.io
+```
+
+Then wire up the passphrase file:
+
+```bash
 echo 'passphrase_file: ~/.dmp/passphrase' >> ~/.dmp/config.yaml
-
-dnsmesh identity show
 ```
 
-After that, every `dnsmesh` command uses the file automatically. Back
-up `~/.dmp/passphrase` to your password manager.
-
-### Option C — interactive prompt
-
-If neither the env var nor a file is configured, the CLI falls back
-to a `getpass` prompt. Safest for one-off invocations on a machine
-you don't fully trust, since nothing is stored. Annoying for
-day-to-day use because every command prompts again.
-
-### Verify
+Sanity-check that the keys derive cleanly:
 
 ```bash
 dnsmesh identity show
 ```
 
-prints your Ed25519 + X25519 public keys + `user_id`. The first
-successful derive on a fresh config writes the derived signing pubkey
-into the config as a typo-tripwire (`verify_pubkey:`). Every later
-command compares against it: a mismatch aborts with a clear message
-rather than silently producing a different identity.
+That prints your Ed25519 + X25519 public keys. If you see them,
+you're set — the first successful derive also writes a typo-tripwire
+into the config so a wrong passphrase later fails loudly instead of
+producing a silent second identity.
 
-If you ever need to bypass the check (e.g. you actually do want to
-swap to a new identity on the same config without `init --force`),
-set `DMP_PASSPHRASE_OVERRIDE_VERIFY=1` for that one invocation.
-Use sparingly — it's the wrong tool for almost every scenario.
+## 4. Register on the node
 
-## Send your first message
-
-Two terminal windows simulate two users. In practice you'd run two
-machines, but separate `DMP_CONFIG_HOME` directories work fine on one box.
-
-**Terminal 1 — Alice**
+This is the one HTTPS hop in the entire flow. The node mints a per-user
+TSIG key scoped to your identity's DNS owner names. Every record write
+after this is RFC 2136 DNS UPDATE under that key — no further HTTPS.
 
 ```bash
-export DMP_CONFIG_HOME=/tmp/alice-home
-export DMP_PASSPHRASE=alice-pass
-dnsmesh init alice --domain mesh.local \
-               --endpoint http://127.0.0.1:8053 \
-               --dns-host 127.0.0.1 --dns-port 5353
-dnsmesh identity publish
+dnsmesh tsig register --node dnsmesh.io
 ```
 
-**Terminal 2 — Bob**
+You'll see the minted key name and its scope (which owner names it
+can write to). The token is saved to `~/.dmp/tokens/dnsmesh.io.json`.
+
+## 5. Publish your identity
 
 ```bash
-export DMP_CONFIG_HOME=/tmp/bob-home
-export DMP_PASSPHRASE=bob-pass
-dnsmesh init bob --domain mesh.local \
-             --endpoint http://127.0.0.1:8053 \
-             --dns-host 127.0.0.1 --dns-port 5353
-
-# Publish bob's identity + a pool of one-time prekeys for forward secrecy.
 dnsmesh identity publish
 dnsmesh identity refresh-prekeys
-
-# Resolve alice's identity from DNS and pin her.
-dnsmesh identity fetch alice --add
-
-# Send.
-dnsmesh send alice "hello alice"
 ```
 
-**Terminal 1 — Alice reads**
+The first command publishes your identity record so others can resolve
+you via DNS. The second pre-positions a pool of one-time prekeys for
+forward secrecy — without them, your first inbound message degrades
+to long-term-key encryption (still encrypted, just not forward-secret).
+
+You're now reachable as `alice@dmp.dnsmesh.io`.
+
+## 6. Add a friend
+
+To send to someone, the CLI needs their identity record pinned. Get
+it via DNS and add as a contact in one step:
 
 ```bash
-# Resolve bob too so his signing key is pinned — receive then accepts
-# only manifests from pinned signers, not TOFU.
-dnsmesh identity fetch bob --add
+dnsmesh identity fetch bob@dmp.dnsmesh.io --add
+```
 
+The `--add` flag pins their signing pubkey. Future messages from
+unknown signers are rejected unless explicitly accepted via
+[`dnsmesh intro`]({{ site.baseurl }}/guide/identity#intros).
+
+## 7. Send and receive
+
+```bash
+# Send
+dnsmesh send bob@dmp.dnsmesh.io "hello bob"
+
+# On bob's side:
 dnsmesh recv
 ```
 
-You should see:
+That's the whole loop. Receive shows decrypted messages with the
+sender's signing-key prefix and a timestamp.
 
-```
-from ef44bf…
-  ts=1776721594
-  hello alice
-```
+## Try it with a friend
 
-{: .tip }
-Running `dnsmesh recv` a second time in the same config home doesn't
-re-deliver the same message — the replay cache persists to
-`$DMP_CONFIG_HOME/replay_cache.json`.
-
-## What just happened
-
-1. Alice encrypted "hello alice" with a recipient prekey → ECDH shared
-   secret → ChaCha20-Poly1305 ciphertext.
-2. The ciphertext got cross-chunk erasure-coded and published as TXT
-   records under the mesh domain.
-3. A signed manifest naming alice's Ed25519 key + the prekey_id + total
-   chunks went into one of bob's 10 mailbox slots.
-4. Bob's `dnsmesh recv` polled the slots, verified alice's signature (pinned
-   contact), checked the replay cache, fetched chunks, ran erasure
-   decode, and decrypted with the prekey's secret half.
-5. The prekey's secret half was then **deleted** locally and from DNS —
-   that message is now forward-secret even if alice's or bob's long-term
-   key leaks.
-
-## Running against a cluster
-
-For resilience against single-node failure, point the CLI at a
-multi-node *cluster* instead of one endpoint. The operator publishes
-a signed `ClusterManifest` at `cluster.<base>` TXT listing the node
-set; the client pins the operator's Ed25519 pubkey + the base domain
-and fans every write to a majority of nodes while unioning every read.
+Two CLIs, two passphrases, two `DMP_CONFIG_HOME` directories — same
+flow on one machine. Replace `alice`/`bob` and the passphrase paths:
 
 ```bash
-# Pin the operator key + base domain once.
-dnsmesh cluster pin 3c6a...the32byteoperatorpubkeyinhex mesh.example.com
+# Terminal 1 — alice
+export DMP_CONFIG_HOME=/tmp/alice
+export DMP_PASSPHRASE="$(cat /path/to/alice-passphrase)"
+dnsmesh init alice --domain dmp.dnsmesh.io --endpoint https://dnsmesh.io
+dnsmesh tsig register --node dnsmesh.io
+dnsmesh identity publish
 
-# Sanity-check that the signed manifest is published and verifiable.
-dnsmesh cluster fetch
-# cluster: mesh.example.com
-#   seq:   7
-#   exp:   1816000000
-#   nodes: 3
-#     n01  http=https://n1.mesh.example.com:8053  dns=203.0.113.10:53
-#     ...
+# Terminal 2 — bob
+export DMP_CONFIG_HOME=/tmp/bob
+export DMP_PASSPHRASE="$(cat /path/to/bob-passphrase)"
+dnsmesh init bob --domain dmp.dnsmesh.io --endpoint https://dnsmesh.io
+dnsmesh tsig register --node dnsmesh.io
+dnsmesh identity publish
+dnsmesh identity fetch alice@dmp.dnsmesh.io --add
+dnsmesh send alice@dmp.dnsmesh.io "hi alice"
 
-# From here on every `dnsmesh send` / `dnsmesh recv` / `dnsmesh identity publish`
-# fans writes across ceil(N/2) nodes and unions reads across all N.
-# Manifests refresh in the background on `cluster_refresh_interval`
-# (default 3600 seconds).
+# Back in terminal 1 — alice
+dnsmesh identity fetch bob@dmp.dnsmesh.io --add
+dnsmesh recv
 ```
 
-When either `cluster_operator_spk` or `cluster_base_domain` is unset
-the CLI falls back to the legacy single-endpoint mode, so existing
-configs keep working unchanged. See
-[User Guide → CLI reference → `dnsmesh cluster`]({{ site.baseurl }}/guide/cli)
-for the full subcommand list.
+## Troubleshooting
+
+**`registration rate-limited (429)`** — public nodes cap registrations
+per IP. Default budget is generous; hit it only if you're testing in
+a tight loop. Wait a minute and retry.
+
+**`subject already held by a different key (409)`** — your username
+is taken on this node, OR you registered before from a different
+machine and don't have the matching passphrase here. Pick another
+username, or restore the passphrase that originally registered.
+
+**`no identity record at id-...`** — the address you're fetching
+hasn't published an identity yet, or hasn't published at the zone you
+think they have. Verify with: `dig _dnsmesh-heartbeat.<their-zone> TXT`.
+
+**`no claim provider accepted the discovery pointer`** — first-contact
+reach needs a claim provider both ends agree on. The default
+`dmp.dnsmesh.io` works for users on the public node. Operators of
+private deployments can pin one with
+`dnsmesh config set claim-provider <url>`.
 
 ## Next
 
-- [User Guide → CLI reference]({{ site.baseurl }}/guide/cli)
-- [User Guide → Identity and contacts]({{ site.baseurl }}/guide/identity)
-- [Deployment → Docker]({{ site.baseurl }}/deployment/docker)
+- [User Guide → CLI reference]({{ site.baseurl }}/guide/cli) — every
+  subcommand and flag, for when you need a specific option
+- [User Guide → Identity and contacts]({{ site.baseurl }}/guide/identity) —
+  TOFU, key rotation, intros
+- [Deployment]({{ site.baseurl }}/deployment) — running your own node
+- [Protocol → Wire format]({{ site.baseurl }}/protocol/wire-format) —
+  what's actually on the wire

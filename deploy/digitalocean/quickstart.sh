@@ -180,9 +180,18 @@ DMP_HTTP_TOKEN=${DMP_OPERATOR_TOKEN}
 #DMP_HEARTBEAT_SELF_ENDPOINT=https://${DMP_NODE_HOSTNAME}
 #DMP_HEARTBEAT_OPERATOR_KEY_PATH=/etc/dmp/operator-ed25519.hex
 
-# Bootstrap seeds. dnsmesh.io is the canonical bootstrap so a fresh
-# node sees the federation on its first heartbeat tick. Comma-separated.
-DMP_HEARTBEAT_SEEDS=https://dnsmesh.io
+# Bootstrap seeds: zones this node will harvest peer heartbeats from
+# on every tick. dmp.dnsmesh.io is the canonical bootstrap so a fresh
+# node sees the federation on its first heartbeat tick. Comma-separated
+# DNS zones.
+DMP_HEARTBEAT_SEEDS=dmp.dnsmesh.io
+
+# Pinned recursors for the heartbeat worker. Without this, the worker
+# uses the host's system resolver, which can cache NXDOMAIN during a
+# zone migration and stall federation for the SOA negative-cache TTL
+# (often 30+ minutes). Cloudflare + Quad9 is a deliberate two-vendor
+# pool — override if you have a preferred resolver.
+DMP_HEARTBEAT_DNS_RESOLVERS=1.1.1.1,9.9.9.9
 EOF
 chmod 600 .env
 ok "wrote .env (mode 0600)"

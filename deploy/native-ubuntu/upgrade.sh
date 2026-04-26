@@ -113,21 +113,61 @@ ENV_FILE="$ETC_DIR/node.env"
 if [[ -f "$ENV_FILE" ]] && ! grep -qE '^[[:space:]]*DMP_HEARTBEAT_SEEDS=' "$ENV_FILE"; then
     # Pre-0.3.3 installs were created without the seeds line. Add it so
     # the heartbeat worker has somewhere to gossip on the first tick
-    # after the upgrade. dnsmesh.io is the canonical bootstrap.
+    # after the upgrade. dmp.dnsmesh.io is the canonical bootstrap.
     cat >> "$ENV_FILE" <<EOF
 
 # Added by upgrade.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ).
-# Heartbeat seeds: nodes this one will pre-emptively send its own
-# heartbeat to on every tick. Without seeds, a new node only meets
-# peers that find it first — dnsmesh.io acts as the canonical
-# bootstrap so federation works out of the box. Comma-separated.
-DMP_HEARTBEAT_SEEDS=https://dnsmesh.io
+# Heartbeat seeds: zones this node will harvest peer heartbeats from
+# on every tick. Without seeds, a new node only meets peers that find
+# it first — dmp.dnsmesh.io acts as the canonical bootstrap so
+# federation works out of the box. Comma-separated DNS zones.
+DMP_HEARTBEAT_SEEDS=dmp.dnsmesh.io
 EOF
     chown root:"$DNSMESH_USER" "$ENV_FILE"
     chmod 0640 "$ENV_FILE"
-    ok "added DMP_HEARTBEAT_SEEDS=https://dnsmesh.io to $ENV_FILE"
+    ok "added DMP_HEARTBEAT_SEEDS=dmp.dnsmesh.io to $ENV_FILE"
+elif [[ -f "$ENV_FILE" ]] && grep -qE '^[[:space:]]*DMP_HEARTBEAT_SEEDS=[[:space:]]*(https?://)?dnsmesh\.io([[:space:]]*$|,)' "$ENV_FILE"; then
+    # 0.5.0-alpha-and-earlier installs wrote the apex zone (or a URL
+    # form that normalizes to it) as the canonical bootstrap. After
+    # the M9 subzone-delegation move, the apex serves nothing and
+    # those nodes silently lose federation when the stale heartbeats
+    # expire. Rewrite to the new served zone in place. Match shapes
+    # we've actually written: ``dnsmesh.io``, ``https://dnsmesh.io``,
+    # ``http://dnsmesh.io``, optionally as the FIRST entry of a
+    # comma list so a multi-seed line keeps any extra entries.
+    cp "$ENV_FILE" "$ENV_FILE.upgrade-bak-$(date +%s)"
+    sed -i -E \
+        -e 's|^([[:space:]]*DMP_HEARTBEAT_SEEDS=[[:space:]]*)(https?://)?dnsmesh\.io([[:space:]]*)$|\1dmp.dnsmesh.io\3|' \
+        -e 's|^([[:space:]]*DMP_HEARTBEAT_SEEDS=[[:space:]]*)(https?://)?dnsmesh\.io,|\1dmp.dnsmesh.io,|' \
+        "$ENV_FILE"
+    ok "rewrote DMP_HEARTBEAT_SEEDS apex → dmp.dnsmesh.io in $ENV_FILE (backup saved)"
 else
     ok "DMP_HEARTBEAT_SEEDS already present (left alone)"
+fi
+
+# ──────────────────────────────────────────────────────────────────────
+# Backfill DMP_HEARTBEAT_DNS_RESOLVERS if missing
+# ──────────────────────────────────────────────────────────────────────
+
+step "Checking node.env for DMP_HEARTBEAT_DNS_RESOLVERS"
+if [[ -f "$ENV_FILE" ]] && ! grep -qE '^[[:space:]]*DMP_HEARTBEAT_DNS_RESOLVERS=' "$ENV_FILE"; then
+    # Without this, the worker uses the host's system resolver, which
+    # can cache NXDOMAIN during a zone migration and stall federation
+    # for the SOA negative-cache TTL (often 30+ minutes). Pinning two
+    # known-good public recursors makes peer discovery deterministic.
+    cat >> "$ENV_FILE" <<EOF
+
+# Added by upgrade.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ).
+# Pinned recursors for the heartbeat worker. Cloudflare + Quad9 is a
+# deliberate two-vendor pool — override if you have a preferred
+# resolver. Empty / unset falls back to the host's system resolver.
+DMP_HEARTBEAT_DNS_RESOLVERS=1.1.1.1,9.9.9.9
+EOF
+    chown root:"$DNSMESH_USER" "$ENV_FILE"
+    chmod 0640 "$ENV_FILE"
+    ok "added DMP_HEARTBEAT_DNS_RESOLVERS=1.1.1.1,9.9.9.9 to $ENV_FILE"
+else
+    ok "DMP_HEARTBEAT_DNS_RESOLVERS already present (left alone)"
 fi
 
 # ──────────────────────────────────────────────────────────────────────

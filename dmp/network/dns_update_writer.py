@@ -29,10 +29,12 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import socket
 from typing import Optional
 
 import dns.exception
 import dns.flags
+import dns.inet
 import dns.message
 import dns.name
 import dns.query
@@ -46,6 +48,74 @@ import dns.update
 from dmp.network.base import DNSRecordWriter
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_to_ip(host, resolver_pool=None):
+    """Return ``host`` if it's already an IPv4/IPv6 literal, else resolve.
+
+    dnspython's ``dns.query.udp`` / ``dns.query.tcp`` accept only IP
+    literals — passing a hostname raises ``ValueError`` deep in
+    ``dns.inet.af_for_address``. Operators naturally configure DMP
+    with hostnames (``tsig_dns_server: dnsmesh.io``), so we resolve
+    here.
+
+    Resolution order (codex round-21 P1):
+      1. ``resolver_pool`` — when the caller has a configured
+         :class:`ResolverPool` (i.e. ``DMP_HEARTBEAT_DNS_RESOLVERS``
+         is set), use it first. This keeps UDP-destination lookups
+         consistent with the rest of DMP's reads — during a zone
+         delegation move, the host's system resolver may still
+         cache a stale NXDOMAIN while the pinned recursors have
+         already refreshed.
+      2. ``socket.getaddrinfo`` — last-resort fallback when no
+         pool is configured (single-host dev setups).
+
+    Returns ``None`` on failure rather than the original hostname.
+    The caller is then responsible for surfacing ``False`` per the
+    :class:`DNSRecordWriter` contract; passing a non-literal back
+    into ``dns.query.udp`` would raise an uncaught ``ValueError``.
+
+    Defensive against ``None`` / non-string / empty input — those
+    are treated as unresolvable.
+    """
+    if not isinstance(host, str) or not host:
+        return None
+    if "\x00" in host:
+        # NUL bytes confuse downstream socket / DNS calls; reject up front
+        # so a typo can't produce inconsistent failure modes across paths.
+        return None
+
+    try:
+        dns.inet.af_for_address(host)
+        return host
+    except (ValueError, dns.exception.SyntaxError):
+        pass
+
+    if resolver_pool is not None and hasattr(resolver_pool, "resolve_address"):
+        try:
+            ip = resolver_pool.resolve_address(host)
+        except Exception:
+            ip = None
+        if ip:
+            return ip
+        # Pool exhausted without an answer — fall through to the system
+        # resolver as a last resort. An operator with strict policies
+        # (``--no-default-resolvers``) is fine here: getaddrinfo would
+        # use whatever resolv.conf points at, which is what they
+        # already accepted by setting that flag.
+
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
+    except (socket.gaierror, UnicodeError):
+        return None
+    for af, _, _, _, sockaddr in infos:
+        if af == socket.AF_INET:
+            return sockaddr[0]
+    for af, _, _, _, sockaddr in infos:
+        if af == socket.AF_INET6:
+            return sockaddr[0]
+    return None
+
 
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_PORT = 53
@@ -102,6 +172,7 @@ class _DnsUpdateWriter(DNSRecordWriter):
         tsig_algorithm: str = DEFAULT_ALGORITHM,
         port: int = DEFAULT_PORT,
         timeout: float = DEFAULT_TIMEOUT,
+        resolver_pool=None,
     ) -> None:
         if not zone:
             raise ValueError("zone must be non-empty")
@@ -113,7 +184,19 @@ class _DnsUpdateWriter(DNSRecordWriter):
             raise ValueError("tsig_secret must be non-empty bytes")
 
         self._zone = zone.strip().rstrip(".").lower()
-        self._server = server
+        # Resolve hostnames at construction so each publish doesn't
+        # repay the lookup cost. dnspython requires IP literals for
+        # the UDP/TCP destination — without this, every operator
+        # would have to hand-edit ``tsig_dns_server`` to an IP.
+        # ``resolver_pool`` (typically the CLI's configured pool of
+        # ``DMP_HEARTBEAT_DNS_RESOLVERS``) keeps UDP-destination
+        # lookups on the same recursors as record reads, so a stale
+        # NXDOMAIN at the system resolver doesn't break writes.
+        # ``_server`` may be ``None`` if resolution fails — ``_send``
+        # checks for that and returns ``False`` per the
+        # ``DNSRecordWriter`` contract.
+        self._server_input = server
+        self._server = _resolve_to_ip(server, resolver_pool=resolver_pool)
         self._port = int(port)
         self._timeout = float(timeout)
 
@@ -179,6 +262,19 @@ class _DnsUpdateWriter(DNSRecordWriter):
     # ------------------------------------------------------------------
 
     def _send(self, upd: dns.update.UpdateMessage, *, op: str, name: str) -> bool:
+        if self._server is None:
+            # Construction-time resolution failed — surface as a clean
+            # False rather than letting ``dns.query.udp`` raise
+            # ``ValueError`` on a non-literal host string. The log
+            # carries the original input so an operator can see WHY
+            # nothing left the box.
+            log.info(
+                "DNS UPDATE %s for %s aborted: cannot resolve server %r",
+                op,
+                name,
+                self._server_input,
+            )
+            return False
         try:
             upd.use_tsig(
                 self._keyring,
