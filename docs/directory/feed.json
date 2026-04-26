@@ -1,15 +1,15 @@
 {
   "version": 1,
-  "generated_at": 1777164935,
+  "generated_at": 1777167671,
   "node_count": 1,
   "nodes": [
     {
       "operator_spk_hex": "55dd5085bb16dbf5adaf24d53a13bbd50c8f9f93e026b194059235a3fd82bfef",
       "endpoint": "https://dnsmesh.pro",
       "version": "0.4.4",
-      "ts": 1777164859,
-      "exp": 1777251259,
-      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMgATaHR0cHM6Ly9kbnNtZXNoLnByb1XdUIW7Ftv1ra8k1ToTu9UMj5+T4CaxlAWSNaP9gr/vBTAuNC40AAEAAAAAae1iOwAAAABp7rO7rDdi4iCIlT7IZ9lUNNTyfnwEG2uH2htg4Czr1aF2EJsmMmT6EsJNKygsp/+vfz/nWAbaYcM5eyVVqQxIDvU7Dg==",
+      "ts": 1777167566,
+      "exp": 1777253966,
+      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMgATaHR0cHM6Ly9kbnNtZXNoLnByb1XdUIW7Ftv1ra8k1ToTu9UMj5+T4CaxlAWSNaP9gr/vBTAuNC40AAEAAAAAae1szgAAAABp7r5O0WXxZoUZgFe5Maotn1atBplCeNlXs2sIyWX01XeqkFoA5AhOEwxF0JMfSNV4Ef7WcW6PMWkWtZBD0xMJa5PpBA==",
       "last_seen_via": [
         "https://dnsmesh.io"
       ]
