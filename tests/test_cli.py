@@ -299,7 +299,12 @@ class TestIdentityPublishFetch:
         cli.main(["identity", "fetch", "alice@alice.example.com", "--add"])
 
         cfg_data = _yaml.safe_load((bob_home / "config.yaml").read_text())
-        entry = cfg_data["contacts"]["alice"]
+        # Codex round-23: contacts pinned via the `user@host` form are
+        # keyed by the FULL canonical address (was: bare username).
+        # Two contacts with the same left-half on different zones MUST
+        # be distinguishable; the bare-name keying is reserved for
+        # shared-mesh fetches without `@host`.
+        entry = cfg_data["contacts"]["alice@alice.example.com"]
         # The persisted entry must carry the REMOTE host, not bob's
         # local domain. Rotation fallback reads this field.
         assert entry["domain"] == "alice.example.com"
@@ -988,6 +993,260 @@ class TestContacts:
         cli.main(["init", "--no-default-resolvers", "alice", "--endpoint", "http://x"])
         cli.main(["contacts", "list"])
         assert "no contacts" in capsys.readouterr().out
+
+
+class TestContactKeyByFullAddress:
+    """Codex round-23 P1: ``dnsmesh identity fetch user@host --add``
+    must store the contact under the FULL canonical address
+    (``user@host``), not the bare username. Two users with the same
+    left-half on different zones (``alice@a.example`` vs
+    ``alice@b.example``) MUST be distinguishable, and a subsequent
+    ``dnsmesh send user@host`` MUST find the contact it just pinned.
+    """
+
+    def test_fetch_with_at_address_stores_full_key(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        # Set up alice's config + store.
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--domain",
+                "alice.example",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        # Bob publishes his identity in a separate config home.
+        bob_home = config_home.parent / "dmp-home-bob"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "bob",
+                "--domain",
+                "bob.example",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pp")
+        cli.main(["identity", "publish"])
+
+        # Alice fetches bob via the user@host form and pins.
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(config_home))
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pp")
+        cli.main(["identity", "fetch", "bob@bob.example", "--add"])
+
+        # The contact MUST be stored under the FULL address.
+        cfg = cli.CLIConfig.load(cli._config_path())
+        assert "bob@bob.example" in cfg.contacts, (
+            f"contact should be keyed by full address; got keys: "
+            f"{list(cfg.contacts.keys())}"
+        )
+
+    def test_fetch_bare_username_keeps_bare_key(
+        self, config_home, shared_store, monkeypatch
+    ):
+        """Shared-mesh / TOFU fetches (no @host) keep the bare-name
+        keying for back-compat with pre-M9 configs."""
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--domain",
+                "shared.mesh",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        bob_home = config_home.parent / "dmp-home-bob"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "bob",
+                "--domain",
+                "shared.mesh",  # same shared mesh
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pp")
+        cli.main(["identity", "publish"])
+
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(config_home))
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pp")
+        cli.main(["identity", "fetch", "bob", "--add"])
+
+        cfg = cli.CLIConfig.load(cli._config_path())
+        assert "bob" in cfg.contacts
+        assert "bob@shared.mesh" not in cfg.contacts
+
+    def test_send_full_address_finds_full_keyed_contact(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """End-to-end: fetch by full address → store under full key →
+        send by full address → finds it. This is the bug the user hit."""
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--domain",
+                "alice.example",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        # Bob publishes from a different home + zone (cross-zone case).
+        bob_home = config_home.parent / "dmp-home-bob"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "bob",
+                "--domain",
+                "bob.example",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pp")
+        cli.main(["identity", "publish"])
+
+        # Alice pins bob via the full address.
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(config_home))
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pp")
+        cli.main(["identity", "fetch", "bob@bob.example", "--add"])
+
+        # Sending to the same full address MUST succeed (used to fail
+        # with "unknown contact `bob@bob.example`" because the contact
+        # was indexed under bare `bob`).
+        rc = cli.main(["send", "bob@bob.example", "hello bob"])
+        assert rc == 0, capsys.readouterr().err
+
+    def test_send_falls_back_to_bare_name_for_legacy_contacts(
+        self, config_home, shared_store, monkeypatch, capsys
+    ):
+        """Pre-M9 configs have contacts under bare names. ``dnsmesh send
+        bob@bob.example`` must still find `bob` in those configs so an
+        upgrade doesn't break existing flows."""
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--domain",
+                "shared.mesh",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        bob_home = config_home.parent / "dmp-home-bob"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(bob_home))
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "bob",
+                "--domain",
+                "shared.mesh",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        monkeypatch.setenv("DMP_PASSPHRASE", "bob-pp")
+        cli.main(["identity", "publish"])
+
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(config_home))
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pp")
+        cli.main(["identity", "fetch", "bob", "--add"])  # no @host → bare key
+
+        # Send by FULL address — must fall back to bare lookup.
+        rc = cli.main(["send", "bob@shared.mesh", "hello"])
+        assert rc == 0, capsys.readouterr().err
+
+
+class TestConfigHomeFlag:
+    """Codex round-23 P1: top-level ``--config-home`` flag for
+    explicit config isolation. The pre-fix only knob was the
+    ``DMP_CONFIG_HOME`` env var, which proved leaky — a stale
+    config in ``~/.dmp/`` could shadow the env-var path during an
+    upgrade and silently produce the wrong subject on
+    ``dnsmesh tsig register``. The flag wins over the env var."""
+
+    def test_flag_overrides_env_var(self, tmp_path, monkeypatch):
+        # Env var points at one path, --config-home points at another.
+        env_path = tmp_path / "env-home"
+        flag_path = tmp_path / "flag-home"
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(env_path))
+        rc = cli.main(
+            [
+                "--config-home",
+                str(flag_path),
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        assert rc == 0
+        # Init MUST have written to the flag path, not the env path.
+        assert (
+            flag_path / "config.yaml"
+        ).exists(), "--config-home flag should win over DMP_CONFIG_HOME env var"
+        assert not (env_path / "config.yaml").exists()
+
+    def test_flag_propagates_to_subsequent_subcommands(self, tmp_path, monkeypatch):
+        flag_path = tmp_path / "flag-home"
+        # First invocation: init under the flag.
+        cli.main(
+            [
+                "--config-home",
+                str(flag_path),
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--domain",
+                "alice.example",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        # Second invocation with the same flag: must read the same config.
+        monkeypatch.setenv("DMP_PASSPHRASE", "alice-pp")
+        rc = cli.main(["--config-home", str(flag_path), "identity", "show"])
+        assert rc == 0
+
+    def test_flag_defaults_tokens_home_to_sibling(self, tmp_path, monkeypatch):
+        """A single --config-home flag should also isolate tokens, so
+        the operator workflow (per-tenant directories) is one-knob."""
+        # Clean any DMP_TOKENS_HOME leaked by a sibling test (the CLI's
+        # main() writes os.environ directly, bypassing monkeypatch's
+        # cleanup hooks; explicit delenv gets us a known starting state).
+        monkeypatch.delenv("DMP_TOKENS_HOME", raising=False)
+        flag_path = tmp_path / "flag-home"
+        cli.main(
+            [
+                "--config-home",
+                str(flag_path),
+                "init",
+                "--no-default-resolvers",
+                "alice",
+                "--endpoint",
+                "http://x",
+            ]
+        )
+        # After init, DMP_TOKENS_HOME should point at <config-home>/tokens.
+        assert os.environ.get("DMP_TOKENS_HOME") == str(flag_path / "tokens")
 
 
 class TestSendRecv:

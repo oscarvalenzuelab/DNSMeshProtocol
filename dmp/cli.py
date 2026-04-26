@@ -2365,13 +2365,24 @@ def cmd_identity_fetch(args: argparse.Namespace) -> int:
                 f"record at {name} carries username {identity.username!r}, "
                 f"not {resolved_username!r} as the address implied",
             )
-        contact_key = identity.username
+        # Codex round-23 fix: when the address is in `user@host` form,
+        # store the contact under the FULL canonical address as the key,
+        # not the bare username. Two contacts with the same left-half
+        # on different zones (`alice@dmp.dnsmesh.io` vs
+        # `alice@dmp.dnsmesh.pro`) MUST be distinguishable, and a
+        # subsequent `dnsmesh send alice@dmp.dnsmesh.pro` SHOULD find
+        # the contact it was just told about. Bare-username keying
+        # stays the default for shared-mesh / TOFU fetches (no @host)
+        # to preserve back-compat with pre-M9 configs.
         if parsed_addr is not None:
             remote_host = parsed_addr[1]
+            contact_key = f"{identity.username}@{remote_host}"
         elif args.domain:
             remote_host = args.domain
+            contact_key = identity.username
         else:
             remote_host = ""
+            contact_key = identity.username
         fetched_spk = identity.ed25519_spk.hex()
 
         # M8.3 codex P2 round 6 fix: search the WHOLE contact list
@@ -2496,11 +2507,24 @@ def cmd_contacts_list(args: argparse.Namespace) -> int:
 
 def cmd_send(args: argparse.Namespace) -> int:
     cfg = CLIConfig.load(_config_path())
-    if args.recipient not in cfg.contacts:
-        _die(
-            1,
-            f"unknown contact `{args.recipient}` — add it first with `dnsmesh contacts add`",
-        )
+    # Codex round-23 fix: contacts can be keyed by full `user@host`
+    # (post-M9, the default for `dnsmesh identity fetch user@host --add`)
+    # OR by bare username (pre-M9 / shared-mesh / `dnsmesh contacts add`).
+    # Resolve in that order so a user who passes a full address gets
+    # the canonical lookup, with bare-name as the back-compat fallback.
+    recipient = args.recipient
+    if recipient not in cfg.contacts:
+        if "@" in recipient:
+            bare = recipient.split("@", 1)[0]
+            if bare in cfg.contacts:
+                recipient = bare
+        if recipient not in cfg.contacts:
+            _die(
+                1,
+                f"unknown contact `{args.recipient}` — add it first with "
+                f"`dnsmesh identity fetch {args.recipient} --add` "
+                f"or `dnsmesh contacts add`",
+            )
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
     try:
@@ -2516,7 +2540,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         # breaks (every claim provider rejected or unreachable).
         claim_outcomes: List[bool] = []
         ok = client.send_message(
-            args.recipient,
+            recipient,
             args.message,
             claim_providers=claim_providers,
             claim_outcomes=claim_outcomes,
@@ -4107,6 +4131,26 @@ def cmd_node(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dnsmesh", description="DNS Mesh Protocol CLI")
+    # Codex round-23 fix: explicit `--config-home` flag for reliable
+    # isolation. Pre-fix the only knob was `DMP_CONFIG_HOME` env var,
+    # which proved leaky in practice — a stale config in the default
+    # `~/.dmp/` would shadow the env-var path in some upgrade scenarios,
+    # silently producing the wrong subject on `dnsmesh tsig register`.
+    # The flag wins over the env var; the env var still works for back-
+    # compat. Both ALSO default `--tokens-home` to a sibling `tokens/`
+    # subdir so a single flag isolates everything per-identity.
+    p.add_argument(
+        "--config-home",
+        default=None,
+        help="path to the config dir (overrides DMP_CONFIG_HOME env var). "
+        "Default: ~/.dmp",
+    )
+    p.add_argument(
+        "--tokens-home",
+        default=None,
+        help="path to the per-node tokens dir (overrides DMP_TOKENS_HOME). "
+        "Default: <config-home>/tokens",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # init
@@ -4595,6 +4639,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Codex round-23 fix: propagate top-level `--config-home` /
+    # `--tokens-home` to the env vars BEFORE any subcommand runs.
+    # All downstream config / token lookups read those env vars
+    # (``_config_path`` in this module, ``tokens_home`` in
+    # ``dmp.client.node_tokens``), so the flag becomes the single
+    # authoritative knob without a sweeping refactor of every
+    # subcommand handler. Flag wins over a pre-existing env var.
+    if getattr(args, "config_home", None):
+        os.environ["DMP_CONFIG_HOME"] = args.config_home
+        # Default the tokens dir to a sibling of the config dir so a
+        # single `--config-home` flag isolates everything per-identity
+        # (operator workflow: per-tenant directories under /etc/dnsmesh).
+        if not getattr(args, "tokens_home", None) and not os.environ.get(
+            "DMP_TOKENS_HOME"
+        ):
+            os.environ["DMP_TOKENS_HOME"] = str(Path(args.config_home) / "tokens")
+    if getattr(args, "tokens_home", None):
+        os.environ["DMP_TOKENS_HOME"] = args.tokens_home
     return args.func(args)
 
 
