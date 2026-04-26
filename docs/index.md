@@ -26,18 +26,21 @@ You don't need to run your own node to try DMP. The reference public
 node at **`https://dnsmesh.io`** is open to anyone:
 
 ```bash
-pip install dnsmesh
+pipx install dnsmesh
 dnsmesh init alice --domain <your-zone> --endpoint dnsmesh.io
-dnsmesh register --node dnsmesh.io
-dnsmesh identity publish
+dnsmesh tsig register --node dnsmesh.io      # one-shot HTTPS, mints TSIG key
+dnsmesh identity publish                      # DNS UPDATE under that key
 ```
 
-What that node currently advertises (`curl https://dnsmesh.io/v1/info`):
+What that node currently advertises
+(`dig @dnsmesh.io _dnsmesh-heartbeat.dnsmesh.io TXT +short`):
 
-- **Open registration.** Anyone can mint a per-user publish token via
-  `dnsmesh register --node dnsmesh.io` — no operator approval, no
-  account, no email. The token is the only thing gating writes; the
-  protocol's signature checks gate everything else.
+- **Open registration over TSIG.** Anyone can mint a per-user TSIG
+  key via `dnsmesh tsig register --node dnsmesh.io` — no operator
+  approval, no account, no email. The TSIG key is what authorizes
+  every subsequent record publish. The `tsig register` step is the
+  only HTTPS exchange in the protocol; everything after is DNS
+  UPDATE (RFC 2136 + RFC 8945).
 - **Claim-provider role.** Strangers who know your address can reach
   you on a first message even before you've pinned them as a contact
   (M8 first-contact layer). Your CLI quarantines them in an `intro`

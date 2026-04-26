@@ -7,6 +7,141 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.5.0-rc1] — M9 DNS-native federation
+
+The protocol speaks DNS both directions now. The only HTTPS exchange
+left is the one-time TSIG-key registration step
+(`POST /v1/registration/tsig-confirm`). Every record write — identity,
+prekeys, mailbox slots, chunks, claim publishes — is RFC 2136 DNS
+UPDATE signed with RFC 8945 TSIG. Reads are plain DNS TXT queries.
+Cluster anti-entropy stays HTTP as the documented HA-only exception
+inside one operator's trust domain (see
+[design/cluster-anti-entropy-http-boundary](https://oscarvalenzuelab.github.io/DNSMeshProtocol/design/cluster-anti-entropy-http-boundary)).
+
+### Added
+
+- **DNS UPDATE handler with TSIG verification** (M9.2.1).
+  `DMPDnsServer` accepts RFC 2136 UPDATE messages signed with TSIG
+  (RFC 8945 HMAC-SHA*). Verified key-name + per-key suffix scope
+  governs which owner names the UPDATE may mutate. `NOTAUTH` /
+  `NOTZONE` / `REFUSED` map cleanly back to TSIG / zone /
+  scope failures. Operator caps (`max_ttl`, `max_value_bytes`,
+  `max_values_per_name`) apply identically to UPDATE writes.
+- **TSIG keystore** (M9.2.2). Sqlite-backed registry of per-user
+  TSIG keys with subject + registered-spk anti-takeover. Wildcard
+  suffix matching (`slot-*.mb-*.<zone>`) lets the per-user scope
+  cover content-addressed DMP record names without granting
+  full-zone authority. Keystore drives the live keyring rebuild on
+  every UPDATE so newly-registered users authorize without
+  restarting the DNS server.
+- **DNS-native registration flow** (M9.2.3). New
+  `POST /v1/registration/tsig-confirm` route mints a per-user TSIG
+  key via the same Ed25519 challenge/confirm ceremony the legacy
+  bearer-token path used. Registered scope: identity (16-char and
+  12-char hash variants for prekeys), claim records, mailbox /
+  chunk wildcards. Atomic anti-takeover prevents two SPKs from
+  claiming the same subject concurrently.
+- **`_DnsUpdateWriter` client (M9.2.4 + M9.2.5).** New CLI command
+  `dnsmesh tsig register --node <host>` walks the registration
+  ceremony and persists the minted TSIG key into config. After
+  that, `_make_client` builds `_DnsUpdateWriter` for every record
+  publish. Cluster mode still routes the user's own writes through
+  this DNS UPDATE writer (the cluster's HTTP anti-entropy
+  propagates internally).
+- **Claim publish over DNS UPDATE** (M9.2.6). `publish_claim`
+  drops the HTTP path and uses an un-TSIG'd UPDATE to the
+  provider's authoritative DNS server. The wire is a signed
+  `ClaimRecord`; the on-zone authentication is the Ed25519
+  signature in the record itself. Provider opt-in via
+  `DMP_CLAIM_PROVIDER=1` + `DMP_DNS_UPDATE_ENABLED=1`. Claim
+  lifetime is capped via `DMP_CLAIM_MAX_TTL`.
+- **3-node DNS-only e2e harness** (`docker-compose.m9-test.yml` +
+  `scripts/m9_e2e_test.py`). 12-step end-to-end validation of
+  multi-node DNS coordination on real containers — heartbeat
+  publish, transitive seen-graph discovery, TSIG registration,
+  in-pattern + out-of-pattern UPDATE, cross-zone claim publish,
+  anti-takeover.
+
+### Changed
+
+- **HeartbeatRecord wire format bumped to `DMPHB03`** (M9.1.1).
+  Adds `claim_provider_zone` field. Legacy `DMPHB02` wires still
+  parse for rolling-upgrade compatibility (treated as empty zone).
+- **Heartbeat worker is DNS-native** (M9.1.2 + M9.1.3). Each tick:
+  publishes own heartbeat at `_dnsmesh-heartbeat.<own-zone>`,
+  republishes recently-verified peers at `_dnsmesh-seen.<own-zone>`
+  as multi-value TXT, queries every seed zone via DNS for
+  transitive discovery. The HTTP-gossip exchange is gone.
+  `DMP_HEARTBEAT_SEEDS` accepts bare zone names; legacy URL form
+  still parses.
+- **CLI claim-provider discovery is DNS-native** (M9.1.3). The
+  `_build_claim_providers` rewrite reads from
+  `_dnsmesh-seen.<zone>` and seed `_dnsmesh-heartbeat.<zone>`
+  records. `select_providers` pulls `claim_provider_zone` straight
+  off each verified wire instead of probing `/v1/info`.
+- **`dnsmesh peers <zone>`** queries DNS directly. Argument is now
+  a zone name (URL form still accepted for back-compat).
+- **Heartbeat-worker resolver source is operator-controlled.**
+  `DMP_HEARTBEAT_DNS_RESOLVERS` env (comma-separated) feeds a
+  `ResolverPool`; default falls back to dnspython's system
+  resolver. The pre-M9 hardcoded 1.1.1.1/8.8.8.8 is gone.
+
+### Removed
+
+- `POST /v1/heartbeat` (peer push).
+- `GET /v1/nodes/seen` (HTTP discovery feed).
+- `GET /nodes` (HTML directory view).
+- `POST /v1/claim/publish` (HTTP claim publish).
+- `GET /v1/info` (replaced by the heartbeat wire's
+  `claim_provider_zone` field).
+- `tests/test_http_heartbeat.py` and `tests/test_http_claim.py`
+  (the routes they exercised are gone). DNS UPDATE +
+  claim-publish coverage moved into `test_dns_server.py`,
+  `test_tsig_keystore.py`, `test_registration_tsig.py`,
+  `test_dns_update_writer.py`, and the docker e2e harness.
+- `scripts/m8_smoke.py` (used the removed HTTP endpoints).
+- The old heartbeat-fixture block in `test_docker_integration.py`
+  (4 tests + container fixture) — redundant with the M9 e2e.
+
+### Fixed
+
+- **No silent dropped UPDATEs.** `_build_update_response` checks
+  the writer's bool return and answers `SERVFAIL` on failure
+  (cluster fanout quorum-miss surfaces correctly to the client
+  for retry instead of looking committed).
+- **Heartbeat publish replaces the RRset every tick** instead of
+  appending — readers no longer lock onto an arbitrarily old
+  self-record after multiple ticks.
+- **CAP_CLAIM_PROVIDER advertisement gated on
+  `DMP_DNS_UPDATE_ENABLED`.** A node with the heartbeat layer
+  enabled but no DNS UPDATE wired no longer falsely advertises
+  claim-provider capability that it can't actually serve.
+- **TSIG key names disambiguated by subject hash** so two subjects
+  on different domains using the same Ed25519 key get distinct
+  keystore rows.
+
+### Documentation
+
+- New `docs/design/cluster-anti-entropy-http-boundary.md` —
+  authoritative reference for the trust-boundary decision keeping
+  cluster anti-entropy HTTP. Linked from the anti-entropy module
+  docstring + the `_build_cluster_writer_factory` docstring.
+- README, `docs/index.md`, `docs/how-it-works.md`, and the Reveal.js
+  `how-resolution-works.html` slides updated to reflect M9: HTTPS is
+  the one-time `tsig register` step, every protocol write is DNS
+  UPDATE.
+- Node landing page (`GET /` HTML) shows the DNS UPDATE
+  registration flow + the `_dnsmesh-heartbeat` / `_dnsmesh-seen`
+  query examples instead of dead links to removed HTTP routes.
+
+### GitHub issues
+
+- Filed [#6](https://github.com/oscarvalenzuelab/DNSMeshProtocol/issues/6)
+  tracking the eventual DNS-native cluster anti-entropy redesign.
+  Decision recorded: option (C) — accept HTTP for cluster-internal
+  sync in 0.5.0, defer (A) pure-DNS digests / (B) DNS UPDATE-based
+  push to a future major version.
+
 ## [0.4.4] — operator UX from live dnsmesh.io / dnsmesh.pro deployment
 
 Three issues caught while validating the M8 stack on the public

@@ -43,8 +43,8 @@ ciphertext to a node to publish as TXT records.
       ├─ username                      ├─ mailbox manifests            ├─ private keys
       └─ pinned contacts               └─ encrypted chunks             └─ received cache
 
-         dnsmesh init                      [HTTP publish API]              dnsmesh identity fetch
-         dnsmesh send bob    ─── POST ──►  stores ciphertext   ◄─── DNS ───  dnsmesh recv  (decrypts locally)
+         dnsmesh init                      [DNS UPDATE + TSIG]             dnsmesh identity fetch
+         dnsmesh send bob    ─── UPDATE ─►  stores ciphertext  ◄─── DNS ───  dnsmesh recv  (decrypts locally)
 ```
 
 Everything on the wire is either **signed** (the node cannot forge it)
@@ -251,55 +251,65 @@ Concrete flow, from scratch:
 No account creation on the node side at any point. Users self-publish
 signed records; the node is a dumb filestore.
 
-## Trust model — three auth modes
+## Trust model — DNS UPDATE + TSIG, with documented exceptions
 
-The node's `/v1/records/*` publish API runs in one of three modes,
-picked via `DMP_AUTH_MODE`:
+After M9 the protocol is DNS both directions. Record writes use
+RFC 2136 DNS UPDATE signed with RFC 8945 TSIG; reads are plain DNS
+TXT queries. The user-to-own-node HTTPS hop survives only as the
+one-time TSIG-key registration ceremony.
 
-- **`open`** (default when no token is configured). No auth, no
-  TokenStore, no registration endpoints. Dev / trusted-LAN only.
-  `dnsmesh identity publish` works unauthenticated. Suitable for
-  running a single-user node on your own laptop.
+**The DNS UPDATE write path:**
 
-- **`legacy`** (implicit when `DMP_OPERATOR_TOKEN` / `DMP_HTTP_TOKEN`
-  is set and `DMP_AUTH_MODE` isn't). Single shared bearer token.
-  Everyone onboarded to the node holds the same secret. Fine for
-  a team or small community where key holders trust each other;
-  the token leaks the moment you hand it to a stranger. This is
-  the pre-M5.5 behavior, still supported.
+The node opts into UPDATE handling via `DMP_DNS_UPDATE_ENABLED=1`.
+Per-user TSIG keys are minted via `POST /v1/registration/tsig-confirm`
+(same Ed25519 challenge/confirm ceremony the legacy bearer-token
+path uses). The minted key carries a per-user pattern scope so
+multiple users can share a zone without overwriting each other:
 
-- **`multi-tenant`** (opt-in via `DMP_AUTH_MODE=multi-tenant`).
-  Per-user publish tokens. Each user has their own bearer, minted
-  either by the operator (`dnsmesh-node-admin token issue`) or
-  self-service (the user runs `dnsmesh register`, proves key control
-  with a signed challenge, and the node mints a token bound to
-  their subject). Publish requests are scope-checked:
-    - Alice's token can POST `dmp.alice.example.com` — her identity
-      record — but not `dmp.bob.example.com`.
-    - Any user's token can POST chunks + mailbox deliveries (the
-      "deliver to anyone's inbox" SMTP analogy), rate-limited
-      per-token.
-    - Neither can POST into the operator namespace (cluster
-      manifests, bootstrap records) — that still requires
-      `DMP_OPERATOR_TOKEN`.
-  Registration and the admin CLI are covered in the
-  [User Guide]({{ site.baseurl }}/guide) and the
-  [Deployment — Multi-tenant node]({{ site.baseurl }}/deployment/multi-tenant)
-  guide.
+- `id-<sha256(subject)[:16]>.<zone>` — identity (suffix tail-match
+  also covers `prekeys.id-<hash>.<zone>` siblings)
+- `id-<sha256(subject)[:12]>.<zone>` — prekey hash truncation
+- `slot-*.mb-*.<zone>` — mailbox slot writes, any recipient hash
+- `chunk-*-*.<zone>` — chunk records, any chunk index + msg key
+- `_dnsmesh-claim-*.<zone>` — claim records published under this
+  user's zone
 
-**Scaling guidance:**
+The keystore enforces these via wildcard suffix matching at
+authorization time. Operator caps (`max_ttl`, `max_value_bytes`,
+`max_values_per_name`) apply identically to UPDATE writes.
 
-- Self-host / one-user node → `open`.
-- Team / friends / one-trust-zone community → `legacy`.
-- Public community node, or you want per-user audit / rate-limit /
-  revocation → `multi-tenant`.
+**The un-TSIG'd UPDATE exception:**
 
-**Anonymity property of `multi-tenant`:** the shared-pool writes
-(chunks + mailbox deliveries) do not log subject or token hash in
-the durable audit. An operator compelled to hand over their
-database cannot, from it alone, reconstruct which user delivered to
-whom. Full sender anonymity against a powerful observer still needs
-Tor / a mixnet — that's M6 territory.
+Cross-zone first-contact claim publishes
+(`claim-N.mb-<hash12>.<provider-zone>`) accept un-TSIG'd UPDATE.
+The wire is a signed `ClaimRecord` and the Ed25519 signature IS
+the on-zone authentication — a sender from zone X never has a
+TSIG account on provider zone Y, but the claim wire's own
+signature is verifiable independently. Other un-TSIG'd UPDATE
+surfaces are REFUSED. The provider's claim-publish acceptance is
+gated on `DMP_CLAIM_PROVIDER` opt-in plus `DMP_DNS_UPDATE_ENABLED`.
+
+**The cluster anti-entropy exception:**
+
+`/v1/sync/digest` + `/v1/sync/pull` between cluster peers stays
+HTTP. Cluster nodes are co-operated by one party, share a signed
+manifest, and the digest/pull cursor protocol doesn't fit cleanly
+into DNS — see
+[the boundary doc]({{ site.baseurl }}/design/cluster-anti-entropy-http-boundary).
+
+**Legacy fallbacks:**
+
+`DMP_AUTH_MODE=legacy` (single shared bearer token) and open mode
+(no auth) still exist for operator-side writes (cluster manifest,
+bootstrap records) and for single-user laptop deployments. The
+M9 user-facing flows ride on top of TSIG.
+
+**Anonymity property:** the shared-pool DNS records (mailbox
+slots + chunks) carry no subject or token-hash in the durable
+audit. An operator handed their database cannot reconstruct who
+delivered to whom from it alone. Full sender anonymity against a
+powerful observer still needs Tor / a mixnet — that's M6
+territory.
 
 ## When NOT to use DMP
 

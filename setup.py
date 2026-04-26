@@ -9,7 +9,7 @@ setup(
     # The import path stays `import dmp` — distribution name and
     # import name intentionally differ (same pattern as pyyaml → yaml).
     name="dnsmesh",
-    version="0.4.4",
+    version="0.5.0-rc1",
     author="Oscar Valenzuela B",
     author_email="oscar.valenzuela.b@gmail.com",
     description="A federated end-to-end encrypted messaging protocol delivered over DNS",

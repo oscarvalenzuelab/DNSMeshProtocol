@@ -226,23 +226,27 @@ flowchart LR
   <div class="takeaway"><strong>Result:</strong> the "server" is just a DNS host. You don't need to trust it the way you trust a messaging company.</div>
 </section>
 
-<!-- 4. Two channels — concrete from the start -->
+<!-- 4. Two channels — DNS-only for protocol traffic, HTTPS for one-time auth -->
 <section>
-  <h2>Two channels: HTTPS for writes (to your own node), DNS for reads</h2>
+  <h2>Two channels: DNS for everything, HTTPS once (just to register)</h2>
   <pre class="mermaid">
 flowchart LR
-    A["Alice's CLI"] -- "HTTPS POST\n(token-authenticated)" --> ANode["Alice's home node\n(serves alice.example)"]
+    A["Alice's CLI"] -- "HTTPS once\n(register, get TSIG key)" --> ANode["Alice's home node\n(serves alice.example)"]
+    A2["Alice's CLI"] -- "DNS UPDATE\n(TSIG-signed)" --> ANode
     B["Bob's CLI"] -- "DNS query\n(no auth)" --> Resolvers["public DNS\nresolvers"]
     Resolvers -- "recursive chain" --> ANode
   </pre>
   <ul style="text-align: left;">
-    <li><strong>Writes:</strong> Alice's CLI POSTs encrypted records to <strong>her own home node only</strong>. That's the single HTTPS connection she ever opens.</li>
-    <li><strong>Reads:</strong> Bob queries DNS for the record. Public resolvers walk the standard chain to Alice's authoritative node and pull it back. No HTTPS handshake between nodes.</li>
+    <li><strong>One HTTPS hop, ever:</strong> Alice runs <code>dnsmesh tsig register</code> once to get a TSIG key from her home node. That's the only HTTPS connection in the protocol.</li>
+    <li><strong>Writes (after register):</strong> Alice's CLI sends RFC 2136 DNS UPDATE messages signed with her TSIG key. Identity, prekeys, mailbox slots, chunks — all DNS UPDATE.</li>
+    <li><strong>Reads:</strong> Bob queries DNS for the record. Public resolvers walk the standard chain to Alice's authoritative node and pull it back.</li>
+    <li><strong>Inter-node:</strong> heartbeat, peer discovery, claim publishes between strangers — also DNS. No HTTPS between independent nodes.</li>
   </ul>
   <div class="takeaway">
-    <strong>Each user only needs HTTPS to their own home node.</strong>
-    Cross-user delivery is the recursive DNS resolver chain doing
-    what it already does for every other lookup on the internet.
+    <strong>The protocol speaks DNS.</strong> HTTPS is only used once,
+    for the user-to-own-node onboarding step. Every record publish,
+    every cross-node coordination is RFC 2136 + RFC 8945 DNS UPDATE
+    or a plain DNS TXT query.
   </div>
 </section>
 
@@ -255,7 +259,7 @@ sequenceDiagram
     participant ANode as Alice's home node\n(serves alice.example)
     participant DNS as DNS (any resolver)
     participant B as Bob CLI
-    A->>ANode: HTTPS POST\nslot-N.mb-{hash(bob)}.alice.example
+    A->>ANode: DNS UPDATE + TSIG\nslot-N.mb-{hash(bob)}.alice.example
     Note over ANode: stored in sqlite\nserved on UDP 53
     B->>DNS: TXT? slot-N.mb-{hash(bob)}.alice.example
     DNS->>ANode: walks the chain\nto Alice's authoritative
@@ -266,9 +270,13 @@ sequenceDiagram
   <p class="small">
     Records live under the <em>sender's</em> zone — Alice publishes
     to <code>...alice.example</code>, addressed to Bob's recipient
-    hash. Bob's CLI walks Alice's zone (because he's pinned her as
-    a contact) and pulls the record via DNS. Bob never needs HTTPS
-    to Alice's node, even though he's reading her records.
+    hash. Alice's TSIG key authorizes her writes (RFC 2136 UPDATE,
+    HMAC-SHA256 per RFC 8945). The on-zone authority is the TSIG
+    keystore at her home node; per-key scope (<code>slot-*.mb-*.alice.example</code>,
+    <code>chunk-*-*.alice.example</code>, <code>id-&lt;hash&gt;.alice.example</code>)
+    keeps Alice from overwriting another user's records on the same
+    zone. Bob's CLI walks Alice's zone via the recursive DNS chain —
+    no HTTPS to Alice's node ever.
   </p>
 </section>
 
@@ -304,7 +312,7 @@ sequenceDiagram
 <!-- 5. Where the user usually trips -->
 <section>
   <h2 class="big-q">"Does the CLI need HTTP?"</h2>
-  <p style="text-align: left;">Both, but for different things:</p>
+  <p style="text-align: left;">Almost never — only the one-time register step.</p>
   <table>
     <thead><tr><th>You're doing...</th><th>Channel</th><th>Network requirements</th></tr></thead>
     <tbody>
@@ -314,19 +322,24 @@ sequenceDiagram
         <td>nothing — local only</td>
       </tr>
       <tr>
-        <td><code>dnsmesh register</code><br>getting a token at a node</td>
-        <td><strong>HTTPS</strong></td>
-        <td>outbound 443 to the node</td>
+        <td><code>dnsmesh tsig register</code><br>onboarding at a node, getting a TSIG key</td>
+        <td><strong>HTTPS once</strong></td>
+        <td>outbound 443 to your home node. The only HTTPS exchange in the protocol.</td>
       </tr>
       <tr>
-        <td><code>dnsmesh identity publish</code><br><code>dnsmesh send</code></td>
-        <td><strong>HTTPS</strong></td>
-        <td>outbound 443 to <em>your own home node only</em>. Records sit on your zone; recipients pull them via DNS. (Optional: HTTPS to claim providers for first-contact reach — best-effort, send still succeeds without it.)</td>
+        <td><code>dnsmesh identity publish</code><br><code>dnsmesh send</code><br><code>dnsmesh identity refresh-prekeys</code></td>
+        <td><strong>DNS UPDATE</strong></td>
+        <td>outbound UDP 53 (or TCP 53) to your home node, signed with your TSIG key. RFC 2136 + RFC 8945. No HTTPS after register.</td>
       </tr>
       <tr>
-        <td><code>dnsmesh identity fetch</code><br><code>dnsmesh recv</code></td>
+        <td><code>dnsmesh identity fetch</code><br><code>dnsmesh recv</code><br><code>dnsmesh peers &lt;zone&gt;</code></td>
         <td><strong>DNS</strong></td>
-        <td>UDP 53 outbound to a recursive resolver (the CLI defaults to 1.1.1.1 / 8.8.8.8). No HTTPS needed for reads.</td>
+        <td>UDP 53 to any recursive resolver. Reads walk the chain.</td>
+      </tr>
+      <tr>
+        <td>First-contact claim publish<br>(stranger reaching you)</td>
+        <td><strong>DNS UPDATE</strong></td>
+        <td>un-TSIG'd UPDATE to the provider's DNS server. The wire is a signed <code>ClaimRecord</code> — Ed25519 sig is the on-zone auth.</td>
       </tr>
     </tbody>
   </table>
@@ -340,19 +353,19 @@ sequenceDiagram
     <tbody>
       <tr><td>Home / coffee shop wifi</td><td class="ok">✓</td><td class="ok">✓</td></tr>
       <tr><td>Hotel captive portal (after login)</td><td class="ok">✓</td><td class="ok">✓</td></tr>
-      <tr><td>Corporate firewall, HTTPS allowed, DNS blocked outbound</td><td class="err">✗ today<br><small>(DoH is on the roadmap)</small></td><td class="ok">✓</td></tr>
-      <tr><td>Network blocking port 53 entirely</td><td class="err">✗ today<br><small>(DoH is on the roadmap)</small></td><td class="ok">✓</td></tr>
+      <tr><td>Corporate firewall, HTTPS allowed, DNS blocked outbound</td><td class="err">✗</td><td class="err">✗</td></tr>
+      <tr><td>Network blocking port 53 entirely</td><td class="err">✗</td><td class="err">✗</td></tr>
       <tr><td>Air-gapped (no internet at all)</td><td class="err">✗</td><td class="err">✗</td></tr>
     </tbody>
   </table>
   <div class="takeaway">
-    <strong>Sending only needs HTTPS to your own home node.</strong>
-    Reads need outbound UDP 53 to <em>some</em> resolver — the CLI's
-    current resolver pool is plain DNS over UDP/TCP, NOT DNS-over-HTTPS.
-    Adding DoH support to the resolver pool is tracked as future work
-    so reads survive networks that block port 53. Most networks
-    (home wifi, hotel captive portals after login, mobile data)
-    pass UDP 53.
+    <strong>The protocol speaks DNS — both directions.</strong>
+    Reads use plain DNS queries; writes use RFC 2136 UPDATE. Both
+    need outbound port 53 (UDP and TCP). Most networks pass it
+    (home wifi, hotel captive portals after login, mobile data).
+    Networks that block port 53 entirely are the one shape DMP
+    can't traverse today; DNS-over-HTTPS support for both reads
+    and UPDATE writes is on the roadmap as a future-work item.
   </div>
 </section>
 
@@ -361,17 +374,18 @@ sequenceDiagram
   <h2>The pieces</h2>
   <pre class="mermaid">
 flowchart LR
-    CLI["dnsmesh CLI\nyour laptop / phone\n(holds private keys)"]
-    HTTP["HTTP API\nport 443"]
-    DNS["DNS server\nUDP port 53"]
+    CLI["dnsmesh CLI\nyour laptop / phone\n(holds private keys + TSIG)"]
+    DNS["DNS server\nUDP/TCP 53\n(query + RFC 2136 UPDATE)"]
+    HTTP["HTTPS\nregister only\n(one-time)"]
     Store[("sqlite\nstore")]
     World["any DNS resolver\nanywhere"]
-    CLI -- POST /v1/records --> HTTP
+    CLI -- "DNS UPDATE + TSIG" --> DNS
+    CLI -. "register (once)" .-> HTTP
     HTTP --> Store
     DNS --> Store
-    World -- TXT query --> DNS
+    World -- "TXT query" --> DNS
   </pre>
-  <p class="small">A DMP node is one process. It speaks HTTPS for writes, DNS for reads, and writes/reads the same sqlite file. No separate database, no auth server, no message broker.</p>
+  <p class="small">A DMP node is one process. It serves DNS on UDP/TCP 53 (queries AND signed UPDATE writes) and exposes one HTTPS route for the one-time registration ceremony. After register, the CLI never opens HTTPS again — every record publish is RFC 2136 DNS UPDATE signed with the user's TSIG key.</p>
 </section>
 
 <!-- 8. End-to-end flow -->
@@ -383,7 +397,7 @@ sequenceDiagram
     participant ANode as Alice's home node
     participant DNS as DNS (anywhere)
     participant B as Bob
-    A->>ANode: POST /v1/records (HTTPS)\nsigned identity record
+    A->>ANode: DNS UPDATE + TSIG\nsigned identity record
     Note right of ANode: stored in sqlite\nserved on UDP 53
     B->>DNS: TXT? dmp.alice.example\n(zone-anchored) or\nid-{hash16}.shared.mesh\n(shared-domain TOFU)
     DNS->>ANode: forwards query
@@ -548,16 +562,15 @@ On the node:
   <pre class="mermaid">
 flowchart LR
     Client["sender's CLI"]
-    Client -- "HTTPS POST\nfan to majority" --> A
-    Client -- "HTTPS POST\nfan to majority" --> C
+    Client -- "DNS UPDATE + TSIG\n(to home node)" --> A
     subgraph Cluster
       A["node-a"]
       B["node-b\n(down)"]
       C["node-c"]
-      A <-- "HTTPS\nanti-entropy" --> C
+      A <-. "HTTP anti-entropy\n(operator-scoped HA)" .-> C
     end
   </pre>
-  <p class="small">Three nodes anti-entropy-sync the same record set every ~30s, <strong>over HTTPS</strong> (<code>/v1/sync/digest</code> + <code>/v1/sync/pull</code>) — never over DNS. Writes from senders fan to a majority of cluster nodes for durability. Reads from the world union across all nodes. When the dead node returns, it pulls everything it missed since its last sync watermark.</p>
+  <p class="small">The user's CLI sends a DNS UPDATE to its home node — DNS-only over the network. Inside the cluster, the three nodes anti-entropy-sync every ~30s over HTTP (<code>/v1/sync/digest</code> + <code>/v1/sync/pull</code>). Cluster peers share one operator-signed manifest, so they live in one administrative trust domain — that's why the boundary stays HTTP. Federation between independent operators is DNS-only; cluster replication is the only inter-node HTTP path. Reads from the world union across all live nodes. When a dead node returns, it pulls everything it missed since its last sync watermark. See <a href="/DNSMeshProtocol/design/cluster-anti-entropy-http-boundary">cluster anti-entropy boundary</a>.</p>
 </section>
 
 <!-- 16. FAQ -->
@@ -566,7 +579,7 @@ flowchart LR
   <ul>
     <li><strong>"<code>dig @node</code> works but my CLI doesn't"</strong> — your CLI is using a different resolver. Check <code>dns_resolvers</code> in <code>~/.dmp/config.yaml</code>.</li>
     <li><strong>"How long until everyone sees my publish?"</strong> — typically 1–3 minutes. Worst case 15 min for slow caches.</li>
-    <li><strong>"Can I read messages on a network without HTTP?"</strong> — yes, DNS-only is enough for reads. Sends require HTTPS to your home node.</li>
+    <li><strong>"Can I read or send on a network without DNS?"</strong> — no. After M9 the protocol is DNS both directions: reads are TXT queries, writes are RFC 2136 UPDATE. Networks that block port 53 entirely block both.</li>
     <li><strong>"Should I run my own resolver?"</strong> — privacy-conscious users yes. <code>dns_resolvers: ['127.0.0.1']</code> after running unbound or similar locally.</li>
   </ul>
 </section>
@@ -574,9 +587,9 @@ flowchart LR
 <!-- 17. CTA -->
 <section class="center">
   <h2>Ready to try?</h2>
-  <pre><code class="language-bash">pip install dnsmesh
+  <pre><code class="language-bash">pipx install dnsmesh
 dnsmesh init alice --domain &lt;your-zone&gt; --endpoint dnsmesh.io
-dnsmesh register --node dnsmesh.io
+dnsmesh tsig register --node dnsmesh.io
 dnsmesh identity publish</code></pre>
   <p class="small" style="margin-top: 2em;">
     <a href="/DNSMeshProtocol/getting-started">Getting started</a> ·

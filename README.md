@@ -97,13 +97,20 @@ M8 claim-provider role, and acts as the canonical bootstrap seed for
 the federated network.
 
 ```bash
-pip install dnsmesh
+pipx install dnsmesh
 dnsmesh init alice --domain <your-zone> --endpoint dnsmesh.io
-dnsmesh register --node dnsmesh.io
-dnsmesh identity publish
+dnsmesh tsig register --node dnsmesh.io     # one HTTPS hop, mints a TSIG key
+dnsmesh identity publish                     # DNS UPDATE + TSIG, no HTTPS
 ```
 
-Curious what's actually advertised: `curl https://dnsmesh.io/v1/info`.
+After M9 the protocol is DNS both directions. The only HTTPS exchange
+is the one-time `tsig register` step that gets you a TSIG key bound
+to your zone. Every subsequent record write — identity, prekeys,
+mailbox slots, chunks, claim publishes — goes over RFC 2136 DNS
+UPDATE signed under that key. Reads are plain DNS TXT queries.
+
+Curious what a node is currently publishing:
+`dig @dnsmesh.io _dnsmesh-heartbeat.dnsmesh.io TXT +short`.
 
 ## Self-host
 
@@ -153,16 +160,21 @@ On the node:
 Full walk-through with screenshots and verification steps:
 [Deployment → DNS subdomain delegation](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/dns-delegation).
 
-Once your node is up, point the CLI at it via the **public hostname**,
-not loopback — the saved registration token is keyed by hostname, so
-`--endpoint http://127.0.0.1:8053` won't auto-attach a token registered
-against `dmp.example.com`.
+Once your node is up, point the CLI at it via the **public hostname**:
 
 ```bash
-dnsmesh init alice@dmp.example.com               # auto-splits user + zone
-dnsmesh register --node dmp.example.com           # mints + saves a token
-dnsmesh identity publish                          # token attaches automatically
+dnsmesh init alice@dmp.example.com                # auto-splits user + zone
+dnsmesh tsig register --node dmp.example.com      # one-shot HTTPS, mints TSIG key
+dnsmesh identity publish                          # DNS UPDATE under that key
 ```
+
+The `tsig register` flow walks the same Ed25519 challenge/confirm
+ceremony the legacy bearer-token path uses, but it returns a TSIG
+key (RFC 8945 HMAC-SHA256) that's persisted in your config and
+auto-attached to every subsequent record publish. The CLI rebuilds
+its writer accordingly: `_DnsUpdateWriter` → port 53 → your home
+node. After register, no HTTPS leaves your machine for the
+protocol's normal flow.
 
 Full walk-through with two users:
 [Getting Started](https://oscarvalenzuelab.github.io/DNSMeshProtocol/getting-started).
@@ -196,15 +208,30 @@ Full walk-through with two users:
   revocation aborts trust on any path that touches the revoked
   key. See
   [`docs/protocol/rotation.md`](https://ovalenzuela.com/DNSMeshProtocol/protocol/rotation).
-- **Multi-tenant node auth (M5.5).** `DMP_AUTH_MODE=multi-tenant`
-  enables per-user publish tokens: every write to `/v1/records/*`
-  is scope-checked against the token's subject, and `dnsmesh register`
-  + `/v1/registration/{challenge,confirm}` give users a self-service
-  path to mint their own tokens via an Ed25519-signed challenge.
-  Shared-pool writes (mailbox + chunks) don't log subject or
-  token hash, so an operator handed the DB cannot reconstruct
-  who-delivered-to-whom. See
-  [Multi-tenant deployment](https://oscarvalenzuelab.github.io/DNSMeshProtocol/deployment/multi-tenant).
+- **DNS-only federation (M9).** Inter-node coordination — heartbeat
+  publishes at `_dnsmesh-heartbeat.<zone>`, transitive discovery via
+  `_dnsmesh-seen.<zone>`, claim-provider discovery, even cross-zone
+  first-contact claim publishes — all goes over plain DNS, no HTTP
+  between independent nodes. The legacy `/v1/heartbeat`,
+  `/v1/nodes/seen`, `/v1/claim/publish`, and `/v1/info` HTTP routes
+  are gone. Cluster anti-entropy (`/v1/sync/digest` +
+  `/v1/sync/pull`) is the documented HA-only exception inside one
+  operator's trust domain — see
+  [the boundary doc](https://oscarvalenzuelab.github.io/DNSMeshProtocol/design/cluster-anti-entropy-http-boundary).
+- **DNS UPDATE + TSIG writes (M9).** `DMP_DNS_UPDATE_ENABLED=1`
+  switches publish from HTTP `/v1/records/*` to RFC 2136 UPDATE
+  signed with RFC 8945 TSIG. Per-user keys minted via
+  `POST /v1/registration/tsig-confirm` (the one-shot HTTPS
+  registration step) carry a per-user pattern scope —
+  `slot-*.mb-*.<zone>`, `chunk-*-*.<zone>`,
+  `id-<sha256(subject)>.<zone>` — so registered users can't
+  overwrite each other's records on shared zones. Operator caps
+  (`max_ttl`, `max_value_bytes`, `max_values_per_name`) apply to
+  UPDATE writes the same way they do to HTTP publishes.
+- **Anti-takeover registration.** `mint_for_subject` does the
+  existence check + key insert atomically under one lock, so two
+  concurrent `tsig-confirm` calls for the same subject under
+  different signing keys can't both succeed.
 - **Zero-config onboarding via bootstrap discovery.** Given just
   `alice@example.com`, `dnsmesh bootstrap discover me@my-domain --auto-pin`
   resolves the cluster, verifies the two-hop trust chain (bootstrap

@@ -493,7 +493,30 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         except Exception:
             reg_host = reg_endpoint.replace("https://", "").replace("http://", "")
 
-        if reg_self_service:
+        # M9: surface DNS-only protocol identity. The node speaks DNS
+        # both directions — heartbeat at _dnsmesh-heartbeat.<zone>, the
+        # seen-graph at _dnsmesh-seen.<zone>, record writes via DNS
+        # UPDATE under per-user TSIG keys minted at /v1/registration/
+        # tsig-confirm. The HTTP landing page exists for human
+        # operators / curious visitors, not as a protocol surface.
+        served_zone = (
+            getattr(self.server, "claim_provider_zone", "") or ""
+        ).strip().lower().rstrip(".")
+        zone_html = served_zone or "&lt;zone&gt;"
+        dns_publishes_block = (
+            "<h2>What this node publishes via DNS</h2>"
+            "<p>Inter-node coordination (M9) is DNS-only. Try these "
+            "from any resolver:</p>"
+            "<pre>"
+            f"dig @{_html.escape(reg_host)} _dnsmesh-heartbeat.{zone_html} TXT +short\n"
+            f"dig @{_html.escape(reg_host)} _dnsmesh-seen.{zone_html} TXT +short"
+            "</pre>"
+            "<p><small>Each TXT value is a signed "
+            "<code>HeartbeatRecord</code> wire. Verify locally with "
+            "<code>dnsmesh peers " + _html.escape(served_zone or reg_host) + "</code>.</small></p>"
+        )
+        dns_update_enabled = bool(getattr(self.server, "tsig_keystore", None))
+        if reg_self_service and dns_update_enabled:
             allowlist = reg_cfg.allowlist if reg_cfg else ()
             if allowlist:
                 allow_html = (
@@ -508,39 +531,51 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
                 )
             expiry_days = int(reg_cfg.expires_in_seconds // 86400) if reg_cfg else 90
             registration_block = (
-                "<h2>Registration</h2>"
-                "<p>This node accepts <strong>self-service registration</strong>. "
-                "Anyone with the <code>dnsmesh</code> CLI can mint a "
-                f"per-user publish token here (default expiry: {expiry_days} days).</p>"
-                f"<pre>pip install dnsmesh\n"
+                "<h2>Registration (DNS UPDATE / TSIG)</h2>"
+                "<p>This node mints <strong>per-user TSIG keys</strong>. "
+                "One HTTPS hop to register, then every record write is "
+                "RFC 2136 DNS UPDATE under that key — no further HTTPS. "
+                f"(Default key lifetime: {expiry_days} days.)</p>"
+                f"<pre>pipx install dnsmesh\n"
                 f"dnsmesh init alice@&lt;your-zone&gt; --endpoint {_html.escape(reg_host)}\n"
-                f"dnsmesh register --node {_html.escape(reg_host)}\n"
+                f"dnsmesh tsig register --node {_html.escape(reg_host)}\n"
                 f"dnsmesh identity publish</pre>" + allow_html
+            )
+        elif reg_self_service:
+            registration_block = (
+                "<h2>Registration</h2>"
+                "<p>Self-service registration is enabled, but the operator "
+                "has not turned on DNS UPDATE writes "
+                "(<code>DMP_DNS_UPDATE_ENABLED=1</code>) yet. Once enabled, "
+                f"<code>dnsmesh tsig register --node {_html.escape(reg_host)}</code> "
+                "will mint a per-user TSIG key.</p>"
             )
         elif auth_mode == "multi-tenant":
             registration_block = (
                 "<h2>Registration</h2>"
-                "<p>This node uses per-user publish tokens "
-                "(<code>multi-tenant</code> mode), but self-service registration "
-                "is currently <strong>disabled</strong>. Tokens are issued by the "
-                "operator on request — contact the operator of "
+                "<p>This node uses per-user credentials but self-service "
+                "registration is currently <strong>disabled</strong>. "
+                "Operators issue keys on request — contact the operator of "
                 f"<code>{_html.escape(reg_endpoint)}</code>.</p>"
             )
         elif auth_mode == "legacy":
             registration_block = (
                 "<h2>Registration</h2>"
                 "<p>This node is in <strong>legacy</strong> auth mode: a single "
-                "operator bearer token gates all writes. Contact the operator "
-                "to request access.</p>"
+                "operator bearer token gates writes. Contact the operator "
+                "to request access. Note that M9 protocol writes prefer "
+                "DNS UPDATE + TSIG; the legacy HTTP path remains for "
+                "operator-side records only.</p>"
             )
         else:
             registration_block = (
                 "<h2>Registration</h2>"
                 "<p>This node is in <strong>open</strong> mode and accepts "
                 "unauthenticated writes. Operators should set "
-                "<code>DMP_AUTH_MODE=multi-tenant</code> + an "
-                "<code>DMP_OPERATOR_TOKEN</code> before exposing the node "
-                "to the public internet. See the "
+                "<code>DMP_AUTH_MODE=multi-tenant</code> + "
+                "<code>DMP_DNS_UPDATE_ENABLED=1</code> + "
+                "<code>DMP_REGISTRATION_ENABLED=1</code> before exposing "
+                "the node to the public internet. See the "
                 '<a href="https://ovalenzuela.com/DNSMeshProtocol/deployment/multi-tenant">'
                 "multi-tenant deployment guide</a>.</p>"
             )
@@ -582,15 +617,20 @@ pre {{ background: #f6f8fa; border: 1px solid #d1d9e0; padding: 0.6em 0.8em; bor
 
 {registration_block}
 
+{dns_publishes_block}
+
 {discovery_block}
 
 <h2>About DNS Mesh Protocol</h2>
 <p>Federated end-to-end encrypted messaging delivered over DNS. Identity = DNS name.
-No central directory, no phone numbers, no servers to trust.</p>
+No central directory, no phone numbers, no servers to trust. As of M9
+the protocol speaks DNS both directions — reads via TXT queries,
+writes via RFC 2136 UPDATE under per-user TSIG keys. The only
+HTTPS exchange is the one-time TSIG-key registration step.</p>
 <ul>
 <li><a href="https://ovalenzuela.com/DNSMeshProtocol/">Documentation</a></li>
 <li><a href="https://github.com/oscarvalenzuelab/DNSMeshProtocol">Source on GitHub</a></li>
-<li><a href="https://pypi.org/project/dnsmesh/">Python client (<code>pip install dnsmesh</code>)</a></li>
+<li><a href="https://pypi.org/project/dnsmesh/">Python client (<code>pipx install dnsmesh</code>)</a></li>
 </ul>
 </body>
 </html>
