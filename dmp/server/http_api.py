@@ -263,12 +263,11 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             return 200
         if self.path == "/v1/registration/challenge":
             return self._handle_registration_challenge()
-        # M9 cleanup: /v1/nodes/seen + /nodes HTML view removed.
+        # M9 cleanup: /v1/nodes/seen, /nodes HTML, and /v1/info removed.
         # Discovery now lives entirely in DNS at _dnsmesh-seen.<zone>
-        # and _dnsmesh-heartbeat.<zone> — there's no HTTP-facing
-        # equivalent any more.
-        if self.path == "/v1/info":
-            return self._handle_node_info()
+        # and _dnsmesh-heartbeat.<zone>; the /v1/info data
+        # (claim_provider_zone, capabilities, version) was absorbed
+        # into the signed heartbeat wire in M9.1.1.
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/sync/digest":
             return self._handle_sync_digest(parsed.query)

@@ -303,6 +303,102 @@ class TestDnsUpdate:
         assert seen_calls and seen_calls[0][0].rstrip(".") == "client"
         assert seen_calls[0][1] == "add"
 
+    def test_anonymous_claim_publish_when_enabled(self):
+        """M9.2.6: an un-TSIG'd UPDATE for a claim-record owner with a
+        verified ClaimRecord wire is accepted ONLY when the server is
+        configured with claim_publish_enabled=True."""
+        import hashlib
+
+        from dmp.core.claim import ClaimRecord
+        from dmp.core.crypto import DMPCrypto
+
+        store = InMemoryDNSStore()
+        port = _free_port()
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keyring=_keyring(),
+            allowed_zones=("example.com",),
+            claim_publish_enabled=True,
+        )
+        # Build a signed ClaimRecord wire.
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        recipient_id = hashlib.sha256(b"recipient").digest()
+        hex12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+        now = int(time.time())
+        claim = ClaimRecord(
+            msg_id=b"\x42" * 16,
+            sender_spk=sender.get_signing_public_key_bytes(),
+            sender_mailbox_domain="alice.example.com",
+            slot=0,
+            ts=now,
+            exp=now + 300,
+        )
+        wire = claim.sign(sender)
+        owner = f"claim-0.mb-{hex12}.example.com."
+
+        with server:
+            upd = dns.update.UpdateMessage("example.com")
+            upd.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.NOERROR
+        stored = store.query_txt_record(owner.rstrip("."))
+        assert stored == [wire]
+
+    def test_anonymous_claim_publish_refused_when_disabled(self):
+        """A node with claim_publish_enabled=False must REFUSE the
+        un-TSIG'd claim publish path even for verified wires. Mirrors
+        the operator's DMP_CLAIM_PROVIDER=0 intent."""
+        import hashlib
+
+        from dmp.core.claim import ClaimRecord
+        from dmp.core.crypto import DMPCrypto
+
+        store = InMemoryDNSStore()
+        port = _free_port()
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keyring=_keyring(),
+            allowed_zones=("example.com",),
+            claim_publish_enabled=False,  # opt-out
+        )
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        recipient_id = hashlib.sha256(b"recipient").digest()
+        hex12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+        now = int(time.time())
+        claim = ClaimRecord(
+            msg_id=b"\x42" * 16,
+            sender_spk=sender.get_signing_public_key_bytes(),
+            sender_mailbox_domain="alice.example.com",
+            slot=0,
+            ts=now,
+            exp=now + 300,
+        )
+        wire = claim.sign(sender)
+        owner = f"claim-0.mb-{hex12}.example.com."
+
+        with server:
+            upd = dns.update.UpdateMessage("example.com")
+            upd.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED
+        assert store.query_txt_record(owner.rstrip(".")) is None
+
     def test_no_writer_means_refused(self):
         """A server constructed without a writer (read-only) refuses
         any UPDATE regardless of TSIG."""

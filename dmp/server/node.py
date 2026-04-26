@@ -849,10 +849,16 @@ class DMPNode:
             # then REFUSED every UPDATE.)
             update_zone = _load_served_zone()
             allowed_zones = (update_zone,) if update_zone else ()
+            # Anonymous (un-TSIG'd) claim-record UPDATE acceptance is
+            # gated on the SAME claim-provider opt-in that controls
+            # CAP_CLAIM_PROVIDER. A node with DMP_CLAIM_PROVIDER=0
+            # must not become a public claim sink (codex round-9 P2).
+            claim_publish_enabled = bool(_load_claim_provider_zone())
             update_kwargs = {
                 "writer": self.store,
                 "tsig_keystore": self.tsig_keystore,
                 "allowed_zones": allowed_zones,
+                "claim_publish_enabled": claim_publish_enabled,
             }
         self.dns = DMPDnsServer(
             self.store,

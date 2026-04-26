@@ -410,8 +410,16 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                         return response
         else:
             # Un-TSIG'd path: only the self-authenticating claim
-            # surface is acceptable. EVERY op must be a claim-record
-            # ADD whose wire verifies as a signed ClaimRecord.
+            # surface is acceptable, AND only when the operator has
+            # opted into the claim-provider role. ``DMPNode.start()``
+            # wires ``claim_publish_enabled`` from the same env-var
+            # that drives CAP_CLAIM_PROVIDER (codex round-9 P2): a
+            # node with DMP_CLAIM_PROVIDER=0 must NOT silently become
+            # an anonymous claim sink just because DNS UPDATE was
+            # turned on for its own users.
+            if not getattr(self.server, "claim_publish_enabled", False):
+                response.set_rcode(dns.rcode.REFUSED)
+                return response
             if not ops:
                 response.set_rcode(dns.rcode.REFUSED)
                 return response
@@ -469,6 +477,7 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         tsig_keystore=None,
         allowed_zones=None,
         update_authorizer=None,
+        claim_publish_enabled=False,
     ):
         super().__init__(server_address, handler_cls)
         self.reader = reader
@@ -480,6 +489,7 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         self.tsig_keystore = tsig_keystore
         self.allowed_zones = allowed_zones or ()
         self.update_authorizer = update_authorizer
+        self.claim_publish_enabled = bool(claim_publish_enabled)
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -521,6 +531,7 @@ class DMPDnsServer:
         tsig_keystore=None,
         allowed_zones: Optional[Sequence[str]] = None,
         update_authorizer: Optional[UpdateAuthorizer] = None,
+        claim_publish_enabled: bool = False,
     ):
         """``writer``, a TSIG source, and ``allowed_zones`` together
         switch on RFC 2136 UPDATE handling. With any of them missing
@@ -552,6 +563,14 @@ class DMPDnsServer:
         self.tsig_keystore = tsig_keystore
         self.allowed_zones = tuple(allowed_zones or ())
         self.update_authorizer = update_authorizer
+        # M9.2.6 round-9 P2: anonymous claim-record UPDATE writes are
+        # gated on this opt-in flag. DMPNode wires it on iff the
+        # operator has CAP_CLAIM_PROVIDER enabled (claim_provider_zone
+        # non-empty AND DMP_CLAIM_PROVIDER not set to off). A node
+        # that wants DNS UPDATE for its own users but does NOT want to
+        # accept first-contact claims from arbitrary senders leaves
+        # this False and the un-TSIG'd path stays REFUSED.
+        self.claim_publish_enabled = bool(claim_publish_enabled)
         self._server: Optional[_ThreadingUDPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -576,6 +595,7 @@ class DMPDnsServer:
             tsig_keystore=self.tsig_keystore,
             allowed_zones=self.allowed_zones,
             update_authorizer=self.update_authorizer,
+            claim_publish_enabled=self.claim_publish_enabled,
         )
         # If the caller asked for port 0, pick up the actual bound port.
         self.port = self._server.server_address[1]
