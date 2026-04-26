@@ -195,7 +195,7 @@ substitute for professional cryptanalysis. A human auditor catches a
 different class of bugs (crypto composition errors, side channels,
 protocol-level attacks, spec-vs-implementation drift) that pattern
 matching cannot find. Until the audit is published, treat DMP as
-experimental for confidentiality-critical traffic.
+non-certified-yet for confidentiality-critical traffic.
 
 Actively shipping:
 

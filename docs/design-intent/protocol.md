@@ -1,5 +1,5 @@
 ---
-title: Protocol overview (aspirational)
+title: Protocol overview (original draft)
 layout: default
 parent: Design Intent
 nav_order: 1

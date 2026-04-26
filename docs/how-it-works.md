@@ -76,17 +76,16 @@ Concretely:
   `slot-N.mb-{hash(bob)}.<alice's mesh_domain>` over the public
   recursive chain.
 
-This is what M8.1 (shipped in 0.4.0) restored: the original DMP
-property that records live under the sender's zone and the recipient
-walks senders' zones via the DNS chain. End-to-end works in every
-realistic configuration:
+This is the original DMP property: records live under the sender's
+zone, and the recipient walks senders' zones via the DNS chain.
+End-to-end works in every realistic configuration:
 
 | Setup | End-to-end works? |
 |---|---|
 | Alice + Bob both register at the same node, share `domain: mesh.gnu.cl` | ✅ |
 | Alice + Bob in a federated 3-node cluster (anti-entropy syncs records between cluster members over HTTPS) | ✅ |
-| Alice on `dnsmesh.io`, Bob on `dnsmesh.pro` with different `mesh_domain`s, **pinned contacts on each side** | ✅ via M8.1 cross-zone receive |
-| Alice on `dnsmesh.io`, Bob on `dnsmesh.pro`, **unpinned stranger** reaches Bob for the first time | ✅ via M8.3 claim layer (requires a reachable claim provider both sides discover) |
+| Alice on `dnsmesh.io`, Bob on `dnsmesh.pro` with different mesh domains, **pinned contacts on each side** | ✅ recv walks each pinned contact's zone, so where the sender lives doesn't matter |
+| Alice on `dnsmesh.io`, Bob on `dnsmesh.pro`, **unpinned stranger** reaches Bob for the first time | ✅ via the claim-layer (requires a reachable claim provider both sides discover) |
 
 Each user only ever needs to reach their own home node. In the
 preferred M9 flow that means one HTTPS onboarding step, then DNS

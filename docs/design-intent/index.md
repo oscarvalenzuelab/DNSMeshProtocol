@@ -20,7 +20,7 @@ For what ships today
 {: #for-what-ships-today }
 
 - [How It Works]({{ site.baseurl }}/how-it-works) — mental model +
-  deployment paths (non-aspirational).
+  deployment paths (current implementation, not draft).
 - [Getting Started]({{ site.baseurl }}/getting-started) — hands-on
   install + first message.
 - [Protocol]({{ site.baseurl }}/protocol) — wire format + crypto as

@@ -430,20 +430,20 @@ sequenceDiagram
 sequenceDiagram
     participant Bob as Bob
     participant R as 1.1.1.1\n(public resolver)
-    participant DO as DigitalOcean\n(owns gnu.cl)
-    participant Node as dnsmesh.io\n(authoritative for mesh.gnu.cl)
-    Bob->>R: TXT? id-xxx.mesh.gnu.cl
+    participant DO as DigitalOcean DNS\n(holds NS for dnsmesh.io)
+    participant Node as dnsmesh-node\n(authoritative for dmp.dnsmesh.io)
+    Bob->>R: TXT? id-xxx.dmp.dnsmesh.io
     alt cached at resolver
       R-->>Bob: cached value
     else cache miss
-      R->>DO: TXT? id-xxx.mesh.gnu.cl
-      DO-->>R: try dnsmesh.io for this
-      R->>Node: TXT? id-xxx.mesh.gnu.cl
+      R->>DO: TXT? id-xxx.dmp.dnsmesh.io
+      DO-->>R: dmp.dnsmesh.io NS = ns1.dnsmesh.io
+      R->>Node: TXT? id-xxx.dmp.dnsmesh.io
       Node-->>R: signed record
       R-->>Bob: signed record
     end
   </pre>
-  <p class="small">Most queries hit a cache. Cold queries walk the chain. Either way, Bob's CLI verifies the signature locally — no trust in resolvers or paths required. "Authoritative" just means "the server that owns the real answer for that zone."</p>
+  <p class="small">Most queries hit a cache. Cold queries walk the chain. Either way, Bob's CLI verifies the signature locally — no trust in resolvers or paths required. "Authoritative" just means "the server that owns the real answer for that zone." The DigitalOcean step is the apex domain registrar, which delegates the <code>dmp.</code> subzone to the dnsmesh-node — see <a href="/DNSMeshProtocol/deployment/dns-delegation">deployment/dns-delegation</a>.</p>
 </section>
 
 <!-- 10. Why default to public resolver -->
