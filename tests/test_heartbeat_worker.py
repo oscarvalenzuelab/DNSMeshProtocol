@@ -112,6 +112,67 @@ class TestPublishOwn:
         assert parsed.endpoint == "https://self.example.com"
         assert parsed.version == "0.1.0"
 
+    def test_shared_zone_does_not_clobber_peers(
+        self, store, transport, now
+    ) -> None:
+        """Codex round-18 P1: when multiple nodes publish heartbeats
+        under the SAME zone (cluster mode where all peers share
+        ``DMP_CLUSTER_BASE_DOMAIN``), each node's tick must NOT wipe
+        the others' wires from ``_dnsmesh-heartbeat.<shared-zone>``.
+
+        Pre-fix: the worker did ``delete_txt_record(name, value=None)``
+        before publishing its own wire, which erased every peer's
+        record on a shared RRset. Cluster discovery collapsed to
+        whichever node ticked last.
+
+        Post-fix: only the node's OWN previous self-wire is evicted
+        (via the tracked ``_last_self_wire``). Peers stay untouched.
+        """
+        # Pre-publish a peer's wire under the shared zone — simulates
+        # another cluster node having already heartbeated into the
+        # same RRset.
+        peer_signer = _signer("peer-a", salt=b"A" * 32)
+        peer_wire = _publish_peer_heartbeat(
+            transport,
+            peer_signer,
+            "shared.example",
+            endpoint="https://peer-a.example.com",
+            ts=now,
+        )
+        # Now run the worker against the SAME shared zone.
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="shared.example",
+        )
+        worker = HeartbeatWorker(
+            cfg, _signer(), store,
+            record_writer=transport, dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+        # Tick once more to exercise the eviction path on the
+        # second tick.
+        worker.tick_once(now=now + 1)
+
+        records = transport.query_txt_record(
+            heartbeat_rrset_name("shared.example")
+        ) or []
+        # Peer's wire is still present (NOT clobbered by self-publish).
+        assert peer_wire in records, (
+            "self-publish wiped a peer's wire from the shared RRset"
+        )
+        # And exactly ONE self-wire is present (latest tick), not two
+        # leftover ones from each tick — the eviction path is working.
+        own_spk = _signer().get_signing_public_key_bytes()
+        own_wires = []
+        for w in records:
+            parsed = HeartbeatRecord.parse_and_verify(w, now=now + 1)
+            if parsed and parsed.operator_spk == own_spk:
+                own_wires.append(w)
+        assert len(own_wires) == 1, (
+            f"expected 1 self-wire after eviction, got {len(own_wires)}"
+        )
+
     def test_no_zone_no_publish(self, store, transport, now) -> None:
         """Without a configured zone the worker still ticks but
         publishes nothing — useful for read-only / disposable nodes."""

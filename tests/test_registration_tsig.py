@@ -88,19 +88,18 @@ class TestMintTsigViaRegistration:
         assert minted.zone == "ops.example"
         assert minted.name.startswith("alice-" + spk_hex[:8])
         assert minted.name.endswith(".ops.example.")
-        # Default scope (M9.2.6 round-17 — multi-tenant safe):
-        # ONLY the user's own identity hashes + spk-prefixed claim
-        # record. Mailbox / chunk wildcards are gated behind
-        # DMP_TSIG_PER_USER_WILDCARDS so a registered user on a
-        # shared zone can't overwrite another user's records.
+        # Default scope (M9.2.6 round-18 — single-user-per-zone is
+        # the M9 design target). Per-user identity hashes + the
+        # user's spk-prefixed claim record + wildcard owner
+        # patterns covering the names ``send_message`` writes.
+        # Multi-tenant operators opt out via DMP_TSIG_TIGHT_SCOPE=1.
         suffixes = set(minted.allowed_suffixes)
         assert any(s.startswith("id-") for s in suffixes)
         assert any(s.startswith("_dnsmesh-claim-" + spk_hex[:16]) for s in suffixes)
-        # Wildcards are NOT in the default scope.
-        assert "slot-*.mb-*.ops.example" not in suffixes
-        assert "chunk-*-*.ops.example" not in suffixes
-        assert "_dnsmesh-claim-*.ops.example" not in suffixes
-        assert "ops.example" not in suffixes
+        assert "slot-*.mb-*.ops.example" in suffixes
+        assert "chunk-*-*.ops.example" in suffixes
+        assert "_dnsmesh-claim-*.ops.example" in suffixes
+        assert "ops.example" not in suffixes  # NOT full-zone
         # Secret is fresh random bytes (32) and survives a re-read.
         assert len(bytes.fromhex(minted.secret_hex)) == 32
         stored = keystore.get(minted.name)
@@ -108,15 +107,15 @@ class TestMintTsigViaRegistration:
         assert stored.secret == bytes.fromhex(minted.secret_hex)
         assert minted.expires_at > 0
 
-    def test_per_user_wildcards_opt_in(
+    def test_tight_scope_drops_wildcards_for_multi_tenant(
         self, keystore, config, challenges, monkeypatch
     ):
-        """``DMP_TSIG_PER_USER_WILDCARDS=1`` adds the
-        ``slot-*.mb-*.<zone>``, ``chunk-*-*.<zone>``, and
-        ``_dnsmesh-claim-*.<zone>`` patterns. Single-user-per-zone
-        deployments need this for ``send_message`` to work; shared
-        zones must leave it off."""
-        monkeypatch.setenv("DMP_TSIG_PER_USER_WILDCARDS", "1")
+        """``DMP_TSIG_TIGHT_SCOPE=1`` (multi-tenant shared zone) drops
+        the wildcard owner patterns so Alice's TSIG key can't
+        overwrite Bob's records on the same zone. ``send_message``
+        UPDATEs WILL be REFUSED in this mode — known limitation
+        until per-sender prefix anchoring lands."""
+        monkeypatch.setenv("DMP_TSIG_TIGHT_SCOPE", "1")
         pc = challenges.issue(config.node_hostname)
         body, _ = _signed_body(
             subject="alice@ops.example",
@@ -130,9 +129,11 @@ class TestMintTsigViaRegistration:
             body=body,
         )
         suffixes = set(minted.allowed_suffixes)
-        assert "slot-*.mb-*.ops.example" in suffixes
-        assert "chunk-*-*.ops.example" in suffixes
-        assert "_dnsmesh-claim-*.ops.example" in suffixes
+        assert "slot-*.mb-*.ops.example" not in suffixes
+        assert "chunk-*-*.ops.example" not in suffixes
+        assert "_dnsmesh-claim-*.ops.example" not in suffixes
+        # Identity scope is still granted.
+        assert any(s.startswith("id-") for s in suffixes)
 
     def test_identity_scope_uses_local_part_not_full_subject(
         self, keystore, config, challenges
@@ -321,11 +322,12 @@ class TestMintTsigViaRegistration:
         )
         # Anchored under the served zone, not the hostname.
         assert minted.zone == "example.com"
-        # Default scope: identity hashes + per-user claim suffix.
         suffixes = set(minted.allowed_suffixes)
         assert any(s.startswith("id-") and s.endswith(".example.com") for s in suffixes)
-        # Wildcards are off by default (round-17), but suffixes
-        # MUST anchor under the served zone, not the HTTP host.
+        # Wildcards land under the served zone with the default
+        # scope mode (single-user-per-zone).
+        assert "slot-*.mb-*.example.com" in suffixes
+        # And NEVER under the hostname.
         for suffix in suffixes:
             assert ".api.example.com" not in suffix
             assert "api.example.com" != suffix

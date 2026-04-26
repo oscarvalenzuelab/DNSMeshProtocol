@@ -192,6 +192,13 @@ class HeartbeatWorker:
         # failed on the last tick waits at least one tick before we
         # try again, so a persistent error doesn't monopolize budget.
         self._cooldown: dict = {}
+        # Last self-heartbeat wire we published, so the next tick can
+        # evict ONLY our own previous wire (not the whole RRset).
+        # Codex round-18 P1: a delete-before-publish that wipes the
+        # owner-name RRset breaks shared zones — every cluster peer
+        # publishing under DMP_CLUSTER_BASE_DOMAIN clobbered the
+        # others' wires every tick.
+        self._last_self_wire: Optional[str] = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -280,14 +287,19 @@ class HeartbeatWorker:
         """Publish this node's signed heartbeat at
         ``_dnsmesh-heartbeat.<dns_zone>``. Returns True on success.
 
-        Replace-the-RRset semantic: ``DNSRecordWriter.publish_txt_record``
-        is APPEND, so a long-running node would otherwise leave every
-        historical heartbeat at the same name. Readers like
-        ``cmd_peers`` and ``_seed_provider_via_dns`` short-circuit on
-        the first verifiable wire and could lock onto an arbitrarily
-        old self-record (wrong ts, capabilities, or endpoint) instead
-        of the current one (codex round-5 P1). We delete the existing
-        RRset first, then publish the fresh wire.
+        Replace-OUR-OWN-wire semantic: ``DNSRecordWriter.publish_txt_record``
+        is APPEND with content-keyed dedup, so a long-running node
+        would otherwise leave every historical heartbeat at the same
+        name (each tick bumps ``ts`` so the wire bytes differ).
+        Readers like ``cmd_peers`` and ``_seed_provider_via_dns``
+        short-circuit on the first verifiable wire and could lock
+        onto an arbitrarily old self-record (codex round-5 P1).
+
+        We delete ONLY our own previous wire (tracked across ticks
+        in ``self._last_self_wire``) before publishing the fresh
+        one — peers' wires at the same RRset name stay intact.
+        Codex round-18 P1: the prior whole-RRset delete clobbered
+        sibling cluster nodes that share a ``DMP_CLUSTER_BASE_DOMAIN``.
         """
         if self._record_writer is None or not self._cfg.dns_zone:
             return False
@@ -300,12 +312,19 @@ class HeartbeatWorker:
             name = heartbeat_rrset_name(self._cfg.dns_zone)
         except ValueError:
             return False
-        try:
-            self._record_writer.delete_txt_record(name, value=None)
-        except Exception:
-            log.exception(
-                "heartbeat self-publish wipe raised for %s; continuing", name
-            )
+        # Evict our previous self-wire if any. ``delete_txt_record(value=…)``
+        # only matches that one TXT value; other publishers' wires
+        # under the same RRset are unaffected.
+        if self._last_self_wire and self._last_self_wire != wire:
+            try:
+                self._record_writer.delete_txt_record(
+                    name, value=self._last_self_wire
+                )
+            except Exception:
+                log.exception(
+                    "heartbeat self-wire eviction raised for %s; continuing",
+                    name,
+                )
         try:
             ok = bool(
                 self._record_writer.publish_txt_record(
@@ -315,7 +334,9 @@ class HeartbeatWorker:
         except Exception:
             log.exception("heartbeat self-publish raised")
             return False
-        if not ok:
+        if ok:
+            self._last_self_wire = wire
+        else:
             log.info("heartbeat self-publish to %s returned False", name)
         return ok
 

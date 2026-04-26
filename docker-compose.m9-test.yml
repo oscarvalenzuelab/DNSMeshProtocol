@@ -65,10 +65,10 @@ services:
       DMP_AUTH_MODE: "multi-tenant"
       DMP_OPERATOR_TOKEN: "alice-operator-token-for-tests"
       DMP_REGISTRATION_ENABLED: "1"
-      # Single-user-per-zone (one user per node) — opt into the
-      # wildcard scope so send_message's slot-*.mb-* / chunk-*-*
-      # owners authorize. Multi-tenant zones leave this off.
-      DMP_TSIG_PER_USER_WILDCARDS: "1"
+      # Default TSIG scope (single-user-per-zone) covers the M9
+      # send_message owner patterns; multi-tenant operators would
+      # set DMP_TSIG_TIGHT_SCOPE=1 to drop the wildcards. Each
+      # node here serves its own zone, so the default is correct.
     volumes:
       - alice-data:/var/lib/dmp
       - ./docker/m9-test/alice-operator.key:/etc/dmp/operator.key:ro
