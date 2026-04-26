@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [0.5.0-rc1] — M9 DNS-native federation
+## [0.5.0] — M9 DNS-native federation
 
 The protocol speaks DNS both directions now. The only HTTPS exchange
 left is the one-time TSIG-key registration step

@@ -228,6 +228,49 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────
+# M9 (0.5.0+): backfill DMP_DNS_UPDATE_ENABLED
+# ──────────────────────────────────────────────────────────────────────
+# M9 moved record writes from HTTP /v1/records/* to RFC 2136 DNS
+# UPDATE + RFC 8945 TSIG. The legacy HTTP heartbeat / nodes/seen /
+# claim-publish / info routes are GONE in 0.5.0. The new write surface
+# is opt-in via DMP_DNS_UPDATE_ENABLED — without it, /v1/registration/
+# tsig-confirm 404s and operators who upgrade are stuck on the
+# legacy bearer-token path that no longer matches the public docs.
+#
+# Default the upgrade to ENABLED so an operator running the public
+# reference deployments (dnsmesh.io / dnsmesh.pro) gets the M9 path
+# automatically. Operators who explicitly want to stay on the
+# tokens-only mode can comment the line out before restarting.
+step "Checking node.env for DMP_DNS_UPDATE_ENABLED (M9)"
+if [[ -f "$ENV_FILE" ]] && \
+        ! grep -qE '^[[:space:]]*#?[[:space:]]*DMP_DNS_UPDATE_ENABLED' "$ENV_FILE"; then
+    cat <<EOF >> "$ENV_FILE"
+
+# M9 (0.5.0+): DNS UPDATE + TSIG record writes.
+# When enabled, ``/v1/registration/tsig-confirm`` mints per-user TSIG
+# keys and the dnsmesh CLI's ``tsig register`` flow becomes the
+# default onboarding path. Each user's writes (identity, prekeys,
+# mailbox slots, chunks, claim publishes) go over RFC 2136 DNS
+# UPDATE — no HTTPS after register. Comment this line out to stay on
+# the legacy bearer-token publish path (not recommended; the legacy
+# /v1/heartbeat, /v1/nodes/seen, /v1/info, /v1/claim/publish HTTP
+# routes are gone in 0.5.0 regardless).
+DMP_DNS_UPDATE_ENABLED=1
+# DMP_TSIG_TIGHT_SCOPE=1 — set this only if the served zone hosts
+# MULTIPLE users (multi-tenant deployment). Drops the wildcard
+# ``slot-*.mb-*`` / ``chunk-*-*`` patterns from minted TSIG keys so
+# Alice can't overwrite Bob's records. Single-user-per-zone (the
+# typical native-ubuntu deploy) leaves it unset; ``send_message``
+# UPDATEs need the wildcards to authorize.
+EOF
+    chown root:"$DNSMESH_USER" "$ENV_FILE"
+    chmod 0640 "$ENV_FILE"
+    ok "added DMP_DNS_UPDATE_ENABLED=1 to $ENV_FILE (M9 DNS UPDATE path)"
+else
+    ok "DMP_DNS_UPDATE_ENABLED already configured in $ENV_FILE (left alone)"
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # Restart and wait for health
 # ──────────────────────────────────────────────────────────────────────
 
