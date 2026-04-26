@@ -151,8 +151,8 @@ def main():
     print(f"  minted key name: {minted['tsig_key_name']}")
     print(f"  scope: {minted['allowed_suffixes']}")
     assert_step(
-        "alice gets a TSIG key scoped to her DMP records",
-        any(s.startswith("id-") for s in minted["allowed_suffixes"]),
+        "alice gets a TSIG key scoped to her served zone",
+        "alice.test" in minted["allowed_suffixes"],
     )
 
     step("4. Publish alice's identity via DNS UPDATE (no HTTP)")
@@ -195,19 +195,25 @@ def main():
     # mapped UDP port (we already did that in step 5).
     print("  (host-side cross-zone DNS chain validation already covered in step 5)")
 
-    step("7. Try writing OUT-OF-SCOPE — must be REFUSED")
-    upd_bad = dns.update.UpdateMessage("alice.test")
+    step("7. Try writing OUT-OF-ZONE — must be NOTAUTH")
+    # In loose-scope mode (default M9.2.6 round-13), the TSIG key
+    # authorizes anything under alice.test. The boundary the user
+    # actually cares about is "you can't write into a different
+    # zone" — alice's key targeting bob.test must bounce. The DNS
+    # server returns NOTAUTH (or NOTZONE) for cross-zone UPDATEs,
+    # not REFUSED.
+    upd_bad = dns.update.UpdateMessage("bob.test")
     upd_bad.add(
-        dns.name.from_text("bob.alice.test."),  # not in scope for alice's TSIG
+        dns.name.from_text("identity.alice.bob.test."),
         300,
         "TXT",
         '"impostor"',
     )
     upd_bad.use_tsig(keyring, keyname=dns.name.from_text(minted["tsig_key_name"]))
-    bad_response = dns.query.udp(upd_bad, ALICE_DNS[0], port=ALICE_DNS[1], timeout=3.0)
+    bad_response = dns.query.udp(upd_bad, BOB_DNS[0], port=BOB_DNS[1], timeout=3.0)
     assert_step(
-        "Out-of-scope UPDATE is REFUSED",
-        bad_response.rcode() == dns.rcode.REFUSED,
+        "Cross-zone UPDATE bounces with NOTAUTH",
+        bad_response.rcode() == dns.rcode.NOTAUTH,
         f"rcode={dns.rcode.to_text(bad_response.rcode())}",
     )
 

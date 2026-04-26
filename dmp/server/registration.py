@@ -547,14 +547,33 @@ def _suffixes_for(
     spk16 = _spk_short(spk_hex, length=16)
     if not z or not subj or not spk16:
         return ()
+    # Codex round-13 P1: a registered user has to publish under owner
+    # names that aren't anchored on their identity hash —
+    # ``slot-N.mb-{hash(recipient)}.{sender_zone}`` and
+    # ``chunk-XXXX-{msg_key}.{sender_zone}`` are content-addressed by
+    # the RECIPIENT and the message, not the sender. Scoping the key
+    # to ``id-<sender_hash>.<zone>`` therefore REFUSES every normal
+    # send_message UPDATE.
+    #
+    # The pragmatic fix is to grant the registered user write access
+    # to anything under the served zone. In single-user-per-zone
+    # deployments (the shape M9 actually targets — each user runs
+    # their own node, the served zone IS their personal zone) this is
+    # correct. Multi-tenant deployments where a single zone hosts
+    # many users would need per-user prefix matching that goes beyond
+    # the current suffix-tail check; that's tracked as a known
+    # limitation for any future multi-tenant work and gated on the
+    # ``DMP_TSIG_LOOSE_SCOPE=0`` env override below.
+    if os.environ.get("DMP_TSIG_LOOSE_SCOPE", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    ):
+        return (z,)
+    # Tight-scope mode (multi-tenant deployments): keep the narrower
+    # set, accepting that send_message UPDATEs WILL be REFUSED.
     suffixes = []
-    # identity + prekeys
     username_hash = hashlib.sha256(subj.encode("utf-8")).hexdigest()[:16]
     suffixes.append(f"id-{username_hash}.{z}")
-    # legacy claim record path
     suffixes.append(f"_dnsmesh-claim-{spk16}.{z}")
-    # mailbox + claim records — only when the registration body
-    # supplied the X25519 pubkey we need to derive the hash.
     x_norm = (x25519_pub_hex or "").strip().lower()
     if x_norm:
         try:
@@ -567,24 +586,41 @@ def _suffixes_for(
     return tuple(suffixes)
 
 
-def _key_name_for(local_part: str, spk_hex: str, zone: str) -> Optional[str]:
-    """Stable per-user TSIG key name. The spk-prefix in the label
-    keeps the name unique even if two users share a local part on
-    different zones (or one is rotated and re-registered).
+def _key_name_for(
+    local_part: str, spk_hex: str, zone: str, *, subject: str = ""
+) -> Optional[str]:
+    """Stable per-user TSIG key name.
+
+    Codex round-13 P2: two subjects with the same local part on
+    different domains (``alice@foo.example`` vs
+    ``alice@bar.example``) used to collide into the same key name
+    when re-using a signing key, and ``mint_for_subject``'s upsert
+    silently overwrote one with the other. Including a hash of the
+    canonical subject (``user@host``) in the label disambiguates
+    them. The spk prefix is kept for human readability.
 
     Returns None when the resulting first label would exceed the
-    63-octet DNS label limit (codex round-6 P2: a long but otherwise
-    valid local part used to mint a usable secret whose key name
-    dnspython then refused to parse, so the user got a 200 response
-    for a credential the DNS server silently never honored).
+    63-octet DNS label limit (codex round-6 P2).
     """
+    import hashlib as _hashlib
+
     z = (zone or "").strip().lower().rstrip(".")
     lp = (local_part or "").strip().lower()
     if not z or not lp:
         return None
-    if len(lp) + _KEY_NAME_LABEL_OVERHEAD > _MAX_DNS_LABEL:
+    spk8 = _spk_short(spk_hex)
+    # Subject hash: 6 hex chars of sha256(subject) — enough to make
+    # the key name unique across (local_part, host) pairs without
+    # exploding the label length. Falls back to an empty string for
+    # legacy callers that didn't pass a subject (admin tooling).
+    subj_norm = (subject or "").strip().lower()
+    subj_tag = ""
+    if subj_norm:
+        subj_tag = _hashlib.sha256(subj_norm.encode("utf-8")).hexdigest()[:6]
+    label = f"{lp}-{spk8}" + (f"-{subj_tag}" if subj_tag else "")
+    if len(label) > _MAX_DNS_LABEL:
         return None
-    return f"{lp}-{_spk_short(spk_hex)}.{z}."
+    return f"{label}.{z}."
 
 
 def mint_tsig_via_registration(
@@ -690,7 +726,7 @@ def mint_tsig_via_registration(
             "could not derive TSIG scope from subject + zone",
             http_status=500,
         )
-    key_name = _key_name_for(local_part, spk_hex, zone)
+    key_name = _key_name_for(local_part, spk_hex, zone, subject=subject)
     if key_name is None:
         # Local part too long for a single DNS label after the
         # ``-<spk8>`` suffix — refuse rather than mint a key whose

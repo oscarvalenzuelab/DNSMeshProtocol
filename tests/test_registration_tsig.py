@@ -71,8 +71,6 @@ def _signed_body(
 
 class TestMintTsigViaRegistration:
     def test_happy_path(self, keystore, config, challenges):
-        import hashlib
-
         pc = challenges.issue(config.node_hostname)
         body, spk_hex = _signed_body(
             subject="alice@ops.example",
@@ -85,38 +83,59 @@ class TestMintTsigViaRegistration:
             config=config,
             body=body,
         )
-        # Key name encodes local part + spk prefix + zone.
+        # Key name encodes local part + spk prefix + subject hash + zone.
         assert minted.subject == "alice@ops.example"
         assert minted.zone == "ops.example"
         assert minted.name.startswith("alice-" + spk_hex[:8])
         assert minted.name.endswith(".ops.example.")
-        # Scope: identity hash + legacy claim record. Without
-        # ``x25519_pub`` in the body, mailbox suffix is omitted.
+        # Default loose-scope mode (M9.2.6 round-13 P1): the minted
+        # key authorizes any owner under the served zone, since DMP
+        # send_message publishes content-addressed records that the
+        # tight-suffix scope can't enumerate.
+        assert minted.allowed_suffixes == ("ops.example",)
+        # Secret is fresh random bytes (32) and survives a re-read.
+        assert len(bytes.fromhex(minted.secret_hex)) == 32
+        stored = keystore.get(minted.name)
+        assert stored is not None
+        assert stored.secret == bytes.fromhex(minted.secret_hex)
+        assert minted.expires_at > 0
+
+    def test_tight_scope_mode_keeps_per_user_suffixes(
+        self, keystore, config, challenges, monkeypatch
+    ):
+        """``DMP_TSIG_LOOSE_SCOPE=0`` opts into the original tight
+        per-user scope (multi-tenant deployments). Send_message
+        publishes WILL be REFUSED here; the operator accepts that."""
+        import hashlib
+
+        monkeypatch.setenv("DMP_TSIG_LOOSE_SCOPE", "0")
+        pc = challenges.issue(config.node_hostname)
+        body, spk_hex = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        minted = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=config,
+            body=body,
+        )
         username_hash = hashlib.sha256(
             "alice@ops.example".encode("utf-8")
         ).hexdigest()[:16]
         assert f"id-{username_hash}.ops.example" in minted.allowed_suffixes
         claim_suffix = f"_dnsmesh-claim-{spk_hex[:16]}.ops.example"
         assert claim_suffix in minted.allowed_suffixes
-        # Secret is fresh random bytes (32) and survives a re-read
-        # through the keystore.
-        assert len(bytes.fromhex(minted.secret_hex)) == 32
-        stored = keystore.get(minted.name)
-        assert stored is not None
-        assert stored.secret == bytes.fromhex(minted.secret_hex)
-        # Expires_at is in the future per config.
-        assert minted.expires_at > 0
 
     def test_x25519_pub_extends_scope_to_mailbox(
-        self, keystore, config, challenges
+        self, keystore, config, challenges, monkeypatch
     ):
-        """Codex round-6 P1: when the registration body includes
-        ``x25519_pub``, the minted key also authorizes mailbox /
-        claim record writes via ``mb-<hash12>.<zone>`` tail
-        matches."""
+        """Tight-scope mode + x25519_pub adds the mailbox suffix."""
         import hashlib
         import os
 
+        monkeypatch.setenv("DMP_TSIG_LOOSE_SCOPE", "0")
         x_pub = os.urandom(32)
         pc = challenges.issue(config.node_hostname)
         body, _ = _signed_body(
@@ -245,11 +264,7 @@ class TestMintTsigViaRegistration:
     ):
         """Codex P1 regression: when DMP_NODE_HOSTNAME is a host BENEATH
         the served zone (api.example.com under example.com), the minted
-        TSIG scope must anchor to the served zone. Otherwise every
-        normal write under example.com bounces as REFUSED because the
-        suffix incorrectly reads ...api.example.com."""
-        import hashlib
-
+        TSIG scope must anchor to the served zone."""
         cfg = RegistrationConfig(
             enabled=True,
             node_hostname="api.example.com",
@@ -271,10 +286,8 @@ class TestMintTsigViaRegistration:
         )
         # Anchored under the served zone, not the hostname.
         assert minted.zone == "example.com"
-        username_hash = hashlib.sha256(
-            "alice@example.com".encode("utf-8")
-        ).hexdigest()[:16]
-        assert f"id-{username_hash}.example.com" in minted.allowed_suffixes
+        # Loose-scope default: scope is the served zone itself.
+        assert "example.com" in minted.allowed_suffixes
         # And NOT under the hostname.
         for suffix in minted.allowed_suffixes:
             assert ".api.example.com" not in suffix

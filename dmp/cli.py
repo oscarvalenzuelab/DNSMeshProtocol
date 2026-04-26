@@ -1125,6 +1125,23 @@ def _candidate_seen_zones(
     # heartbeat worker publishes _dnsmesh-seen records under.
     _push(getattr(cfg, "tsig_zone", "") or "")
     _push(_zone_from_endpoint_url(cfg.endpoint))
+    # Codex round-13 P2: in cluster mode, surface each cluster node's
+    # served zone as a fallback when the cluster anchor's seen-graph
+    # is temporarily missing. We don't have a direct "served zone"
+    # field in the cluster manifest yet, so we approximate via the
+    # node's HTTP host. This brings back deployments where each
+    # cluster node IS its own zone apex (the common single-host
+    # case); split-host clusters (api.X.example.com / example.com)
+    # still rely on the cluster_base_domain candidate above. Tracked
+    # as a known limitation; the proper fix is a manifest field.
+    cluster_client = (
+        getattr(client, "_cluster_client", None) if client is not None else None
+    )
+    manifest = getattr(cluster_client, "manifest", None) if cluster_client else None
+    nodes = getattr(manifest, "nodes", None) if manifest is not None else None
+    if nodes:
+        for node in nodes:
+            _push(_zone_from_endpoint_url(getattr(node, "http_endpoint", "")))
     return out
 
 
