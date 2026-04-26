@@ -1148,24 +1148,30 @@ def _candidate_seen_zones(
 def _fetch_seen_feed_dns(
     reader: DNSRecordReader, zones: Sequence[str]
 ) -> List[str]:
-    """Query ``_dnsmesh-seen.<zone>`` for each zone, return first hit
-    that yields at least one verifiable wire.
+    """Query ``_dnsmesh-seen.<zone>`` for each candidate zone and
+    return the COMBINED set of verifiable wires across all of them.
 
-    Codex round-7 P2: stopping at the first non-empty RRset broke
-    discovery whenever the cluster anchor's seen-graph contained
-    only malformed / unverifiable wires — ``parse_seen_feed`` would
-    drop everything and the caller never moved on to the next
-    candidate zone. Now we re-verify here too and only return the
-    first zone that actually produced a usable record.
+    Codex round-7 P2: don't stop at the first non-empty RRset that
+    happens to be malformed — re-verify here and only return zones
+    that produced usable records.
 
-    The returned list is the raw wire strings (multi-value TXT
-    publishes one wire per value); the caller still re-verifies via
-    ``parse_seen_feed``. Re-verifying twice is cheap relative to the
-    DNS round-trip we'd otherwise miss.
+    Codex round-15 P2: don't stop at the first zone that produces
+    ANY verifiable wire either. Mixed deployments may have a
+    cluster-anchor seen feed full of non-provider peers AND a
+    sibling-node seen feed that's the only one currently
+    advertising ``CAP_CLAIM_PROVIDER``. The caller's
+    ``select_providers`` ranks across the union, so combining feeds
+    here gives it the full picture.
+
+    Wires are deduped by content. Re-verifying twice (here and in
+    the caller's ``parse_seen_feed``) is cheap relative to the DNS
+    round-trips we'd otherwise miss.
     """
     from dmp.client.claim_routing import parse_seen_feed
     from dmp.server.heartbeat_worker import seen_rrset_name
 
+    combined: List[str] = []
+    seen_wires: Set[str] = set()
     for zone in zones:
         if not zone:
             continue
@@ -1182,12 +1188,13 @@ def _fetch_seen_feed_dns(
         wires = [v for v in values if isinstance(v, str)]
         if not wires:
             continue
-        # Quick verification pass — if every wire is bad, fall through
-        # so a sibling zone still gets a chance to contribute.
         if not parse_seen_feed(wires):
             continue
-        return wires
-    return []
+        for w in wires:
+            if w not in seen_wires:
+                seen_wires.add(w)
+                combined.append(w)
+    return combined
 
 
 def _seed_provider_via_dns(
