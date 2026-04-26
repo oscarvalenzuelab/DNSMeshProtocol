@@ -383,9 +383,7 @@ def _load_heartbeat_from_env(
     from dmp.server.heartbeat_worker import _zone_from_seed
 
     seed_zones = tuple(
-        z
-        for s in seed_peers_raw.split(",")
-        if (z := _zone_from_seed(s.strip()))
+        z for s in seed_peers_raw.split(",") if (z := _zone_from_seed(s.strip()))
     )
     interval = int(os.environ.get("DMP_HEARTBEAT_INTERVAL_SECONDS", "300"))
     ttl = int(os.environ.get("DMP_HEARTBEAT_TTL_SECONDS", "86400"))
@@ -888,9 +886,7 @@ class DMPNode:
 
             try:
                 claim_max_ttl = int(
-                    os.environ.get(
-                        "DMP_CLAIM_MAX_TTL", str(DEFAULT_CLAIM_MAX_TTL)
-                    )
+                    os.environ.get("DMP_CLAIM_MAX_TTL", str(DEFAULT_CLAIM_MAX_TTL))
                 )
             except ValueError:
                 claim_max_ttl = DEFAULT_CLAIM_MAX_TTL

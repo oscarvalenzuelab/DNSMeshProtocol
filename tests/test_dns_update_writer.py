@@ -61,9 +61,7 @@ def _mint_key(keystore: TSIGKeyStore, name: str, allowed_suffixes):
 
 class TestPublish:
     def test_publish_lands_in_record_store(self, record_store, keystore):
-        key = _mint_key(
-            keystore, "alice", ("alice.example.com",)
-        )
+        key = _mint_key(keystore, "alice", ("alice.example.com",))
         server, port = _start_server(record_store, keystore)
         writer = _DnsUpdateWriter(
             zone="example.com",
@@ -73,9 +71,7 @@ class TestPublish:
             tsig_secret=key.secret,
         )
         try:
-            ok = writer.publish_txt_record(
-                "alice.example.com", "v=dmp1;t=identity"
-            )
+            ok = writer.publish_txt_record("alice.example.com", "v=dmp1;t=identity")
         finally:
             server.stop()
         assert ok is True
@@ -97,15 +93,13 @@ class TestPublish:
             tsig_secret=key.secret,
         )
         try:
-            ok = writer.publish_txt_record(
-                "prekey.alice.example.com", "v=dmp1;k=abc"
-            )
+            ok = writer.publish_txt_record("prekey.alice.example.com", "v=dmp1;k=abc")
         finally:
             server.stop()
         assert ok is True
-        assert record_store.query_txt_record(
-            "prekey.alice.example.com"
-        ) == ["v=dmp1;k=abc"]
+        assert record_store.query_txt_record("prekey.alice.example.com") == [
+            "v=dmp1;k=abc"
+        ]
 
     def test_publish_with_special_chars_in_value(self, record_store, keystore):
         """TXT values containing ``;`` (the DNS comment delimiter) and

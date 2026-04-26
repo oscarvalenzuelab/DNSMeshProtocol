@@ -1155,9 +1155,7 @@ def _candidate_seen_zones(
     return out
 
 
-def _fetch_seen_feed_dns(
-    reader: DNSRecordReader, zones: Sequence[str]
-) -> List[str]:
+def _fetch_seen_feed_dns(reader: DNSRecordReader, zones: Sequence[str]) -> List[str]:
     """Query ``_dnsmesh-seen.<zone>`` for each candidate zone and
     return the COMBINED set of verifiable wires across all of them.
 
@@ -4549,8 +4547,7 @@ def build_parser() -> argparse.ArgumentParser:
     # peers (DNS-native discovery feed of a single zone)
     p_peers = sub.add_parser(
         "peers",
-        help="show the heartbeat directory a node publishes at "
-        "_dnsmesh-seen.<zone>",
+        help="show the heartbeat directory a node publishes at " "_dnsmesh-seen.<zone>",
     )
     p_peers.add_argument(
         "endpoint",

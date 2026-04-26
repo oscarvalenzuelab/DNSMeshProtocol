@@ -21,7 +21,6 @@ from dmp.core.prekeys import Prekey, PrekeyStore, prekey_rrset_name
 from dmp.network.base import DNSRecordReader, DNSRecordStore, DNSRecordWriter
 from dmp.network.memory import InMemoryDNSStore
 
-
 # M9.2.6 — claim-publish DNS UPDATE helpers.
 #
 # Default DNS port for cross-zone UPDATE writes. Real deployments run
@@ -32,9 +31,9 @@ import os as _os
 from urllib.parse import urlsplit as _urlsplit
 
 
-def _provider_dns_target(provider_endpoint: str, provider_zone: str) -> Optional[
-    Tuple[str, int]
-]:
+def _provider_dns_target(
+    provider_endpoint: str, provider_zone: str
+) -> Optional[Tuple[str, int]]:
     """Resolve the (host, port) we should send a claim UPDATE to.
 
     Order (codex round-15 P1):
@@ -131,6 +130,7 @@ def _publish_claim_via_dns_update(
         except Exception:
             return False
     return response.rcode() == dns.rcode.NOERROR
+
 
 SLOT_COUNT = 10
 DEFAULT_TTL_SECONDS = 300
@@ -932,9 +932,7 @@ class DMPClient:
         if provider_writer is not None:
             try:
                 return bool(
-                    provider_writer.publish_txt_record(
-                        name, wire, ttl=int(ttl)
-                    )
+                    provider_writer.publish_txt_record(name, wire, ttl=int(ttl))
                 )
             except Exception:
                 return False

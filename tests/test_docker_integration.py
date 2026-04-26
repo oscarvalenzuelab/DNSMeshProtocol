@@ -584,5 +584,3 @@ def test_container_rotation_compromise_revokes_old_key(node_container):
         SUBJECT_TYPE_USER_IDENTITY,
     )
     assert resolved is None
-
-

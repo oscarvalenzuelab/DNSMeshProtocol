@@ -60,9 +60,7 @@ class TestSuffixMatch:
         ``mb-abc.bob.alice.test`` — the wildcard stays in one label."""
         assert _suffix_match("mb-abc.alice.test", "mb-*.alice.test")
         # Subdomain extension still works (suffix tail-match preserved).
-        assert _suffix_match(
-            "extra.mb-abc.alice.test", "mb-*.alice.test"
-        )
+        assert _suffix_match("extra.mb-abc.alice.test", "mb-*.alice.test")
         # Different zone — NOT in scope.
         assert not _suffix_match("mb-abc.bob.test", "mb-*.alice.test")
 
@@ -119,12 +117,8 @@ class TestPutAndGet:
 
 class TestMint:
     def test_generates_random_secret(self, store):
-        a = store.mint(
-            name="alice", allowed_suffixes=("alice.example.com",)
-        )
-        b = store.mint(
-            name="bob", allowed_suffixes=("bob.example.com",)
-        )
+        a = store.mint(name="alice", allowed_suffixes=("alice.example.com",))
+        b = store.mint(name="bob", allowed_suffixes=("bob.example.com",))
         assert a.secret != b.secret
         assert len(a.secret) == 32
 
@@ -219,9 +213,7 @@ class TestAuthorizer:
             allowed_suffixes=("alice.example.com",),
         )
         authorize = store.build_authorizer()
-        assert authorize(
-            dns.name.from_text("alice."), "add", "foo.alice.example.com"
-        )
+        assert authorize(dns.name.from_text("alice."), "add", "foo.alice.example.com")
 
     def test_out_of_scope_owner_rejected(self, store):
         store.put(
@@ -230,9 +222,7 @@ class TestAuthorizer:
             allowed_suffixes=("alice.example.com",),
         )
         authorize = store.build_authorizer()
-        assert not authorize(
-            dns.name.from_text("alice."), "add", "bob.example.com"
-        )
+        assert not authorize(dns.name.from_text("alice."), "add", "bob.example.com")
 
     def test_revoke_after_keyring_build_blocks_authorize(self, store):
         """A live revoke between TSIG verification and applying the
@@ -245,15 +235,11 @@ class TestAuthorizer:
         )
         authorize = store.build_authorizer()
         store.revoke("alice")
-        assert not authorize(
-            dns.name.from_text("alice."), "add", "alice.example"
-        )
+        assert not authorize(dns.name.from_text("alice."), "add", "alice.example")
 
     def test_unknown_key_rejected(self, store):
         authorize = store.build_authorizer()
-        assert not authorize(
-            dns.name.from_text("ghost."), "add", "anything.example"
-        )
+        assert not authorize(dns.name.from_text("ghost."), "add", "anything.example")
 
 
 class TestEndToEndWithDnsServer:

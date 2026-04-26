@@ -332,9 +332,7 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
     # M9.2.1 — UPDATE handling
     # ------------------------------------------------------------------
 
-    def _build_update_response(
-        self, query: dns.message.Message
-    ) -> dns.message.Message:
+    def _build_update_response(self, query: dns.message.Message) -> dns.message.Message:
         """Apply an RFC 2136 UPDATE to the writer.
 
         Auth model (after M9.2.6):
@@ -398,16 +396,12 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             deleting = getattr(rrset, "deleting", None)
             if deleting is None:
                 for rdata in rrset:
-                    value = b"".join(rdata.strings).decode(
-                        "utf-8", errors="replace"
-                    )
+                    value = b"".join(rdata.strings).decode("utf-8", errors="replace")
                     ops.append(("add", owner, value, int(rrset.ttl) or DEFAULT_TTL))
             elif deleting == dns.rdataclass.NONE:
                 # Delete a specific RR from the RRset (rdata must match).
                 for rdata in rrset:
-                    value = b"".join(rdata.strings).decode(
-                        "utf-8", errors="replace"
-                    )
+                    value = b"".join(rdata.strings).decode("utf-8", errors="replace")
                     ops.append(("delete", owner, value, 0))
             elif deleting == dns.rdataclass.ANY:
                 # Delete the entire RRset at this owner.
@@ -437,6 +431,7 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             )
         )
         adds_per_owner: dict = {}
+
         # Codex round-17 P2: ``max_values_per_name`` must include
         # records ALREADY at this owner, not just the adds in the
         # current packet. Otherwise N single-record UPDATEs grow the
@@ -507,9 +502,7 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                             response.set_rcode(dns.rcode.REFUSED)
                             return response
                     except Exception:
-                        log.exception(
-                            "update_authorizer raised; rejecting UPDATE"
-                        )
+                        log.exception("update_authorizer raised; rejecting UPDATE")
                         response.set_rcode(dns.rcode.SERVFAIL)
                         return response
         else:
@@ -537,9 +530,7 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                 if not _is_claim_owner(owner, zone_text):
                     response.set_rcode(dns.rcode.REFUSED)
                     return response
-                if not _claim_within_lifetime_cap(
-                    value, max_ttl=cap, now=now_i
-                ):
+                if not _claim_within_lifetime_cap(value, max_ttl=cap, now=now_i):
                     # Wire wasn't a verifiable claim OR claim's exp is
                     # past the operator's lifetime cap — REFUSE rather
                     # than silently accept a far-future record that
@@ -549,7 +540,9 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                     return response
                 # Clamp the requested DNS TTL to the operator's cap so a
                 # client can't request a 10-year cache lifetime.
-                clamped_ttl = min(int(ttl) if ttl else DEFAULT_TTL, cap) if cap else int(ttl)
+                clamped_ttl = (
+                    min(int(ttl) if ttl else DEFAULT_TTL, cap) if cap else int(ttl)
+                )
                 applied.append((op, owner, value, clamped_ttl))
             ops = applied
 

@@ -164,9 +164,7 @@ class TestMintTsigViaRegistration:
         full_hash16 = _hashlib.sha256(b"alice@ops.example").hexdigest()[:16]
         assert f"id-{full_hash16}.ops.example" not in minted.allowed_suffixes
 
-    def test_x25519_pub_extends_scope_to_mailbox(
-        self, keystore, config, challenges
-    ):
+    def test_x25519_pub_extends_scope_to_mailbox(self, keystore, config, challenges):
         """When the registration body includes ``x25519_pub`` the
         minted key gains ``mb-<hash12>.<zone>`` — the user's own
         mailbox alias. Works in default (tight) mode."""
@@ -296,9 +294,7 @@ class TestMintTsigViaRegistration:
                 body=body,
             )
 
-    def test_scope_anchors_to_served_zone_not_node_hostname(
-        self, keystore, challenges
-    ):
+    def test_scope_anchors_to_served_zone_not_node_hostname(self, keystore, challenges):
         """Codex P1 regression: when DMP_NODE_HOSTNAME is a host BENEATH
         the served zone (api.example.com under example.com), the minted
         TSIG scope must anchor to the served zone."""
@@ -333,9 +329,7 @@ class TestMintTsigViaRegistration:
             assert ".api.example.com" not in suffix
             assert "api.example.com" != suffix
 
-    def test_served_zone_falls_back_to_node_hostname(
-        self, keystore, challenges
-    ):
+    def test_served_zone_falls_back_to_node_hostname(self, keystore, challenges):
         """When served_zone isn't set explicitly we still want a
         usable scope — back-compat for single-host deployments where
         node_hostname IS the zone apex."""
@@ -583,9 +577,9 @@ class TestHttpEndpoint:
                 import hashlib as _hashlib
 
                 local_part = subject.split("@", 1)[0]
-                username_hash = _hashlib.sha256(
-                    local_part.encode("utf-8")
-                ).hexdigest()[:16]
+                username_hash = _hashlib.sha256(local_part.encode("utf-8")).hexdigest()[
+                    :16
+                ]
                 identity_owner = f"id-{username_hash}.ops.example."
                 upd = dns.update.UpdateMessage("ops.example")
                 upd.add(
@@ -598,13 +592,11 @@ class TestHttpEndpoint:
                     client_keyring,
                     keyname=dns.name.from_text(minted["tsig_key_name"]),
                 )
-                response = dns.query.udp(
-                    upd, "127.0.0.1", port=dns_port, timeout=2.0
-                )
+                response = dns.query.udp(upd, "127.0.0.1", port=dns_port, timeout=2.0)
             assert response.rcode() == dns.rcode.NOERROR
-            assert record_store.query_txt_record(
-                identity_owner.rstrip(".")
-            ) == ["v=dmp1;t=identity"]
+            assert record_store.query_txt_record(identity_owner.rstrip(".")) == [
+                "v=dmp1;t=identity"
+            ]
         finally:
             keystore.close()
 

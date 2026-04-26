@@ -322,9 +322,7 @@ class HeartbeatWorker:
         # under the same RRset are unaffected.
         if self._last_self_wire and self._last_self_wire != wire:
             try:
-                self._record_writer.delete_txt_record(
-                    name, value=self._last_self_wire
-                )
+                self._record_writer.delete_txt_record(name, value=self._last_self_wire)
             except Exception:
                 log.exception(
                     "heartbeat self-wire eviction raised for %s; continuing",
@@ -367,9 +365,7 @@ class HeartbeatWorker:
         except ValueError:
             return 0
         try:
-            rows = self._store.list_recent(
-                limit=self._cfg.max_seen_publish, now=now_i
-            )
+            rows = self._store.list_recent(limit=self._cfg.max_seen_publish, now=now_i)
         except Exception:
             log.exception("SeenStore.list_recent raised; skipping seen-graph publish")
             return 0
@@ -474,9 +470,7 @@ class HeartbeatWorker:
                     if self._store.accept(wire, remote_addr=zone, now=now_i):
                         accepted += 1
                 except Exception:
-                    log.exception(
-                        "SeenStore.accept raised for wire from %s", name
-                    )
+                    log.exception("SeenStore.accept raised for wire from %s", name)
         return accepted > 0
 
     # ------------------------------------------------------------------

@@ -126,9 +126,7 @@ class TestDMPDnsServer:
 
 def _keyring(name: str = "client.", secret: bytes = b"\x10" * 32):
     """Build a one-key TSIG keyring (HMAC-SHA256, 32-byte secret)."""
-    return dns.tsigkeyring.from_text(
-        {name: base64.b64encode(secret).decode("ascii")}
-    )
+    return dns.tsigkeyring.from_text({name: base64.b64encode(secret).decode("ascii")})
 
 
 def _send_update(update: dns.update.UpdateMessage, port: int):
@@ -202,9 +200,7 @@ class TestDnsUpdate:
         store = InMemoryDNSStore()
         server, port = self._server(store)
         upd = dns.update.UpdateMessage("example.com")
-        upd.add(
-            dns.name.from_text("foo.example.com."), 300, "TXT", '"intruder"'
-        )
+        upd.add(dns.name.from_text("foo.example.com."), 300, "TXT", '"intruder"')
         upd.use_tsig(
             _keyring(name="other.", secret=b"\xff" * 32),
             keyname=dns.name.from_text("other."),
@@ -234,9 +230,7 @@ class TestDnsUpdate:
         server, port = self._server(store)
         # Zone in UPDATE is example.com but the owner is in other.com.
         upd = dns.update.UpdateMessage("example.com")
-        upd.add(
-            dns.name.from_text("foo.other.com."), 300, "TXT", '"bad"'
-        )
+        upd.add(dns.name.from_text("foo.other.com."), 300, "TXT", '"bad"')
         upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
         with server:
             response = _send_update(upd, port)
@@ -269,12 +263,8 @@ class TestDnsUpdate:
 
         server, port = self._server(store, update_authorizer=authorizer)
         upd = dns.update.UpdateMessage("example.com")
-        upd.add(
-            dns.name.from_text("allowed.example.com."), 300, "TXT", '"ok"'
-        )
-        upd.add(
-            dns.name.from_text("denied.example.com."), 300, "TXT", '"no"'
-        )
+        upd.add(dns.name.from_text("allowed.example.com."), 300, "TXT", '"ok"')
+        upd.add(dns.name.from_text("denied.example.com."), 300, "TXT", '"no"')
         upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
         with server:
             response = _send_update(upd, port)
@@ -294,9 +284,7 @@ class TestDnsUpdate:
 
         server, port = self._server(store, update_authorizer=authorizer)
         with server:
-            response = _send_update(
-                self._build_add("ok.example.com", "v"), port
-            )
+            response = _send_update(self._build_add("ok.example.com", "v"), port)
         assert response.rcode() == dns.rcode.NOERROR
         assert store.query_txt_record("ok.example.com") == ["v"]
         # Authorizer received the verified TSIG key name.
@@ -457,9 +445,7 @@ class TestDnsUpdate:
         store = InMemoryDNSStore()
         server, port = self._server(store, update_max_value_bytes=256)
         # Three quoted 200-byte strings = 600 bytes when concatenated.
-        long_rdata = " ".join(
-            ['"' + ("a" * 200) + '"' for _ in range(3)]
-        )
+        long_rdata = " ".join(['"' + ("a" * 200) + '"' for _ in range(3)])
         with server:
             upd = dns.update.UpdateMessage("example.com")
             upd.add(
@@ -547,8 +533,6 @@ class TestDnsUpdate:
             allowed_zones=("example.com",),
         )
         with server:
-            response = _send_update(
-                self._build_add("foo.example.com", "v"), port
-            )
+            response = _send_update(self._build_add("foo.example.com", "v"), port)
         assert response.rcode() == dns.rcode.REFUSED
         assert store.query_txt_record("foo.example.com") is None

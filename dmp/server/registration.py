@@ -571,13 +571,19 @@ def _suffixes_for(
     #     escape hatch — single-user node where the operator wants
     #     no scope-checking at all.
     if os.environ.get("DMP_TSIG_LOOSE_SCOPE", "0").strip().lower() in (
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     ):
         return (z,)
 
-    tight_scope = os.environ.get(
-        "DMP_TSIG_TIGHT_SCOPE", "0"
-    ).strip().lower() in ("1", "true", "yes", "on")
+    tight_scope = os.environ.get("DMP_TSIG_TIGHT_SCOPE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     suffixes = []
     # Identity + prekey owner hashes are derived from
     # ``cfg.username`` (the LOCAL PART of subject), not the full

@@ -500,8 +500,11 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         # tsig-confirm. The HTTP landing page exists for human
         # operators / curious visitors, not as a protocol surface.
         served_zone = (
-            getattr(self.server, "claim_provider_zone", "") or ""
-        ).strip().lower().rstrip(".")
+            (getattr(self.server, "claim_provider_zone", "") or "")
+            .strip()
+            .lower()
+            .rstrip(".")
+        )
         zone_html = served_zone or "&lt;zone&gt;"
         dns_publishes_block = (
             "<h2>What this node publishes via DNS</h2>"
@@ -513,7 +516,9 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             "</pre>"
             "<p><small>Each TXT value is a signed "
             "<code>HeartbeatRecord</code> wire. Verify locally with "
-            "<code>dnsmesh peers " + _html.escape(served_zone or reg_host) + "</code>.</small></p>"
+            "<code>dnsmesh peers "
+            + _html.escape(served_zone or reg_host)
+            + "</code>.</small></p>"
         )
         dns_update_enabled = bool(getattr(self.server, "tsig_keystore", None))
         if reg_self_service and dns_update_enabled:

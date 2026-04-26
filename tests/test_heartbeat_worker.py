@@ -84,9 +84,7 @@ def _publish_peer_heartbeat(
 
 
 class TestPublishOwn:
-    def test_solo_node_publishes_into_zone(
-        self, store, transport, now
-    ) -> None:
+    def test_solo_node_publishes_into_zone(self, store, transport, now) -> None:
         """A node with a configured zone publishes its own heartbeat
         regardless of whether it has seeds — peers will discover it
         by querying the zone."""
@@ -103,18 +101,14 @@ class TestPublishOwn:
             dns_reader=transport,
         )
         worker.tick_once(now=now)
-        records = transport.query_txt_record(
-            heartbeat_rrset_name("self.example")
-        )
+        records = transport.query_txt_record(heartbeat_rrset_name("self.example"))
         assert records and len(records) == 1
         parsed = HeartbeatRecord.parse_and_verify(records[0], now=now)
         assert parsed is not None
         assert parsed.endpoint == "https://self.example.com"
         assert parsed.version == "0.1.0"
 
-    def test_shared_zone_does_not_clobber_peers(
-        self, store, transport, now
-    ) -> None:
+    def test_shared_zone_does_not_clobber_peers(self, store, transport, now) -> None:
         """Codex round-18 P1: when multiple nodes publish heartbeats
         under the SAME zone (cluster mode where all peers share
         ``DMP_CLUSTER_BASE_DOMAIN``), each node's tick must NOT wipe
@@ -146,21 +140,24 @@ class TestPublishOwn:
             dns_zone="shared.example",
         )
         worker = HeartbeatWorker(
-            cfg, _signer(), store,
-            record_writer=transport, dns_reader=transport,
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
         )
         worker.tick_once(now=now)
         # Tick once more to exercise the eviction path on the
         # second tick.
         worker.tick_once(now=now + 1)
 
-        records = transport.query_txt_record(
-            heartbeat_rrset_name("shared.example")
-        ) or []
-        # Peer's wire is still present (NOT clobbered by self-publish).
-        assert peer_wire in records, (
-            "self-publish wiped a peer's wire from the shared RRset"
+        records = (
+            transport.query_txt_record(heartbeat_rrset_name("shared.example")) or []
         )
+        # Peer's wire is still present (NOT clobbered by self-publish).
+        assert (
+            peer_wire in records
+        ), "self-publish wiped a peer's wire from the shared RRset"
         # And exactly ONE self-wire is present (latest tick), not two
         # leftover ones from each tick — the eviction path is working.
         own_spk = _signer().get_signing_public_key_bytes()
@@ -169,9 +166,9 @@ class TestPublishOwn:
             parsed = HeartbeatRecord.parse_and_verify(w, now=now + 1)
             if parsed and parsed.operator_spk == own_spk:
                 own_wires.append(w)
-        assert len(own_wires) == 1, (
-            f"expected 1 self-wire after eviction, got {len(own_wires)}"
-        )
+        assert (
+            len(own_wires) == 1
+        ), f"expected 1 self-wire after eviction, got {len(own_wires)}"
 
     def test_no_zone_no_publish(self, store, transport, now) -> None:
         """Without a configured zone the worker still ticks but
@@ -212,15 +209,16 @@ class TestPublishOwn:
 
 
 class TestHarvestPeers:
-    def test_seed_zone_heartbeat_ingested(
-        self, store, transport, now
-    ) -> None:
+    def test_seed_zone_heartbeat_ingested(self, store, transport, now) -> None:
         """A configured seed zone's heartbeat is queried, verified,
         and stored in the seen-store."""
         peer = _signer("peer-a", b"A" * 32)
         _publish_peer_heartbeat(
-            transport, peer, "peer.example",
-            endpoint="https://peer.example.com", ts=now,
+            transport,
+            peer,
+            "peer.example",
+            endpoint="https://peer.example.com",
+            ts=now,
         )
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
@@ -240,9 +238,7 @@ class TestHarvestPeers:
         endpoints = [r.endpoint for r in rows]
         assert endpoints == ["https://peer.example.com"]
 
-    def test_garbage_at_zone_silently_dropped(
-        self, store, transport, now
-    ) -> None:
+    def test_garbage_at_zone_silently_dropped(self, store, transport, now) -> None:
         """A zone serving a malformed record at the heartbeat name —
         SeenStore.accept verifies and rejects, store stays empty."""
         transport.publish_txt_record(
@@ -265,9 +261,7 @@ class TestHarvestPeers:
         worker.tick_once(now=now)
         assert store.count() == 0
 
-    def test_self_zone_filtered_from_harvest(
-        self, store, transport, now
-    ) -> None:
+    def test_self_zone_filtered_from_harvest(self, store, transport, now) -> None:
         """If the worker's own zone appears in the seed list, the
         worker doesn't query itself (would re-ingest its own
         heartbeat with the wrong remote-addr provenance)."""
@@ -279,8 +273,11 @@ class TestHarvestPeers:
         )
         peer = _signer("peer-b", b"B" * 32)
         _publish_peer_heartbeat(
-            transport, peer, "peer.example",
-            endpoint="https://peer.example.com", ts=now,
+            transport,
+            peer,
+            "peer.example",
+            endpoint="https://peer.example.com",
+            ts=now,
         )
         worker = HeartbeatWorker(
             cfg,
@@ -296,9 +293,7 @@ class TestHarvestPeers:
         rows = store.list_recent(now=now)
         assert [r.endpoint for r in rows] == ["https://peer.example.com"]
 
-    def test_oversized_gossip_truncated(
-        self, store, transport, now
-    ) -> None:
+    def test_oversized_gossip_truncated(self, store, transport, now) -> None:
         """A zone serving more heartbeats than max_gossip_per_response
         only contributes that many to the seen-store. Defends against
         a hostile zone forcing unbounded crypto work."""
@@ -312,9 +307,7 @@ class TestHarvestPeers:
                 ts=now,
                 exp=now + 86400,
             ).sign(s)
-            transport.publish_txt_record(
-                heartbeat_rrset_name("hostile.example"), wire
-            )
+            transport.publish_txt_record(heartbeat_rrset_name("hostile.example"), wire)
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
@@ -334,9 +327,7 @@ class TestHarvestPeers:
 
 
 class TestSeedZoneList:
-    def test_max_peers_caps_harvest_set(
-        self, store, transport, now
-    ) -> None:
+    def test_max_peers_caps_harvest_set(self, store, transport, now) -> None:
         """max_peers caps the per-tick harvest fan-out."""
         seeds = tuple(f"s{i}.example" for i in range(10))
         cfg = HeartbeatWorkerConfig(
@@ -364,22 +355,21 @@ class TestSeedZoneList:
         )
         worker.tick_once(now=now)
         # 3 seed zones queried for heartbeats (max_peers cap).
-        heartbeat_queries = [
-            q for q in queried if q.startswith("_dnsmesh-heartbeat.")
-        ]
+        heartbeat_queries = [q for q in queried if q.startswith("_dnsmesh-heartbeat.")]
         assert len(heartbeat_queries) == 3
 
-    def test_legacy_url_seed_normalized_to_zone(
-        self, store, transport, now
-    ) -> None:
+    def test_legacy_url_seed_normalized_to_zone(self, store, transport, now) -> None:
         """A 0.4.x operator's DMP_HEARTBEAT_SEEDS entry was a URL
         like `https://dnsmesh.io`. node.py's _zone_from_seed strips
         the scheme; verify the worker accepts a zone-formatted seed
         without further translation."""
         peer = _signer("peer-c", b"C" * 32)
         _publish_peer_heartbeat(
-            transport, peer, "dnsmesh.io",
-            endpoint="https://dnsmesh.io", ts=now,
+            transport,
+            peer,
+            "dnsmesh.io",
+            endpoint="https://dnsmesh.io",
+            ts=now,
         )
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
@@ -398,9 +388,7 @@ class TestSeedZoneList:
 
 
 class TestCooldown:
-    def test_failing_zone_cools_down(
-        self, store, transport, now
-    ) -> None:
+    def test_failing_zone_cools_down(self, store, transport, now) -> None:
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
@@ -438,9 +426,7 @@ class TestCooldown:
         worker.tick_once(now=now + 180)
         assert attempts["broken"] == 2
 
-    def test_recovering_zone_clears_cooldown(
-        self, store, transport, now
-    ) -> None:
+    def test_recovering_zone_clears_cooldown(self, store, transport, now) -> None:
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
             version="0.1.0",
@@ -462,8 +448,11 @@ class TestCooldown:
         # Now publish a real heartbeat at flaky.example.
         peer = _signer("flake", b"F" * 32)
         _publish_peer_heartbeat(
-            transport, peer, "flaky.example",
-            endpoint="https://flaky.example.com", ts=now + 119,
+            transport,
+            peer,
+            "flaky.example",
+            endpoint="https://flaky.example.com",
+            ts=now + 119,
         )
         # Tick 3: cooldown elapsed, retry, succeeds.
         result = worker.tick_once(now=now + 120)
@@ -474,9 +463,7 @@ class TestCooldown:
 
 
 class TestOwnHeartbeatShape:
-    def test_published_wire_round_trips(
-        self, store, transport, now
-    ) -> None:
+    def test_published_wire_round_trips(self, store, transport, now) -> None:
         """The wire we publish at _dnsmesh-heartbeat.<zone> is a
         verifiable HeartbeatRecord."""
         cfg = HeartbeatWorkerConfig(
@@ -495,9 +482,7 @@ class TestOwnHeartbeatShape:
             dns_reader=transport,
         )
         worker.tick_once(now=now)
-        records = transport.query_txt_record(
-            heartbeat_rrset_name("self.example")
-        )
+        records = transport.query_txt_record(heartbeat_rrset_name("self.example"))
         assert records
         parsed = HeartbeatRecord.parse_and_verify(records[0], now=now)
         assert parsed is not None
@@ -670,9 +655,7 @@ class TestSeenGraphPublish:
         worker2.tick_once(now=now)
         assert transport.list_names() == []  # still nothing published
 
-    def test_seen_graph_capped_at_max_seen_publish(
-        self, store, transport, now
-    ) -> None:
+    def test_seen_graph_capped_at_max_seen_publish(self, store, transport, now) -> None:
         """A flood of seen peers must not produce an unbounded RRset —
         the worker caps at max_seen_publish."""
         # Publish 5 peers; cap to 3.
@@ -706,9 +689,7 @@ class TestSeenGraphPublish:
         assert published is not None
         assert len(published) == 3
 
-    def test_seen_graph_replaces_rrset_each_tick(
-        self, store, transport, now
-    ) -> None:
+    def test_seen_graph_replaces_rrset_each_tick(self, store, transport, now) -> None:
         """Codex P1 regression: seen-graph publish must REPLACE the
         existing RRset, not APPEND to it. publish_txt_record's append
         semantics meant stale wires lingered for ttl_seconds and
@@ -787,9 +768,7 @@ class TestSeenGraphPublish:
             endpoint="https://peer-a.example.com",
             ts=now,
         )
-        transport.publish_txt_record(
-            seen_rrset_name("shared.example"), sibling_wire
-        )
+        transport.publish_txt_record(seen_rrset_name("shared.example"), sibling_wire)
         # Now run our own worker against the same shared zone with
         # its own different peer in its SeenStore.
         own_peer = _signer("peer-c", salt=b"C" * 32)
@@ -807,20 +786,21 @@ class TestSeenGraphPublish:
             seed_zones=("peer-c.example",),
         )
         worker = HeartbeatWorker(
-            cfg, _signer(), store,
-            record_writer=transport, dns_reader=transport,
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
         )
         worker.tick_once(now=now)
         worker.tick_once(now=now + 1)
 
-        records = transport.query_txt_record(
-            seen_rrset_name("shared.example")
-        ) or []
+        records = transport.query_txt_record(seen_rrset_name("shared.example")) or []
         # Sibling cluster node's wire is still present (NOT
         # clobbered by the seen-graph publish).
-        assert sibling_wire in records, (
-            "seen-graph publish wiped a sibling cluster node's wire"
-        )
+        assert (
+            sibling_wire in records
+        ), "seen-graph publish wiped a sibling cluster node's wire"
 
     def test_seen_graph_values_are_independently_verifiable(
         self, store, transport, now
@@ -828,9 +808,7 @@ class TestSeenGraphPublish:
         """A consumer querying _dnsmesh-seen.<zone> can re-verify
         every wire on its own — no trust in the publishing node
         beyond DNS chain integrity."""
-        signers = [
-            _signer(f"peer-{i}", salt=bytes([0x20 + i]) * 32) for i in range(2)
-        ]
+        signers = [_signer(f"peer-{i}", salt=bytes([0x20 + i]) * 32) for i in range(2)]
         for i, signer in enumerate(signers):
             _publish_peer_heartbeat(
                 transport,

@@ -42,6 +42,7 @@ def _zone_from_endpoint_host(endpoint: str) -> str:
         return ""
     return host
 
+
 # Default retention — how long past `exp` we keep a row before the
 # sweep evicts it. Tuned so a brief operator outage (a few hours)
 # doesn't immediately disappear the node from the directory.

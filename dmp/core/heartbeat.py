@@ -314,13 +314,8 @@ class HeartbeatRecord:
             try:
                 self.claim_provider_zone.encode("ascii")
             except UnicodeEncodeError as exc:
-                raise ValueError(
-                    "claim_provider_zone must be ASCII"
-                ) from exc
-            if any(
-                ord(c) < 0x21 or ord(c) == 0x7F
-                for c in self.claim_provider_zone
-            ):
+                raise ValueError("claim_provider_zone must be ASCII") from exc
+            if any(ord(c) < 0x21 or ord(c) == 0x7F for c in self.claim_provider_zone):
                 raise ValueError(
                     "claim_provider_zone contains whitespace or control characters"
                 )
@@ -407,17 +402,13 @@ class HeartbeatRecord:
             (zone_len,) = struct.unpack(">B", body[off : off + 1])
             off += 1
             if zone_len > MAX_CLAIM_PROVIDER_ZONE_LEN:
-                raise ValueError(
-                    f"claim_provider_zone_len out of range: {zone_len}"
-                )
+                raise ValueError(f"claim_provider_zone_len out of range: {zone_len}")
             if off + zone_len > len(body):
                 raise ValueError("body truncated in claim_provider_zone")
             try:
                 claim_provider_zone = body[off : off + zone_len].decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise ValueError(
-                    f"claim_provider_zone not valid utf-8: {exc}"
-                ) from exc
+                raise ValueError(f"claim_provider_zone not valid utf-8: {exc}") from exc
             off += zone_len
 
         if off + 16 > len(body):

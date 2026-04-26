@@ -68,6 +68,7 @@ class SubjectAlreadyOwnedError(Exception):
         super().__init__(f"subject already owned: {subject}")
         self.subject = subject
 
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tsig_keys (
     name             TEXT PRIMARY KEY,
@@ -153,7 +154,7 @@ def _glob_suffix_match(owner: str, pattern: str) -> bool:
     if len(owner_labels) < len(pattern_labels):
         return False
     # Right-align: compare last len(pattern_labels) owner labels.
-    aligned = owner_labels[-len(pattern_labels):]
+    aligned = owner_labels[-len(pattern_labels) :]
     for pl, ol in zip(pattern_labels, aligned):
         if not _label_glob(pl, ol):
             return False
@@ -283,9 +284,7 @@ class TSIGKeyStore:
         canonical = _normalize_name(name)
         if not isinstance(secret, (bytes, bytearray)) or not secret:
             raise ValueError("secret must be non-empty bytes")
-        suffixes = tuple(
-            sorted({_normalize_suffix(s) for s in allowed_suffixes if s})
-        )
+        suffixes = tuple(sorted({_normalize_suffix(s) for s in allowed_suffixes if s}))
         if not suffixes:
             raise ValueError("at least one non-empty allowed suffix is required")
         subject_norm = (subject or "").strip().lower()
@@ -388,9 +387,7 @@ class TSIGKeyStore:
         canonical = _normalize_name(name)
         if not isinstance(registered_spk, str) or not registered_spk:
             raise ValueError("registered_spk must be a non-empty hex string")
-        suffixes = tuple(
-            sorted({_normalize_suffix(s) for s in allowed_suffixes if s})
-        )
+        suffixes = tuple(sorted({_normalize_suffix(s) for s in allowed_suffixes if s}))
         if not suffixes:
             raise ValueError("at least one non-empty allowed suffix is required")
         subject_norm = (subject or "").strip().lower()
@@ -572,7 +569,9 @@ class TSIGKeyStore:
             except Exception:
                 continue
             try:
-                key = dns.tsig.Key(name=kname, secret=row.secret, algorithm=row.algorithm)
+                key = dns.tsig.Key(
+                    name=kname, secret=row.secret, algorithm=row.algorithm
+                )
             except Exception:
                 # Unsupported algorithm — skip rather than fail the
                 # whole keyring build.

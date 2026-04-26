@@ -119,9 +119,7 @@ class _DnsUpdateWriter(DNSRecordWriter):
 
         algo_norm = (tsig_algorithm or "").strip().lower()
         if algo_norm not in SUPPORTED_TSIG_ALGORITHMS:
-            raise ValueError(
-                f"unsupported TSIG algorithm: {tsig_algorithm!r}"
-            )
+            raise ValueError(f"unsupported TSIG algorithm: {tsig_algorithm!r}")
         # dnspython's keyring API takes either a dict[Name, bytes] or
         # dict[Name, dns.tsig.Key]. We use ``dns.tsig.Key`` to pin the
         # algorithm explicitly (the bytes-only form defaults to
@@ -180,9 +178,7 @@ class _DnsUpdateWriter(DNSRecordWriter):
     # transport
     # ------------------------------------------------------------------
 
-    def _send(
-        self, upd: dns.update.UpdateMessage, *, op: str, name: str
-    ) -> bool:
+    def _send(self, upd: dns.update.UpdateMessage, *, op: str, name: str) -> bool:
         try:
             upd.use_tsig(
                 self._keyring,
@@ -234,9 +230,7 @@ class _DnsUpdateWriter(DNSRecordWriter):
                         timeout=self._timeout,
                     )
                 except (dns.exception.DNSException, OSError):
-                    log.exception(
-                        "DNS UPDATE TCP retry failed for %s/%s", op, name
-                    )
+                    log.exception("DNS UPDATE TCP retry failed for %s/%s", op, name)
                     return False
 
         rcode = response.rcode()
