@@ -296,32 +296,72 @@ sequenceDiagram
   </p>
 </section>
 
-<!-- 4c. Cross-zone delivery (M8.1 — what the protocol does today) -->
+<!-- 4c. Cross-zone delivery — different operators, different domains -->
 <section>
-  <h2>Cross-zone delivery just works</h2>
+  <h2>Cross-domain delivery: two operators, two zones, one message</h2>
   <p style="text-align: left;">
-    Alice and Bob can be on completely different home nodes (and
-    different DNS zones) and still exchange messages. Bob's
-    <code>dnsmesh recv</code> polls each of his pinned contacts'
-    zones through the recursive DNS chain.
+    Alice's node and Bob's node are run by <em>different people</em>.
+    Different domains, different operators, no shared infrastructure
+    between them. They never coordinate. The message still gets
+    through — because the protocol speaks DNS, and DNS is
+    federated by design.
   </p>
+  <pre class="mermaid">
+sequenceDiagram
+    participant A as Alice's CLI
+    participant ANode as Alice's node\n(dmp.dnsmesh.io)
+    participant DNS as public DNS\n(any recursor)
+    participant B as Bob's CLI
+
+    rect rgba(80,180,80,0.10)
+      Note right of A: alice@dmp.dnsmesh.io
+      A->>ANode: DNS UPDATE + TSIG\n(write encrypted message\nfor bob@dmp.dnsmesh.pro)
+      Note over ANode: stored as TXT records\nunder dmp.dnsmesh.io
+    end
+
+    rect rgba(80,140,200,0.10)
+      Note left of B: bob@dmp.dnsmesh.pro
+      B->>DNS: TXT? slot-N.mb-{hash(bob)}.dmp.dnsmesh.io
+      Note right of DNS: walks the recursive chain\nto whichever node is\nauthoritative for dmp.dnsmesh.io
+      DNS->>ANode: forwards query
+      ANode-->>DNS: ciphertext + Alice's signature
+      DNS-->>B: ciphertext + Alice's signature
+      B->>B: verify Alice's signature\ndecrypt with Bob's prekey
+    end
+  </pre>
+  <p class="small" style="text-align: left;">
+    The records live on <strong>Alice's</strong> node, addressed to
+    Bob's recipient hash. Bob's node never sees them — Bob's CLI
+    pulls them directly through the public recursive chain that
+    every internet device already uses for every other DNS lookup.
+    The two operators don't peer, don't gossip, don't even know
+    about each other. They just both serve their own zones. This
+    is the live demo from <code>dmp.dnsmesh.io</code> ↔
+    <code>dmp.dnsmesh.pro</code>: two real public nodes,
+    independent operators, full round-trip messaging end-to-end
+    encrypted.
+  </p>
+</section>
+
+<!-- 4c-bonus. Setup matrix -->
+<section>
+  <h2>What works today</h2>
   <table>
-    <thead><tr><th>Setup</th><th>Works today?</th></tr></thead>
+    <thead><tr><th>Setup</th><th>Works?</th></tr></thead>
     <tbody>
-      <tr><td>Both users registered at the same node, same zone</td><td class="ok">✓</td></tr>
-      <tr><td>Both users in a federated 3-node cluster (anti-entropy sync)</td><td class="ok">✓</td></tr>
-      <tr><td>Different nodes, different zones, no cluster — pinned contacts on each side</td><td class="ok">✓</td></tr>
-      <tr><td>Different nodes, different zones, an unpinned stranger reaches you for the first time</td><td class="warn">✓ via M8 claim layer<br><small>(requires a reachable claim provider that both sides discover)</small></td></tr>
+      <tr><td>Both users on the same node + same zone</td><td class="ok">✓</td></tr>
+      <tr><td>Both users in a 3-node federated cluster (anti-entropy sync between cluster members)</td><td class="ok">✓</td></tr>
+      <tr><td>Different operators, different domains, <strong>both sides have pinned the other as a contact</strong></td><td class="ok">✓</td></tr>
+      <tr><td>Different operators, different domains, <strong>unpinned stranger</strong> reaches you for the first time</td><td class="warn">✓ via the claim layer<br><small>(requires a claim provider both sides discover)</small></td></tr>
     </tbody>
   </table>
   <p class="small">
-    Cross-zone delivery between independent nodes works because the
-    receive path walks each pinned contact's zone — so it doesn't
-    matter where the sender lives, only that the receiver has them
-    pinned. First-contact reach (the last row, when neither side has
-    pinned the other yet) routes through a tiny signed pointer at a
-    claim-provider node — see the
-    <a href="/DNSMeshProtocol/protocol/">protocol overview</a>.
+    Cross-domain delivery works because <code>dnsmesh recv</code>
+    walks each pinned contact's zone, so where the sender lives
+    doesn't matter — only that the receiver has them pinned.
+    First-contact reach for unpinned strangers (the last row)
+    routes through a tiny signed pointer at a claim-provider node —
+    see the <a href="/DNSMeshProtocol/protocol/">protocol overview</a>.
   </p>
 </section>
 
