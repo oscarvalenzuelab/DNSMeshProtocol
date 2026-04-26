@@ -604,6 +604,13 @@ def _suffixes_for(
         suffixes.append(f"_dnsmesh-claim-*.{z}")
         suffixes.append(f"slot-*.mb-*.{z}")
         suffixes.append(f"chunk-*-*.{z}")
+        # M9.2.6 same-zone claim path: when the user IS their own
+        # provider (single-node deployment), publish_claim writes
+        # ``claim-N.mb-<hash12>.<zone>`` through ``self.writer``,
+        # which after ``dnsmesh tsig register`` is the DNS UPDATE
+        # writer. Without this suffix that publish would be
+        # REFUSED. Codex round-20 P2.
+        suffixes.append(f"claim-*.mb-*.{z}")
     x_norm = (x25519_pub_hex or "").strip().lower()
     if x_norm:
         try:

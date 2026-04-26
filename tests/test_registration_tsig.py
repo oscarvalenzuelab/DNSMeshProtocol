@@ -99,6 +99,7 @@ class TestMintTsigViaRegistration:
         assert "slot-*.mb-*.ops.example" in suffixes
         assert "chunk-*-*.ops.example" in suffixes
         assert "_dnsmesh-claim-*.ops.example" in suffixes
+        assert "claim-*.mb-*.ops.example" in suffixes
         assert "ops.example" not in suffixes  # NOT full-zone
         # Secret is fresh random bytes (32) and survives a re-read.
         assert len(bytes.fromhex(minted.secret_hex)) == 32
