@@ -208,6 +208,166 @@ class TestPublishOwn:
         assert transport.list_names() == []
 
 
+class TestOrphanSweep:
+    """Codex round-22 P1 — restart leaves orphan self-wires at
+    ``_dnsmesh-heartbeat.<own-zone>`` because ``_last_self_wire``
+    lives in process memory only. The worker MUST evict them on
+    first tick of each lifetime, otherwise the RRset grows
+    unbounded across restarts and inflates UDP responses past the
+    512-byte cap."""
+
+    def test_first_tick_sweeps_prior_process_self_wires(
+        self, store, transport, now
+    ) -> None:
+        """Pre-seed the RRset with three self-wires from earlier
+        process lifetimes (same operator key, different ts). The
+        first tick should leave exactly ONE wire — the freshly-
+        published current one."""
+        signer = _signer("operator-A", salt=b"A" * 32)
+        zone = "self.example"
+        # Simulate prior-lifetime publishes: 3 wires at the RRset,
+        # all signed by the same operator, all at older timestamps.
+        for offset in (-300, -120, -30):
+            old = HeartbeatRecord(
+                endpoint="https://self.example.com",
+                operator_spk=signer.get_signing_public_key_bytes(),
+                version="0.4.9",
+                ts=now + offset,
+                exp=now + offset + 86400,
+            )
+            transport.publish_txt_record(heartbeat_rrset_name(zone), old.sign(signer))
+        assert (
+            len(transport.query_txt_record(heartbeat_rrset_name(zone))) == 3
+        ), "fixture sanity"
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.2",
+            dns_zone=zone,
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            signer,
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+
+        records = transport.query_txt_record(heartbeat_rrset_name(zone))
+        assert (
+            len(records) == 1
+        ), f"expected exactly 1 self-wire after sweep, got {len(records)}"
+        # And the surviving one is the FRESH publish, not a stale
+        # carry-over: it MUST verify under `now` with the strict
+        # ±300s freshness gate.
+        rec = HeartbeatRecord.parse_and_verify(records[0], now=now)
+        assert rec is not None
+        assert rec.version == "0.5.2"
+        assert rec.ts == now
+
+    def test_sweep_does_not_touch_other_operators(self, store, transport, now) -> None:
+        """A shared zone (cluster-mode siblings) carries multiple
+        operators' self-wires at the same RRset. The sweep MUST
+        only delete wires signed by THIS operator's key."""
+        zone = "shared.example"
+        peer_signer = _signer("peer-B", salt=b"B" * 32)
+        peer_wire = _publish_peer_heartbeat(
+            transport,
+            peer_signer,
+            zone,
+            endpoint="https://peer-b.example.com",
+            ts=now - 60,
+        )
+        # Plant an orphan self-wire as if from a previous lifetime.
+        own_signer = _signer("operator-A", salt=b"A" * 32)
+        old = HeartbeatRecord(
+            endpoint="https://self.example.com",
+            operator_spk=own_signer.get_signing_public_key_bytes(),
+            version="0.4.9",
+            ts=now - 200,
+            exp=now - 200 + 86400,
+        )
+        transport.publish_txt_record(heartbeat_rrset_name(zone), old.sign(own_signer))
+        assert len(transport.query_txt_record(heartbeat_rrset_name(zone))) == 2
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.2",
+            dns_zone=zone,
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            own_signer,
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+
+        records = transport.query_txt_record(heartbeat_rrset_name(zone))
+        # Peer's wire still there + exactly one fresh self-wire.
+        assert peer_wire in records, "peer's wire must survive the sweep"
+        assert len(records) == 2
+
+    def test_sweep_only_runs_once(self, store, transport, now) -> None:
+        """Subsequent ticks shouldn't re-sweep — the in-process
+        ``_last_self_wire`` tracking handles eviction from then on,
+        and re-querying the RRset every tick is wasted I/O."""
+        signer = _signer("operator-A", salt=b"A" * 32)
+        zone = "self.example"
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.2",
+            dns_zone=zone,
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            signer,
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+        )
+        # Tick 1 — sweep flag flips.
+        worker.tick_once(now=now)
+        assert worker._orphan_sweep_done is True
+        # Plant a fake orphan AFTER tick 1. Tick 2 must NOT delete
+        # it (sweep already done; this proves the flag gates the
+        # one-time behavior).
+        rogue = HeartbeatRecord(
+            endpoint="https://self.example.com",
+            operator_spk=signer.get_signing_public_key_bytes(),
+            version="0.4.9",
+            ts=now - 60,
+            exp=now - 60 + 86400,
+        )
+        rogue_wire = rogue.sign(signer)
+        transport.publish_txt_record(heartbeat_rrset_name(zone), rogue_wire)
+
+        worker.tick_once(now=now + 60)
+        records = transport.query_txt_record(heartbeat_rrset_name(zone))
+        assert rogue_wire in records, "post-sweep planted wire must NOT be cleaned"
+
+    def test_no_record_writer_skips_sweep_silently(self, store, transport, now) -> None:
+        """A worker constructed without a record_writer can't read
+        OR write — sweep should no-op cleanly, not crash."""
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.2",
+            dns_zone="self.example",
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=None,
+            dns_reader=transport,
+        )
+        # No exception — _publish_own returns False and sweep is
+        # never reached because record_writer is None.
+        worker.tick_once(now=now)
+
+
 class TestHarvestPeers:
     def test_seed_zone_heartbeat_ingested(self, store, transport, now) -> None:
         """A configured seed zone's heartbeat is queried, verified,
@@ -354,9 +514,17 @@ class TestSeedZoneList:
             dns_reader=transport,
         )
         worker.tick_once(now=now)
-        # 3 seed zones queried for heartbeats (max_peers cap).
-        heartbeat_queries = [q for q in queried if q.startswith("_dnsmesh-heartbeat.")]
-        assert len(heartbeat_queries) == 3
+        # 3 seed zones queried for heartbeats (max_peers cap). The
+        # own-zone read from the codex round-22 orphan-sweep is on
+        # the local store and isn't a peer harvest, so exclude it
+        # from the count.
+        peer_heartbeat_queries = [
+            q
+            for q in queried
+            if q.startswith("_dnsmesh-heartbeat.")
+            and q != "_dnsmesh-heartbeat.self.example"
+        ]
+        assert len(peer_heartbeat_queries) == 3
 
     def test_legacy_url_seed_normalized_to_zone(self, store, transport, now) -> None:
         """A 0.4.x operator's DMP_HEARTBEAT_SEEDS entry was a URL

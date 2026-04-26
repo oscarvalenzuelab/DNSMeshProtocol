@@ -345,36 +345,48 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         if self_endpoint and self_spk_hex:
             key = (self_spk_hex, self_endpoint)
             now = int(__import__("time").time())
-            # If a peer already gossiped self back, keep that row's ts;
-            # otherwise synthesize one with ts=now ("self-attested
-            # liveness") so a fresh solo node still has a row.
-            if key not in merged:
-                import os as _os
+            # Codex round-22 P2 — synthesize self ALWAYS, overwriting
+            # any peer-gossipped self entry. The running process is
+            # authoritative for its own version + liveness; a peer's
+            # gossipped-back wire is at best a stale snapshot from
+            # before the last restart. Without this overwrite, a
+            # fresh upgrade (0.5.x → 0.5.y) showed the OLD version on
+            # the operator's own /nodes page until peer harvest
+            # cycles caught up — surfacing what looked like a failed
+            # upgrade even when the local process WAS the new
+            # version.
+            import os as _os
 
-                # Fall back to the installed package version when
-                # DMP_HEARTBEAT_VERSION isn't set in the env. Without
-                # this, the synthesized self-row in the directory UI
-                # (and the JSON feed at /v1/nodes/seen) hard-codes
-                # "dev" as the version, which is what dnsmesh.io
-                # surfaced on its own /nodes page until 0.4.1 — even
-                # though the node was running a real release. Operator
-                # override via DMP_HEARTBEAT_VERSION still wins for
-                # ops who want a build-number / git-sha.
-                version = _os.environ.get("DMP_HEARTBEAT_VERSION", "").strip()
-                if not version:
-                    try:
-                        from dmp import __version__ as _pkg_version
+            # Fall back to the installed package version when
+            # DMP_HEARTBEAT_VERSION isn't set in the env. Without
+            # this, the synthesized self-row in the directory UI
+            # hard-codes "dev" as the version, which is what
+            # dnsmesh.io surfaced on its own /nodes page until 0.4.1
+            # — even though the node was running a real release.
+            # Operator override via DMP_HEARTBEAT_VERSION still wins
+            # for ops who want a build-number / git-sha.
+            version = _os.environ.get("DMP_HEARTBEAT_VERSION", "").strip()
+            if not version:
+                try:
+                    from dmp import __version__ as _pkg_version
 
-                        version = _pkg_version or "dev"
-                    except Exception:
-                        version = "dev"
-                merged[key] = DirectoryRow(
-                    endpoint=self_endpoint,
-                    operator_spk_hex=self_spk_hex,
-                    version=version,
-                    ts=now,
-                    sources=1,
-                )
+                    version = _pkg_version or "dev"
+                except Exception:
+                    version = "dev"
+            # Preserve ``sources`` count from any existing peer-
+            # gossipped row so an operator can still see "1 peer is
+            # gossiping me back" — useful as an out-of-band signal
+            # that federation is bidirectional. Default to 1 (self-
+            # attested liveness) when no peer has gossipped self yet.
+            existing = merged.get(key)
+            sources = existing.sources if existing else 1
+            merged[key] = DirectoryRow(
+                endpoint=self_endpoint,
+                operator_spk_hex=self_spk_hex,
+                version=version,
+                ts=now,
+                sources=sources,
+            )
 
         # Newest first. Self typically wins this sort on solo nodes.
         return sorted(merged.values(), key=lambda r: r.ts, reverse=True)

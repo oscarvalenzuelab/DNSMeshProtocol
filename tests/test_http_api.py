@@ -1,11 +1,16 @@
 """Tests for the HTTP API exposing DMP records."""
 
 import socket
+import time
+from pathlib import Path
 
 import pytest
 import requests
 
+from dmp.core.crypto import DMPCrypto
+from dmp.core.heartbeat import HeartbeatRecord
 from dmp.network.memory import InMemoryDNSStore
+from dmp.server.heartbeat_store import SeenStore
 from dmp.server.http_api import DMPHttpApi
 
 
@@ -208,3 +213,92 @@ class TestAuth:
         api, _ = auth_api_store
         r = requests.get(f"{_base(api)}/health", timeout=2)
         assert r.status_code == 200
+
+
+class TestSelfRowSynthesisOverridesGossipped:
+    """Codex round-22 P2 — the synthesized self-row at /  must
+    overwrite any peer-gossipped self entry. Pre-fix: a peer's
+    stale self-wire (e.g. version 0.5.0 from before an upgrade)
+    was kept in ``merged`` and the synthesized row was skipped,
+    so the operator's own /nodes page lied about the running
+    version after every upgrade until peer harvest cycles caught
+    up. Post-fix: synthesized self always wins; peer-gossipped
+    self is only consulted for the ``sources`` count."""
+
+    def test_self_row_uses_running_version_not_gossipped(self, tmp_path: Path):
+        # Boot a SeenStore + ingest a peer-gossipped self-wire
+        # at an old version. (Same operator key as self, since
+        # peers gossip what they harvested from us.)
+        seen_store = SeenStore(str(tmp_path / "seen.db"))
+        try:
+            crypto = DMPCrypto.from_passphrase("operator-A", salt=b"A" * 32)
+            spk_hex = crypto.get_signing_public_key_bytes().hex()
+            now = int(time.time())
+            stale = HeartbeatRecord(
+                endpoint="https://self.example.com",
+                operator_spk=crypto.get_signing_public_key_bytes(),
+                version="0.4.9",  # pre-upgrade — what a peer would still gossip
+                ts=now - 90,  # within the freshness gate
+                exp=now - 90 + 86400,
+            )
+            wire = stale.sign(crypto)
+            seen_store.accept(wire, now=now)
+
+            api = DMPHttpApi(
+                InMemoryDNSStore(),
+                host="127.0.0.1",
+                port=_free_port(),
+                heartbeat_store=seen_store,
+                heartbeat_self_endpoint="https://self.example.com",
+                heartbeat_self_spk_hex=spk_hex,
+            )
+            api.start()
+            try:
+                r = requests.get(f"{_base(api)}/", timeout=3)
+                assert r.status_code == 200
+                # Pull the running package version — that's what
+                # synthesis MUST report on the self row.
+                from dmp import __version__ as pkg_version
+
+                # The HTML table has one row keyed by (spk, endpoint).
+                # The stale 0.4.9 wire MUST NOT appear; the running
+                # version MUST.
+                assert (
+                    "0.4.9" not in r.text
+                ), "stale peer-gossipped self version leaked into render"
+                assert pkg_version in r.text, (
+                    f"synthesized self-row should report running "
+                    f"version {pkg_version}"
+                )
+            finally:
+                api.stop()
+        finally:
+            seen_store.close()
+
+    def test_self_row_present_when_no_peer_gossip(self, tmp_path: Path):
+        """A solo node with no peer harvest still gets a self-row
+        — the synthesized one ensures the page never looks empty."""
+        seen_store = SeenStore(str(tmp_path / "seen.db"))
+        try:
+            crypto = DMPCrypto.from_passphrase("solo-op", salt=b"S" * 32)
+            spk_hex = crypto.get_signing_public_key_bytes().hex()
+            api = DMPHttpApi(
+                InMemoryDNSStore(),
+                host="127.0.0.1",
+                port=_free_port(),
+                heartbeat_store=seen_store,
+                heartbeat_self_endpoint="https://solo.example.com",
+                heartbeat_self_spk_hex=spk_hex,
+            )
+            api.start()
+            try:
+                r = requests.get(f"{_base(api)}/", timeout=3)
+                assert r.status_code == 200
+                assert "https://solo.example.com" in r.text
+                from dmp import __version__ as pkg_version
+
+                assert pkg_version in r.text
+            finally:
+                api.stop()
+        finally:
+            seen_store.close()

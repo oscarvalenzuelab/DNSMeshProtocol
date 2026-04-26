@@ -7,6 +7,60 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.5.2] — Post-M9 patch: heartbeat RRset orphan sweep + self-row preference
+
+Surfaced during the 0.5.1 deployment validation: the operator's own
+"Recent peers" page on dnsmesh.io showed "(1)" with the stale
+pre-upgrade version, even though messaging end-to-end was working
+fine. Two related bugs, both fixed.
+
+### Fixed
+
+- **Heartbeat RRset accumulates orphan self-wires across restarts**
+  (codex round-22 P1). ``HeartbeatWorker._publish_own`` tracks
+  ``self._last_self_wire`` in process memory and uses it for
+  delete-then-add cleanup — but every restart loses that tracking,
+  and the prior process's wire stays at
+  ``_dnsmesh-heartbeat.<own-zone>`` until its ``exp`` fires (24h
+  default). Across multiple restarts (e.g. an upgrade cycle), the
+  RRset grew to 10+ wires (each ~250 bytes), inflating the UDP DNS
+  response past 512 bytes. Public recursors that don't gracefully
+  retry over TCP (or whose negative-cache held the truncated state)
+  returned empty for the heartbeat query, breaking the federation's
+  discovery story even while messaging worked. Fix: a one-time
+  startup sweep on first publish reads the current RRset, identifies
+  every TXT value signed by the running process's operator key, and
+  deletes them before the fresh publish. Other operators' wires on
+  shared zones (cluster-mode siblings) are matched on operator_spk
+  and left untouched. Four new tests:
+  ``test_first_tick_sweeps_prior_process_self_wires``,
+  ``test_sweep_does_not_touch_other_operators``,
+  ``test_sweep_only_runs_once``,
+  ``test_no_record_writer_skips_sweep_silently``.
+- **Synthesized self-row was masked by stale peer-gossipped self**
+  (codex round-22 P2). ``_directory_rows`` in ``http_api.py`` only
+  synthesized the self-row when ``key not in merged`` — so a peer
+  that gossipped back the operator's pre-upgrade heartbeat wire
+  blocked the synthesis, and the operator's own ``/`` page reported
+  the OLD version after every upgrade until peer harvest cycles
+  caught up. Fix: synthesize self UNCONDITIONALLY using the running
+  package version — the running process is authoritative for its
+  own version + liveness, peer gossip is at most a stale snapshot.
+  ``sources`` count is preserved from any peer-gossipped row so the
+  out-of-band signal "N peers gossiping me back" stays visible.
+  Two new tests in ``test_http_api.py``:
+  ``test_self_row_uses_running_version_not_gossipped``,
+  ``test_self_row_present_when_no_peer_gossip``.
+
+### Operational note
+
+Running 0.5.2 ``upgrade.sh`` on each existing 0.5.0 / 0.5.1 node
+clears the orphan-wire backlog on the next ``systemctl restart``.
+The first heartbeat tick after restart sweeps every prior-process
+self-wire and publishes a single fresh one. Within one harvest
+cycle (≤5 min), peers re-harvest the cleaned RRset and the public
+DNS chain returns a sane response again.
+
 ## [0.5.1] — Post-M9 patch: hostname-aware DNS UPDATE + zone migration
 
 Follow-up to 0.5.0. Two CLI bugs surfaced during the live cross-zone

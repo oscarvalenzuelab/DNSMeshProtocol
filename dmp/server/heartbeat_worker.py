@@ -204,6 +204,19 @@ class HeartbeatWorker:
         # sibling cluster nodes; we only delete the wires we last
         # published, never the whole RRset.
         self._last_seen_wires: Set[str] = set()
+        # Codex round-22 P1 — restart leaves orphan self-wires at
+        # ``_dnsmesh-heartbeat.<own-zone>``. ``_last_self_wire`` lives
+        # in process memory only, so each restart loses the eviction
+        # tracking and the next publish appends without cleanup. Over
+        # multiple restarts (e.g. an upgrade cycle) the RRset grows
+        # unbounded until each wire's ``exp`` fires (24h default),
+        # which inflates UDP responses past 512 bytes and makes
+        # public recursors return empty for the heartbeat query.
+        # First call to ``_publish_own`` does a one-time sweep of
+        # any existing self-wires (matched by operator_spk on parse-
+        # and-verify) and deletes them before publishing the fresh
+        # one. Flips after the first successful sweep.
+        self._orphan_sweep_done: bool = False
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -317,6 +330,15 @@ class HeartbeatWorker:
             name = heartbeat_rrset_name(self._cfg.dns_zone)
         except ValueError:
             return False
+        # Codex round-22 P1 — first-tick orphan sweep. ``_last_self_wire``
+        # only tracks wires this process published; on a restart it's
+        # ``None`` and the previous lifetime's wires are orphaned at
+        # the RRset until ``exp`` (24h default) lapses. Sweep them
+        # explicitly so each restart leaves exactly one self-wire,
+        # not N+1.
+        if not self._orphan_sweep_done:
+            self._sweep_orphan_self_wires(name, current_wire=wire, now=now_i)
+            self._orphan_sweep_done = True
         # Evict our previous self-wire if any. ``delete_txt_record(value=…)``
         # only matches that one TXT value; other publishers' wires
         # under the same RRset are unaffected.
@@ -342,6 +364,82 @@ class HeartbeatWorker:
         else:
             log.info("heartbeat self-publish to %s returned False", name)
         return ok
+
+    def _sweep_orphan_self_wires(
+        self, name: str, *, current_wire: str, now: int
+    ) -> int:
+        """Delete prior-process self-wires at ``name``.
+
+        Called once per worker lifetime, before the first publish.
+        Reads the current RRset from the local store, parses each
+        TXT value, identifies entries signed by THIS operator's
+        signing key, and deletes them. The fresh wire about to be
+        published replaces them all with a single entry.
+
+        Other publishers' wires under the same RRset are untouched —
+        the match key is the operator's Ed25519 spk, not the owner
+        name. Cluster siblings sharing a zone keep their wires.
+
+        ``current_wire`` is excluded from the sweep so we don't
+        delete the wire we're about to publish (rare, but possible
+        if an earlier process happened to publish the byte-identical
+        wire — same ts, same sig — within this second).
+
+        ``now`` is the tick's reference time. We pass it explicitly
+        through to ``parse_and_verify`` so a wire whose ``exp`` has
+        already lapsed in wall-clock terms but remains "current" in
+        the worker's logical time still matches. The test harness
+        also relies on this — fixture clocks aren't real time.
+        Wide skew (``10**9``) lets us match wires from arbitrarily
+        long ago without rejecting them on freshness alone; only
+        the signature + spk identity gates whether we delete.
+
+        Returns the number of orphan wires deleted, for tests and
+        operator visibility. Zero on first install, on a healthy
+        long-running process, or when the writer doesn't expose a
+        read API.
+        """
+        reader = self._record_writer
+        if not hasattr(reader, "query_txt_record"):
+            return 0
+        try:
+            existing = reader.query_txt_record(name)
+        except Exception:
+            log.exception("orphan self-wire sweep: query raised for %s", name)
+            return 0
+        if not existing:
+            return 0
+
+        own_spk = self._crypto.get_signing_public_key_bytes()
+        deleted = 0
+        for value in existing:
+            if value == current_wire:
+                continue
+            rec = HeartbeatRecord.parse_and_verify(
+                value, now=now, ts_skew_seconds=10**9
+            )
+            if rec is None:
+                # Bad sig / shape / expired — safe to ignore. We don't
+                # delete other operators' garbage; the DNS server's own
+                # ingest path is what cleans those.
+                continue
+            if bytes(rec.operator_spk) != own_spk:
+                continue
+            try:
+                if self._record_writer.delete_txt_record(name, value=value):
+                    deleted += 1
+            except Exception:
+                log.exception(
+                    "orphan self-wire delete raised for %s; continuing",
+                    name,
+                )
+        if deleted:
+            log.info(
+                "swept %d orphan self-wire(s) at %s on worker startup",
+                deleted,
+                name,
+            )
+        return deleted
 
     def _publish_seen_graph(self, now_i: int) -> int:
         """Republish recently-seen peer wires under
