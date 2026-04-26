@@ -473,6 +473,19 @@ def _load_heartbeat_from_env(
         dns_zone=publish_zone,
         seed_zones=seed_zones,
     )
+    # Cluster peer harvest: when ``DMP_SYNC_PEERS`` is set the
+    # operator already lists co-cluster peers as comma-separated
+    # endpoints. Forwarding those to the heartbeat worker means a
+    # fresh node bootstrapped via cluster anchors immediately
+    # harvests sibling nodes' heartbeats without needing a
+    # duplicated ``DMP_HEARTBEAT_SEEDS``. Codex round-19 P2.
+    sync_peers_raw = os.environ.get("DMP_SYNC_PEERS", "").strip()
+
+    def _cluster_peers_from_env():
+        if not sync_peers_raw:
+            return ()
+        return tuple(p.strip() for p in sync_peers_raw.split(",") if p.strip())
+
     # The worker shares DMPNode's record store for publishes and
     # uses the caller-provided DNS reader for peer queries. The
     # caller wires both in — this loader doesn't open new resources.
@@ -482,6 +495,7 @@ def _load_heartbeat_from_env(
         store,
         record_writer=record_writer,
         dns_reader=dns_reader,
+        cluster_peers_provider=_cluster_peers_from_env if sync_peers_raw else None,
     )
 
     # Rate limits on the HTTP endpoints — independent submit / seen

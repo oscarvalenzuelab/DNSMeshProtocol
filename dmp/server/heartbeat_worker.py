@@ -199,6 +199,11 @@ class HeartbeatWorker:
         # publishing under DMP_CLUSTER_BASE_DOMAIN clobbered the
         # others' wires every tick.
         self._last_self_wire: Optional[str] = None
+        # Same per-wire eviction story for the seen-graph. Codex
+        # round-19 P1: ``_dnsmesh-seen.<shared-zone>`` is shared with
+        # sibling cluster nodes; we only delete the wires we last
+        # published, never the whole RRset.
+        self._last_seen_wires: Set[str] = set()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -369,24 +374,38 @@ class HeartbeatWorker:
             log.exception("SeenStore.list_recent raised; skipping seen-graph publish")
             return 0
 
-        # Replace-the-RRset semantic: clear the existing TXT values at
-        # this name before publishing the current snapshot. The
-        # ``DNSRecordWriter.publish_txt_record`` contract is APPEND, so
-        # without an explicit delete the old wires linger until TTL
-        # expiry and consumers see stale + fresh peers mixed (codex P1
-        # — discovery convergence stalls after a few ticks). The
-        # snapshot we just pulled from SeenStore already reflects the
-        # current top-N by recency.
-        try:
-            self._record_writer.delete_txt_record(name, value=None)
-        except Exception:
-            log.exception("seen-graph wipe raised for %s; continuing", name)
-
-        published = 0
+        # Replace-OUR-OWN-wires semantic. ``DNSRecordWriter.publish_txt_record``
+        # is APPEND, so without explicit eviction the old wires
+        # linger until TTL expiry and consumers see stale + fresh
+        # peers mixed (M9.1.3 P1 — discovery convergence stalls
+        # after a few ticks).
+        #
+        # Round-19 P1: a whole-RRset delete (``value=None``) wipes
+        # sibling cluster nodes that publish into the same shared
+        # ``_dnsmesh-seen.<shared-zone>``. We track exactly which
+        # wires THIS node published last tick and evict only those —
+        # peers' contributions stay intact.
+        next_wires: Set[str] = set()
         for row in rows:
             wire = getattr(row, "wire", None)
             if not isinstance(wire, str) or not wire:
                 continue
+            next_wires.add(wire)
+        # Anything we published last time but won't republish now
+        # has dropped out (peer aged out of SeenStore). Evict those
+        # specific values from the RRset.
+        for stale in self._last_seen_wires - next_wires:
+            try:
+                self._record_writer.delete_txt_record(name, value=stale)
+            except Exception:
+                log.exception(
+                    "seen-graph stale-wire eviction raised for %s; continuing",
+                    name,
+                )
+
+        published = 0
+        published_now: Set[str] = set()
+        for wire in next_wires:
             try:
                 ok = bool(
                     self._record_writer.publish_txt_record(
@@ -398,6 +417,11 @@ class HeartbeatWorker:
                 continue
             if ok:
                 published += 1
+                published_now.add(wire)
+        # Track only what actually landed — wires we tried to publish
+        # but the writer rejected stay out of the eviction set so the
+        # next tick won't try to delete something we never wrote.
+        self._last_seen_wires = published_now
         return published
 
     # ------------------------------------------------------------------

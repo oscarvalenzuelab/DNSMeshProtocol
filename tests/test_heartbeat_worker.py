@@ -736,10 +736,24 @@ class TestSeenGraphPublish:
         first = transport.query_txt_record(seen_rrset_name("self.example")) or []
         assert len(first) == 1
 
-        # Tick 2: peer-a's wire in the local SeenStore expires; peer-b
-        # arrives. The published RRset must reflect ONLY peer-b.
-        # Force expiry by jumping past peer-a's exp window.
+        # Tick 2 on the SAME worker instance: peer-a's wire in the
+        # local SeenStore expires; peer-b arrives. The published
+        # RRset must reflect ONLY peer-b. The worker tracks
+        # ``_last_seen_wires`` across ticks and evicts the wires
+        # it published last that have dropped out of the snapshot
+        # — peer-a's stale wire is among them.
         future = now + 86400 * 2  # past the default 24h heartbeat window
+        # Reset cooldown so the failing peer-a seed doesn't block
+        # the new peer-b harvest.
+        worker._cooldown.clear()
+        # Reconfigure the seed list at runtime so the existing worker
+        # harvests peer-b on tick 2.
+        worker._cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.0",
+            dns_zone="self.example",
+            seed_zones=("peer-b.example",),
+        )
         _publish_peer_heartbeat(
             transport,
             _signer("peer-b", salt=b"B" * 32),
@@ -747,26 +761,66 @@ class TestSeenGraphPublish:
             endpoint="https://peer-b.example.com",
             ts=future,
         )
-        worker = HeartbeatWorker(
-            HeartbeatWorkerConfig(
-                self_endpoint="https://self.example.com",
-                version="0.5.0",
-                dns_zone="self.example",
-                seed_zones=("peer-b.example",),
-            ),
-            signer,
-            store,
-            record_writer=transport,
-            dns_reader=transport,
-        )
         worker.tick_once(now=future)
         second = transport.query_txt_record(seen_rrset_name("self.example")) or []
         # Only the live peer (peer-b) should appear; peer-a's stale
-        # wire from tick 1 must be evicted.
+        # wire from tick 1 was evicted via per-wire tracking.
         assert len(second) == 1
         parsed = HeartbeatRecord.parse_and_verify(second[0], now=future)
         assert parsed is not None
         assert parsed.endpoint == "https://peer-b.example.com"
+
+    def test_shared_zone_seen_graph_does_not_clobber_peers(
+        self, store, transport, now
+    ) -> None:
+        """Codex round-19 P1: when multiple cluster nodes publish
+        their seen-graph under the SAME shared zone, each node's
+        tick must NOT wipe the others' contributions from
+        ``_dnsmesh-seen.<shared-zone>``."""
+        # A peer cluster node already published a wire into the
+        # shared seen RRset (simulated by direct write).
+        peer_signer = _signer("peer-a", salt=b"A" * 32)
+        sibling_wire = _publish_peer_heartbeat(
+            transport,
+            peer_signer,
+            "peer-a.example",
+            endpoint="https://peer-a.example.com",
+            ts=now,
+        )
+        transport.publish_txt_record(
+            seen_rrset_name("shared.example"), sibling_wire
+        )
+        # Now run our own worker against the same shared zone with
+        # its own different peer in its SeenStore.
+        own_peer = _signer("peer-c", salt=b"C" * 32)
+        own_wire = _publish_peer_heartbeat(
+            transport,
+            own_peer,
+            "peer-c.example",
+            endpoint="https://peer-c.example.com",
+            ts=now,
+        )
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.5.0",
+            dns_zone="shared.example",
+            seed_zones=("peer-c.example",),
+        )
+        worker = HeartbeatWorker(
+            cfg, _signer(), store,
+            record_writer=transport, dns_reader=transport,
+        )
+        worker.tick_once(now=now)
+        worker.tick_once(now=now + 1)
+
+        records = transport.query_txt_record(
+            seen_rrset_name("shared.example")
+        ) or []
+        # Sibling cluster node's wire is still present (NOT
+        # clobbered by the seen-graph publish).
+        assert sibling_wire in records, (
+            "seen-graph publish wiped a sibling cluster node's wire"
+        )
 
     def test_seen_graph_values_are_independently_verifiable(
         self, store, transport, now
