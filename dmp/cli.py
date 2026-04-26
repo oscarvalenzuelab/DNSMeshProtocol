@@ -1083,6 +1083,15 @@ def _candidate_seen_zones(
 
     Empty list when nothing is configured; caller falls back to the
     built-in seeds.
+
+    Codex round-8 P2: do NOT derive zones from cluster manifest node
+    HTTP hostnames. In clustered deployments where each node's HTTP
+    host sits BENEATH the served zone (``api.node.example.com`` /
+    ``example.com``), the worker publishes the seen-graph at the
+    served zone; querying ``_dnsmesh-seen.api.node.example.com``
+    returns NXDOMAIN and discovery silently collapses to seeds. The
+    cluster anchor (``cluster_base_domain``) is the right cluster-
+    wide candidate, and ``cfg.endpoint`` covers the single-node case.
     """
     out: List[str] = []
     seen: Set[str] = set()
@@ -1096,14 +1105,6 @@ def _candidate_seen_zones(
 
     if cfg.cluster_base_domain:
         _push(cfg.cluster_base_domain)
-    cluster_client = (
-        getattr(client, "_cluster_client", None) if client is not None else None
-    )
-    manifest = getattr(cluster_client, "manifest", None) if cluster_client else None
-    nodes = getattr(manifest, "nodes", None) if manifest is not None else None
-    if nodes:
-        for node in nodes:
-            _push(_zone_from_endpoint_url(getattr(node, "http_endpoint", "")))
     _push(_zone_from_endpoint_url(cfg.endpoint))
     return out
 
@@ -3008,9 +3009,18 @@ def cmd_tsig_register(args: argparse.Namespace) -> int:
     cfg.tsig_algorithm = algorithm or "hmac-sha256"
     cfg.tsig_zone = zone
     # Resolve the DNS server: --dns-server > --node host > endpoint host.
+    # Strip any HTTP-port suffix from the node host — ``_DnsUpdateWriter``
+    # passes the host string directly to dns.query.udp and hands the
+    # port separately, so a "host:8053" string here would break every
+    # publish. (Codex round-8 P1.)
     dns_server = (args.dns_server or "").strip()
     if not dns_server:
-        dns_server = node_host
+        bare = node_host
+        if bare.startswith("[") and "]" in bare:
+            bare = bare[: bare.find("]") + 1]  # IPv6 literal — keep brackets
+        elif ":" in bare and bare.count(":") == 1:
+            bare = bare.split(":", 1)[0]
+        dns_server = bare
     cfg.tsig_dns_server = dns_server
     cfg.tsig_dns_port = int(args.dns_port) if args.dns_port else 53
     cfg.save(_config_path())
