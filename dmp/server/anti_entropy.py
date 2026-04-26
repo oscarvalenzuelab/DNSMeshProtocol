@@ -1,5 +1,47 @@
 """Anti-entropy sync worker for DMP nodes.
 
+M9 architectural boundary
+-------------------------
+**Federation and first-contact are DNS-only; cluster replication is
+an operator-scoped HA mechanism and the only remaining inter-node
+HTTP path.**
+
+Federation paths (heartbeat, discovery, claim publish,
+TSIG-authorized record writes) run between mutually-untrusting nodes
+across independent zones and operators, so they go over DNS — the
+remote side never has to expose an authenticated HTTP surface to
+strangers. Cluster anti-entropy (``/v1/sync/digest`` +
+``/v1/sync/pull``) runs between peers that the SAME operator stands
+up to scale or survive failures; they verify each other through one
+operator-signed cluster manifest and share credentials by design.
+That trust difference is what the transport choice tracks.
+
+Concretely:
+
+  - Cluster peers are not mutually-untrusting. The operator publishes
+    a signed cluster manifest at ``cluster.<base-zone>``; every node
+    in the cluster verifies sibling identity through the same pinned
+    operator key. The "two distrustful federation peers talk DNS"
+    threat model doesn't apply — these are co-operated nodes inside
+    one administrative trust domain.
+  - The digest/pull cursor protocol (``(ts, name, value_hash)``
+    pagination, partial pulls, hash-based selection) doesn't fit
+    cleanly into DNS query/response semantics, and forcing it through
+    multi-value TXT + custom cursor encoding adds wire complexity
+    without changing the trust boundary.
+  - Cluster nodes already need an HTTP path between each other for
+    ops surfaces (health, metrics) operators rely on.
+
+If you're running a single-node setup, the anti-entropy worker isn't
+wired in at all (no peers to sync with) and this exception doesn't
+apply. The DNS-only federation paths are independent of cluster mode.
+
+A future major version may revisit this — see GitHub issue #6 for
+the design space (DNS UPDATE-based push, pure-DNS sync via custom
+RRsets, both evaluated). For 0.5.0 the sync stays HTTP and this
+docstring + ``docs/design/cluster-anti-entropy-http-boundary.md``
+are the authoritative reference for the boundary decision.
+
 Today a cluster is kept consistent purely by client-side fan-out: every
 publish goes to every node. If a node was offline when a publish happened
 it never learns about the record. M2.4 closes that gap with a pull-based

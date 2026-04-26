@@ -609,6 +609,16 @@ def _build_cluster_writer_factory(config: CLIConfig):
     Each cluster node has an `http_endpoint`; we hand that to
     `_HttpWriter`. For auth, prefer `cluster_node_token` (cluster-specific
     token), else fall back to the generic `http_token`, else no auth.
+
+    M9 architectural note (issue #6, option C): per-cluster-node fanout
+    stays HTTP on purpose. Cluster peers share one administrative
+    domain (signed manifest + pinned operator key) so the "no
+    inter-node HTTP" rule that governs federation does NOT apply
+    inside a cluster. ``_make_client`` already routes the user's
+    own writes through ``_DnsUpdateWriter`` when the TSIG block is
+    populated; this factory only kicks in for the legacy non-TSIG
+    cluster fanout. See ``dmp/server/anti_entropy.py`` module
+    docstring + ``docs/design/cluster-anti-entropy-http-boundary.md``.
     """
     token = config.cluster_node_token or config.http_token or None
 
