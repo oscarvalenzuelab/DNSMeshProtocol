@@ -115,6 +115,35 @@ one operator's HA domain.
   exception: cluster peers share one operator-signed manifest and live
   in one administrative trust domain.
 
+### Why reads and writes take different network paths
+
+Within DNS, writes go **direct** to the authoritative node, but
+reads go **through public recursors**. That asymmetry is on
+purpose:
+
+- **Writes (Alice publishes):** Alice → Alice's node, in one hop.
+  An RFC 2136 UPDATE is a signed packet that must reach the auth
+  node directly — recursors don't relay UPDATEs. Authentication
+  is per-user TSIG with per-user owner-name scope, so only the
+  right user can write under a given record name.
+- **Reads (Bob fetches):** Bob → public recursor (`1.1.1.1`,
+  `8.8.8.8` by default) → Alice's node, via the standard DNS
+  recursive chain. No auth needed; the record's Ed25519 signature
+  is the integrity check. The recursor cache absorbs repeated
+  reads, so Alice's auth node scales like any DNS server.
+
+The split also gives a small but real privacy property: the
+operator of Alice's auth node sees the recursor's IP for every
+read, not Bob's IP. Many receivers blending behind one recursor
+makes per-receiver tracking from the auth node alone hard. (Doesn't
+help against the recursor itself; that's a separate threat model.)
+
+Bob can override the default and query Alice's node directly via
+`dns_resolvers: [<auth-node-ip>:53]` — useful when the recursor
+chain has a stale cache, or when the operator wants to bypass
+public resolvers entirely. Tradeoff: no caching, and the auth
+node's operator sees Bob's IP.
+
 Visual walkthrough in the
 [How resolution works]({{ site.baseurl }}/how-resolution-works.html)
 slide deck.

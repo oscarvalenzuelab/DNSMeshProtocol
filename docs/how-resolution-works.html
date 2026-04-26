@@ -289,6 +289,72 @@ sequenceDiagram
   </p>
 </section>
 
+<!-- 4b-pair-1. Read path vs write path -->
+<section>
+  <h2>Read path vs write path</h2>
+  <pre class="mermaid">
+flowchart LR
+    Alice["Alice's CLI\n(write)"]
+    Bob["Bob's CLI\n(read)"]
+    Resolver["public resolver\n(1.1.1.1, 8.8.8.8)"]
+    ANode["Alice's node\nauthoritative for\ndmp.dnsmesh.io"]
+
+    Alice -- "DNS UPDATE + TSIG\n(direct, signed)" --> ANode
+    Bob -- "TXT query\n(no auth)" --> Resolver
+    Resolver -- "recursive chain" --> ANode
+  </pre>
+  <p class="small" style="text-align: left;">
+    <strong>Writes go direct.</strong> An RFC 2136 UPDATE is a signed
+    packet that has to land at the authoritative node. Recursors
+    don't relay UPDATEs.<br>
+    <strong>Reads go through recursors.</strong> A plain TXT query
+    rides the same public DNS chain every other lookup uses. The
+    recursor walks NS records, lands on Alice's node, returns the
+    answer. Default in <code>dnsmesh init</code>:
+    <code>1.1.1.1, 8.8.8.8</code>.
+  </p>
+</section>
+
+<!-- 4b-pair-2. Why the asymmetry matters -->
+<section>
+  <h2>Why writes are direct and reads go through recursors</h2>
+  <table>
+    <thead><tr><th></th><th>Writes (Alice publishes)</th><th>Reads (Bob fetches)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Hops</td>
+        <td>Alice → Alice's node</td>
+        <td>Bob → recursor → Alice's node</td>
+      </tr>
+      <tr>
+        <td>Authentication</td>
+        <td>RFC 2136 UPDATE + RFC 8945 TSIG. Per-user key, per-user scope.</td>
+        <td>None. The record is signed; that's the auth.</td>
+      </tr>
+      <tr>
+        <td>Cacheable?</td>
+        <td>No.</td>
+        <td>Yes — recursor cache absorbs repeated reads.</td>
+      </tr>
+      <tr>
+        <td>Privacy from the auth-node operator</td>
+        <td>Operator sees Alice's IP (writer is identified).</td>
+        <td>Operator sees the recursor's IP, not Bob's. Many readers blend.</td>
+      </tr>
+      <tr>
+        <td>What this enables</td>
+        <td>Only the right user can write under a given owner name.</td>
+        <td>Receivers blend in; auth nodes scale via cache; reads work on any network where DNS works.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="small">
+    Different security properties, different network paths. The
+    asymmetry is the point: writes are authenticated and node-direct,
+    reads are open and recursor-cached.
+  </p>
+</section>
+
 <!-- 4c. Cross-zone delivery — different operators, different domains -->
 <section>
   <h2>Cross-domain delivery: two operators, two zones, one message</h2>
