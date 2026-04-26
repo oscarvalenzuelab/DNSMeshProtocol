@@ -96,6 +96,64 @@ def _name_under_zone(name: str, zone: str) -> bool:
     return n == z or n.endswith("." + z)
 
 
+# ---------------------------------------------------------------------------
+# M9.2.6 — un-TSIG'd claim-record publish surface.
+#
+# The on-zone owner pattern for first-contact claim records is
+# ``claim-{slot}.mb-{hash12(recipient_id)}.{provider_zone}``. The TXT
+# value is a signed ``ClaimRecord`` — the Ed25519 sender signature
+# IS the on-zone authentication, so requiring TSIG on top of that
+# would be redundant AND would break first-contact reach (a sender
+# almost never has a TSIG account on the recipient's claim provider).
+# Other write surfaces stay TSIG-only; the unauthenticated path is
+# narrowed to claim-record ADDs whose wire actually verifies.
+# ---------------------------------------------------------------------------
+
+
+def _is_claim_owner(owner: str, zone: str) -> bool:
+    """True iff ``owner`` matches ``claim-<slot>.mb-<hash12>.<zone>``."""
+    n = _normalize_zone(owner)
+    z = _normalize_zone(zone)
+    if not z or not (n == z or n.endswith("." + z)):
+        return False
+    relative = n[: -len("." + z)] if n.endswith("." + z) else ""
+    parts = relative.split(".")
+    if len(parts) != 2:
+        return False
+    slot_label, mailbox_label = parts
+    if not slot_label.startswith("claim-"):
+        return False
+    slot = slot_label[len("claim-") :]
+    if not slot.isdigit():
+        return False
+    if not mailbox_label.startswith("mb-"):
+        return False
+    h = mailbox_label[len("mb-") :]
+    if len(h) != 12 or not all(c in "0123456789abcdef" for c in h):
+        return False
+    return True
+
+
+def _is_signed_claim_wire(value: Optional[str]) -> bool:
+    """True iff ``value`` parses as a signed ``ClaimRecord`` wire.
+
+    Imports ``dmp.core.claim`` lazily so the dns_server module stays
+    usable in environments that haven't installed the claim layer
+    (tests, minimal-build images).
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        from dmp.core.claim import ClaimRecord
+    except Exception:
+        return False
+    try:
+        rec = ClaimRecord.parse_and_verify(value)
+    except Exception:
+        return False
+    return rec is not None
+
+
 class _DMPRequestHandler(socketserver.DatagramRequestHandler):
     """Handles one UDP DNS query per call."""
 
@@ -246,17 +304,18 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
     ) -> dns.message.Message:
         """Apply an RFC 2136 UPDATE to the writer.
 
-        Preconditions checked here:
-          - server has a writer + keyring (else REFUSED).
-          - request carried a verified TSIG (else REFUSED — without TSIG
-            an UPDATE is ambient-authority and we won't honor it).
-          - request's zone section is in ``allowed_zones`` (else NOTAUTH).
+        Auth model (after M9.2.6):
 
-        Per-RR checks:
-          - non-TXT RR types are silently skipped (we only manage TXT).
-          - per-RR ``update_authorizer(key_name, op, name)`` is consulted
-            when set; a False result rejects the entire UPDATE so we
-            never apply a partial change.
+          - The default path requires TSIG. Verified key + per-key
+            scope governs which owner names the UPDATE may mutate.
+          - One narrow exception: claim records at
+            ``claim-N.mb-<hash12>.<zone>``. The wire ITSELF is a
+            signed ``ClaimRecord`` (Ed25519); the on-zone authority
+            is delegated to that signature. We accept un-TSIG'd
+            UPDATEs whose ops are exclusively claim-record adds with
+            verifiable wires. This lets a sender publish a first-
+            contact claim at a provider it has no account on,
+            without weakening any other write surface.
 
         Currently supported operations (RFC 2136 §2.5):
           - 2.5.1 Add to an RRset: TXT class IN, ttl > 0, with rdata
@@ -271,21 +330,7 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         response.flags |= dns.flags.AA
 
         writer = self.server.writer
-        # Either a static keyring or a keystore qualifies — both unlock
-        # the UPDATE path. The keystore's per-packet build runs in the
-        # outer ``handle()`` for parse-time TSIG verification; we just
-        # need to confirm one is wired here.
-        keyring_present = (
-            self.server.tsig_keystore is not None
-            or self.server.tsig_keyring is not None
-        )
-        if writer is None or not keyring_present:
-            response.set_rcode(dns.rcode.REFUSED)
-            return response
-        # Without a verified TSIG, we won't accept any update. dnspython
-        # surfaces the verified key name on ``query.keyname``.
-        key_name = getattr(query, "keyname", None)
-        if not getattr(query, "had_tsig", False) or key_name is None:
+        if writer is None:
             response.set_rcode(dns.rcode.REFUSED)
             return response
 
@@ -299,14 +344,8 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             response.set_rcode(dns.rcode.NOTAUTH)
             return response
 
-        # Static authorizer wins (tests use this). Otherwise build a
-        # fresh authorizer from the keystore so revokes and scope
-        # updates land without a server restart.
-        authorizer: Optional[UpdateAuthorizer] = self.server.update_authorizer
-        if authorizer is None and self.server.tsig_keystore is not None:
-            authorizer = self.server.tsig_keystore.build_authorizer()
-        # Collect ops first so we can authorize all of them before
-        # applying any. Halts on first auth failure.
+        # Collect ops up front so we can decide auth disposition based
+        # on the FULL set, not just the first op.
         ops: List[Tuple[str, str, Optional[str], int]] = []
         for rrset in query.update:
             owner = rrset.name.to_text(omit_final_dot=True)
@@ -344,15 +383,47 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                 response.set_rcode(dns.rcode.FORMERR)
                 return response
 
-        if authorizer is not None:
-            for op, owner, _value, _ttl in ops:
-                try:
-                    if not authorizer(key_name, op, owner):
-                        response.set_rcode(dns.rcode.REFUSED)
+        # Auth disposition.
+        had_tsig = bool(getattr(query, "had_tsig", False))
+        key_name = getattr(query, "keyname", None)
+        keyring_present = (
+            self.server.tsig_keystore is not None
+            or self.server.tsig_keyring is not None
+        )
+
+        if had_tsig and key_name is not None and keyring_present:
+            # Standard TSIG path: per-key scope authorization.
+            authorizer: Optional[UpdateAuthorizer] = self.server.update_authorizer
+            if authorizer is None and self.server.tsig_keystore is not None:
+                authorizer = self.server.tsig_keystore.build_authorizer()
+            if authorizer is not None:
+                for op, owner, _value, _ttl in ops:
+                    try:
+                        if not authorizer(key_name, op, owner):
+                            response.set_rcode(dns.rcode.REFUSED)
+                            return response
+                    except Exception:
+                        log.exception(
+                            "update_authorizer raised; rejecting UPDATE"
+                        )
+                        response.set_rcode(dns.rcode.SERVFAIL)
                         return response
-                except Exception:
-                    log.exception("update_authorizer raised; rejecting UPDATE")
-                    response.set_rcode(dns.rcode.SERVFAIL)
+        else:
+            # Un-TSIG'd path: only the self-authenticating claim
+            # surface is acceptable. EVERY op must be a claim-record
+            # ADD whose wire verifies as a signed ClaimRecord.
+            if not ops:
+                response.set_rcode(dns.rcode.REFUSED)
+                return response
+            for op, owner, value, _ttl in ops:
+                if op != "add":
+                    response.set_rcode(dns.rcode.REFUSED)
+                    return response
+                if not _is_claim_owner(owner, zone_text):
+                    response.set_rcode(dns.rcode.REFUSED)
+                    return response
+                if not _is_signed_claim_wire(value):
+                    response.set_rcode(dns.rcode.REFUSED)
                     return response
 
         for op, owner, value, ttl in ops:

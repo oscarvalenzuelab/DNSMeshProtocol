@@ -263,10 +263,10 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             return 200
         if self.path == "/v1/registration/challenge":
             return self._handle_registration_challenge()
-        if self.path == "/v1/nodes/seen":
-            return self._handle_nodes_seen()
-        if self.path == "/nodes":
-            return self._handle_nodes_html()
+        # M9 cleanup: /v1/nodes/seen + /nodes HTML view removed.
+        # Discovery now lives entirely in DNS at _dnsmesh-seen.<zone>
+        # and _dnsmesh-heartbeat.<zone> — there's no HTTP-facing
+        # equivalent any more.
         if self.path == "/v1/info":
             return self._handle_node_info()
         parsed = urlsplit(self.path)
@@ -437,8 +437,9 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
                 "</tr></thead>"
                 f"<tbody>{peer_rows}</tbody>"
                 "</table>"
-                '<p><small><a href="/v1/nodes/seen">Raw signed feed</a> '
-                ' &middot; <a href="/nodes">/nodes view</a></small></p>'
+                "<p><small>Raw discovery is DNS-only as of M9: "
+                "<code>dig @&lt;node&gt; _dnsmesh-heartbeat.&lt;zone&gt; TXT</code>"
+                " or <code>_dnsmesh-seen.&lt;zone&gt;</code>.</small></p>"
             )
         else:
             discovery_block = (
@@ -631,10 +632,11 @@ No central directory, no phone numbers, no servers to trust.</p>
             return self._handle_registration_confirm()
         if parsed.path == "/v1/registration/tsig-confirm":
             return self._handle_registration_tsig_confirm()
-        if parsed.path == "/v1/heartbeat":
-            return self._handle_heartbeat_submit()
-        if parsed.path == "/v1/claim/publish":
-            return self._handle_claim_publish()
+        # M9 cleanup: POST /v1/heartbeat and POST /v1/claim/publish
+        # removed. Heartbeat publish is DNS-native (worker writes to
+        # _dnsmesh-heartbeat.<own-zone>); claim publish goes through
+        # un-TSIG'd DNS UPDATE to the provider's authoritative DNS
+        # server, gated by the wire's Ed25519 signature.
         name = self._match_name()
         if name is None:
             self._send_json(404, {"error": "not found"})
@@ -885,314 +887,6 @@ No central directory, no phone numbers, no servers to trust.</p>
         """Return True iff the node has opted into the heartbeat
         layer. Disabled = both endpoints 404."""
         return bool(getattr(self.server, "heartbeat_store", None))
-
-    def _heartbeat_rate_ok(self, *, endpoint: str) -> bool:
-        """Per-IP rate limiter for heartbeat endpoints.
-
-        Two separate buckets, keyed by endpoint role:
-
-          - ``submit``  — gates ``POST /v1/heartbeat``. Peers write
-            one heartbeat per tick (~5 min); budget is tight and
-            per-IP limits discourage runaway submitters.
-          - ``seen``    — gates ``GET /v1/nodes/seen``. An aggregator
-            scraping every 30-60s is legitimate; budget is generous.
-
-        Splitting the buckets means heavy read traffic from a
-        scraper on a shared NAT / reverse-proxy IP does not burn
-        the submit budget for legitimate peer ingestion.
-        """
-        if endpoint == "submit":
-            limiter = getattr(self.server, "heartbeat_submit_rate_limiter", None)
-        else:
-            limiter = getattr(self.server, "heartbeat_seen_rate_limiter", None)
-        if limiter is None:
-            return True
-        key = self.client_address[0] if self.client_address else "?"
-        return limiter.allow(key)
-
-    def _handle_heartbeat_submit(self) -> int:
-        """POST /v1/heartbeat: peer pushes a signed heartbeat.
-
-        Verifies + stores via SeenStore.accept(). Responds with
-        ``{"ok": true, "seen": [<wire>, ...]}`` — up to N of the
-        most-recently-seen OTHER heartbeats, which the caller adds
-        to its own ping list. Gossip-on-ping is how the mesh
-        bootstraps without a centralized peer registry.
-
-        The response field is ``seen`` (not ``gossip``) to match the
-        design doc and the GET /v1/nodes/seen schema — a client that
-        consumes both endpoints parses the same key name in both.
-        """
-        if not self._heartbeat_enabled():
-            self._send_json(404, {"error": "not found"})
-            return 404
-        if not self._heartbeat_rate_ok(endpoint="submit"):
-            self._send_json(429, {"error": "heartbeat rate limit exceeded"})
-            return 429
-        body = self._read_json_body()
-        if not isinstance(body, dict):
-            self._send_json(400, {"error": "invalid body"})
-            return 400
-        wire = body.get("wire")
-        if not isinstance(wire, str) or not wire:
-            self._send_json(400, {"error": "wire (string) required"})
-            return 400
-
-        remote_addr = self.client_address[0] if self.client_address else ""
-        store = self.server.heartbeat_store
-        record = store.accept(wire, remote_addr=remote_addr)
-        if record is None:
-            # Covers: wrong prefix / too big / bad base64 / bad magic /
-            # bad sig / low-order pubkey / ts outside skew / expired.
-            # Returning 400 rather than 401 because the caller isn't
-            # claiming an identity here — they're submitting a wire
-            # that's self-authenticating, and we just disagreed.
-            self._send_json(
-                400,
-                {"error": "heartbeat verification failed"},
-            )
-            return 400
-
-        gossip_limit = int(getattr(self.server, "heartbeat_gossip_limit", 10))
-        # Gossip-on-ping response: recent heartbeats from OTHER
-        # operators. Exclude the submitter's own spk so A never tells
-        # B about A's own heartbeat; also excludes any other wire
-        # under the same operator key (same-operator concurrent
-        # submits don't echo each other).
-        own_spk_hex = bytes(record.operator_spk).hex()
-        rows = store.list_recent(now=None, limit=gossip_limit + 1)
-        seen = [r.wire for r in rows if r.operator_spk_hex != own_spk_hex][
-            :gossip_limit
-        ]
-        self._send_json(
-            200,
-            {
-                "ok": True,
-                "accepted_operator_spk_hex": own_spk_hex,
-                "seen": seen,
-            },
-        )
-        return 200
-
-    def _handle_nodes_html(self) -> int:
-        """GET /nodes: human-readable HTML view of this node's heartbeat
-        directory. Same data as /v1/nodes/seen but rendered for a
-        browser, so an operator can point a teammate at the URL without
-        having to explain JSON parsing.
-
-        Returns 404 when the heartbeat layer is disabled — the route
-        only makes sense when the node is opted into discovery.
-        """
-        if not self._heartbeat_enabled():
-            self._send_json(404, {"error": "discovery disabled on this node"})
-            return 404
-        if not self._heartbeat_rate_ok(endpoint="seen"):
-            self._send_json(429, {"error": "heartbeat rate limit exceeded"})
-            return 429
-
-        from dmp.server.heartbeat_html import render
-
-        directory_rows = self._directory_rows()
-
-        self_endpoint = getattr(self.server, "heartbeat_self_endpoint", None) or ""
-        self_spk_hex = getattr(self.server, "heartbeat_self_spk_hex", None) or ""
-
-        import html as _html
-
-        header = (
-            '<div class="self-block">'
-            f"<strong>This node:</strong> "
-            f'<a href="{_html.escape(self_endpoint, quote=True)}">'
-            f"{_html.escape(self_endpoint)}</a><br>"
-            f"<small>operator pubkey: <code>{_html.escape(self_spk_hex)}</code></small>"
-            f"<br><small>{len(directory_rows)} peers in the last 72h · "
-            f'<a href="/v1/nodes/seen">raw JSON feed</a></small>'
-            "</div>"
-        )
-        body = render(
-            directory_rows,
-            title="DMP node directory",
-            header_html=header,
-        )
-        data = body.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "public, max-age=30")
-        self.end_headers()
-        self.wfile.write(data)
-        return 200
-
-    # ----------------------- M8.3: claim publish + node info ------------
-
-    def _handle_node_info(self) -> int:
-        """GET /v1/info: discovery endpoint for this node's identity + caps.
-
-        Used by clients to learn the DNS zone a claim-provider node
-        serves under. Without this endpoint, clients fall back to the
-        endpoint hostname as the implied zone — which is the right
-        guess for the common case but breaks when a multi-tenant node
-        serves claims under a zone different from its HTTP host.
-
-        The response is a small JSON document; no auth required.
-        """
-        zone = getattr(self.server, "claim_provider_zone", "") or ""
-        endpoint = getattr(self.server, "heartbeat_self_endpoint", "") or ""
-        spk_hex = getattr(self.server, "heartbeat_self_spk_hex", "") or ""
-        capabilities = int(getattr(self.server, "advertised_capabilities", 0) or 0)
-        self._send_json(
-            200,
-            {
-                "endpoint": endpoint,
-                "operator_spk": spk_hex,
-                "claim_provider_zone": zone,
-                "capabilities": capabilities,
-            },
-        )
-        return 200
-
-    def _handle_claim_publish(self) -> int:
-        """POST /v1/claim/publish: store a signed claim under our zone.
-
-        The body is ``{"value": "<wire>"}`` — a signed
-        ``v=dmp1;t=claim;...`` record produced by the sender. The
-        server:
-
-          1. Verifies the wire parses + signature checks (the
-             sender's Ed25519 sig over the claim body is the
-             authentication; no bearer token required).
-          2. Refuses if the server isn't configured as a claim
-             provider (``DMP_CLAIM_PROVIDER=0`` or no zone set).
-          3. Computes the RRset name as
-             ``claim-{slot}.mb-{hash12(recipient_id)}.{provider_zone}``
-             — but the recipient_id isn't in the claim body
-             (M8.2 dropped it for wire-size). The server has no
-             way to know the recipient_id, so the publishing
-             client provides ``recipient_id_hex12`` alongside
-             ``value`` in the body. The server validates that
-             the hash is a 12-char hex string and uses it
-             verbatim in the RRset name; cross-recipient replay
-             of a captured claim is harmless because the manifest
-             still ties the message to a specific recipient_id
-             (see ``dmp/core/claim.py`` design notes).
-          4. Stores the wire under the computed name.
-
-        Rate-limited per source IP via the standard
-        ``self._check_rate_limit()``; aggressive flooding by a
-        single IP gets 429ed before signature verification (cheap
-        defense for the provider operator).
-        """
-        from dmp.core.claim import RECORD_PREFIX as _CLAIM_PREFIX
-        from dmp.core.claim import ClaimRecord
-
-        zone = getattr(self.server, "claim_provider_zone", "") or ""
-        if not zone:
-            self._send_json(404, {"error": "this node is not a claim provider"})
-            return 404
-        if not self._check_rate_limit():
-            return 429
-
-        body = self._read_json_body()
-        if body is None:
-            self._send_json(400, {"error": "invalid body"})
-            return 400
-        wire = body.get("value")
-        recip_hex = body.get("recipient_id_hex12")
-        ttl = body.get("ttl", 300)
-        if (
-            not isinstance(wire, str)
-            or not isinstance(recip_hex, str)
-            or not isinstance(ttl, int)
-            or ttl <= 0
-        ):
-            self._send_json(
-                400,
-                {
-                    "error": "value (str), recipient_id_hex12 (str), "
-                    "ttl (int > 0) required"
-                },
-            )
-            return 400
-        if len(recip_hex) != 12 or not all(c in "0123456789abcdef" for c in recip_hex):
-            self._send_json(
-                400, {"error": "recipient_id_hex12 must be 12 lowercase hex chars"}
-            )
-            return 400
-        if not wire.startswith(_CLAIM_PREFIX):
-            self._send_json(400, {"error": "value is not a claim wire"})
-            return 400
-
-        record = ClaimRecord.parse_and_verify(wire)
-        if record is None:
-            # Sig didn't verify or freshness check failed.
-            self._send_json(400, {"error": "claim verification failed"})
-            return 400
-
-        # Cap TTL at the server's max_ttl so a sender can't pin a
-        # long-lived claim past the operator's policy. Codex P2
-        # final-review fix: ALSO reject claims whose signed `exp` is
-        # further in the future than `max_ttl` allows. Truncating
-        # only the DNS-record TTL leaves the signed payload
-        # advertising a far-future exp; an anti-entropy peer that
-        # pulls the wire (M8.4 gossip) would happily verify and
-        # re-publish under whatever TTL it likes — defeating the
-        # operator's policy. Refuse the wire instead.
-        max_ttl = self.server.max_ttl
-        now = int(__import__("time").time())
-        claim_lifetime = int(record.exp) - now
-        if claim_lifetime > max_ttl:
-            self._send_json(
-                400,
-                {
-                    "error": (
-                        f"claim exp {record.exp} requests "
-                        f"{claim_lifetime}s of lifetime, exceeds "
-                        f"operator cap of {max_ttl}s"
-                    )
-                },
-            )
-            return 400
-        if ttl > max_ttl:
-            ttl = max_ttl
-
-        rrset_name = f"claim-{record.slot}.mb-{recip_hex}.{zone}"
-
-        writer = self._writer()
-        if writer is None:
-            self._send_json(501, {"error": "writer not configured"})
-            return 501
-        ok = writer.publish_txt_record(rrset_name, wire, ttl=ttl)
-        status = 201 if ok else 502
-        self._send_json(status, {"ok": ok, "name": rrset_name})
-        return status
-
-    def _handle_nodes_seen(self) -> int:
-        """GET /v1/nodes/seen: public snapshot of verified heartbeats
-        this node has accumulated. Used by directory aggregators."""
-        if not self._heartbeat_enabled():
-            self._send_json(404, {"error": "not found"})
-            return 404
-        if not self._heartbeat_rate_ok(endpoint="seen"):
-            self._send_json(429, {"error": "heartbeat rate limit exceeded"})
-            return 429
-        store = self.server.heartbeat_store
-        limit = int(getattr(self.server, "heartbeat_seen_limit", 500))
-        rows = store.list_recent(limit=limit)
-        self_endpoint = getattr(self.server, "heartbeat_self_endpoint", None)
-        self_spk_hex = getattr(self.server, "heartbeat_self_spk_hex", None)
-        self._send_json(
-            200,
-            {
-                "version": 1,
-                "self": {
-                    "endpoint": self_endpoint,
-                    "operator_spk_hex": self_spk_hex,
-                    "enabled": True,
-                },
-                "seen": [{"wire": r.wire} for r in rows],
-            },
-        )
-        return 200
 
     # ---- anti-entropy sync routes -----------------------------------------
 

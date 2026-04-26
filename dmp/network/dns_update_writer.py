@@ -210,7 +210,7 @@ class _DnsUpdateWriter(DNSRecordWriter):
                 timeout=self._timeout,
                 raise_on_truncation=True,
             )
-        except dns.exception.Truncated:
+        except dns.message.Truncated:
             try:
                 response = dns.query.tcp(
                     upd, self._server, port=self._port, timeout=self._timeout

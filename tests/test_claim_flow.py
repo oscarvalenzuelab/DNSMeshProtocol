@@ -82,6 +82,9 @@ def _publish_claim_for_latest(
     # Pick the most recent (highest ts) manifest as the "latest."
     candidates.sort(key=lambda c: c[2], reverse=True)
     chosen_slot, chosen_msg_id, _ = candidates[0]
+    # Test fixture: sender + provider share the in-memory store, so
+    # we hand publish_claim the writer directly. Production senders
+    # build a one-shot DNS UPDATE to the provider's zone instead.
     ok = alice.publish_claim(
         recipient_id=bob_recipient_id,
         msg_id=chosen_msg_id,
@@ -89,6 +92,7 @@ def _publish_claim_for_latest(
         sender_mailbox_domain=sender_zone,
         ttl=ttl,
         provider_zone=provider_zone,
+        provider_writer=store,
     )
     assert ok
     return chosen_msg_id
@@ -419,6 +423,7 @@ class TestIntroQueueCli:
             "bob",
             "first-contact reach via send",
             claim_providers=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)],
+            claim_writer=store,
         )
         assert ok
         # The claim is published — bob's recv discovers it without
@@ -447,6 +452,7 @@ class TestIntroQueueCli:
             "bob",
             "intro through receive_messages",
             claim_providers=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)],
+            claim_writer=store,
         )
         # Single-call recv: pinned mailboxes (none yet) + claim providers.
         delivered = bob.receive_messages(

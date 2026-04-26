@@ -211,7 +211,78 @@ def main():
         f"rcode={dns.rcode.to_text(bad_response.rcode())}",
     )
 
-    step("8. Try re-registering same subject under a DIFFERENT spk — must 409")
+    step("8. Cross-zone claim publish via un-TSIG'd DNS UPDATE")
+    # Build a signed ClaimRecord and publish it at the provider's DNS
+    # server. No TSIG — the on-zone authentication is the wire's
+    # Ed25519 signature.
+    import os as _os
+    _os.environ["DMP_PROVIDER_DNS_PORT"] = "5373"
+    from dmp.client.client import DMPClient
+
+    sender = DMPClient(
+        "alice", "alice-pass", domain="alice.test",
+    )
+    # Pin a stub recipient so we have a recipient_id to address. We
+    # use bob's actual X25519 pubkey from a fresh client constructed
+    # under bob's passphrase — same shape send_message would build.
+    bob_client = DMPClient("bob", "bob-pass", domain="bob.test")
+    sender.add_contact(
+        "bob",
+        bob_client.get_public_key_hex(),
+        domain="bob.test",
+        signing_key_hex=bob_client.get_signing_public_key_hex(),
+    )
+    import hashlib as _hashlib
+    bob_recipient_id = _hashlib.sha256(
+        bob_client.crypto.get_public_key_bytes()
+    ).digest()
+
+    # Send the UPDATE to the provider's host-mapped DNS port (5373).
+    # In production the provider's DNS endpoint is its zone apex on
+    # port 53; here we use the local mapped port via 127.0.0.1.
+    ok = sender.publish_claim(
+        recipient_id=bob_recipient_id,
+        msg_id=b"\x42" * 16,
+        slot=0,
+        sender_mailbox_domain="alice.test",
+        ttl=300,
+        provider_zone="claims.test",
+        provider_endpoint="http://127.0.0.1:8073",
+    )
+    assert_step(
+        "Claim landed at provider via un-TSIG'd DNS UPDATE",
+        ok is True,
+        "publish_claim returned True",
+    )
+
+    # Verify the provider has the record.
+    bob_hash = _hashlib.sha256(bob_recipient_id).hexdigest()[:12]
+    claim_owner = f"claim-0.mb-{bob_hash}.claims.test"
+    claim_values = _query_txt(PROVIDER_DNS, claim_owner)
+    assert_step(
+        "Provider's DNS serves the published claim record",
+        len(claim_values) >= 1,
+        f"got {len(claim_values)} value(s) at {claim_owner}",
+    )
+
+    step("9. Provider rejects un-TSIG'd UPDATE for non-claim owner names")
+    # Same un-TSIG'd path, but targeting a non-claim owner — must REFUSE.
+    import dns.update as _u
+    upd_bad = _u.UpdateMessage("claims.test")
+    upd_bad.add(
+        dns.name.from_text("identity.alice.claims.test."),
+        300,
+        "TXT",
+        '"v=dmp1;t=identity;impostor"',
+    )
+    bad_resp = dns.query.udp(upd_bad, PROVIDER_DNS[0], port=PROVIDER_DNS[1], timeout=2.0)
+    assert_step(
+        "Un-TSIG'd UPDATE for non-claim owner is REFUSED",
+        bad_resp.rcode() == dns.rcode.REFUSED,
+        f"rcode={dns.rcode.to_text(bad_resp.rcode())}",
+    )
+
+    step("10. Try re-registering same subject under a DIFFERENT spk — must 409")
     with urllib.request.urlopen(
         f"{ALICE_HTTP}/v1/registration/challenge", timeout=4
     ) as r:

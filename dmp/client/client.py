@@ -21,6 +21,110 @@ from dmp.core.prekeys import Prekey, PrekeyStore, prekey_rrset_name
 from dmp.network.base import DNSRecordReader, DNSRecordStore, DNSRecordWriter
 from dmp.network.memory import InMemoryDNSStore
 
+
+# M9.2.6 — claim-publish DNS UPDATE helpers.
+#
+# Default DNS port for cross-zone UPDATE writes. Real deployments run
+# the DMP DNS server on 53. Dev environments override via the
+# ``DMP_PROVIDER_DNS_PORT`` env to match a custom port (the e2e harness
+# uses 5353).
+import os as _os
+from urllib.parse import urlsplit as _urlsplit
+
+
+def _provider_dns_target(provider_endpoint: str, provider_zone: str) -> Optional[
+    Tuple[str, int]
+]:
+    """Resolve the (host, port) we should send a claim UPDATE to.
+
+    Order:
+      1. ``provider_endpoint`` URL host (e.g. ``https://node:8053``
+         → ``node``).
+      2. ``provider_zone`` itself (works when the zone apex is also
+         the public hostname of the authoritative server, the common
+         case for dnsmesh.io and friends).
+
+    Port is ``DMP_PROVIDER_DNS_PORT`` when set (dev override), else 53.
+    """
+    host = ""
+    if provider_endpoint:
+        try:
+            parts = _urlsplit(
+                provider_endpoint
+                if "://" in provider_endpoint
+                else "https://" + provider_endpoint
+            )
+            host = (parts.hostname or "").strip().lower()
+        except ValueError:
+            host = ""
+    if not host:
+        host = (provider_zone or "").strip().lower().rstrip(".")
+    if not host:
+        return None
+    raw_port = _os.environ.get("DMP_PROVIDER_DNS_PORT", "").strip()
+    try:
+        port = int(raw_port) if raw_port else 53
+    except ValueError:
+        port = 53
+    return (host, port)
+
+
+def _publish_claim_via_dns_update(
+    *,
+    zone: str,
+    target: Tuple[str, int],
+    name: str,
+    wire: str,
+    ttl: int,
+) -> bool:
+    """Build + send an un-TSIG'd DNS UPDATE for one claim record.
+
+    The provider's DNS server accepts un-TSIG'd UPDATE iff EVERY op is
+    a claim-record ADD whose wire verifies as a signed ClaimRecord
+    (see ``dmp.server.dns_server._is_signed_claim_wire``). The Ed25519
+    signature in the wire IS the on-zone authentication; TSIG on top
+    would gate only the network path, which the senders generally
+    can't be authenticated on.
+    """
+    try:
+        import dns.exception
+        import dns.flags
+        import dns.message  # noqa: F401  (forces submodule registration)
+        import dns.name
+        import dns.query
+        import dns.rcode
+        import dns.update
+    except Exception:
+        return False
+    host, port = target
+    upd = dns.update.UpdateMessage(zone)
+    try:
+        upd.add(
+            dns.name.from_text(name.rstrip(".") + "."),
+            int(ttl),
+            "TXT",
+            '"' + wire.replace("\\", "\\\\").replace('"', r"\"") + '"',
+        )
+    except Exception:
+        return False
+    try:
+        response = dns.query.udp(
+            upd, host, port=port, timeout=5.0, raise_on_truncation=True
+        )
+    except dns.message.Truncated:
+        try:
+            response = dns.query.tcp(upd, host, port=port, timeout=5.0)
+        except Exception:
+            return False
+    except Exception:
+        return False
+    if response.flags & dns.flags.TC:
+        try:
+            response = dns.query.tcp(upd, host, port=port, timeout=5.0)
+        except Exception:
+            return False
+    return response.rcode() == dns.rcode.NOERROR
+
 SLOT_COUNT = 10
 DEFAULT_TTL_SECONDS = 300
 
@@ -432,6 +536,7 @@ class DMPClient:
         ttl: int = DEFAULT_TTL_SECONDS,
         claim_providers: Sequence[Tuple[str, str]] = (),
         claim_outcomes: Optional[List[bool]] = None,
+        claim_writer: Optional[DNSRecordWriter] = None,
     ) -> bool:
         """Send an encrypted message to a pinned contact.
 
@@ -607,6 +712,7 @@ class DMPClient:
                     ttl=ttl,
                     provider_zone=provider_zone,
                     provider_endpoint=provider_endpoint or "",
+                    provider_writer=claim_writer,
                 )
                 if claim_outcomes is not None:
                     claim_outcomes.append(bool(outcome))
@@ -760,21 +866,29 @@ class DMPClient:
         """Publish one signed claim record at a single provider.
 
         The claim is a tiny pointer: it tells whoever polls that
-        `sender_spk` has mail for the recipient (identified by the
-        hash12 in the RRset name) at slot `slot` of zone
-        `sender_mailbox_domain`. The recipient verifies the signature,
-        then fetches the manifest+chunks from `sender_mailbox_domain`
+        ``sender_spk`` has mail for the recipient (identified by the
+        hash12 in the RRset name) at slot ``slot`` of zone
+        ``sender_mailbox_domain``. The recipient verifies the signature,
+        then fetches the manifest+chunks from ``sender_mailbox_domain``
         via the normal cross-zone receive path (M8.1).
 
-        Two delivery paths:
+        Delivery (M9.2.6 — DNS-only):
 
-          - ``provider_endpoint`` is a non-empty URL → HTTP POST to
-            ``{endpoint}/v1/claim/publish``. This is the production
-            path: claims must actually arrive at the provider's
-            store, not the sender's home node.
-          - ``provider_writer`` is set OR endpoint is empty → write
-            via the writer (for tests where sender + provider share
-            an in-memory store, and as a back-compat path).
+          - ``provider_writer`` set → write via that writer. Tests use
+            this to point the sender + provider at a shared in-memory
+            store; production deployments use it for cross-zone DNS
+            UPDATE wiring.
+          - Otherwise build a one-shot un-TSIG'd DNS UPDATE to the
+            provider's DNS port (derived from ``provider_endpoint``
+            host or ``provider_zone``). The provider's DNS server
+            accepts the un-TSIG'd UPDATE only when the wire parses as
+            a verifiable ``ClaimRecord``; the on-zone authentication
+            IS that Ed25519 signature, so requiring TSIG would only
+            block first-contact reach.
+
+        ``provider_endpoint`` is now used purely as a hostname source
+        for the DNS UPDATE target — the legacy HTTP ``/v1/claim/publish``
+        path is gone (the user authorized breaking that, M9 cleanup).
 
         Returns True on successful publish. Failures (oversize,
         signing mismatch, write rejection, network error) return
@@ -803,58 +917,48 @@ class DMPClient:
         except (ValueError, Exception):
             return False
 
-        if provider_endpoint:
-            return self._http_publish_claim(
-                provider_endpoint, wire, recipient_id, int(ttl)
-            )
-
         try:
             name = claim_rrset_name(recipient_id, int(slot), provider_zone)
         except ValueError:
             return False
-        writer = provider_writer or self.writer
-        try:
-            return writer.publish_txt_record(name, wire, ttl=int(ttl))
-        except Exception:
-            return False
 
-    @staticmethod
-    def _http_publish_claim(
-        provider_endpoint: str,
-        wire: str,
-        recipient_id: bytes,
-        ttl: int,
-    ) -> bool:
-        """POST a signed claim to ``{endpoint}/v1/claim/publish``.
+        if provider_writer is not None:
+            try:
+                return bool(
+                    provider_writer.publish_txt_record(
+                        name, wire, ttl=int(ttl)
+                    )
+                )
+            except Exception:
+                return False
 
-        Returns True on 2xx. The provider's endpoint expects:
-
-            { "value": <wire>, "recipient_id_hex12": <hex12>, "ttl": int }
-
-        Errors are swallowed and surfaced as False — first-contact
-        reach is best-effort. ``requests`` is imported lazily so a
-        process that never publishes claims (legacy / read-only) does
-        not pull in the dependency.
-        """
-        import hashlib
-
-        try:
-            import requests  # type: ignore[import-not-found]
-        except Exception:
-            return False
-        try:
-            hex12 = hashlib.sha256(bytes(recipient_id)).hexdigest()[:12]
-            url = provider_endpoint.rstrip("/") + "/v1/claim/publish"
-            resp = requests.post(
-                url,
-                json={
-                    "value": wire,
-                    "recipient_id_hex12": hex12,
-                    "ttl": int(ttl),
-                },
-                timeout=5,
+        # No explicit writer override.
+        #
+        # Cross-zone path (production): the provider zone is different
+        # from this client's own zone, OR the caller passed a
+        # ``provider_endpoint``. Build a one-shot un-TSIG'd DNS UPDATE
+        # against the provider's authoritative DNS server — the claim
+        # wire's Ed25519 signature is the on-zone authentication, so
+        # TSIG is not required for this surface (M9.2.6 server-side
+        # gate enforces this).
+        provider_z = (provider_zone or "").strip().lower().rstrip(".")
+        own_zone = (self.domain or "").strip().lower().rstrip(".")
+        if provider_endpoint or (provider_z and provider_z != own_zone):
+            target = _provider_dns_target(provider_endpoint, provider_zone)
+            if not target:
+                return False
+            return _publish_claim_via_dns_update(
+                zone=provider_zone,
+                target=target,
+                name=name,
+                wire=wire,
+                ttl=int(ttl),
             )
-            return resp.status_code in (200, 201)
+
+        # Same-zone / colocated path: sender IS the provider (test
+        # fixtures, single-node setups). Use the local writer.
+        try:
+            return bool(self.writer.publish_txt_record(name, wire, ttl=int(ttl)))
         except Exception:
             return False
 
