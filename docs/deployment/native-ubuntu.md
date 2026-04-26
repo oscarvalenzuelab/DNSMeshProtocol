@@ -148,9 +148,16 @@ sudo nano /etc/dnsmesh/node.env   # replace DMP_OPERATOR_TOKEN
 sudo systemctl restart dnsmesh-node
 ```
 
-Existing per-user tokens stored under `~/.dmp/tokens/<host>.json` on
-client machines need to be re-issued (run `dnsmesh register --node <host>`
-from the client side).
+Existing client-side credentials need to be re-minted:
+
+- **M9 default (TSIG):** the per-user TSIG key sits in the
+  `tsig_*` block of `~/.dmp/config.yaml`. Re-mint with
+  `dnsmesh tsig register --node <host>` — the new key replaces
+  the in-config block atomically.
+- **Legacy HTTP-token path:** the bearer token sits at
+  `~/.dmp/tokens/<host>.json`. Re-issue with
+  `dnsmesh register --node <host>` or have the operator hand out
+  a fresh token via `dnsmesh-node-admin token rotate`.
 
 ### Enabling multi-tenant auth
 
@@ -181,12 +188,13 @@ sudo chmod 0440 /etc/dnsmesh/operator-ed25519.hex
 sudo systemctl restart dnsmesh-node
 ```
 
-Once on, your node appears at
-`https://dmp.example.com/nodes` (HTML view) and
-`https://dmp.example.com/v1/nodes/seen` (JSON feed). Add it to the
-canonical aggregator at
-[`/directory/`]({{ site.baseurl }}/directory/) by PR-adding the URL
-to `directory/seeds.txt`.
+Once on, your node publishes its signed heartbeat at the DNS owner
+name `_dnsmesh-heartbeat.<DMP_DOMAIN>` and republishes the harvested
+seen-graph at `_dnsmesh-seen.<DMP_DOMAIN>` — both queryable via the
+public DNS chain. The node's HTML landing page at `/` includes a
+"Recent peers" table rendered from the seen-store. (The legacy
+M5.8 HTTP routes `/v1/nodes/seen` and `/v1/heartbeat` were removed
+in M9.)
 
 ## Sandboxing
 

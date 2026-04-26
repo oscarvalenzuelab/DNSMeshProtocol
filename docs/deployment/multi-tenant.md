@@ -8,13 +8,28 @@ nav_order: 4
 # Running a multi-tenant node (M5.5)
 {: .no_toc }
 
+{: .warning }
+**This page covers the M5.5 HTTP-bearer-token flow.** M9 (0.5.0)
+introduced **per-user TSIG keys** as the preferred mechanism: the
+operator opts in with `DMP_DNS_UPDATE_ENABLED=1`, users mint a
+key with `dnsmesh tsig register`, and every record write goes
+over RFC 2136 DNS UPDATE — no HTTPS after the one-shot
+registration. New deployments should use TSIG.
+The HTTP-token path documented below is preserved for back-compat
+and remains a valid alternative when DNS UPDATE isn't reachable
+(e.g. ports closed by the network). See
+[Getting Started]({{ site.baseurl }}/getting-started) for the
+canonical M9 flow and
+[CLI reference → `dnsmesh tsig`]({{ site.baseurl }}/guide/cli#dnsmesh-tsig)
+for the TSIG side.
+
 1. TOC
 {:toc}
 
-A **multi-tenant** DMP node issues a separate bearer token to each
-user and enforces, on every publish, that Alice's token can only
-write Alice's identity / rotation / prekey records. This page is
-the operator setup.
+A **multi-tenant** DMP node issues a separate publishing credential
+to each user and enforces, on every publish, that Alice's
+credential can only write Alice's identity / rotation / prekey
+records. This page is the operator setup.
 
 If you're running a personal node (one user, probably yourself),
 skip this — use `DMP_AUTH_MODE=open` (the default without any

@@ -9,6 +9,23 @@ nav_order: 11
 
 {: .no_toc }
 
+{: .note }
+**Historical design doc.** M5.8 specified an HTTP-gossip
+heartbeat (`POST /v1/heartbeat` + `GET /v1/nodes/seen`). M9
+(0.5.0) replaced both with a DNS-native model: nodes publish
+their signed heartbeat at `_dnsmesh-heartbeat.<zone>` TXT and
+republish their harvested seen-graph at
+`_dnsmesh-seen.<zone>`. The wire format evolved from `DMPHB02`
+to `DMPHB03` along with the transport — M9 added a
+`claim_provider_zone` field so peers can discover served zones
+straight from the heartbeat (replacing the removed
+`GET /v1/info` advertisement). The Ed25519 signature scheme,
+operator-key model, and threat properties below carry forward
+unchanged. The HTTP routes documented here return 404 on 0.5.x
+nodes. See
+[Deployment → heartbeat]({{ site.baseurl }}/deployment/heartbeat)
+for the M9 operator surface.
+
 1. TOC
 {:toc}
 

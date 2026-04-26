@@ -8,12 +8,25 @@ nav_order: 5
 # Registering on a multi-tenant node (M5.5)
 {: .no_toc }
 
+{: .warning }
+**This page covers the legacy HTTP-token registration flow
+(`dnsmesh register`).** M9 (0.5.0) replaced it with `dnsmesh tsig
+register` — same Ed25519 challenge/confirm ceremony, but the node
+returns a TSIG key instead of a bearer token, and every subsequent
+record write goes over DNS UPDATE rather than HTTPS POST. New
+deployments should use TSIG; see
+[CLI reference → `dnsmesh tsig`]({{ site.baseurl }}/guide/cli#dnsmesh-tsig)
+or [Getting Started]({{ site.baseurl }}/getting-started). The
+HTTP-token flow below remains valid when DNS UPDATE isn't reachable
+(network blocks UDP 53 outbound, etc.) and on operators who haven't
+opted into `DMP_DNS_UPDATE_ENABLED`.
+
 1. TOC
 {:toc}
 
 On a **multi-tenant** node — one that serves more than one user's
-identity — every publisher needs their own bearer token. This page
-is how you get one.
+identity — every publisher needs their own credential. This page is
+how you get one via the legacy HTTP-token path.
 
 If the operator told you "the node is open" or handed you a single
 shared secret, you're not on a multi-tenant node; just export

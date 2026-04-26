@@ -19,11 +19,15 @@ reachable from clients on the public internet.
 
 DMP nodes ship two things on different ports:
 
-- An **HTTP API** (TCP 443 behind Caddy, or 8053 directly) used by
-  *publishers*: the node operator's own clients (and registered users)
-  POST signed records to `/v1/records/...` and `/v1/claim/publish`.
-- A **DNS authoritative server** (UDP 53) that returns those records as
-  TXT responses to anyone who queries the right name.
+- An **HTTP API** (TCP 443 behind Caddy, or 8053 directly) — used
+  for registration only: clients hit `/v1/registration/tsig-confirm`
+  once to mint a per-user TSIG key. Every record write after that
+  is DNS UPDATE, not HTTP. (M5.5-era HTTP record routes existed at
+  `/v1/records/...` and `/v1/claim/publish` but were removed in M9.)
+- A **DNS authoritative server** (UDP 53) that accepts TSIG-signed
+  RFC 2136 UPDATE messages from registered users and returns the
+  resulting records as TXT responses to anyone who queries the right
+  name.
 
 A typical operator buys `example.com` from a registrar (Namecheap,
 Google Domains, DigitalOcean, etc.), points an A record at their VPS,
@@ -131,12 +135,24 @@ the `claim_provider_zone` advertisement to `mesh.example.com`.
 
 ```bash
 sudo systemctl restart dnsmesh-node
-curl -s https://example.com/v1/info
-# expected:
-# {"endpoint":"https://example.com",
-#  "operator_spk":"...",
-#  "claim_provider_zone":"mesh.example.com",
-#  "capabilities":1}
+
+# Verify the node is up and serving the new zone (the M5.5
+# `/v1/info` HTTP route was removed in M9 — these checks replace
+# it):
+sudo systemctl status dnsmesh-node --no-pager | head -10
+# expected: active (running)
+
+# Confirm UDP 53 is bound:
+sudo ss -ulnp | grep ':53 '
+# expected: 0.0.0.0:53 ... users:(("python",...))
+
+# (Optional, requires DMP_HEARTBEAT_ENABLED=1) Decode the
+# advertised served-zone from the heartbeat wire:
+dig +short @127.0.0.1 _dnsmesh-heartbeat.mesh.example.com TXT
+# expected on a heartbeat-enabled node: "v=dmp1;t=heartbeat;..."
+# Empty on heartbeat-disabled nodes; that's fine — heartbeat is
+# opt-in and the rest of step 4 below verifies delegation
+# end-to-end without it.
 ```
 
 ### 4. Verify the public DNS chain
@@ -144,8 +160,8 @@ curl -s https://example.com/v1/info
 ```bash
 # Pick any record the node is serving — easiest to publish a fresh
 # identity and dig the resulting name.
-dnsmesh init alice@mesh.example.com --endpoint example.com
-dnsmesh register --node example.com
+dnsmesh init alice --domain mesh.example.com --endpoint https://example.com
+dnsmesh tsig register --node example.com
 dnsmesh identity publish
 # → published identity to id-XXX.mesh.example.com
 
@@ -249,12 +265,13 @@ The DMP node needs to:
 
 ## Heartbeat + cross-zone interaction
 
-After delegation, claims gossiped between providers via M8.4 anti-
-entropy still flow correctly — the heartbeat-discovered providers'
-zones come from `/v1/info` (`claim_provider_zone`), which 0.4.1
-correctly reports as `mesh.example.com` after the env-var change.
-No further reconfiguration on peer nodes is required; the new zone
-propagates automatically through the seen-graph.
+After delegation, claims gossiped between providers still flow
+correctly — peer nodes harvest the advertised provider zone from
+the heartbeat wire's `claim_provider_zone` field
+(at `_dnsmesh-heartbeat.<served-zone>` TXT) on the next tick.
+No further reconfiguration on peer nodes is required; the new
+zone propagates automatically through the seen-graph at
+`_dnsmesh-seen.<each-peer's-zone>`.
 
 ## Multiple zones on one node
 
@@ -279,7 +296,7 @@ the authoritative DNS for each. To do this:
 |---|---|---|
 | `dig @1.1.1.1 id-XXX.mesh.example.com TXT` returns empty | Delegation not propagated | Wait 5 min; re-check the registrar panel |
 | `dig @<node-IP>:53 ...` ALSO returns empty | Node isn't serving the zone | Check `DMP_DOMAIN` matches the delegated subdomain; restart `dnsmesh-node` |
-| Records resolve fine but `/v1/info` shows old `claim_provider_zone` | Service didn't restart | `sudo systemctl restart dnsmesh-node` |
+| Records resolve fine but `_dnsmesh-heartbeat.<zone>` decodes the OLD `claim_provider_zone` | Service didn't restart, OR stale wire hasn't expired yet | `sudo systemctl restart dnsmesh-node` (orphan-sweep clears stale wires from 0.5.2 onward) |
 | Public DNS reaches the node but TXT is empty | Wrong zone in DMP_DOMAIN | Match `DMP_DOMAIN=mesh.example.com` exactly to the delegated subdomain (no trailing dot) |
 | `dig @1.1.1.1` returns SERVFAIL | Node DNS server isn't responding to UDP 53 | Check firewall, `ss -ulnp`, and `journalctl -u dnsmesh-node` |
 

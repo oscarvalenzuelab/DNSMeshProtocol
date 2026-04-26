@@ -315,13 +315,13 @@ sequenceDiagram
     </tbody>
   </table>
   <p class="small">
-    The "different zones, no cluster" case is what M8.1 fixed in
-    0.4.0 — the recv path now walks each pinned contact's zone
-    instead of being hard-bound to <code>self.domain</code>.
-    First-contact reach (the last row) routes through a tiny
-    signed pointer at a claim-provider node — see the M8 design
-    notes in
-    <a href="/DNSMeshProtocol/protocol/">/protocol/</a>.
+    Cross-zone delivery between independent nodes works because the
+    receive path walks each pinned contact's zone — so it doesn't
+    matter where the sender lives, only that the receiver has them
+    pinned. First-contact reach (the last row, when neither side has
+    pinned the other yet) routes through a tiny signed pointer at a
+    claim-provider node — see the
+    <a href="/DNSMeshProtocol/protocol/">protocol overview</a>.
   </p>
 </section>
 
@@ -604,9 +604,14 @@ flowchart LR
 <section class="center">
   <h2>Ready to try?</h2>
   <pre><code class="language-bash">pipx install dnsmesh
-dnsmesh init alice --domain &lt;your-zone&gt; --endpoint dnsmesh.io
+dnsmesh init alice --domain dmp.dnsmesh.io --endpoint https://dnsmesh.io
 dnsmesh tsig register --node dnsmesh.io
 dnsmesh identity publish</code></pre>
+  <p class="small" style="margin-top: 1em;">
+    Address: <code>alice@dmp.dnsmesh.io</code>. Replace
+    <code>dmp.dnsmesh.io</code> with the served zone of any DMP
+    node you trust (or your own).
+  </p>
   <p class="small" style="margin-top: 2em;">
     <a href="/DNSMeshProtocol/getting-started">Getting started</a> ·
     <a href="/DNSMeshProtocol/how-it-works">How DMP works (text)</a> ·

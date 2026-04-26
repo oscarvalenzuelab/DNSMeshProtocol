@@ -9,6 +9,18 @@ nav_order: 10
 
 {: .no_toc }
 
+{: .note }
+**Historical design doc.** M5.5 introduced per-user HTTP bearer
+tokens; M9 (0.5.0) carried the threat model forward but replaced
+the network primitive with **per-user TSIG keys** (RFC 8945) over
+RFC 2136 DNS UPDATE — same subject-bound write authorization,
+same anti-takeover semantics, same scope rules, but writes now
+travel as signed DNS UPDATE messages rather than authenticated
+HTTPS POSTs. The threat-model analysis below applies unchanged to
+both primitives; only the wire-level mechanism evolved. See the
+[CLI tsig reference]({{ site.baseurl }}/guide/cli#dnsmesh-tsig)
+for the M9 happy path.
+
 1. TOC
 {:toc}
 

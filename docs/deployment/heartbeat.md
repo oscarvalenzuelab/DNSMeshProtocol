@@ -8,6 +8,23 @@ nav_order: 5
 # Running the heartbeat layer (M5.8)
 {: .no_toc }
 
+{: .warning }
+**This page describes the M5.8 HTTP-gossip heartbeat, which was
+replaced in M9 (0.5.0).** The HTTP routes documented below
+(`POST /v1/heartbeat`, `GET /v1/nodes/seen`) no longer exist —
+they return 404 on every 0.5.x node. M9's DNS-native replacement:
+nodes publish their signed heartbeat at `_dnsmesh-heartbeat.<zone>`
+as a TXT record and republish their harvested seen-graph at
+`_dnsmesh-seen.<zone>`. Discovery happens through the recursive
+DNS chain. Configuration env vars
+(`DMP_HEARTBEAT_ENABLED`, `DMP_HEARTBEAT_SELF_ENDPOINT`,
+`DMP_HEARTBEAT_OPERATOR_KEY_PATH`, `DMP_HEARTBEAT_SEEDS`,
+`DMP_HEARTBEAT_DNS_RESOLVERS`) carry the same names but the seeds
+are now DNS zones (e.g. `dmp.dnsmesh.io`), not HTTPS URLs. See
+[Getting Started]({{ site.baseurl }}/getting-started) for the
+canonical M9 flow. This page is kept as historical reference for
+operators upgrading from pre-0.5.0 deployments.
+
 1. TOC
 {:toc}
 

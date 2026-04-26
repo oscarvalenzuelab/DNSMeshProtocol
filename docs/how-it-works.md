@@ -168,7 +168,7 @@ the team*. For anyone who wants real sovereignty: *run your own*.
 For users who don't want to operate infrastructure.
 
 ```bash
-pip install dnsmeshprotocol     # (once published; today: pip install -e .)
+pipx install dnsmesh
 dnsmesh init alice --domain dmp.yournode.com
 dnsmesh tsig register --node dmp.yournode.com
 dnsmesh identity publish
@@ -231,30 +231,36 @@ Concrete flow, from scratch:
    community's. Let's say `dmp.example.com`.
 2. **Install the CLI.**
    ```bash
-   git clone https://github.com/oscarvalenzuelab/DNSMeshProtocol.git
-   cd DNSMeshProtocol && pip install -e .
+   pipx install dnsmesh
    ```
 3. **Create a local identity.** This generates an Ed25519 signing
    keypair and an X25519 encryption keypair from a passphrase and
    stores the private halves in `~/.dmp/config.yaml`. The private keys
    **never leave the laptop**.
    ```bash
-   dnsmesh init alice --domain example.com
+   dnsmesh init alice --domain example.com --endpoint https://dmp.example.com
    ```
-4. **Publish the public keys.** The CLI signs an `IdentityRecord`
-   locally and POSTs it to the node. The node stores it as a TXT
-   record that any DNS client can now resolve.
+4. **Register on the node.** One HTTPS hop to mint a per-user TSIG
+   key bound to your Ed25519 signing key. After this, no further
+   HTTPS leaves the laptop for the protocol's normal flow.
+   ```bash
+   dnsmesh tsig register --node dmp.example.com
+   ```
+5. **Publish the public keys.** The CLI signs an `IdentityRecord`
+   locally and writes it via RFC 2136 DNS UPDATE under the TSIG key
+   from step 4. The node serves it as a TXT record that any DNS
+   client can now resolve.
    ```bash
    dnsmesh identity publish
    ```
-5. **Share the address.** Tell friends: *I'm `alice@example.com`.*
-6. **Friends fetch and pin.** Their client resolves the TXT record,
+6. **Share the address.** Tell friends: *I'm `alice@example.com`.*
+7. **Friends fetch and pin.** Their client resolves the TXT record,
    verifies the Ed25519 signature, stores the public keys as a
    contact.
    ```bash
    dnsmesh identity fetch alice@example.com --add
    ```
-7. **Exchange messages.** `dnsmesh send bob "hello"` on Alice's side →
+8. **Exchange messages.** `dnsmesh send bob "hello"` on Alice's side →
    encrypt locally, chunk, publish chunks as TXT records keyed by a
    shared hash both sides can derive. `dnsmesh recv` on Bob's side →
    resolve the chunks, verify, decrypt locally.

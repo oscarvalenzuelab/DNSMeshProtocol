@@ -112,15 +112,21 @@ The CLI auto-prepends `https://` to bare hostnames. Pass a full
 `http://host:port` URL when pointing at a local-dev node.
 
 If multi-tenant auth is enabled (recommended for any node serving
-people you don't personally run), users register for a per-user
-publish token over HTTPS:
+people you don't personally run), users register once to mint a
+per-user TSIG key. After that, every record write goes over RFC 2136
+DNS UPDATE under that key — no more HTTPS to the node:
 
 ```bash
-dnsmesh register --node dmp.example.com
+dnsmesh tsig register --node dmp.example.com
+dnsmesh identity publish
 ```
 
 See [Multi-tenant deployment]({{ site.baseurl }}/deployment/multi-tenant)
-for how to enable registration on the node side.
+for how to enable registration on the node side. The legacy
+HTTP-token flow (`dnsmesh register`) still works for back-compat
+but new deployments should use TSIG — see
+[Getting Started]({{ site.baseurl }}/getting-started) for the
+canonical flow.
 
 ## Production hardening
 
@@ -191,11 +197,16 @@ Run `dig +short dmp.example.com` from outside and confirm it returns
 your Droplet's public IP, then check the DigitalOcean Cloud Firewall
 config.
 
-**`dnsmesh init` succeeds but `identity publish` returns 401.** The
-operator token in `~/.dmp/tokens/<hostname>.json` does not match the
-one in `/opt/dnsmesh/.env`. Either re-register
-(`dnsmesh register --node <hostname>` if multi-tenant auth is on) or
-copy the token from `/opt/dnsmesh/.env` manually.
+**`dnsmesh init` succeeds but `identity publish` returns 401 / REFUSED.**
+The CLI's TSIG key (or legacy bearer token) doesn't match what the
+node expects. Re-mint:
+
+- **M9 default:** `dnsmesh tsig register --node <hostname>` to get a
+  fresh TSIG key. Then `identity publish` again.
+- **Legacy multi-tenant token mode:** `dnsmesh register --node <hostname>`
+  if the operator runs `DMP_AUTH_MODE=multi-tenant` without TSIG, or
+  copy `DMP_OPERATOR_TOKEN` from `/opt/dnsmesh/.env` manually for a
+  single-user laptop deploy.
 
 **UDP 53 is closed.** Either `ufw` is rejecting it or the DigitalOcean
 Cloud Firewall is. `ufw status` should show `53/udp ALLOW`. If you
