@@ -352,6 +352,55 @@ class TestDnsUpdate:
         stored = store.query_txt_record(owner.rstrip("."))
         assert stored == [wire]
 
+    def test_anonymous_claim_publish_refuses_overlong_lifetime(self):
+        """Codex round-9 P2: claims with exp far past the operator's
+        ``claim_max_ttl`` are REFUSED, even when the wire verifies.
+        Stops a sender from pinning the RRset against retention."""
+        import hashlib
+
+        from dmp.core.claim import ClaimRecord
+        from dmp.core.crypto import DMPCrypto
+
+        store = InMemoryDNSStore()
+        port = _free_port()
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keyring=_keyring(),
+            allowed_zones=("example.com",),
+            claim_publish_enabled=True,
+            claim_max_ttl=600,  # 10 minutes
+        )
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        recipient_id = hashlib.sha256(b"recipient").digest()
+        hex12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+        now = int(time.time())
+        # exp 24 hours ahead — well past 10-minute cap.
+        claim = ClaimRecord(
+            msg_id=b"\x42" * 16,
+            sender_spk=sender.get_signing_public_key_bytes(),
+            sender_mailbox_domain="alice.example.com",
+            slot=0,
+            ts=now,
+            exp=now + 86400,
+        )
+        wire = claim.sign(sender)
+        owner = f"claim-0.mb-{hex12}.example.com."
+
+        with server:
+            upd = dns.update.UpdateMessage("example.com")
+            upd.add(
+                dns.name.from_text(owner),
+                86400,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED
+        assert store.query_txt_record(owner.rstrip(".")) is None
+
     def test_anonymous_claim_publish_refused_when_disabled(self):
         """A node with claim_publish_enabled=False must REFUSE the
         un-TSIG'd claim publish path even for verified wires. Mirrors

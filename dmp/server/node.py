@@ -854,11 +854,27 @@ class DMPNode:
             # CAP_CLAIM_PROVIDER. A node with DMP_CLAIM_PROVIDER=0
             # must not become a public claim sink (codex round-9 P2).
             claim_publish_enabled = bool(_load_claim_provider_zone())
+            # Anonymous-claim lifetime cap. Operator override via
+            # ``DMP_CLAIM_MAX_TTL`` env (seconds); defaults to the
+            # DNS server's own DEFAULT_CLAIM_MAX_TTL (1 day) so a
+            # sender can't pin the RRset for longer than the
+            # operator's retention window.
+            from dmp.server.dns_server import DEFAULT_CLAIM_MAX_TTL
+
+            try:
+                claim_max_ttl = int(
+                    os.environ.get(
+                        "DMP_CLAIM_MAX_TTL", str(DEFAULT_CLAIM_MAX_TTL)
+                    )
+                )
+            except ValueError:
+                claim_max_ttl = DEFAULT_CLAIM_MAX_TTL
             update_kwargs = {
                 "writer": self.store,
                 "tsig_keystore": self.tsig_keystore,
                 "allowed_zones": allowed_zones,
                 "claim_publish_enabled": claim_publish_enabled,
+                "claim_max_ttl": claim_max_ttl,
             }
         self.dns = DMPDnsServer(
             self.store,

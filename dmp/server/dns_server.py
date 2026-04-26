@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 import socketserver
 import threading
+import time
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import dns.exception
@@ -61,6 +62,11 @@ log = logging.getLogger(__name__)
 
 MAX_TXT_STRING = 255
 DEFAULT_TTL = 60
+# Cap on the lifetime an anonymous claim record may be published with.
+# Mirrors the operator's HTTP-side ``max_ttl`` (M5.5 default 1 day) so
+# a sender can't write a far-future ``exp`` and have the provider host
+# the record indefinitely. Operator override via DMP_CLAIM_MAX_TTL.
+DEFAULT_CLAIM_MAX_TTL = 86_400
 
 
 def _split_for_txt_strings(value: str, max_len: int = MAX_TXT_STRING) -> list[bytes]:
@@ -141,17 +147,37 @@ def _is_signed_claim_wire(value: Optional[str]) -> bool:
     usable in environments that haven't installed the claim layer
     (tests, minimal-build images).
     """
+    return _verified_claim_record(value) is not None
+
+
+def _verified_claim_record(value: Optional[str]):
+    """Parse + verify a claim wire. Returns the ``ClaimRecord`` or None."""
     if not isinstance(value, str) or not value:
-        return False
+        return None
     try:
         from dmp.core.claim import ClaimRecord
     except Exception:
-        return False
+        return None
     try:
-        rec = ClaimRecord.parse_and_verify(value)
+        return ClaimRecord.parse_and_verify(value)
     except Exception:
+        return None
+
+
+def _claim_within_lifetime_cap(value: str, *, max_ttl: int, now: int) -> bool:
+    """True iff the wire's ``exp - now`` and the requested DNS TTL
+    both stay under ``max_ttl``.
+
+    Stops a sender from publishing a 10-year claim that pins a
+    provider's RRset until expiry. Mirrors the M5.5 HTTP path's
+    ``max_ttl`` enforcement (codex round-9 P2).
+    """
+    rec = _verified_claim_record(value)
+    if rec is None:
         return False
-    return rec is not None
+    if max_ttl <= 0:
+        return True
+    return int(rec.exp) - int(now) <= int(max_ttl)
 
 
 class _DMPRequestHandler(socketserver.DatagramRequestHandler):
@@ -423,16 +449,31 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             if not ops:
                 response.set_rcode(dns.rcode.REFUSED)
                 return response
-            for op, owner, value, _ttl in ops:
+            cap = int(getattr(self.server, "claim_max_ttl", DEFAULT_CLAIM_MAX_TTL))
+            now_i = int(time.time())
+            applied: List[Tuple[str, str, Optional[str], int]] = []
+            for op, owner, value, ttl in ops:
                 if op != "add":
                     response.set_rcode(dns.rcode.REFUSED)
                     return response
                 if not _is_claim_owner(owner, zone_text):
                     response.set_rcode(dns.rcode.REFUSED)
                     return response
-                if not _is_signed_claim_wire(value):
+                if not _claim_within_lifetime_cap(
+                    value, max_ttl=cap, now=now_i
+                ):
+                    # Wire wasn't a verifiable claim OR claim's exp is
+                    # past the operator's lifetime cap — REFUSE rather
+                    # than silently accept a far-future record that
+                    # would pin the RRset against retention policy
+                    # (codex round-9 P2).
                     response.set_rcode(dns.rcode.REFUSED)
                     return response
+                # Clamp the requested DNS TTL to the operator's cap so a
+                # client can't request a 10-year cache lifetime.
+                clamped_ttl = min(int(ttl) if ttl else DEFAULT_TTL, cap) if cap else int(ttl)
+                applied.append((op, owner, value, clamped_ttl))
+            ops = applied
 
         for op, owner, value, ttl in ops:
             try:
@@ -478,6 +519,7 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         allowed_zones=None,
         update_authorizer=None,
         claim_publish_enabled=False,
+        claim_max_ttl=DEFAULT_CLAIM_MAX_TTL,
     ):
         super().__init__(server_address, handler_cls)
         self.reader = reader
@@ -490,6 +532,7 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         self.allowed_zones = allowed_zones or ()
         self.update_authorizer = update_authorizer
         self.claim_publish_enabled = bool(claim_publish_enabled)
+        self.claim_max_ttl = int(claim_max_ttl)
         self._semaphore = threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
@@ -532,6 +575,7 @@ class DMPDnsServer:
         allowed_zones: Optional[Sequence[str]] = None,
         update_authorizer: Optional[UpdateAuthorizer] = None,
         claim_publish_enabled: bool = False,
+        claim_max_ttl: int = DEFAULT_CLAIM_MAX_TTL,
     ):
         """``writer``, a TSIG source, and ``allowed_zones`` together
         switch on RFC 2136 UPDATE handling. With any of them missing
@@ -571,6 +615,7 @@ class DMPDnsServer:
         # accept first-contact claims from arbitrary senders leaves
         # this False and the un-TSIG'd path stays REFUSED.
         self.claim_publish_enabled = bool(claim_publish_enabled)
+        self.claim_max_ttl = int(claim_max_ttl)
         self._server: Optional[_ThreadingUDPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -596,6 +641,7 @@ class DMPDnsServer:
             allowed_zones=self.allowed_zones,
             update_authorizer=self.update_authorizer,
             claim_publish_enabled=self.claim_publish_enabled,
+            claim_max_ttl=self.claim_max_ttl,
         )
         # If the caller asked for port 0, pick up the actual bound port.
         self.port = self._server.server_address[1]
