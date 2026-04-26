@@ -13,6 +13,12 @@ on:
     # GitHub's cron runners at the top of the hour.
     - cron: "17 6 * * 1"
 
+# Minimum GITHUB_TOKEN perms. CodeQL flagged the absence as
+# `actions/missing-workflow-permissions`; every job in this workflow
+# only needs read access (checkout + pip-audit + hypothesis fuzz).
+permissions:
+  contents: read
+
 jobs:
   pip-audit:
     name: pip-audit (lockfiles + environment)

@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# Minimum GITHUB_TOKEN perms. CodeQL flagged the absence as
+# `actions/missing-workflow-permissions`; every job in this workflow
+# only needs read access to the repo (checkout + tests).
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (py${{ matrix.python }})
