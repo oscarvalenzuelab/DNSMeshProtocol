@@ -3028,15 +3028,24 @@ def cmd_tsig_register(args: argparse.Namespace) -> int:
     cfg.tsig_algorithm = algorithm or "hmac-sha256"
     cfg.tsig_zone = zone
     # Resolve the DNS server: --dns-server > --node host > endpoint host.
-    # Strip any HTTP-port suffix from the node host — ``_DnsUpdateWriter``
-    # passes the host string directly to dns.query.udp and hands the
-    # port separately, so a "host:8053" string here would break every
-    # publish. (Codex round-8 P1.)
+    # Strip any HTTP-port suffix AND any IPv6 brackets from the node
+    # host — ``_DnsUpdateWriter`` hands the string straight to
+    # ``dns.query.udp``/``getaddrinfo``, neither of which accepts
+    # ``[::1]:5353`` or ``[::1]`` literals. We pass a bare IP. Codex
+    # round-8 P1 handled the port; round-12 P2 handles brackets.
     dns_server = (args.dns_server or "").strip()
     if not dns_server:
         bare = node_host
         if bare.startswith("[") and "]" in bare:
-            bare = bare[: bare.find("]") + 1]  # IPv6 literal — keep brackets
+            close = bare.find("]")
+            inner = bare[1:close]
+            rest = bare[close + 1 :]
+            if rest.startswith(":"):
+                # ``[::1]:8053`` → drop ``:8053`` along with brackets.
+                bare = inner
+            else:
+                # ``[::1]`` → strip brackets only.
+                bare = inner
         elif ":" in bare and bare.count(":") == 1:
             bare = bare.split(":", 1)[0]
         dns_server = bare

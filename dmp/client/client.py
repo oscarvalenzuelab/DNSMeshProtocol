@@ -38,15 +38,30 @@ def _provider_dns_target(provider_endpoint: str, provider_zone: str) -> Optional
     """Resolve the (host, port) we should send a claim UPDATE to.
 
     Order:
-      1. ``provider_endpoint`` URL host (e.g. ``https://node:8053``
-         → ``node``).
-      2. ``provider_zone`` itself (works when the zone apex is also
-         the public hostname of the authoritative server, the common
-         case for dnsmesh.io and friends).
+      1. ``provider_endpoint`` URL host when it's an IP literal —
+         that's an explicit operator override (and the e2e harness'
+         loopback). IP literals can't be the served zone apex, so
+         using them here is unambiguous.
+      2. ``provider_zone`` — the operator's signed advertisement of
+         where their authoritative DNS server lives (M9.1.1 wire
+         field). For deployments where the HTTP host differs from
+         the served zone (``api.example.com`` / ``example.com``),
+         the zone is the right DNS UPDATE target. Codex round-12 P2.
+      3. ``provider_endpoint`` URL host (non-IP) as a back-compat
+         fallback for legacy peers that don't advertise
+         ``claim_provider_zone`` yet.
 
     Port is ``DMP_PROVIDER_DNS_PORT`` when set (dev override), else 53.
     """
-    host = ""
+    import ipaddress as _ipaddress
+
+    raw_port = _os.environ.get("DMP_PROVIDER_DNS_PORT", "").strip()
+    try:
+        port = int(raw_port) if raw_port else 53
+    except ValueError:
+        port = 53
+
+    endpoint_host = ""
     if provider_endpoint:
         try:
             parts = _urlsplit(
@@ -54,19 +69,24 @@ def _provider_dns_target(provider_endpoint: str, provider_zone: str) -> Optional
                 if "://" in provider_endpoint
                 else "https://" + provider_endpoint
             )
-            host = (parts.hostname or "").strip().lower()
+            endpoint_host = (parts.hostname or "").strip().lower()
         except ValueError:
-            host = ""
-    if not host:
-        host = (provider_zone or "").strip().lower().rstrip(".")
-    if not host:
-        return None
-    raw_port = _os.environ.get("DMP_PROVIDER_DNS_PORT", "").strip()
-    try:
-        port = int(raw_port) if raw_port else 53
-    except ValueError:
-        port = 53
-    return (host, port)
+            endpoint_host = ""
+
+    # IP literal in the endpoint = explicit override.
+    if endpoint_host:
+        try:
+            _ipaddress.ip_address(endpoint_host)
+            return (endpoint_host, port)
+        except ValueError:
+            pass
+
+    zone_host = (provider_zone or "").strip().lower().rstrip(".")
+    if zone_host:
+        return (zone_host, port)
+    if endpoint_host:
+        return (endpoint_host, port)
+    return None
 
 
 def _publish_claim_via_dns_update(

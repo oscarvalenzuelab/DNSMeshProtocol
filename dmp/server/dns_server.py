@@ -478,11 +478,29 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         for op, owner, value, ttl in ops:
             try:
                 if op == "add" and value is not None:
-                    writer.publish_txt_record(owner, value, ttl=ttl)
+                    ok = writer.publish_txt_record(owner, value, ttl=ttl)
                 elif op == "delete":
-                    writer.delete_txt_record(owner, value=value)
+                    ok = writer.delete_txt_record(owner, value=value)
+                else:
+                    ok = False
             except Exception:
                 log.exception("writer raised during UPDATE apply; SERVFAIL")
+                response.set_rcode(dns.rcode.SERVFAIL)
+                return response
+            # Codex round-12 P1: a writer that returns False (e.g. the
+            # cluster fanout missing quorum) means the record DID NOT
+            # persist. Returning NOERROR would silently lose the
+            # write — the sender treats the UPDATE as committed and
+            # never retries. Surface the failure as SERVFAIL so the
+            # caller can fall back / retry. Delete-of-missing-name is
+            # the one false positive (writer returns False because
+            # nothing matched), which we accept as benign noise.
+            if not ok and op == "add":
+                log.info(
+                    "writer.publish_txt_record returned False for %s — "
+                    "answering SERVFAIL so the client can retry",
+                    owner,
+                )
                 response.set_rcode(dns.rcode.SERVFAIL)
                 return response
 
