@@ -848,7 +848,17 @@ def _make_client(
                 reader_factory=_make_cluster_reader_factory(config, bootstrap_reader),
                 refresh_interval=refresh_interval,
             )
-            writer = cluster_client.writer
+            # Codex round-11 P1: when the user has a TSIG key, prefer
+            # the DNS UPDATE writer aimed at the user's home node over
+            # the per-node HTTP fanout. The cluster's anti-entropy
+            # worker is responsible for propagating the write to
+            # peers (still HTTP between cluster nodes — issue #6).
+            # Effect: a registered user's writes always go DNS-only
+            # over the network, regardless of cluster_enabled.
+            if config.tsig_key_name and config.tsig_secret_hex:
+                writer = _build_writer(config)
+            else:
+                writer = cluster_client.writer
             # Cross-domain reads (e.g. `dnsmesh identity fetch
             # alice@other-domain.com`) would NXDOMAIN through the
             # cluster's authoritative nodes because those nodes have
@@ -1089,15 +1099,20 @@ def _candidate_seen_zones(
     host sits BENEATH the served zone (``api.node.example.com`` /
     ``example.com``), the worker publishes the seen-graph at the
     served zone; querying ``_dnsmesh-seen.api.node.example.com``
-    returns NXDOMAIN and discovery silently collapses to seeds. The
-    cluster anchor (``cluster_base_domain``) is the right cluster-
-    wide candidate, and ``cfg.endpoint`` covers the single-node case.
+    returns NXDOMAIN and discovery silently collapses to seeds.
+
+    Codex round-11 P2: ``cfg.endpoint`` host has the same problem in
+    single-node deployments where the public hostname differs from
+    the served zone. We now prefer ``cfg.tsig_zone`` (the served
+    zone the user's home node advertised at registration time) over
+    endpoint-host derivation, falling back to host derivation only
+    when no zone hint is on hand.
     """
     out: List[str] = []
     seen: Set[str] = set()
 
     def _push(zone: str) -> None:
-        z = (zone or "").strip().lower()
+        z = (zone or "").strip().lower().rstrip(".")
         if not z or z in seen:
             return
         seen.add(z)
@@ -1105,6 +1120,10 @@ def _candidate_seen_zones(
 
     if cfg.cluster_base_domain:
         _push(cfg.cluster_base_domain)
+    # tsig_zone is set by ``dnsmesh tsig register`` and represents the
+    # zone the home node is authoritative for — the same zone the
+    # heartbeat worker publishes _dnsmesh-seen records under.
+    _push(getattr(cfg, "tsig_zone", "") or "")
     _push(_zone_from_endpoint_url(cfg.endpoint))
     return out
 
