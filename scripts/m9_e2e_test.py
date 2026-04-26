@@ -162,7 +162,10 @@ def main():
             bytes.fromhex(minted["tsig_secret_hex"])
         ).decode("ascii"),
     })
-    username_hash = hashlib.sha256(subject.encode("utf-8")).hexdigest()[:16]
+    # Identity records hash the LOCAL PART of subject (matches
+    # ``dnsmesh identity publish`` and the M9.2.3 round-17 P1 fix).
+    local_part = subject.split("@", 1)[0]
+    username_hash = hashlib.sha256(local_part.encode("utf-8")).hexdigest()[:16]
     identity_owner = f"id-{username_hash}.alice.test."
     upd = dns.update.UpdateMessage("alice.test")
     upd.add(

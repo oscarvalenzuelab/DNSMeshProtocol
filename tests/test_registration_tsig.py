@@ -88,15 +88,19 @@ class TestMintTsigViaRegistration:
         assert minted.zone == "ops.example"
         assert minted.name.startswith("alice-" + spk_hex[:8])
         assert minted.name.endswith(".ops.example.")
-        # Default scope (M9.2.6 round-14): per-user pattern set
-        # covering identity, mailbox slots, chunks, and claim records
-        # via wildcard suffixes. NOT a full-zone grant.
+        # Default scope (M9.2.6 round-17 — multi-tenant safe):
+        # ONLY the user's own identity hashes + spk-prefixed claim
+        # record. Mailbox / chunk wildcards are gated behind
+        # DMP_TSIG_PER_USER_WILDCARDS so a registered user on a
+        # shared zone can't overwrite another user's records.
         suffixes = set(minted.allowed_suffixes)
-        assert "id-" in next(s for s in suffixes if s.startswith("id-"))
-        assert "slot-*.mb-*.ops.example" in suffixes
-        assert "chunk-*-*.ops.example" in suffixes
-        assert "_dnsmesh-claim-*.ops.example" in suffixes
-        assert "ops.example" not in suffixes  # NOT full-zone
+        assert any(s.startswith("id-") for s in suffixes)
+        assert any(s.startswith("_dnsmesh-claim-" + spk_hex[:16]) for s in suffixes)
+        # Wildcards are NOT in the default scope.
+        assert "slot-*.mb-*.ops.example" not in suffixes
+        assert "chunk-*-*.ops.example" not in suffixes
+        assert "_dnsmesh-claim-*.ops.example" not in suffixes
+        assert "ops.example" not in suffixes
         # Secret is fresh random bytes (32) and survives a re-read.
         assert len(bytes.fromhex(minted.secret_hex)) == 32
         stored = keystore.get(minted.name)
@@ -104,17 +108,17 @@ class TestMintTsigViaRegistration:
         assert stored.secret == bytes.fromhex(minted.secret_hex)
         assert minted.expires_at > 0
 
-    def test_tight_scope_mode_keeps_per_user_suffixes(
+    def test_per_user_wildcards_opt_in(
         self, keystore, config, challenges, monkeypatch
     ):
-        """``DMP_TSIG_LOOSE_SCOPE=0`` opts into the original tight
-        per-user scope (multi-tenant deployments). Send_message
-        publishes WILL be REFUSED here; the operator accepts that."""
-        import hashlib
-
-        monkeypatch.setenv("DMP_TSIG_LOOSE_SCOPE", "0")
+        """``DMP_TSIG_PER_USER_WILDCARDS=1`` adds the
+        ``slot-*.mb-*.<zone>``, ``chunk-*-*.<zone>``, and
+        ``_dnsmesh-claim-*.<zone>`` patterns. Single-user-per-zone
+        deployments need this for ``send_message`` to work; shared
+        zones must leave it off."""
+        monkeypatch.setenv("DMP_TSIG_PER_USER_WILDCARDS", "1")
         pc = challenges.issue(config.node_hostname)
-        body, spk_hex = _signed_body(
+        body, _ = _signed_body(
             subject="alice@ops.example",
             challenge_hex=pc.challenge_hex,
             node=pc.node,
@@ -125,21 +129,48 @@ class TestMintTsigViaRegistration:
             config=config,
             body=body,
         )
-        username_hash = hashlib.sha256(
-            "alice@ops.example".encode("utf-8")
-        ).hexdigest()[:16]
-        assert f"id-{username_hash}.ops.example" in minted.allowed_suffixes
-        claim_suffix = f"_dnsmesh-claim-{spk_hex[:16]}.ops.example"
-        assert claim_suffix in minted.allowed_suffixes
+        suffixes = set(minted.allowed_suffixes)
+        assert "slot-*.mb-*.ops.example" in suffixes
+        assert "chunk-*-*.ops.example" in suffixes
+        assert "_dnsmesh-claim-*.ops.example" in suffixes
+
+    def test_identity_scope_uses_local_part_not_full_subject(
+        self, keystore, config, challenges
+    ):
+        """Codex round-17 P1.1: ``dnsmesh identity publish`` derives
+        the owner-name hash from the LOCAL PART (``cfg.username``),
+        not the full subject. The minted scope must match — using
+        sha256(full subject) here would mint a key that REFUSES
+        the user's own identity / prekey publishes."""
+        import hashlib as _hashlib
+
+        pc = challenges.issue(config.node_hostname)
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        minted = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=config,
+            body=body,
+        )
+        local_hash16 = _hashlib.sha256(b"alice").hexdigest()[:16]
+        assert f"id-{local_hash16}.ops.example" in minted.allowed_suffixes
+        # And the bad form (full-subject hash) must NOT be in scope.
+        full_hash16 = _hashlib.sha256(b"alice@ops.example").hexdigest()[:16]
+        assert f"id-{full_hash16}.ops.example" not in minted.allowed_suffixes
 
     def test_x25519_pub_extends_scope_to_mailbox(
-        self, keystore, config, challenges, monkeypatch
+        self, keystore, config, challenges
     ):
-        """Tight-scope mode + x25519_pub adds the mailbox suffix."""
+        """When the registration body includes ``x25519_pub`` the
+        minted key gains ``mb-<hash12>.<zone>`` — the user's own
+        mailbox alias. Works in default (tight) mode."""
         import hashlib
         import os
 
-        monkeypatch.setenv("DMP_TSIG_LOOSE_SCOPE", "0")
         x_pub = os.urandom(32)
         pc = challenges.issue(config.node_hostname)
         body, _ = _signed_body(
@@ -290,11 +321,11 @@ class TestMintTsigViaRegistration:
         )
         # Anchored under the served zone, not the hostname.
         assert minted.zone == "example.com"
-        # Pattern suffixes anchor to the served zone.
+        # Default scope: identity hashes + per-user claim suffix.
         suffixes = set(minted.allowed_suffixes)
-        assert "slot-*.mb-*.example.com" in suffixes
-        assert "chunk-*-*.example.com" in suffixes
-        # And NOT under the hostname.
+        assert any(s.startswith("id-") and s.endswith(".example.com") for s in suffixes)
+        # Wildcards are off by default (round-17), but suffixes
+        # MUST anchor under the served zone, not the HTTP host.
         for suffix in suffixes:
             assert ".api.example.com" not in suffix
             assert "api.example.com" != suffix
@@ -543,12 +574,14 @@ class TestHttpEndpoint:
                     }
                 )
                 # Use an actual DMP record owner — identity at
-                # ``id-<hash16>.<zone>``. This is the suffix we
-                # actually granted, so the UPDATE should land.
+                # ``id-<hash16>.<zone>``. The hash is sha256 of the
+                # LOCAL PART (matches what ``dnsmesh identity publish``
+                # writes — codex round-17 P1.1 fix).
                 import hashlib as _hashlib
 
+                local_part = subject.split("@", 1)[0]
                 username_hash = _hashlib.sha256(
-                    subject.encode("utf-8")
+                    local_part.encode("utf-8")
                 ).hexdigest()[:16]
                 identity_owner = f"id-{username_hash}.ops.example."
                 upd = dns.update.UpdateMessage("ops.example")

@@ -507,6 +507,32 @@ class TestDnsUpdate:
             response = _send_update(upd, port)
         assert response.rcode() == dns.rcode.REFUSED
 
+    def test_cumulative_rrset_cap_across_updates(self):
+        """Codex round-17 P2: ``max_values_per_name`` must include
+        records ALREADY in the store, not just the adds in the
+        current packet. A client sending N single-record UPDATEs
+        used to bypass the cap."""
+        store = InMemoryDNSStore()
+        # Pre-populate two values at the owner.
+        store.publish_txt_record("foo.example.com", "v0")
+        store.publish_txt_record("foo.example.com", "v1")
+        server, port = self._server(store, update_max_values_per_name=2)
+        with server:
+            upd = dns.update.UpdateMessage("example.com")
+            upd.add(
+                dns.name.from_text("foo.example.com."),
+                300,
+                "TXT",
+                '"v2"',
+            )
+            upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
+            response = _send_update(upd, port)
+        # Adding v2 would push the RRset to 3 entries — over the
+        # cap of 2. REFUSED.
+        assert response.rcode() == dns.rcode.REFUSED
+        # And the existing values stayed intact.
+        assert sorted(store.query_txt_record("foo.example.com")) == ["v0", "v1"]
+
     def test_no_writer_means_refused(self):
         """A server constructed without a writer (read-only) refuses
         any UPDATE regardless of TSIG."""

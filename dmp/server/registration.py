@@ -547,40 +547,65 @@ def _suffixes_for(
     spk16 = _spk_short(spk_hex, length=16)
     if not z or not subj or not spk16:
         return ()
-    # Codex round-14 P1: default scope is the per-user pattern set,
-    # NOT the full served zone. Loose-scope (``DMP_TSIG_LOOSE_SCOPE=1``)
-    # remains as an explicit opt-in for solo-deployment cases where
-    # the served zone IS the user's personal zone, but a multi-tenant
-    # deployment must not let Alice overwrite Bob's records.
+    # Three scope modes (codex round-17 P1.2 hardened the defaults):
     #
-    # The patterns below use the M9.2.6 wildcard suffix matcher
-    # (``_label_glob``) to cover the content-addressed record names
-    # ``DMPClient.send_message`` actually writes to:
-    #   - identity / prekeys → ``id-<username_hash16>.<zone>`` (tail
-    #     match also covers ``prekeys.id-...`` siblings)
-    #   - mailbox slots → ``slot-*.mb-*.<zone>`` (any slot, any
-    #     recipient hash, anchored under the user's own zone)
-    #   - chunks → ``chunk-*-*.<zone>`` (any chunk index, any msg key)
-    #   - claim records (legacy + new) → ``_dnsmesh-claim-*.<zone>``
-    #     and the per-user spk-prefixed form
+    #   - DEFAULT (multi-tenant safe). Only ``id-<hash>.<zone>``
+    #     (16- and 12-char truncations) and the user's spk-prefixed
+    #     claim record. Identity, prekeys, and the per-user claim
+    #     record authorize. Mailbox / chunk wildcards are NOT
+    #     granted, so a registered user cannot overwrite another
+    #     user's slot-/chunk- records on a shared zone. The cost:
+    #     ``send_message``'s mailbox + chunk publishes will be
+    #     REFUSED in this mode.
+    #
+    #   - DMP_TSIG_PER_USER_WILDCARDS=1 (single-user-per-zone). Adds
+    #     ``slot-*.mb-*.<zone>``, ``chunk-*-*.<zone>``, and
+    #     ``_dnsmesh-claim-*.<zone>`` so ``send_message`` actually
+    #     works. Operators of zones used by ONE user only can flip
+    #     this on safely. NEVER on a shared zone.
+    #
+    #   - DMP_TSIG_LOOSE_SCOPE=1 (solo / dev). Whole zone. The
+    #     escape hatch.
     if os.environ.get("DMP_TSIG_LOOSE_SCOPE", "0").strip().lower() in (
         "1", "true", "yes", "on",
     ):
         return (z,)
+
+    # Default: tight per-USER scope. Safe for multi-tenant zones
+    # because Alice's TSIG key only authorizes Alice's identity /
+    # prekey hash labels (and her spk-prefixed claim record). It
+    # does NOT cover the content-addressed names ``send_message``
+    # publishes (``slot-N.mb-<recipient_hash>.<zone>``,
+    # ``chunk-XXXX-<msg_key>.<zone>``) — those would need per-sender
+    # prefix anchoring in the record naming itself, which M9 doesn't
+    # have yet. Operators of single-user-per-zone deployments who
+    # accept that broader authority opt in via
+    # ``DMP_TSIG_PER_USER_WILDCARDS=1`` (codex round-17 P1.2).
     suffixes = []
-    username_hash16 = hashlib.sha256(subj.encode("utf-8")).hexdigest()[:16]
+    # Identity + prekey owner hashes are derived from
+    # ``cfg.username`` (the LOCAL PART of subject), not the full
+    # subject. ``dmp.core.identity`` and ``dmp.core.prekeys`` both
+    # hash that. Using the full subject here would mint a key that
+    # doesn't authorize the names ``identity publish`` actually
+    # writes — codex round-17 P1.1.
+    local_norm = (local_part or "").strip().lower()
+    username_hash16 = hashlib.sha256(local_norm.encode("utf-8")).hexdigest()[:16]
     suffixes.append(f"id-{username_hash16}.{z}")
-    # Prekey records use sha256(subject)[:12], not [:16] — different
-    # truncation, different label content (codex round-16 P1). The
-    # prekey RRset name is ``prekeys.id-<hash12>.<zone>``, which
-    # tail-matches ``id-<hash12>.<zone>``, so we add the 12-char form
-    # explicitly so refresh-prekeys UPDATEs authorize.
-    username_hash12 = hashlib.sha256(subj.encode("utf-8")).hexdigest()[:12]
+    username_hash12 = hashlib.sha256(local_norm.encode("utf-8")).hexdigest()[:12]
     suffixes.append(f"id-{username_hash12}.{z}")
+    # User's own claim-record prefix.
     suffixes.append(f"_dnsmesh-claim-{spk16}.{z}")
-    suffixes.append(f"_dnsmesh-claim-*.{z}")
-    suffixes.append(f"slot-*.mb-*.{z}")
-    suffixes.append(f"chunk-*-*.{z}")
+
+    # Single-user-per-zone wildcards. Operators of multi-tenant
+    # zones MUST leave this off — these suffixes authorize ANY
+    # user's mailbox / chunk / claim writes when the zone is shared
+    # across users.
+    if os.environ.get("DMP_TSIG_PER_USER_WILDCARDS", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        suffixes.append(f"_dnsmesh-claim-*.{z}")
+        suffixes.append(f"slot-*.mb-*.{z}")
+        suffixes.append(f"chunk-*-*.{z}")
     x_norm = (x25519_pub_hex or "").strip().lower()
     if x_norm:
         try:

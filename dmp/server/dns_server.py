@@ -437,6 +437,29 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             )
         )
         adds_per_owner: dict = {}
+        # Codex round-17 P2: ``max_values_per_name`` must include
+        # records ALREADY at this owner, not just the adds in the
+        # current packet. Otherwise N single-record UPDATEs grow the
+        # RRset past the cap. We probe the writer-as-reader (most
+        # writers also implement ``DNSRecordReader``) for the
+        # existing count; backends that don't expose a query path
+        # gracefully fall back to per-packet counting. We also check
+        # the server's primary reader as a secondary source.
+        def _existing_count(owner_name: str) -> int:
+            for src in (writer, getattr(self.server, "reader", None)):
+                if src is None:
+                    continue
+                q = getattr(src, "query_txt_record", None)
+                if not callable(q):
+                    continue
+                try:
+                    values = q(owner_name)
+                except Exception:
+                    continue
+                if values is not None:
+                    return len(values)
+            return 0
+
         for op, owner, value, ttl in ops:
             if op != "add":
                 continue
@@ -448,7 +471,18 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                 response.set_rcode(dns.rcode.REFUSED)
                 return response
             if max_values_per_name > 0:
-                adds_per_owner[owner] = adds_per_owner.get(owner, 0) + 1
+                if owner not in adds_per_owner:
+                    # First time we see this owner in this UPDATE —
+                    # seed the running count with whatever's in the
+                    # store today (including duplicates we'd dedupe).
+                    adds_per_owner[owner] = _existing_count(owner)
+                # Distinct-value adds count toward the cap. Repeated
+                # adds of an existing value collapse on the writer
+                # side (publish_txt_record dedupes), so they
+                # technically don't grow the RRset — but counting
+                # them stays conservative and matches what the HTTP
+                # publish path historically did.
+                adds_per_owner[owner] += 1
                 if adds_per_owner[owner] > max_values_per_name:
                     response.set_rcode(dns.rcode.REFUSED)
                     return response
