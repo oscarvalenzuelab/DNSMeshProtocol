@@ -228,7 +228,7 @@ flowchart LR
 
 <!-- 4. Two channels — DNS-only for protocol traffic, HTTPS for one-time auth -->
 <section>
-  <h2>Two channels: DNS for everything, HTTPS once (just to register)</h2>
+  <h2>Two channels: DNS for everything, HTTPS once</h2>
   <pre class="mermaid">
 flowchart LR
     A["Alice's CLI"] -- "HTTPS once\n(register, get TSIG key)" --> ANode["Alice's home node\n(serves alice.example)"]
@@ -237,18 +237,11 @@ flowchart LR
     Resolvers -- "recursive chain" --> ANode
   </pre>
   <ul style="text-align: left;">
-    <li><strong>Normal user flow:</strong> Alice runs <code>dnsmesh tsig register</code> once to get a TSIG key from her home node. After that, her client writes with DNS UPDATE.</li>
-    <li><strong>Writes (after register):</strong> Alice's CLI sends RFC 2136 DNS UPDATE messages signed with her TSIG key. Identity, prekeys, mailbox slots, chunks — all DNS UPDATE.</li>
-    <li><strong>Reads:</strong> Bob queries DNS for the record. Public resolvers walk the standard chain to Alice's authoritative node and pull it back.</li>
-    <li><strong>Inter-node:</strong> heartbeat, peer discovery, claim publishes between strangers — also DNS. No HTTPS between independent nodes.</li>
+    <li><strong>HTTPS once:</strong> Alice registers (<code>dnsmesh tsig register</code>) and gets a TSIG key.</li>
+    <li><strong>Writes:</strong> RFC 2136 DNS UPDATE under that key. Every record — identity, prekeys, mailbox, chunks.</li>
+    <li><strong>Reads:</strong> plain DNS queries. Bob walks the standard chain to Alice's node and pulls.</li>
+    <li><strong>Between nodes:</strong> also DNS. No HTTPS between independent operators.</li>
   </ul>
-  <div class="takeaway">
-    <strong>The protocol speaks DNS.</strong> In the preferred M9 path,
-    HTTPS is only the one-time user-to-own-node onboarding step.
-    After that, record publishes are RFC 2136 + RFC 8945 DNS UPDATE
-    and reads are plain DNS TXT queries. The only remaining inter-node
-    HTTP path is cluster anti-entropy inside one operator's HA domain.
-  </div>
 </section>
 
 <!-- 4a. Glossary -->
