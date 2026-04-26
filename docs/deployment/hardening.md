@@ -18,10 +18,11 @@ not "nice to haves."
 {:toc}
 
 {: .warning }
-External cryptographic audit is tracked separately (see `ROADMAP.md`
-M4.2-M4.4). The hardening below is orthogonal: these are the
-operator-facing knobs whose defaults still need to be right regardless
-of how the audit concludes.
+External cryptographic audit is tracked separately (see
+[SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md)).
+The hardening below is orthogonal: these are the operator-facing
+knobs whose defaults still need to be right regardless of how the
+audit concludes.
 
 ## 1. TLS is not optional in production
 

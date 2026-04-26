@@ -2,15 +2,6 @@
 
 Thanks for considering a patch. A few ground rules.
 
-**Contributing as an AI agent?** Read
-[`AGENTS.md`](AGENTS.md) first. That document defines the multi-agent
-workflow (Planner / Implementer / Validator / Reviewer / Integrator),
-the task lifecycle, parallelism rules, and the definition of done.
-This file is for humans; `AGENTS.md` is the operating manual for
-automated contributors. Current sprint work lives in
-[`TASKS.md`](TASKS.md); the long-horizon plan is
-[`ROADMAP.md`](ROADMAP.md).
-
 ## Before you start
 
 - This is alpha software. Protocol and API can change. Expect to revisit
@@ -109,8 +100,8 @@ not `test_parse_and_verify_2`. Future-you will thank you.
 - Feature flags "just in case." Make the decision; delete the flag.
 - PRs that disable `--no-verify`, skip hooks, or bypass the test suite
   to land something.
-- Protocol changes without a corresponding update to `DMP_SPEC.md` /
-  `PROTOCOL.md` / `CHANGELOG.md`.
+- Protocol changes without a corresponding update to `docs/protocol/`
+  and `CHANGELOG.md`.
 
 ## Questions
 

@@ -25,9 +25,8 @@ For what ships today
   install + first message.
 - [Protocol]({{ site.baseurl }}/protocol) — wire format + crypto as
   implemented.
-- [ROADMAP.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md) —
-  milestone-by-milestone status, with commit references for every
-  shipped item.
+- [CHANGELOG.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/CHANGELOG.md) —
+  release-by-release log of what shipped, with commit references.
 - [SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md) —
   honest list of what's protected and what isn't.
 
@@ -76,7 +75,6 @@ Items from the original spec that are **deliberately deferred**:
   M3 cluster model, routing reduces to "which cluster nodes to
   query," and mature mesh libraries (Yggdrasil, cjdns) address
   multi-hop IP-layer routing better than a message-layer protocol
-  could. See the "Deferred / unlikely" section of
-  [ROADMAP.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md).
+  could.
 - **Using DMP as a relay for non-DMP traffic** — also deferred; DMP
   is an application-layer protocol, not an overlay network.

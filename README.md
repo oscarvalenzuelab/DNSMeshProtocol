@@ -104,7 +104,3 @@ See [CONTRIBUTING.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/m
 ## License
 
 [AGPL-3.0](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/LICENSE) — if you host DMP as a service you must publish your changes.
-
-## Author
-
-Oscar Valenzuela · [oscarvalenzuelab](https://github.com/oscarvalenzuelab)

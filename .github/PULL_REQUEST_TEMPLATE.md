@@ -1,19 +1,13 @@
 <!--
-PR title format: `[<TASK-ID>] <one-line summary>`
-Read AGENTS.md before opening this PR.
+PR title format: short imperative, ~72 chars max.
+e.g. `cli: store contacts under full user@host key`
 -->
-
-## Task
-
-**Task ID:** `<M1.1 | M1.2 | ...>` (from `TASKS.md`)
-**Role:** Implementer
-**Worktree:** `<branch name>`
 
 ## What changed
 
 <!--
 30-second summary. Why did this change happen, and what does the
-reader need to know to review it? Link ROADMAP.md / TASKS.md items.
+reader need to know to review it?
 -->
 
 ## Tests
@@ -54,17 +48,8 @@ working? If yes, enumerate and add to CHANGELOG.md under BREAKING.
 - [ ] CLI surface changed (docs updated)
 - [ ] Library API changed (docs updated)
 
-## Review gates
-
-<!-- Fill these in as review progresses. -->
-
-- [ ] CI green (Validator)
-- [ ] Codex review requested
-- [ ] Codex review clean (no open P1)
-- [ ] Human maintainer approved
-
 ## Definition of done
 
 - [ ] `CHANGELOG.md` updated under the right section
 - [ ] `docs/` updated for any user-facing change
-- [ ] `TASKS.md` will move to `done` with this commit SHA
+- [ ] CI green

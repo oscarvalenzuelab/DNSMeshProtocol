@@ -15,8 +15,8 @@ write redundancy + anti-entropy sync (M2), bootstrap-domain gossip
 items are Dijkstra-style mesh routing and using DMP as a relay
 for non-DMP traffic. The spec-to-ship delta is tracked line-by-line
 in the [Design Intent index]({{ site.baseurl }}/design-intent)
-page; per-milestone status and commit refs are in
-[ROADMAP.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md).
+page; per-release status and commit refs are in
+[CHANGELOG.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/CHANGELOG.md).
 
 ## Project Overview
 

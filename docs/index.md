@@ -236,7 +236,7 @@ Actively shipping:
   routing, end-to-end flows, and threat model, designed so an
   independent implementer can build interoperable clients.
 
-Certification backlog — work on the path to `v1.0`, tracked in [`ROADMAP.md`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/ROADMAP.md) and as [GitHub issues](https://github.com/oscarvalenzuelab/DNSMeshProtocol/issues?q=is%3Aissue+label%3Acertification-backlog):
+Certification backlog — work on the path to `v1.0`, tracked as [GitHub issues](https://github.com/oscarvalenzuelab/DNSMeshProtocol/issues?q=is%3Aissue+label%3Acertification-backlog):
 
 - **External cryptographic audit** (M4.2–M4.4). The gate for tagging
   `v0.2.0-beta` and for treating DMP as anything other than alpha

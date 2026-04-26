@@ -79,3 +79,9 @@ docker/m8-test/*operator*
 
 # Playwright MCP browser snapshots — local-only, never commit
 .playwright-mcp/
+
+# Internal/working files (kept locally, not published)
+TASKS.md
+ROADMAP.md
+AGENTS.md
+info.txt
