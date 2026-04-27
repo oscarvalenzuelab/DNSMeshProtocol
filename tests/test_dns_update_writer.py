@@ -484,3 +484,55 @@ class TestNsFallbackUsesResolverPool:
             "pooled NS-host A lookup must fail closed, not leak to "
             "socket.getaddrinfo"
         )
+
+    def test_allow_system_fallback_resolves_external_ns_host(self, monkeypatch):
+        """Codex round-9 P1: ``allow_system_fallback=True`` is the
+        explicit opt-in for hybrid split-host deployments where the
+        pool can answer the NS RRset query but cannot recurse on
+        the returned NS hostnames (typical of authoritative-only
+        pools). With the flag, the NS-host A lookup falls through
+        to ``socket.getaddrinfo``; without it, the strict default
+        (round-8) keeps the trust boundary closed."""
+
+        # Stub getaddrinfo so the test doesn't hit real DNS. The
+        # function gets called twice: once for the apex (which fails
+        # in our scenario) and once for the NS hostname (which
+        # succeeds because allow_system_fallback=True).
+        sentinel_ip = "198.51.100.42"
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            if host == "ns1.partial-pool.example":
+                return [
+                    (
+                        socket.AF_INET,
+                        socket.SOCK_DGRAM,
+                        0,
+                        "",
+                        (sentinel_ip, 0),
+                    )
+                ]
+            # Anything else (the apex) — pretend NXDOMAIN.
+            raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname")
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+        pool = self._StubPool(
+            address_map={
+                # Pool can't resolve apex OR the external NS host —
+                # it's authoritative-only for the operator's zones.
+                "partial-pool.example": None,
+                "ns1.partial-pool.example": None,
+            },
+            ns_map={
+                "partial-pool.example": ["ns1.partial-pool.example"],
+            },
+        )
+        ip = _resolve_to_ip(
+            "partial-pool.example",
+            resolver_pool=pool,
+            allow_system_fallback=True,
+        )
+        assert ip == sentinel_ip
+        # Sanity: without the opt-in the same setup fails closed.
+        ip_strict = _resolve_to_ip("partial-pool.example", resolver_pool=pool)
+        assert ip_strict is None

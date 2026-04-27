@@ -50,7 +50,7 @@ from dmp.network.base import DNSRecordWriter
 log = logging.getLogger(__name__)
 
 
-def _resolve_to_ip(host, resolver_pool=None):
+def _resolve_to_ip(host, resolver_pool=None, allow_system_fallback=False):
     """Return ``host`` if it's already an IPv4/IPv6 literal, else resolve.
 
     dnspython's ``dns.query.udp`` / ``dns.query.tcp`` accept only IP
@@ -77,6 +77,19 @@ def _resolve_to_ip(host, resolver_pool=None):
 
     Defensive against ``None`` / non-string / empty input — those
     are treated as unresolvable.
+
+    ``allow_system_fallback`` (codex round-9 P1; default False) is
+    the opt-in escape hatch for hybrid split-host deployments where
+    the configured pool can answer the NS RRset query but cannot
+    recursively resolve the returned NS hostnames (e.g. an
+    authoritative-only pool). Passing True lets the NS-chain branch
+    fall back to ``socket.getaddrinfo`` for the NS-host A lookup
+    when the pool returns None. The default is False — pinned-
+    recursor operators want a strict trust boundary that never
+    leaks to the host's system view, even on transient pool misses.
+    Callers who set ``allow_system_fallback=True`` are explicitly
+    accepting the leak in exchange for resolving external NS hosts
+    their pool can't reach.
     """
     if not isinstance(host, str) or not host:
         return None
@@ -135,9 +148,29 @@ def _resolve_to_ip(host, resolver_pool=None):
         try:
             ns_hosts = list(resolver_pool.resolve_ns_hosts(host))
         except Exception:
-            return None
+            ns_hosts = []
+        # If the pool found NS records, prefer those. Otherwise the
+        # behavior depends on the operator's trust intent: strict
+        # mode (default) fails closed; opt-in
+        # ``allow_system_fallback=True`` consults the system resolver
+        # for the NS query as a last-resort.
         if not ns_hosts:
-            return None
+            if not allow_system_fallback:
+                return None
+            try:
+                import dns.resolver as _r
+
+                ns_answers = _r.resolve(host, "NS", raise_on_no_answer=False)
+            except Exception:
+                return None
+            for rdata in ns_answers:
+                ns_name = getattr(rdata, "target", None)
+                if ns_name is None:
+                    continue
+                try:
+                    ns_hosts.append(ns_name.to_text(omit_final_dot=True))
+                except Exception:
+                    continue
     else:
         try:
             import dns.resolver as _r
@@ -155,15 +188,22 @@ def _resolve_to_ip(host, resolver_pool=None):
                 continue
     for ns_text in ns_hosts:
         if pooled and hasattr(resolver_pool, "resolve_address"):
-            # Pool-only path: never falls through to the system view.
+            # Pool path: try the pool first.
             try:
                 ip = resolver_pool.resolve_address(ns_text)
             except Exception:
                 ip = None
             if ip:
                 return ip
-            continue  # try the next NS host through the pool
-        # Pool-less path: system resolver is the last-resort.
+            # Pool can't recurse on this NS hostname. Strict mode
+            # (default) skips to the next NS host without leaking
+            # to the system resolver. ``allow_system_fallback=True``
+            # falls through to ``socket.getaddrinfo`` for hybrid
+            # split-host deployments — the operator opted in.
+            if not allow_system_fallback:
+                continue
+        # Pool-less path OR opted-in system fallback: system
+        # resolver as last-resort.
         try:
             ns_infos = socket.getaddrinfo(ns_text, None, type=socket.SOCK_DGRAM)
         except (socket.gaierror, UnicodeError):
