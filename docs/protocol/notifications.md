@@ -136,6 +136,14 @@ fallback covers the missed notification within one fallback
 interval. The CLI logs the outcome for operator visibility but
 exits 0 on partial success.
 
+Routing target: the un-TSIG'd UPDATE goes to the recipient zone's
+apex hostname on the configured DNS port (53 in production, override
+via `DMP_PROVIDER_DNS_PORT` for dev). The reference implementation
+piggybacks on the existing `_provider_dns_target` helper, which
+prefers an explicit endpoint URL host when given and falls back to
+zone-as-host otherwise; M10 sends pass an empty endpoint so the
+zone apex is always used.
+
 Implementation note: the existing
 [`_publish_claim_via_dns_update`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/dmp/client/client.py)
 helper already handles this exact UPDATE shape; M10 adds a second
@@ -222,6 +230,13 @@ A node MAY enable both `DMP_RECEIVER_CLAIM_NOTIFICATIONS` and
 disjoint owner-name patterns (provider role uses
 `<provider-zone>`, receiver role uses `<own-zone>`).
 
+The per-recipient rate limit (`DMP_CLAIM_RATE_PER_USER_PER_SEC` /
+`DMP_CLAIM_RATE_BURST`) is keyed on the `hash12` extracted from the
+incoming owner name and applies uniformly to **both** un-TSIG'd
+claim surfaces (M8.3 first-contact provider AND M10 receiver-zone).
+A single noisy sender targeting one recipient cannot burn the whole
+zone's budget; legitimate cross-recipient traffic is unaffected.
+
 The `claim-*.mb-*.<own-zone>` accept path enforces the same
 record-shape validation as the M8.3 path:
 
@@ -253,7 +268,14 @@ CLI is just faster on average.
 |---|---|
 | `dnsmesh recv --primary-only` | Run phase 1 only. Diagnoses primary-path latency in isolation. |
 | `dnsmesh recv --skip-primary` | Run phase 2 only. Diagnoses missed claims (compare delivered set against `--primary-only`'s set). |
-| `dnsmesh recv --once` | Single tick, then exit. (Existing flag; unchanged.) |
+
+`dnsmesh recv` is a one-shot per invocation; cadences in the
+[Tunable cadence](#tunable-cadence) table are consumed by external
+schedulers (cron, systemd timers) calling `dnsmesh recv` and
+`dnsmesh recv --skip-primary` at different rates. A persisted
+`recv_secondary_disable=true` short-circuits to the same behavior
+as `--primary-only` so a high-trust deployment doesn't have to
+re-pass the flag on every invocation.
 
 ### Visibility
 
@@ -300,6 +322,20 @@ change beyond the second UPDATE call per send.
 A pre-M10 receiver that doesn't run phase 1 misses the latency
 improvement but doesn't miss any messages. Phase 2 is the
 existing M9 receive path.
+
+**Pure-TOFU receivers** (zero pinned signing keys — the legacy
+default before any contact has been added) MUST skip phase 1 even
+when both flags would otherwise enable it. The M8.3 claim path
+deposits non-pinned senders into the intro queue, which is the
+correct behavior for first-contact-via-provider; but in pure
+TOFU mode the M9 receive contract is "trust any signature-valid
+manifest, deliver to the inbox", and phase 1 quarantining would
+shadow phase 2's TOFU delivery via the replay cache. The reference
+implementation skips phase 1 unless `len(known_spks) > 0`; once
+the user pins any contact, phase 1 re-engages and the M8.3
+intro-queue semantics apply to non-pinned senders. The `recv
+--primary-only` diagnostic flag overrides the skip — an operator
+who explicitly asks for phase 1 gets it, regardless of pin state.
 
 ### Operator migration
 
