@@ -144,6 +144,17 @@ prefers an explicit endpoint URL host when given and falls back to
 zone-as-host otherwise; M10 sends pass an empty endpoint so the
 zone apex is always used.
 
+Same-zone deployments (sender + recipient share a home node) MUST
+also route through the un-TSIG'd UPDATE path — the sender does NOT
+get to write the M10 claim through their authorized TSIG writer
+just because they happen to share a zone with the recipient. The
+M10 publish is gated on the recipient operator's
+`DMP_RECEIVER_CLAIM_NOTIFICATIONS` opt-in AND the per-recipient
+rate limit, both of which only fire on the un-TSIG'd accept path.
+A same-zone bypass would silently activate M10 for any same-zone
+recipient even when the operator left the flag off, defeating the
+operator's opt-out and the rate-limit budget.
+
 Implementation note: the existing
 [`_publish_claim_via_dns_update`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/dmp/client/client.py)
 helper already handles this exact UPDATE shape; M10 adds a second
@@ -198,6 +209,22 @@ The replay cache keyed on `(sender_spk, msg_id)` ensures a message
 delivered through phase 1 isn't redelivered when phase 2 finds the
 same manifest later.
 
+### Orthogonal: M8.3 first-contact claim_providers
+
+The M8.3 first-contact provider channel (`claim_providers` poll on a
+shared provider tier) is independent of the M10 phase-1/phase-2
+split and MUST run on every receive pass regardless of which phase
+toggles are set. Phase 1 is the M10 own-zone latency optimization;
+phase 2 is the M9 slot-walk fallback; the provider channel is the
+M8.3 stranger-reach surface. Disabling phase 1 or phase 2 (whether
+via `--primary-only`, `--skip-primary`, or
+`recv_secondary_disable=true`) MUST NOT silently turn off
+first-contact discovery — an unpinned-stranger intro that arrives
+through a shared provider tier still needs to land in the intro
+queue. The reference implementation polls all configured
+`claim_providers` after the phase-2 slot walk, before returning to
+the caller.
+
 ### Tunable cadence
 
 | Config field | Default | Purpose |
@@ -209,6 +236,16 @@ same manifest later.
 A receiver running phase 1 only with `recv_secondary_disable=true`
 loses defense-in-depth but minimizes query overhead — appropriate
 for a node operator running their own home node.
+
+The persisted `recv_secondary_disable=true` knob MUST respect the
+[pure-TOFU phase-1 skip rule](#receiver-migration). On a fresh
+install or any config with zero pinned signing keys, the knob
+becomes a no-op (phase 2 stays enabled) so legacy callers without
+any pin still deliver signature-valid manifests to the inbox. Once
+the user pins any contact, the knob engages and short-circuits to
+phase 1 only. Implementations MAY surface a one-line diagnostic
+when the knob is configured but the no-op condition holds, so the
+operator can tell the knob is currently inert.
 
 ## Server config
 

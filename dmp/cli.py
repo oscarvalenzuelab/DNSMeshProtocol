@@ -2803,11 +2803,32 @@ def cmd_recv(args: argparse.Namespace) -> int:
         # are diagnostic flags wired directly onto the receive_messages
         # call. ``recv_secondary_disable`` (config-only) drops phase 2
         # silently for high-trust deployments — equivalent to
-        # ``--skip-primary``'s inverse, but persisted across runs.
+        # ``--primary-only``, but persisted across runs.
+        #
+        # Codex round-1 P1: the persisted knob MUST respect the
+        # pure-TOFU rule. ``receive_messages`` skips phase 1 in pure
+        # TOFU so legacy callers without any pinned spk still deliver
+        # signature-valid manifests to the inbox; if cmd_recv forced
+        # ``primary_only=True`` on a fresh install, those messages
+        # would silently quarantine into the intro queue. Gate the
+        # short-circuit on having at least one pinned signing key.
         primary_only = bool(getattr(args, "primary_only", False))
         skip_primary = bool(getattr(args, "skip_primary", False))
-        if cfg.recv_secondary_disable and not skip_primary:
-            primary_only = True
+        if cfg.recv_secondary_disable and not skip_primary and not primary_only:
+            has_pinned_spk = any(
+                bool(c.signing_key_bytes) for c in client.contacts.values()
+            )
+            if has_pinned_spk:
+                primary_only = True
+            else:
+                print(
+                    "  NOTE: recv_secondary_disable=true is configured but no "
+                    "contacts are pinned yet — phase 2 stays enabled to "
+                    "preserve TOFU delivery. Pin a contact (e.g. "
+                    "`dnsmesh identity fetch user@host --add`) for the "
+                    "knob to engage.",
+                    file=sys.stderr,
+                )
         inbox = client.receive_messages(
             claim_providers=claim_providers,
             primary_only=primary_only,

@@ -755,6 +755,13 @@ class DMPClient:
         # slot walk recovers within `recv_secondary_interval_seconds`.
         # Skipped when the contact predates `Contact.domain` (empty)
         # because we have no recipient zone to address.
+        #
+        # ``force_un_tsig_d=True`` (codex round-1 P2): the M10 publish
+        # MUST exercise the recipient's home-node opt-in gate AND the
+        # per-recipient rate limit, even when sender + recipient share
+        # a zone. Without this, a same-zone deployment would write the
+        # claim through the sender's authorized TSIG writer, defeating
+        # the operator's ``DMP_RECEIVER_CLAIM_NOTIFICATIONS`` opt-out.
         if contact.domain:
             outcome = self.publish_claim(
                 recipient_id=recipient_id,
@@ -765,6 +772,7 @@ class DMPClient:
                 provider_zone=contact.domain,
                 provider_endpoint="",
                 provider_writer=claim_writer,
+                force_un_tsig_d=True,
             )
             if recipient_claim_outcome is not None:
                 recipient_claim_outcome.append(bool(outcome))
@@ -853,25 +861,29 @@ class DMPClient:
         # call (a message delivered via phase 1 is then dedup'd at
         # phase 2).
         #
-        # Skipped in pure TOFU mode (zero pinned signing keys). The
-        # claim-path semantics quarantine non-pinned senders into the
-        # intro queue (M8.3 contract), which would shadow phase 2's
-        # TOFU "trust any signature-valid manifest" delivery. Once
-        # the user pins any contact, phase 1 re-engages.
-        if not skip_primary and known_spks:
+        # Skipped by default in pure TOFU mode (zero pinned signing
+        # keys). The claim-path semantics quarantine non-pinned
+        # senders into the intro queue (M8.3 contract), which would
+        # shadow phase 2's TOFU "trust any signature-valid manifest"
+        # delivery via the replay cache. Once the user pins any
+        # contact, phase 1 re-engages. The ``primary_only`` diagnostic
+        # flag overrides the TOFU skip — an operator who explicitly
+        # asked for phase 1 gets it.
+        if not skip_primary and (known_spks or primary_only):
             primary = self.receive_claims_from_own_zone()
             results.extend(primary.delivered)
-            if primary_only:
-                return results
-        elif primary_only:
-            # Caller forced phase 1. Honor it even in TOFU mode —
-            # diagnostic flag is more important than the cosmetic
-            # intro-queue noise.
-            primary = self.receive_claims_from_own_zone()
-            results.extend(primary.delivered)
-            return results
 
-        for zone in self._zones_to_poll():
+        # Phase 2 — slot walk across pinned-contact zones plus own.
+        # ``primary_only`` skips this. Note: the M8.3 first-contact
+        # claim_providers pass below is a SEPARATE channel from
+        # phase 2 and runs regardless of the diagnostic phase flags
+        # (codex round-1 P1: ``--primary-only`` only isolates the M10
+        # latency path, it does not turn off stranger-reach).
+        if primary_only:
+            slot_walk_zones: List[str] = []
+        else:
+            slot_walk_zones = self._zones_to_poll()
+        for zone in slot_walk_zones:
             for slot in range(SLOT_COUNT):
                 slot_domain = self._slot_domain(self.user_id, slot, zone=zone)
                 records = self.reader.query_txt_record(slot_domain)
@@ -956,6 +968,7 @@ class DMPClient:
         provider_zone: str,
         provider_endpoint: str = "",
         provider_writer: Optional[DNSRecordWriter] = None,
+        force_un_tsig_d: bool = False,
     ) -> bool:
         """Publish one signed claim record at a single provider.
 
@@ -983,6 +996,16 @@ class DMPClient:
         ``provider_endpoint`` is now used purely as a hostname source
         for the DNS UPDATE target — the legacy HTTP ``/v1/claim/publish``
         path is gone (the user authorized breaking that, M9 cleanup).
+
+        ``force_un_tsig_d`` (codex round-1 P2): the M10 send_message
+        path passes True so the same-zone branch is bypassed and the
+        recipient's home node always sees the un-TSIG'd UPDATE. Without
+        this, a same-zone deployment (sender + recipient both on
+        ``dmp.dnsmesh.io``) would publish via the sender's authorized
+        TSIG writer, defeating the operator's
+        ``DMP_RECEIVER_CLAIM_NOTIFICATIONS`` opt-in AND the per-recipient
+        rate limit. Default False preserves the M8.3 same-zone-test
+        fixture behavior.
 
         Returns True on successful publish. Failures (oversize,
         signing mismatch, write rejection, network error) return
@@ -1028,14 +1051,20 @@ class DMPClient:
         #
         # Cross-zone path (production): the provider zone is different
         # from this client's own zone, OR the caller passed a
-        # ``provider_endpoint``. Build a one-shot un-TSIG'd DNS UPDATE
-        # against the provider's authoritative DNS server — the claim
-        # wire's Ed25519 signature is the on-zone authentication, so
-        # TSIG is not required for this surface (M9.2.6 server-side
-        # gate enforces this).
+        # ``provider_endpoint``, OR ``force_un_tsig_d`` was set (M10
+        # send always wants the recipient's home node to enforce the
+        # opt-in gate, even when sender + recipient share a zone).
+        # Build a one-shot un-TSIG'd DNS UPDATE against the provider's
+        # authoritative DNS server — the claim wire's Ed25519 signature
+        # is the on-zone authentication, so TSIG is not required for
+        # this surface (M9.2.6 server-side gate enforces this).
         provider_z = (provider_zone or "").strip().lower().rstrip(".")
         own_zone = (self.domain or "").strip().lower().rstrip(".")
-        if provider_endpoint or (provider_z and provider_z != own_zone):
+        if (
+            force_un_tsig_d
+            or provider_endpoint
+            or (provider_z and provider_z != own_zone)
+        ):
             target = _provider_dns_target(provider_endpoint, provider_zone)
             if not target:
                 return False

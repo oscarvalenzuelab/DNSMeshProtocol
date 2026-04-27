@@ -416,6 +416,251 @@ class TestM10Client:
 
 
 # ---------------------------------------------------------------------------
+# Codex round-1 regression coverage
+# ---------------------------------------------------------------------------
+
+
+class TestCodexRound1Regressions:
+    """Locks in the three findings from the post-M10-implementation
+    codex review:
+
+      P1: ``--primary-only`` / ``--skip-primary`` MUST NOT silently
+          turn off the M8.3 first-contact ``claim_providers`` channel.
+      P1: ``recv_secondary_disable=true`` in pure TOFU MUST preserve
+          the M9 'phase 2 delivers any signature-valid manifest'
+          contract (cmd_recv-level gate).
+      P2: M10 ``send_message`` MUST always exercise the recipient
+          home-node opt-in gate, even same-zone — the un-TSIG'd
+          UPDATE accept path is the gate, so the publish must go
+          through it (not via the sender's authorized writer).
+    """
+
+    PROVIDER_ZONE = "claims.dnsmesh.io"
+
+    def test_claim_providers_polled_under_primary_only(self):
+        """Codex P1 #1: ``primary_only=True`` MUST still poll
+        ``claim_providers``. Phase 2 (slot walk) is the only thing
+        the diagnostic flag turns off — the M8.3 first-contact
+        provider channel is orthogonal."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        eve = DMPClient("eve", "eve-pass", domain="eve.mesh", store=store)
+
+        # Bob pins alice (so phase 1's TOFU skip rule doesn't fire),
+        # but NOT eve. Eve is the unpinned stranger whose claim has
+        # to land in the intro queue via the M8.3 provider channel.
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.mesh",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        eve.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        # Eve sends with M8.3 claim_providers ONLY (no recipient-zone
+        # publish — drop bob's domain to skip the M10 path).
+        eve.contacts["bob"].domain = ""  # type: ignore[attr-defined]
+        ok = eve.send_message(
+            "bob",
+            "stranger first-contact",
+            claim_providers=[(self.PROVIDER_ZONE, "")],
+            claim_writer=store,
+        )
+        assert ok
+
+        # Run with primary_only=True. The claim_providers polling
+        # MUST still run, depositing eve's intro into the queue.
+        delivered = bob.receive_messages(
+            primary_only=True,
+            claim_providers=[(self.PROVIDER_ZONE, "")],
+        )
+        assert delivered == []  # eve isn't pinned → not delivered to inbox
+        intros = bob.intro_queue.list_intros()
+        assert len(intros) == 1, (
+            "claim_providers polling was silently turned off by "
+            "primary_only — eve's first-contact intro is missing"
+        )
+        assert intros[0].plaintext == b"stranger first-contact"
+
+    def test_claim_providers_polled_under_skip_primary(self):
+        """Same regression flagged in the same finding: ``skip_primary``
+        MUST also leave the claim_providers channel intact."""
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        eve = DMPClient("eve", "eve-pass", domain="eve.mesh", store=store)
+
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.mesh",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        eve.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        eve.contacts["bob"].domain = ""  # type: ignore[attr-defined]
+        ok = eve.send_message(
+            "bob",
+            "stranger via skip_primary",
+            claim_providers=[(self.PROVIDER_ZONE, "")],
+            claim_writer=store,
+        )
+        assert ok
+
+        delivered = bob.receive_messages(
+            skip_primary=True,
+            claim_providers=[(self.PROVIDER_ZONE, "")],
+        )
+        assert delivered == []
+        intros = bob.intro_queue.list_intros()
+        assert len(intros) == 1
+        assert intros[0].plaintext == b"stranger via skip_primary"
+
+    def test_tofu_primary_only_override_engages_phase1(self):
+        """Codex P1 #2 (lower-half check): the ``primary_only`` diagnostic
+        flag DOES override the TOFU skip rule — an operator who explicitly
+        asks for phase 1 gets it, regardless of pin state. This
+        complements the cmd_recv-level fix that prevents the persisted
+        ``recv_secondary_disable`` knob from triggering the same
+        override on a fresh install."""
+        store = InMemoryDNSStore()
+        # No pinned contacts → pure TOFU.
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        ok = alice.send_message("bob", "tofu primary-only", claim_writer=store)
+        assert ok
+
+        # Default path (no primary_only) → phase 1 SKIPPED in pure
+        # TOFU; phase 2 slot walk delivers (bob has no contact zones
+        # except own, but the M10 claim isn't queried). Result: zero.
+        # Phase 2 won't find anything because alice published to
+        # alice.mesh, which bob's _zones_to_poll doesn't cover (no
+        # pinned contact for alice). So: zero deliveries — which is
+        # the legitimate pre-M10 behavior for a TOFU receiver who
+        # doesn't even know alice exists.
+        delivered_default = bob.receive_messages()
+        assert delivered_default == []
+
+        # Explicit primary_only=True overrides TOFU skip → phase 1
+        # runs → finds the M10 claim → quarantines into intro queue
+        # because the sender_spk isn't pinned.
+        delivered_forced = bob.receive_messages(primary_only=True)
+        assert delivered_forced == []
+        # The intro should be there from the forced phase 1 pass.
+        assert len(bob.intro_queue.list_intros()) == 1
+
+
+class TestCodexRound1ServerSameZone:
+    """Codex P2 #3 server-side coverage: a same-zone M10 publish from
+    ``send_message`` MUST be REFUSED when the recipient's home node
+    has ``DMP_RECEIVER_CLAIM_NOTIFICATIONS=0``. Previously the
+    same-zone branch fell through to ``self.writer`` (the sender's
+    authorized writer), bypassing the opt-in entirely."""
+
+    def test_same_zone_send_message_un_tsig_d_path_invoked(self):
+        """Whitebox: confirm send_message routes the M10 publish
+        through ``_publish_claim_via_dns_update``, not the
+        TSIG'd writer, even when ``contact.domain == self.domain``."""
+        from dmp.client import client as _client
+
+        store = InMemoryDNSStore()
+        # Same-zone deployment: alice + bob both on dmp.example.com.
+        alice = DMPClient("alice", "alice-pass", domain="dmp.example.com", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="dmp.example.com", store=store)
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="dmp.example.com",  # SAME zone as alice's
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        captured: list = []
+        original = _client._publish_claim_via_dns_update
+
+        def _capture_un_tsig_d(*, zone, target, name, wire, ttl, **kw):
+            captured.append({"zone": zone, "target": target, "name": name})
+            # Pretend the un-TSIG'd UPDATE succeeded so send_message
+            # returns True.
+            return True
+
+        # Also stub the target resolver so we don't need real DNS.
+        _client._provider_dns_target = lambda *_a, **_k: ("127.0.0.1", 5353)
+        _client._publish_claim_via_dns_update = _capture_un_tsig_d
+        try:
+            ok = alice.send_message("bob", "same-zone but un-TSIG'd")
+        finally:
+            _client._publish_claim_via_dns_update = original
+
+        assert ok, "send_message should still succeed"
+        assert len(captured) == 1, (
+            "M10 publish did NOT route through "
+            "_publish_claim_via_dns_update — same-zone bypass regressed"
+        )
+        assert captured[0]["zone"] == "dmp.example.com"
+        assert captured[0]["name"].endswith(".dmp.example.com")
+
+    def test_same_zone_publish_refused_when_server_flag_off(self):
+        """Server-level: a real DMPDnsServer with both flags off MUST
+        REFUSE the M10 publish even when the un-TSIG'd UPDATE is sent
+        from a host that would otherwise be inside the served zone.
+        Confirms the operator opt-out actually keeps the surface closed."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        # Both un-TSIG'd accept flags OFF — the operator hasn't opted
+        # into either M8.3 or M10. TSIG is configured (some other
+        # users on this node are publishing their own records via
+        # TSIG'd UPDATE), but the un-TSIG'd surface stays closed.
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keyring={},
+            allowed_zones=("dmp.example.com",),
+            claim_publish_enabled=False,
+            receiver_claim_publish_enabled=False,
+        )
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        recipient_id = hashlib.sha256(b"recipient").digest()
+        h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+        wire = _claim_wire(sender, recipient_id, sender_zone="dmp.example.com")
+        owner = f"claim-0.mb-{h12}.dmp.example.com."
+
+        with server:
+            upd = dns.update.UpdateMessage("dmp.example.com")
+            upd.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED, (
+            f"same-zone un-TSIG'd UPDATE should be REFUSED with "
+            f"both flags off, got {dns.rcode.to_text(response.rcode())}"
+        )
+        assert store.query_txt_record(owner.rstrip(".")) is None
+
+
+# ---------------------------------------------------------------------------
 # Server-side scenarios — real DNS server + UDP
 # ---------------------------------------------------------------------------
 
