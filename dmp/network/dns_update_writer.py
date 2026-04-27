@@ -107,13 +107,41 @@ def _resolve_to_ip(host, resolver_pool=None):
     try:
         infos = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
     except (socket.gaierror, UnicodeError):
-        return None
+        infos = []
     for af, _, _, _, sockaddr in infos:
         if af == socket.AF_INET:
             return sockaddr[0]
     for af, _, _, _, sockaddr in infos:
         if af == socket.AF_INET6:
             return sockaddr[0]
+
+    # NS-chain fallback (codex round-3 P2): when the zone apex itself
+    # has no A/AAAA record (split-host deployments where DNS UPDATE
+    # targets a sibling hostname), fetch the zone's NS records and
+    # resolve the first NS hostname. The recipient's home node IS the
+    # auth server for its zone; chasing NS gives us its real address
+    # without forcing operators to persist a per-contact endpoint.
+    try:
+        import dns.resolver as _r
+
+        ns_answers = _r.resolve(host, "NS", raise_on_no_answer=False)
+    except Exception:
+        return None
+    for rdata in ns_answers:
+        ns_name = getattr(rdata, "target", None)
+        if ns_name is None:
+            continue
+        ns_text = ns_name.to_text(omit_final_dot=True)
+        try:
+            ns_infos = socket.getaddrinfo(ns_text, None, type=socket.SOCK_DGRAM)
+        except (socket.gaierror, UnicodeError):
+            continue
+        for af, _, _, _, sockaddr in ns_infos:
+            if af == socket.AF_INET:
+                return sockaddr[0]
+        for af, _, _, _, sockaddr in ns_infos:
+            if af == socket.AF_INET6:
+                return sockaddr[0]
     return None
 
 

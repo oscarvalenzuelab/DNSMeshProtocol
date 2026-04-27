@@ -610,44 +610,92 @@ class TestCodexRound1ServerSameZone:
     same-zone branch fell through to ``self.writer`` (the sender's
     authorized writer), bypassing the opt-in entirely."""
 
-    def test_same_zone_send_message_skips_m10_publish(self):
-        """Codex round-2 P2 #1: when ``contact.domain == self.domain``,
-        the M10 publish is skipped entirely. Phase 2's slot walk on
-        own zone already covers same-zone delivery, and writing M10
-        claims to the SENDER's own zone (which is what the legacy
-        backfill case ends up doing) is wasted effort that nobody
-        queries."""
+    def test_legacy_backfilled_contact_skips_m10_publish(self):
+        """Codex round-3 P1 #2: a contact with no persisted domain
+        (legacy ``contacts add`` without ``identity fetch``) is
+        backfilled to ``self.domain`` for prekey/rotation back-compat.
+        That contact's ``domain_explicit`` stays False, so the M10
+        publish is SKIPPED — those records would otherwise land in
+        the SENDER's own zone where nobody queries them."""
         from dmp.client import client as _client
 
         store = InMemoryDNSStore()
-        # Same-zone deployment: alice + bob both on dmp.example.com.
         alice = DMPClient("alice", "alice-pass", domain="dmp.example.com", store=store)
         bob = DMPClient("bob", "bob-pass", domain="dmp.example.com", store=store)
+        # Legacy add: no domain passed → backfill to self.domain,
+        # domain_explicit=False.
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
-            domain="dmp.example.com",  # SAME zone as alice's
             signing_key_hex=bob.get_signing_public_key_hex(),
         )
+        assert alice.contacts["bob"].domain == "dmp.example.com"
+        assert alice.contacts["bob"].domain_explicit is False
 
         captured: list = []
         original = _client._publish_claim_via_dns_update
 
-        def _capture_un_tsig_d(*, zone, target, name, wire, ttl, **kw):
-            captured.append({"zone": zone, "target": target, "name": name})
+        def _capture(*, zone, target, name, wire, ttl, **kw):
+            captured.append({"zone": zone, "name": name})
             return True
 
-        _client._publish_claim_via_dns_update = _capture_un_tsig_d
+        _client._publish_claim_via_dns_update = _capture
         try:
-            ok = alice.send_message("bob", "same-zone — no M10 needed")
+            ok = alice.send_message("bob", "legacy backfill — no M10")
         finally:
             _client._publish_claim_via_dns_update = original
 
         assert ok, "send_message should still succeed (chunks landed)"
         assert captured == [], (
-            f"same-zone M10 publish should be skipped, but got "
-            f"{len(captured)} call(s) to _publish_claim_via_dns_update"
+            f"legacy backfilled contact should NOT trigger M10 "
+            f"publish, but got {len(captured)} call(s)"
         )
+
+    def test_explicit_same_zone_send_message_publishes_m10(self):
+        """Codex round-3 P1 #2 (positive): a contact whose domain
+        was explicitly set (e.g. via ``dnsmesh identity fetch
+        user@host --add``), even if it matches ``self.domain``, MUST
+        still trigger the M10 publish so ``recv --primary-only`` and
+        ``recv_secondary_disable=true`` work in same-zone deployments
+        where phase 2 is the only fallback."""
+        from dmp.client import client as _client
+
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="dmp.example.com", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="dmp.example.com", store=store)
+        # Explicit same-zone: caller passed the zone name even though
+        # it matches alice's own.
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="dmp.example.com",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        assert alice.contacts["bob"].domain_explicit is True
+
+        captured: list = []
+        original = _client._publish_claim_via_dns_update
+        original_target = _client._provider_dns_target
+
+        def _capture(*, zone, target, name, wire, ttl, **kw):
+            captured.append({"zone": zone, "name": name})
+            return True
+
+        _client._provider_dns_target = lambda *_a, **_k: ("127.0.0.1", 5353)
+        _client._publish_claim_via_dns_update = _capture
+        try:
+            ok = alice.send_message("bob", "same-zone but explicit")
+        finally:
+            _client._publish_claim_via_dns_update = original
+            _client._provider_dns_target = original_target
+
+        assert ok
+        assert len(captured) == 1, (
+            "explicit same-zone contact should trigger M10 publish "
+            "(needed for --primary-only / recv_secondary_disable)"
+        )
+        assert captured[0]["zone"] == "dmp.example.com"
+        assert captured[0]["name"].endswith(".dmp.example.com")
 
     def test_cross_zone_send_message_routes_through_un_tsig_d(self):
         """Codex round-2 P1: cross-zone M10 publish MUST always go
@@ -770,6 +818,29 @@ def _claim_wire(
     return claim.sign(sender_crypto)
 
 
+def _keystore_with_recipient(zone: str, recipient_hash12: str, tmp_path):
+    """Build an on-disk TSIGKeyStore that has one user registered with
+    a scope containing ``mb-{recipient_hash12}.{zone}``.
+
+    M10-only mode (codex round-3 P1) gates the un-TSIG'd accept path
+    on registered recipient hashes; tests exercising that mode need a
+    real keystore rather than the empty ``tsig_keyring={}`` shortcut.
+    """
+    from dmp.server.tsig_keystore import TSIGKeyStore
+
+    db_path = str(tmp_path / "tsig.db")
+    store = TSIGKeyStore(db_path)
+    store.put(
+        name=f"user-{recipient_hash12}.",
+        secret=b"\x33" * 32,
+        allowed_suffixes=[
+            f"mb-{recipient_hash12}.{zone}",
+            f"slot-*.mb-{recipient_hash12}.{zone}",
+        ],
+    )
+    return store
+
+
 class TestM10Server:
     def test_default_refuses_m10_writes_when_flag_off(self):
         """Both DMP_CLAIM_PROVIDER and DMP_RECEIVER_CLAIM_NOTIFICATIONS
@@ -805,24 +876,29 @@ class TestM10Server:
         assert response.rcode() == dns.rcode.REFUSED
         assert store.query_txt_record(owner.rstrip(".")) is None
 
-    def test_m10_flag_enables_un_tsig_d_publish(self):
-        """With DMP_RECEIVER_CLAIM_NOTIFICATIONS=1, a verified claim wire
-        publishes successfully even though DMP_CLAIM_PROVIDER stays off."""
+    def test_m10_flag_enables_un_tsig_d_publish(self, tmp_path):
+        """With DMP_RECEIVER_CLAIM_NOTIFICATIONS=1, a verified claim
+        wire for a REGISTERED recipient publishes successfully even
+        though DMP_CLAIM_PROVIDER stays off. Codex round-3 P1: the
+        accept path requires the recipient hash to belong to one of
+        the node's registered users, so this test ships a keystore
+        with the hash registered."""
         store = InMemoryDNSStore()
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        recipient_id = hashlib.sha256(b"recipient").digest()
+        h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+        keystore = _keystore_with_recipient("dmp.example.com", h12, tmp_path)
         port = _free_port()
         server = DMPDnsServer(
             store,
             host="127.0.0.1",
             port=port,
             writer=store,
-            tsig_keyring={},
+            tsig_keystore=keystore,
             allowed_zones=("dmp.example.com",),
             claim_publish_enabled=False,
             receiver_claim_publish_enabled=True,
         )
-        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
-        recipient_id = hashlib.sha256(b"recipient").digest()
-        h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
         wire = _claim_wire(sender, recipient_id)
         owner = f"claim-0.mb-{h12}.dmp.example.com."
 
@@ -838,23 +914,110 @@ class TestM10Server:
         assert response.rcode() == dns.rcode.NOERROR
         assert store.query_txt_record(owner.rstrip(".")) == [wire]
 
-    def test_bad_signature_refused(self):
-        """A claim wire whose signature is corrupted fails verification at
-        the server and the UPDATE is REFUSED — no record lands."""
+    def test_m10_only_refuses_unregistered_recipient_hash(self, tmp_path):
+        """Codex round-3 P1: M10-only mode (DMP_RECEIVER_CLAIM_NOTIFICATIONS=1
+        + DMP_CLAIM_PROVIDER=0) MUST refuse claim writes whose hash12
+        doesn't correspond to a registered user on the served zone.
+        Otherwise the operator's M8.3 opt-out (closed first-contact
+        provider role) is silently re-opened by M10."""
         store = InMemoryDNSStore()
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        # Register ONE recipient on the keystore.
+        registered_id = hashlib.sha256(b"registered").digest()
+        registered_h12 = hashlib.sha256(registered_id).hexdigest()[:12]
+        keystore = _keystore_with_recipient("dmp.example.com", registered_h12, tmp_path)
         port = _free_port()
         server = DMPDnsServer(
             store,
             host="127.0.0.1",
             port=port,
             writer=store,
-            tsig_keyring={},
+            tsig_keystore=keystore,
             allowed_zones=("dmp.example.com",),
+            claim_publish_enabled=False,
             receiver_claim_publish_enabled=True,
         )
+
+        # Stranger sends a claim for a DIFFERENT hash that's NOT
+        # registered on this node — server must REFUSE.
+        stranger_id = hashlib.sha256(b"stranger").digest()
+        stranger_h12 = hashlib.sha256(stranger_id).hexdigest()[:12]
+        wire = _claim_wire(sender, stranger_id)
+        owner = f"claim-0.mb-{stranger_h12}.dmp.example.com."
+
+        with server:
+            upd = dns.update.UpdateMessage("dmp.example.com")
+            upd.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED, (
+            "M10-only mode must reject claims for un-registered "
+            "recipient hashes; got "
+            f"{dns.rcode.to_text(response.rcode())}"
+        )
+        assert store.query_txt_record(owner.rstrip(".")) is None
+
+    def test_m8_3_provider_role_accepts_any_recipient_hash(self, tmp_path):
+        """When DMP_CLAIM_PROVIDER=1 (open first-contact provider tier),
+        the registered-hash gate does NOT apply — the whole point of
+        the M8.3 role is to accept claims for arbitrary recipients
+        the operator does not know about. Codex round-3 P1: confirm
+        the gate fires only in M10-only mode."""
+        store = InMemoryDNSStore()
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        # Stranger recipient — NOT registered on this node.
+        stranger_id = hashlib.sha256(b"stranger").digest()
+        stranger_h12 = hashlib.sha256(stranger_id).hexdigest()[:12]
+        # Empty keystore (no users registered) but provider role on.
+        keystore = _keystore_with_recipient("dmp.example.com", "ffffffffffff", tmp_path)
+        port = _free_port()
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keystore=keystore,
+            allowed_zones=("dmp.example.com",),
+            claim_publish_enabled=True,  # M8.3 open provider tier
+            receiver_claim_publish_enabled=True,
+        )
+        wire = _claim_wire(sender, stranger_id)
+        owner = f"claim-0.mb-{stranger_h12}.dmp.example.com."
+
+        with server:
+            upd = dns.update.UpdateMessage("dmp.example.com")
+            upd.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.NOERROR
+        assert store.query_txt_record(owner.rstrip(".")) == [wire]
+
+    def test_bad_signature_refused(self, tmp_path):
+        """A claim wire whose signature is corrupted fails verification at
+        the server and the UPDATE is REFUSED — no record lands."""
+        store = InMemoryDNSStore()
         sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
         recipient_id = hashlib.sha256(b"recipient").digest()
         h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+        keystore = _keystore_with_recipient("dmp.example.com", h12, tmp_path)
+        port = _free_port()
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keystore=keystore,
+            allowed_zones=("dmp.example.com",),
+            receiver_claim_publish_enabled=True,
+        )
         wire = _claim_wire(sender, recipient_id)
         # Flip a few bits inside the base64 body so the signature no
         # longer verifies under sender_spk.
@@ -876,28 +1039,29 @@ class TestM10Server:
         assert response.rcode() == dns.rcode.REFUSED
         assert store.query_txt_record(owner.rstrip(".")) is None
 
-    def test_rate_limit_exhaustion_returns_servfail(self):
+    def test_rate_limit_exhaustion_returns_servfail(self, tmp_path):
         """Per-recipient-hash bucket: once burst is exhausted, further
         UPDATEs for the SAME hash12 are answered SERVFAIL until the
         bucket refills. Distinct from REFUSED for shape violations:
         SERVFAIL signals a transient backoff to the legitimate sender."""
         store = InMemoryDNSStore()
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        recipient_id = hashlib.sha256(b"recipient").digest()
+        h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+        keystore = _keystore_with_recipient("dmp.example.com", h12, tmp_path)
         port = _free_port()
         server = DMPDnsServer(
             store,
             host="127.0.0.1",
             port=port,
             writer=store,
-            tsig_keyring={},
+            tsig_keystore=keystore,
             allowed_zones=("dmp.example.com",),
             receiver_claim_publish_enabled=True,
             # Tight bucket so the test exhausts in two writes without
             # waiting for refill.
             claim_rate_limit=RateLimit(rate_per_second=0.01, burst=2),
         )
-        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
-        recipient_id = hashlib.sha256(b"recipient").digest()
-        h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
         owner = f"claim-0.mb-{h12}.dmp.example.com."
 
         with server:

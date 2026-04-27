@@ -185,7 +185,14 @@ class TestMintTsigViaRegistration:
             config=config,
             body=body,
         )
-        mailbox_hash = hashlib.sha256(x_pub).hexdigest()[:12]
+        # Codex round-3 P1: registration's mailbox-hash convention is
+        # ``hash12(recipient_id)`` = ``sha256(sha256(x_pub))[:12]`` so
+        # it matches the actual ``mb-{hash12}.{zone}`` owner format.
+        # The prior single-round formulation silently disagreed with
+        # owner names; tight-scope mode would have rejected the
+        # user's own mailbox writes.
+        recipient_id = hashlib.sha256(x_pub).digest()
+        mailbox_hash = hashlib.sha256(recipient_id).hexdigest()[:12]
         assert f"mb-{mailbox_hash}.ops.example" in minted.allowed_suffixes
 
     def test_long_local_part_rejected(self, keystore, config, challenges):

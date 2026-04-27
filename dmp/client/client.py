@@ -163,6 +163,17 @@ class Contact:
     whose `sender_spk` doesn't match a contact the user has explicitly
     accepted. Older configs that predate the Ed25519 pin leave
     `signing_key_bytes` empty and fall back to TOFU on first delivery.
+
+    ``domain_explicit`` (codex round-3 P1) distinguishes contacts whose
+    domain was explicitly set by the user (e.g. via
+    ``dnsmesh identity fetch user@host --add``) from contacts whose
+    domain was backfilled to ``self.domain`` for back-compat with M5.4
+    prekey + rotation lookups. The M10 publish path uses this flag:
+    explicit-domain contacts get phase-1 notifications even when same
+    zone (so ``recv --primary-only`` works in same-zone deployments);
+    backfilled-domain contacts skip the publish (which would otherwise
+    write claim records into the SENDER's own zone where nobody queries
+    them).
     """
 
     username: str
@@ -171,6 +182,7 @@ class Contact:
         bytes  # Ed25519 signing pubkey (32 bytes); may be b'' for legacy contacts
     )
     domain: str
+    domain_explicit: bool = False
 
 
 @dataclass
@@ -367,11 +379,17 @@ class DMPClient:
         else:
             signing_key_bytes = b""
 
+        # ``domain_explicit`` records whether the caller passed a real
+        # zone name (M10 phase-1 should target it) or relied on the
+        # ``self.domain`` backfill for back-compat (skip M10 — those
+        # claim records would land in the sender's own zone).
+        domain_explicit = bool(domain)
         self.contacts[username] = Contact(
             username=username,
             public_key_bytes=public_key_bytes,
             signing_key_bytes=signing_key_bytes,
             domain=domain or self.domain,
+            domain_explicit=domain_explicit,
         )
         return True
 
@@ -754,29 +772,31 @@ class DMPClient:
         # landed at the sender's zone, and the recipient's phase-2
         # slot walk recovers within `recv_secondary_interval_seconds`.
         #
-        # Routing rules (codex round-2 P2):
-        #   - ``contact.domain`` empty → skip. The CLI hasn't recorded
-        #     a recipient zone for this contact (legacy
-        #     ``dnsmesh contacts add`` without ``identity fetch``); we
-        #     have nowhere to address the claim.
-        #   - ``contact.domain == self.domain`` → skip. Both legitimate
-        #     same-zone deployments AND legacy backfilled contacts
-        #     (``_make_client`` fills empty entry.domain with the local
-        #     effective_domain for back-compat with M5.4 prekey /
-        #     rotation lookups). Phase 2's slot walk on own zone
-        #     already covers same-zone delivery; an M10 write here
-        #     would publish claim records to the SENDER's own zone
-        #     where neither the sender's nor the recipient's recv
-        #     ever queries them.
-        #   - Cross-zone (the M10 happy path) → publish.
+        # Routing rules:
+        #   - ``contact.domain_explicit`` False → skip. The contact
+        #     either has no recorded zone (legacy ``contacts add``
+        #     without ``identity fetch``) or was backfilled to
+        #     ``self.domain`` by ``_make_client`` for M5.4 prekey /
+        #     rotation back-compat. M10 records published under a
+        #     backfilled contact's ``domain`` would land in the
+        #     SENDER's own zone where nobody queries them. (Codex
+        #     round-2 P2 caught this; round-3 P1 sharpened it via the
+        #     explicit flag so real same-zone deployments still get
+        #     M10.)
+        #   - ``contact.domain_explicit`` True (cross-zone OR
+        #     legitimate same-zone) → publish. Same-zone explicit
+        #     contacts need M10 too: ``recv --primary-only`` and
+        #     ``recv_secondary_disable=true`` only see the M10 path,
+        #     so without the publish those modes silently miss every
+        #     same-zone message (codex round-3 P1).
         #
-        # ``force_un_tsig_d=True`` (codex round-1 P2): the cross-zone
-        # publish MUST exercise the recipient's home-node opt-in gate
-        # AND the per-recipient rate limit. Without this, a hypothetical
+        # ``force_un_tsig_d=True`` (codex round-1 P2): the publish
+        # MUST exercise the recipient's home-node opt-in gate AND the
+        # per-recipient rate limit. Without this, a hypothetical
         # library caller passing ``claim_writer`` would write the claim
         # through their own authorized writer, defeating the operator's
         # ``DMP_RECEIVER_CLAIM_NOTIFICATIONS`` opt-out.
-        if contact.domain and contact.domain != self.domain:
+        if contact.domain and contact.domain_explicit:
             outcome = self.publish_claim(
                 recipient_id=recipient_id,
                 msg_id=msg_id,

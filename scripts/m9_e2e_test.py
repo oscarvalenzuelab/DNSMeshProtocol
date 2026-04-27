@@ -46,7 +46,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from dmp.core.heartbeat import HeartbeatRecord
 from dmp.server.registration import _build_signing_payload
 
-
 ALICE_DNS = ("127.0.0.1", 5371)
 BOB_DNS = ("127.0.0.1", 5372)
 PROVIDER_DNS = ("127.0.0.1", 5373)
@@ -108,9 +107,24 @@ def main():
 
     step("2. Each node's seen-graph carries the other peers (transitive discovery)")
     for label, dns_addr, zone, expected_peers in (
-        ("alice", ALICE_DNS, "alice.test", {"http://bob-node:8053", "http://provider-node:8053"}),
-        ("bob", BOB_DNS, "bob.test", {"http://alice-node:8053", "http://provider-node:8053"}),
-        ("provider", PROVIDER_DNS, "claims.test", {"http://alice-node:8053", "http://bob-node:8053"}),
+        (
+            "alice",
+            ALICE_DNS,
+            "alice.test",
+            {"http://bob-node:8053", "http://provider-node:8053"},
+        ),
+        (
+            "bob",
+            BOB_DNS,
+            "bob.test",
+            {"http://alice-node:8053", "http://provider-node:8053"},
+        ),
+        (
+            "provider",
+            PROVIDER_DNS,
+            "claims.test",
+            {"http://alice-node:8053", "http://bob-node:8053"},
+        ),
     ):
         wires = _query_txt(dns_addr, f"_dnsmesh-seen.{zone}")
         endpoints = set()
@@ -137,12 +151,14 @@ def main():
     sig = priv.sign(payload)
     req = urllib.request.Request(
         f"{ALICE_HTTP}/v1/registration/tsig-confirm",
-        data=json.dumps({
-            "subject": subject,
-            "ed25519_spk": pub.hex(),
-            "challenge": challenge["challenge"],
-            "signature": sig.hex(),
-        }).encode("utf-8"),
+        data=json.dumps(
+            {
+                "subject": subject,
+                "ed25519_spk": pub.hex(),
+                "challenge": challenge["challenge"],
+                "signature": sig.hex(),
+            }
+        ).encode("utf-8"),
         headers={"content-type": "application/json"},
         method="POST",
     )
@@ -157,11 +173,13 @@ def main():
     )
 
     step("4. Publish alice's identity via DNS UPDATE (no HTTP)")
-    keyring = dns.tsigkeyring.from_text({
-        minted["tsig_key_name"]: base64.b64encode(
-            bytes.fromhex(minted["tsig_secret_hex"])
-        ).decode("ascii"),
-    })
+    keyring = dns.tsigkeyring.from_text(
+        {
+            minted["tsig_key_name"]: base64.b64encode(
+                bytes.fromhex(minted["tsig_secret_hex"])
+            ).decode("ascii"),
+        }
+    )
     # Identity records hash the LOCAL PART of subject (matches
     # ``dnsmesh identity publish`` and the M9.2.3 round-17 P1 fix).
     local_part = subject.split("@", 1)[0]
@@ -267,11 +285,14 @@ def main():
     # server. No TSIG — the on-zone authentication is the wire's
     # Ed25519 signature.
     import os as _os
+
     _os.environ["DMP_PROVIDER_DNS_PORT"] = "5373"
     from dmp.client.client import DMPClient
 
     sender = DMPClient(
-        "alice", "alice-pass", domain="alice.test",
+        "alice",
+        "alice-pass",
+        domain="alice.test",
     )
     # Pin a stub recipient so we have a recipient_id to address. We
     # use bob's actual X25519 pubkey from a fresh client constructed
@@ -284,6 +305,7 @@ def main():
         signing_key_hex=bob_client.get_signing_public_key_hex(),
     )
     import hashlib as _hashlib
+
     bob_recipient_id = _hashlib.sha256(
         bob_client.crypto.get_public_key_bytes()
     ).digest()
@@ -319,6 +341,7 @@ def main():
     step("9. Provider rejects un-TSIG'd UPDATE for non-claim owner names")
     # Same un-TSIG'd path, but targeting a non-claim owner — must REFUSE.
     import dns.update as _u
+
     upd_bad = _u.UpdateMessage("claims.test")
     upd_bad.add(
         dns.name.from_text("identity.alice.claims.test."),
@@ -326,7 +349,9 @@ def main():
         "TXT",
         '"v=dmp1;t=identity;impostor"',
     )
-    bad_resp = dns.query.udp(upd_bad, PROVIDER_DNS[0], port=PROVIDER_DNS[1], timeout=2.0)
+    bad_resp = dns.query.udp(
+        upd_bad, PROVIDER_DNS[0], port=PROVIDER_DNS[1], timeout=2.0
+    )
     assert_step(
         "Un-TSIG'd UPDATE for non-claim owner is REFUSED",
         bad_resp.rcode() == dns.rcode.REFUSED,
@@ -346,12 +371,14 @@ def main():
     sig2 = priv2.sign(payload2)
     req2 = urllib.request.Request(
         f"{ALICE_HTTP}/v1/registration/tsig-confirm",
-        data=json.dumps({
-            "subject": subject,
-            "ed25519_spk": pub2.hex(),
-            "challenge": challenge2["challenge"],
-            "signature": sig2.hex(),
-        }).encode("utf-8"),
+        data=json.dumps(
+            {
+                "subject": subject,
+                "ed25519_spk": pub2.hex(),
+                "challenge": challenge2["challenge"],
+                "signature": sig2.hex(),
+            }
+        ).encode("utf-8"),
         headers={"content-type": "application/json"},
         method="POST",
     )

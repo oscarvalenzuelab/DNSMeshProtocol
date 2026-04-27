@@ -37,6 +37,9 @@ import sys
 import time
 from typing import List, Optional, Tuple
 
+import json
+import urllib.request
+
 import dns.message
 import dns.name
 import dns.query
@@ -54,7 +57,6 @@ from dmp.core.claim import ClaimRecord, claim_rrset_name  # noqa: E402
 from dmp.core.crypto import DMPCrypto  # noqa: E402
 from dmp.core.heartbeat import HeartbeatRecord  # noqa: E402
 from dmp.network.base import DNSRecordReader, DNSRecordWriter  # noqa: E402
-
 
 ALICE_DNS = ("127.0.0.1", 5181)
 BOB_DNS = ("127.0.0.1", 5182)
@@ -222,6 +224,47 @@ def _wait_for_node(host_port: Tuple[str, int], zone: str, max_wait: int = 30) ->
 # ---------------------------------------------------------------------------
 
 
+def _register_user_with_node(node_http: str, client: DMPClient, subject: str) -> None:
+    """Walk /v1/registration/{challenge,tsig-confirm} for ``client``.
+
+    Registers the user with the node's TSIG keystore and (importantly
+    for codex round-3 P1) seeds the M10 receiver-zone accept path with
+    the user's mailbox hash12 in the registered-recipient set.
+    Without this, bob-node would REFUSE alice's M10 publish for
+    bob's hash even with ``DMP_RECEIVER_CLAIM_NOTIFICATIONS=1``,
+    since the registry would be empty.
+    """
+    challenge_url = f"{node_http}/v1/registration/challenge"
+    with urllib.request.urlopen(challenge_url, timeout=4) as r:
+        ch = json.loads(r.read())
+    challenge_hex = ch["challenge"]
+    node_hostname = ch["node"]
+    payload = (
+        bytes.fromhex(challenge_hex)
+        + subject.encode("utf-8")
+        + node_hostname.encode("utf-8")
+        + b"\x01"
+    )
+    sig = client.crypto.sign_data(payload).hex()
+    confirm_req = urllib.request.Request(
+        f"{node_http}/v1/registration/tsig-confirm",
+        data=json.dumps(
+            {
+                "subject": subject,
+                "ed25519_spk": client.get_signing_public_key_hex(),
+                "challenge": challenge_hex,
+                "signature": sig,
+                "x25519_pub": client.get_public_key_hex(),
+            }
+        ).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(confirm_req, timeout=4) as r:
+        body = json.loads(r.read())
+    assert body.get("tsig_key_name"), f"registration failed: {body!r}"
+
+
 def main() -> None:
     _patch_provider_dns_target()
 
@@ -285,6 +328,22 @@ def main() -> None:
         "bob" in alice.contacts and "alice" in bob.contacts,
     )
 
+    step("2.5. Register bob with bob-node so the M10 hash gate accepts")
+    # Codex round-3 P1: when DMP_CLAIM_PROVIDER=0 and
+    # DMP_RECEIVER_CLAIM_NOTIFICATIONS=1, the un-TSIG'd accept path
+    # gates on the recipient hash being in the keystore's registered
+    # set. Bob's TSIG-registration walks the
+    # /v1/registration/tsig-confirm flow and seeds his hash12 into
+    # bob-node's keystore.
+    _register_user_with_node(BOB_HTTP, bob, "bob@bob.test")
+    assert_step("bob registered with bob-node (TSIG + mb-hash scope)", True)
+    # Alice also registers with alice-node so she has authority over
+    # her own zone's records via DNS UPDATE (not strictly needed here
+    # because the harness uses operator-token HTTP for chunk publish,
+    # but it keeps the test surface realistic).
+    _register_user_with_node(ALICE_HTTP, alice, "alice@alice.test")
+    assert_step("alice registered with alice-node", True)
+
     step("3. alice sends a real message to bob (manifest+chunks AND M10 claim)")
     recipient_outcome: List[bool] = []
     ok = alice.send_message(
@@ -300,9 +359,7 @@ def main() -> None:
     )
 
     step("4. M10 claim is sitting under bob.test (DNS-side check)")
-    bob_recipient_id = hashlib.sha256(
-        bytes.fromhex(bob.get_public_key_hex())
-    ).digest()
+    bob_recipient_id = hashlib.sha256(bytes.fromhex(bob.get_public_key_hex())).digest()
     bob_h12 = hashlib.sha256(bob_recipient_id).hexdigest()[:12]
     found_claim = False
     for slot in range(10):
@@ -383,9 +440,7 @@ def main() -> None:
         "TXT",
         '"' + wire.replace('"', r"\"") + '"',
     )
-    response = dns.query.udp(
-        upd, STRANGER_DNS[0], port=STRANGER_DNS[1], timeout=3.0
-    )
+    response = dns.query.udp(upd, STRANGER_DNS[0], port=STRANGER_DNS[1], timeout=3.0)
     assert_step(
         "stranger-node answers REFUSED (M10 default-off contract)",
         response.rcode() == dns.rcode.REFUSED,
@@ -400,8 +455,9 @@ def main() -> None:
     )
 
     step("8. Positive control: same UPDATE against bob-node (M10 on) succeeds")
-    # Same wire shape but addressed under bob.test — a different owner
-    # name that bob-node accepts because DMP_RECEIVER_CLAIM_NOTIFICATIONS=1.
+    # Same wire shape but addressed under bob.test — a registered
+    # hash, so bob-node accepts because DMP_RECEIVER_CLAIM_NOTIFICATIONS=1
+    # AND bob's mailbox hash is in the keystore (step 2.5).
     bob_owner = (
         f"claim-9.mb-{bob_h12}.bob.test."  # slot 9 to avoid colliding with step 4
     )
@@ -417,6 +473,46 @@ def main() -> None:
         "bob-node accepts the un-TSIG'd UPDATE (NOERROR)",
         response2.rcode() == dns.rcode.NOERROR,
         f"rcode={dns.rcode.to_text(response2.rcode())}",
+    )
+
+    step("9. M10-only gate: unregistered hash on bob-node is REFUSED")
+    # Codex round-3 P1: with DMP_CLAIM_PROVIDER=0 and
+    # DMP_RECEIVER_CLAIM_NOTIFICATIONS=1, bob-node MUST reject claim
+    # writes whose hash12 doesn't correspond to a registered user
+    # (otherwise enabling M10 silently re-opens the public claim sink
+    # that the M8.3 opt-out was supposed to close).
+    fake_recipient = b"unregistered-stranger-recipient"
+    fake_id = hashlib.sha256(fake_recipient).digest()
+    fake_h12 = hashlib.sha256(fake_id).hexdigest()[:12]
+    fake_claim = ClaimRecord(
+        msg_id=b"\x88" * 16,
+        sender_spk=alice.crypto.get_signing_public_key_bytes(),
+        sender_mailbox_domain="alice.test",
+        slot=0,
+        ts=int(time.time()),
+        exp=int(time.time()) + 300,
+    )
+    fake_wire = fake_claim.sign(alice.crypto)
+    fake_owner = f"claim-0.mb-{fake_h12}.bob.test."
+    upd_fake = dns.update.UpdateMessage("bob.test")
+    upd_fake.add(
+        dns.name.from_text(fake_owner),
+        300,
+        "TXT",
+        '"' + fake_wire.replace('"', r"\"") + '"',
+    )
+    response_fake = dns.query.udp(upd_fake, BOB_DNS[0], port=BOB_DNS[1], timeout=3.0)
+    assert_step(
+        "bob-node REFUSES claim for unregistered hash",
+        response_fake.rcode() == dns.rcode.REFUSED,
+        f"rcode={dns.rcode.to_text(response_fake.rcode())} "
+        f"(unregistered hash={fake_h12})",
+    )
+    no_records = _query_txt(BOB_DNS, fake_owner.rstrip("."))
+    assert_step(
+        "no record landed in bob-node's store under the unregistered hash",
+        not no_records,
+        f"records={no_records}",
     )
 
     print("\n=== M10 E2E PASSED ===")

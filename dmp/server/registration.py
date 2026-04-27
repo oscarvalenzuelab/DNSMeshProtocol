@@ -624,7 +624,17 @@ def _suffixes_for(
         except ValueError:
             x_bytes = b""
         if len(x_bytes) == 32:
-            mailbox_hash = hashlib.sha256(x_bytes).hexdigest()[:12]
+            # Owner names use ``mb-{hash12(recipient_id)}.{zone}`` where
+            # ``recipient_id = sha256(x25519_pub).digest()`` and
+            # ``hash12(b) = sha256(b).hexdigest()[:12]`` — i.e., TWO
+            # sha256 rounds. Codex round-3 P1 caught the prior
+            # convention here (``sha256(x_pub)[:12]``, only one round)
+            # which silently disagreed with the actual owner format;
+            # tight-scope mode would have rejected the user's own
+            # mailbox writes, and the M10 registered-recipient set
+            # ended up with the wrong hashes.
+            recipient_id = hashlib.sha256(x_bytes).digest()
+            mailbox_hash = hashlib.sha256(recipient_id).hexdigest()[:12]
             suffixes.append(f"mb-{mailbox_hash}.{z}")
     return tuple(suffixes)
 

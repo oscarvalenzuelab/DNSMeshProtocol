@@ -531,10 +531,13 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             # A node with neither flag must NOT silently become an
             # anonymous claim sink just because DNS UPDATE was turned
             # on for its own TSIG'd users (codex round-9 P2).
-            if not (
+            claim_provider_on = bool(
                 getattr(self.server, "claim_publish_enabled", False)
-                or getattr(self.server, "receiver_claim_publish_enabled", False)
-            ):
+            )
+            receiver_claim_on = bool(
+                getattr(self.server, "receiver_claim_publish_enabled", False)
+            )
+            if not (claim_provider_on or receiver_claim_on):
                 response.set_rcode(dns.rcode.REFUSED)
                 return response
             if not ops:
@@ -543,6 +546,40 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             cap = int(getattr(self.server, "claim_max_ttl", DEFAULT_CLAIM_MAX_TTL))
             now_i = int(time.time())
             claim_limiter = getattr(self.server, "claim_rate_limiter", None)
+            # Codex round-3 P1: when the operator opted OUT of the M8.3
+            # public first-contact provider role (DMP_CLAIM_PROVIDER=0)
+            # but opted IN to M10 receiver-zone notifications, the
+            # un-TSIG'd accept path MUST restrict writes to recipient
+            # hashes that correspond to registered users on this zone.
+            # Without that, M10 would silently re-open the public
+            # write surface that DMP_CLAIM_PROVIDER=0 was supposed to
+            # close. The keystore tracks the registered hash12 set
+            # (each user's TSIG scope includes ``mb-{hash12}.{zone}``).
+            # When BOTH flags are on (operator wants the open M8.3
+            # provider tier AND M10 for their own users), the open
+            # provider role wins and any signed claim is acceptable.
+            allowed_recipient_hashes: Optional[set] = None
+            if receiver_claim_on and not claim_provider_on:
+                keystore = getattr(self.server, "tsig_keystore", None)
+                if keystore is not None and hasattr(
+                    keystore, "registered_recipient_hashes"
+                ):
+                    try:
+                        allowed_recipient_hashes = keystore.registered_recipient_hashes(
+                            zone_text
+                        )
+                    except Exception:
+                        log.exception(
+                            "tsig_keystore.registered_recipient_hashes raised; "
+                            "treating as empty set (claim writes will be REFUSED)"
+                        )
+                        allowed_recipient_hashes = set()
+                else:
+                    # No keystore → no notion of registered users →
+                    # nothing to admit. Refuse all writes rather than
+                    # silently accept (defense-in-depth: M10-only mode
+                    # without a registry is misconfigured).
+                    allowed_recipient_hashes = set()
             applied: List[Tuple[str, str, Optional[str], int]] = []
             for op, owner, value, ttl in ops:
                 if op != "add":
@@ -550,6 +587,18 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                     return response
                 hash12 = _claim_owner_hash12(owner, zone_text)
                 if hash12 is None:
+                    response.set_rcode(dns.rcode.REFUSED)
+                    return response
+                if (
+                    allowed_recipient_hashes is not None
+                    and hash12 not in allowed_recipient_hashes
+                ):
+                    log.info(
+                        "M10-only claim UPDATE rejected: hash %s not "
+                        "in registered users for zone=%s",
+                        hash12,
+                        zone_text,
+                    )
                     response.set_rcode(dns.rcode.REFUSED)
                     return response
                 if not _claim_within_lifetime_cap(value, max_ttl=cap, now=now_i):

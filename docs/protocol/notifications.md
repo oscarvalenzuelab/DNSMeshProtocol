@@ -144,18 +144,22 @@ prefers an explicit endpoint URL host when given and falls back to
 zone-as-host otherwise; M10 sends pass an empty endpoint so the
 zone apex is always used.
 
-Same-zone deployments (sender + recipient share a home node) SHOULD
-skip the M10 publish entirely. Phase 2's slot walk on the own zone
-(which is also the recipient's zone in this case) already covers
-delivery without an extra round-trip, and an M10 publish here
-would write a claim record into the SENDER's own zone where neither
-the sender's own recv (different hash12) nor the recipient's
-cross-zone recv ever queries it. The reference implementation
-gates on `contact.domain != self.domain`. This also covers the
-legacy back-compat case where pre-M5.4 contacts without a stored
-domain are backfilled to the local effective domain at client-build
-time — those contacts MUST NOT trigger an M10 publish to the
-sender's own zone.
+Same-zone deployments (sender + recipient explicitly share a home
+node) DO publish the M10 claim — phase-1-only modes
+(`recv --primary-only`, `recv_secondary_disable=true`) need it,
+since phase 2 is suppressed in those configurations. The publish
+target is the same zone as the sender's own, but the un-TSIG'd
+UPDATE still goes through the recipient home-node opt-in gate.
+
+The publish is gated on `Contact.domain_explicit`: when the user
+explicitly recorded the recipient's zone (e.g. via
+`dnsmesh identity fetch user@host --add`), the M10 publish fires.
+Legacy contacts predating the `domain` field — backfilled to the
+local effective domain at client-build time for M5.4 prekey /
+rotation back-compat — keep `domain_explicit=False` and skip the
+M10 publish. Without that distinction, those legacy contacts would
+otherwise direct the M10 claim into the SENDER's own zone where
+nobody queries it.
 
 Cross-zone publishes (the M10 happy path) MUST go through the
 un-TSIG'd UPDATE path so the recipient's home node enforces the
@@ -164,14 +168,13 @@ rate limit. A library caller that supplies an authorized writer
 override MUST NOT bypass that path: the writer override is a test
 escape hatch for in-process fixtures, not a production contract.
 
-**Routing limitation (split-host deployments).** The current routing
-target derivation (zone apex on the configured DNS port) assumes
-the recipient's home node serves DNS at the zone apex. Operators
-running a split-host setup — zone delegated via NS records to a
-different hostname — are not yet supported by the M10 publish path;
-the un-TSIG'd UPDATE will fail to find a destination IP and the
-sender's slot-walk fallback (phase 2) covers delivery instead.
-A follow-up will add NS-chain or per-contact endpoint resolution.
+**Split-host routing.** When the recipient zone apex has no A/AAAA
+record (operators running the auth DNS server on a sibling hostname
+delegated via NS records), the routing target falls back to the
+zone's NS records: the un-TSIG'd UPDATE is sent to the IP of the
+first authoritative nameserver. This handles the standard split-host
+delegation pattern without forcing operators to persist a per-contact
+endpoint URL.
 
 Implementation note: the existing
 [`_publish_claim_via_dns_update`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/dmp/client/client.py)
@@ -284,6 +287,22 @@ A node MAY enable both `DMP_RECEIVER_CLAIM_NOTIFICATIONS` and
 `DMP_CLAIM_PROVIDER` simultaneously — the two roles operate on
 disjoint owner-name patterns (provider role uses
 `<provider-zone>`, receiver role uses `<own-zone>`).
+
+**Registered-recipient gate (M10-only mode).** When
+`DMP_RECEIVER_CLAIM_NOTIFICATIONS=1` is set without
+`DMP_CLAIM_PROVIDER=1`, the un-TSIG'd accept path MUST further
+restrict incoming claim writes to recipient hash12 values that
+correspond to a registered user on the served zone. Each user's
+TSIG registration includes a `mb-{hash12(recipient_id)}.{zone}`
+suffix in their scope (where `recipient_id = sha256(x25519_pub)`),
+and the keystore exposes the active set to the DNS server. Without
+this gate, enabling M10 silently re-opens the public claim sink
+that `DMP_CLAIM_PROVIDER=0` was supposed to close — a stranger
+could write claim records under any hash12 they invent and burn
+storage / rate-limit budget. The check is conditional on the M8.3
+provider role staying off; when both flags are on, the open
+provider role wins (its whole point is accepting claims for
+recipients the operator does not know).
 
 The per-recipient rate limit (`DMP_CLAIM_RATE_PER_USER_PER_SEC` /
 `DMP_CLAIM_RATE_BURST`) is keyed on the `hash12` extracted from the

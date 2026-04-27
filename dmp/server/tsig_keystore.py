@@ -604,6 +604,47 @@ class TSIGKeyStore:
 
         return authorize
 
+    def registered_recipient_hashes(self, zone: str, now: Optional[int] = None) -> set:
+        """Return the set of mailbox hash12s registered under ``zone``.
+
+        Each user who registers via ``/v1/registration/tsig-confirm``
+        with their X25519 public key gets a TSIG scope entry of the
+        form ``mb-{hash12}.{zone}`` (see
+        ``dmp/server/registration.py``). M10 (codex round-3 P1) uses
+        this set to gate un-TSIG'd claim writes when
+        ``DMP_RECEIVER_CLAIM_NOTIFICATIONS=1`` and
+        ``DMP_CLAIM_PROVIDER=0`` — the operator opted out of the
+        public first-contact write surface, so M10 must accept claim
+        records ONLY for users who actually live on this node's zone.
+
+        Returns a fresh set each call (built from the current active
+        key set) so a revoke / register that happens mid-tick takes
+        effect on the next packet without restarting the server.
+        """
+        z = (zone or "").strip().lower().rstrip(".")
+        if not z:
+            return set()
+        prefix = "mb-"
+        suffix = "." + z
+        hashes: set = set()
+        for row in self.list_active(now=now):
+            for s in row.allowed_suffixes:
+                norm = (s or "").strip().lower().rstrip(".")
+                # Look for ``mb-{hex12}.{zone}``. Skip wildcards
+                # (``mb-*.{zone}``) — those grant authority but don't
+                # identify a registered user.
+                if not norm.endswith(suffix):
+                    continue
+                head = norm[: -len(suffix)]
+                if not head.startswith(prefix):
+                    continue
+                h = head[len(prefix) :]
+                if "*" in h:
+                    continue
+                if len(h) == 12 and all(c in "0123456789abcdef" for c in h):
+                    hashes.add(h)
+        return hashes
+
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------

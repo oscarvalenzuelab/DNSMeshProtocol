@@ -1027,7 +1027,16 @@ def _make_client(
     # RRset. Legacy contacts (no `domain` field) fall back to the
     # local effective domain — back-compat for pre-M5.4 configs.
     for name, entry in config.contacts.items():
-        contact_domain = entry.get("domain", "") or effective_domain
+        # Pass the RAW persisted domain (possibly "") to add_contact,
+        # which records ``Contact.domain_explicit`` based on whether
+        # the caller supplied a non-empty value. The internal backfill
+        # to ``self.domain`` still happens inside add_contact for
+        # back-compat with M5.4 prekey + rotation lookups, but the
+        # explicit flag distinguishes legacy backfill from real same-
+        # zone setups so M10 publish can target the right contacts
+        # (codex round-3 P1 — real same-zone needs M10; legacy backfill
+        # must skip it).
+        contact_domain = entry.get("domain", "")
         remote_username = entry.get("remote_username", "")
         ok = client.add_contact(
             name,
