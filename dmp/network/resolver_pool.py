@@ -413,6 +413,43 @@ class ResolverPool(DNSRecordReader):
                         return str(addr)
         return None
 
+    def resolve_ns_hosts(self, zone: str) -> List[str]:
+        """Return the zone's NS hostnames as resolved via the pool.
+
+        M10 / split-host fallback (codex round-7 P2): when the zone
+        apex has no A/AAAA record (auth DNS server is at a sibling
+        hostname delegated via NS records), the recipient's home node
+        is reachable only by chasing NS. The fallback MUST go through
+        the pool — operators on split-horizon / pinned-recursor
+        deployments configured the pool exactly so DMP's view of DNS
+        doesn't get poisoned by the host's system resolver.
+
+        Returns the textual NS hostnames (no trailing dot) in the
+        order returned by the first resolver that answered. Empty
+        list on no answers / transport failure.
+        """
+        for state in self._iter_ordered():
+            try:
+                answers = state.resolver.resolve(zone, "NS")
+            except self._NAME_NOT_FOUND_ERRORS:
+                continue
+            except self._TRANSPORT_ERRORS:
+                self._mark_failure(state)
+                continue
+            self._mark_success(state)
+            out: List[str] = []
+            for rdata in answers:
+                target = getattr(rdata, "target", None)
+                if target is None:
+                    continue
+                try:
+                    out.append(target.to_text(omit_final_dot=True))
+                except Exception:
+                    continue
+            if out:
+                return out
+        return []
+
     # ---------------------------------------------------------------
     # Introspection helpers (not part of DNSRecordReader)
     # ---------------------------------------------------------------

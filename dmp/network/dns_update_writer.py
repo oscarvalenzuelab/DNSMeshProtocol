@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import socket
-from typing import Optional
+from typing import List, Optional
 
 import dns.exception
 import dns.flags
@@ -121,17 +121,45 @@ def _resolve_to_ip(host, resolver_pool=None):
     # resolve the first NS hostname. The recipient's home node IS the
     # auth server for its zone; chasing NS gives us its real address
     # without forcing operators to persist a per-contact endpoint.
-    try:
-        import dns.resolver as _r
+    #
+    # Codex round-7 P2: the NS-chain MUST run through ``resolver_pool``
+    # when the caller has one. Split-horizon / pinned-recursor
+    # operators configured the pool exactly so DMP's DNS view stays
+    # consistent — falling back to the host's system resolver here
+    # would defeat that trust model. Pool first, system resolver
+    # only as a last resort for callers that didn't configure one.
+    ns_hosts: List[str] = []
+    if resolver_pool is not None and hasattr(resolver_pool, "resolve_ns_hosts"):
+        try:
+            ns_hosts = list(resolver_pool.resolve_ns_hosts(host))
+        except Exception:
+            ns_hosts = []
+    if not ns_hosts:
+        try:
+            import dns.resolver as _r
 
-        ns_answers = _r.resolve(host, "NS", raise_on_no_answer=False)
-    except Exception:
-        return None
-    for rdata in ns_answers:
-        ns_name = getattr(rdata, "target", None)
-        if ns_name is None:
-            continue
-        ns_text = ns_name.to_text(omit_final_dot=True)
+            ns_answers = _r.resolve(host, "NS", raise_on_no_answer=False)
+        except Exception:
+            return None
+        for rdata in ns_answers:
+            ns_name = getattr(rdata, "target", None)
+            if ns_name is None:
+                continue
+            try:
+                ns_hosts.append(ns_name.to_text(omit_final_dot=True))
+            except Exception:
+                continue
+    for ns_text in ns_hosts:
+        # Resolve each NS hostname via the pool first (same trust
+        # model), falling back to the system resolver only when the
+        # pool can't answer.
+        if resolver_pool is not None and hasattr(resolver_pool, "resolve_address"):
+            try:
+                ip = resolver_pool.resolve_address(ns_text)
+            except Exception:
+                ip = None
+            if ip:
+                return ip
         try:
             ns_infos = socket.getaddrinfo(ns_text, None, type=socket.SOCK_DGRAM)
         except (socket.gaierror, UnicodeError):

@@ -375,3 +375,70 @@ class TestResolveToIp:
         assert ok is False
         ok = writer.delete_txt_record("foo.example.com")
         assert ok is False
+
+
+class TestNsFallbackUsesResolverPool:
+    """Codex round-7 P2: the NS-chain fallback in ``_resolve_to_ip``
+    MUST route through ``resolver_pool`` when the caller has one. On
+    split-horizon / pinned-recursor deployments the pool IS the
+    operator's trusted DNS view; punting to the host's system
+    resolver here would defeat that trust model."""
+
+    class _StubPool:
+        """Minimal duck-typed ResolverPool stand-in — records calls
+        and returns scripted answers."""
+
+        def __init__(
+            self,
+            address_map: dict,
+            ns_map: dict,
+        ) -> None:
+            self.address_map = address_map
+            self.ns_map = ns_map
+            self.address_calls: list = []
+            self.ns_calls: list = []
+
+        def resolve_address(self, host: str):
+            self.address_calls.append(host)
+            return self.address_map.get(host)
+
+        def resolve_ns_hosts(self, zone: str):
+            self.ns_calls.append(zone)
+            return list(self.ns_map.get(zone, ()))
+
+    def test_apex_with_no_a_falls_through_pool_ns_chain(self):
+        """Zone apex with no A record → pool's resolve_ns_hosts is
+        consulted, then the NS hostname resolves via the same pool."""
+        pool = self._StubPool(
+            address_map={
+                # Zone apex has no A — pool returns None.
+                "split-host.example": None,
+                # NS hostname resolves to the auth server's IP.
+                "ns1.split-host.example": "203.0.113.7",
+            },
+            ns_map={
+                "split-host.example": [
+                    "ns1.split-host.example",
+                ],
+            },
+        )
+        ip = _resolve_to_ip("split-host.example", resolver_pool=pool)
+        assert ip == "203.0.113.7"
+        assert pool.ns_calls == ["split-host.example"]
+        # resolve_address called for the apex (failed) AND the NS host
+        # (succeeded).
+        assert "split-host.example" in pool.address_calls
+        assert "ns1.split-host.example" in pool.address_calls
+
+    def test_apex_with_a_record_skips_ns_chain(self):
+        """When the apex resolves directly via the pool, NS-chain MUST
+        NOT fire — that's only a fallback for split-host setups."""
+        pool = self._StubPool(
+            address_map={"normal.example": "203.0.113.42"},
+            ns_map={},
+        )
+        ip = _resolve_to_ip("normal.example", resolver_pool=pool)
+        assert ip == "203.0.113.42"
+        assert (
+            pool.ns_calls == []
+        ), "NS-chain should not fire when the apex has an A record"

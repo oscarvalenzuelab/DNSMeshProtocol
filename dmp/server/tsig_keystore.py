@@ -679,29 +679,54 @@ class TSIGKeyStore:
         prefix = "mb-"
         suffix = "." + z
 
-        def _key_covers_zone(row) -> bool:
-            """True iff ``row``'s scope authorizes any owner inside ``z``.
+        def _key_covers_mailbox_in_zone(row) -> bool:
+            """True iff ``row``'s scope authorizes mailbox writes under ``z``.
 
-            A multi-zone keystore (or stale rows from a previous zone)
-            can carry registrations whose scope doesn't actually touch
-            this zone. Codex round-6 P1: gating the x_pub-derived
-            hash on this check keeps M10's per-zone isolation honest —
-            otherwise a user registered under ``alpha.example`` would
-            be admitted as a recipient under ``beta.example`` too,
-            silently re-opening the public surface that
-            ``DMP_CLAIM_PROVIDER=0`` was supposed to close.
+            Codex round-6 P1 added a zone-filter; round-7 P1 tightened
+            it: a row that only authorizes identity / heartbeat
+            records under ``z`` (e.g. ``id-XXX.{z}``,
+            ``_dnsmesh-claim-XXX.{z}``) MUST NOT qualify the user as a
+            mailbox recipient on this zone. Otherwise an admin-issued
+            key whose scope happens to contain a non-mailbox owner
+            ending in ``.{z}`` would silently admit the user's
+            x25519-derived hash for M10 claim writes — defeating the
+            point of the gate.
+
+            Mailbox-authorizing entries (the only ones that count):
+
+              - ``<zone>`` — bare-zone (``DMP_TSIG_LOOSE_SCOPE=1``;
+                authorizes everything, including mailboxes).
+              - ``mb-{hash12}.{zone}`` — per-user explicit mailbox
+                anchor (post-round-3 / round-4 registrations).
+              - ``mb-*.{zone}`` — wildcard mailbox (single-user-per-
+                zone default).
+              - ``slot-*.mb-*.{zone}`` — wildcard slot writes.
+              - ``claim-*.mb-*.{zone}`` — wildcard claim writes
+                (M9.2.6 + M10).
             """
             for s in row.allowed_suffixes:
                 norm = (s or "").strip().lower().rstrip(".")
                 if not norm:
                     continue
-                if norm == z or norm.endswith(suffix):
+                # Bare zone (loose scope).
+                if norm == z:
+                    return True
+                if not norm.endswith(suffix):
+                    continue
+                head = norm[: -len(suffix)]
+                # Direct ``mb-…`` anchor under this zone.
+                if head.startswith(prefix):
+                    return True
+                # ``slot-…`` / ``claim-…`` mailbox patterns under this zone.
+                if head.startswith("slot-") and ".mb-" in head:
+                    return True
+                if head.startswith("claim-") and ".mb-" in head:
                     return True
             return False
 
         hashes: set = set()
         for row in self.list_active(now=now):
-            scoped_to_zone = _key_covers_zone(row)
+            scoped_to_zone = _key_covers_mailbox_in_zone(row)
             # Preferred path: recompute from the persisted X25519 pub.
             x_hex = (row.registered_x25519_pub or "").strip().lower()
             if x_hex and scoped_to_zone:

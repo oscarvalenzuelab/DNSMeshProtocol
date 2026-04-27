@@ -1272,6 +1272,103 @@ class TestM10Server:
         )
         assert store.query_txt_record(owner.rstrip(".")) == [wire]
 
+    def test_x25519_pub_hash_requires_mailbox_scope_not_just_zone_suffix(
+        self, tmp_path
+    ):
+        """Codex round-7 P1: a row whose ``allowed_suffixes`` only
+        contains identity-style entries under ``{zone}`` (e.g.
+        ``id-XXX.{zone}``) MUST NOT qualify the user's x25519 hash
+        for M10 admission. The round-6 fix was too permissive: it
+        treated any suffix ending in ``.{zone}`` as proof the row
+        belonged to that zone, even if the actual scope didn't
+        authorize mailbox writes there."""
+        from dmp.server.tsig_keystore import TSIGKeyStore
+
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        recipient_crypto = DMPCrypto.from_passphrase("identity-only", salt=b"I" * 32)
+        x_pub = recipient_crypto.get_public_key_bytes()
+        recipient_id = hashlib.sha256(x_pub).digest()
+        h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+
+        db_path = str(tmp_path / "tsig.db")
+        keystore = TSIGKeyStore(db_path)
+        # Identity-only key: scope authorizes id-XXX.{zone} owners
+        # but NOT mailbox writes. Storing x_pub anyway (registration
+        # always persists it). Pre-fix, registered_recipient_hashes
+        # would happily admit this user as an M10 recipient.
+        keystore.put(
+            name="identity-only.",
+            secret=b"\x99" * 32,
+            allowed_suffixes=["id-deadbeef0011.dmp.example.com"],
+            registered_x25519_pub=x_pub.hex(),
+        )
+
+        admitted = keystore.registered_recipient_hashes("dmp.example.com")
+        assert h12 not in admitted, (
+            "round-6 zone-suffix check is too loose — id-XXX.{zone} "
+            "should not qualify as mailbox scope"
+        )
+
+        # Server-level: M10-only mode REFUSES the claim because the
+        # hash isn't in the registered set.
+        store = InMemoryDNSStore()
+        port = _free_port()
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keystore=keystore,
+            allowed_zones=("dmp.example.com",),
+            claim_publish_enabled=False,
+            receiver_claim_publish_enabled=True,
+        )
+        wire = _claim_wire(sender, recipient_id)
+        owner = f"claim-0.mb-{h12}.dmp.example.com."
+        with server:
+            upd = dns.update.UpdateMessage("dmp.example.com")
+            upd.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED
+
+    def test_x25519_pub_hash_admitted_for_explicit_mailbox_scope(self, tmp_path):
+        """Round-7 P1 (positive): a row with an actual mailbox-
+        authorizing entry — ``mb-{hash}.{zone}``, ``mb-*.{zone}``,
+        ``slot-*.mb-*.{zone}``, ``claim-*.mb-*.{zone}``, or the bare
+        zone — DOES qualify for M10 admission."""
+        from dmp.server.tsig_keystore import TSIGKeyStore
+
+        recipient_crypto = DMPCrypto.from_passphrase("mb-user", salt=b"M" * 32)
+        x_pub = recipient_crypto.get_public_key_bytes()
+        recipient_id = hashlib.sha256(x_pub).digest()
+        h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+
+        for ok_suffix in (
+            "dmp.example.com",  # bare zone (loose-scope)
+            f"mb-{h12}.dmp.example.com",  # explicit mailbox anchor
+            "mb-*.dmp.example.com",  # wildcard mailbox
+            "slot-*.mb-*.dmp.example.com",  # wildcard slots
+            "claim-*.mb-*.dmp.example.com",  # wildcard claims
+        ):
+            db_path = str(tmp_path / f"tsig-{abs(hash(ok_suffix)):x}.db")
+            keystore = TSIGKeyStore(db_path)
+            keystore.put(
+                name=f"user-{abs(hash(ok_suffix)):x}.",
+                secret=b"\xaa" * 32,
+                allowed_suffixes=[ok_suffix],
+                registered_x25519_pub=x_pub.hex(),
+            )
+            admitted = keystore.registered_recipient_hashes("dmp.example.com")
+            assert h12 in admitted, (
+                f"mailbox-authorizing suffix {ok_suffix!r} should qualify "
+                "the user's hash for M10 admission"
+            )
+
     def test_x25519_pub_hash_filtered_by_zone_scope(self, tmp_path):
         """Codex round-6 P1: ``registered_recipient_hashes`` MUST NOT
         admit an x25519-derived hash unless the registering key's
