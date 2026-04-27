@@ -29,6 +29,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import os
 import socket
 from typing import List, Optional
 
@@ -97,6 +98,18 @@ def _resolve_to_ip(host, resolver_pool=None, allow_system_fallback=False):
         # NUL bytes confuse downstream socket / DNS calls; reject up front
         # so a typo can't produce inconsistent failure modes across paths.
         return None
+
+    # Codex round-10 P2: production callers (``_DnsUpdateWriter.__init__``,
+    # ``_publish_claim_via_dns_update``) don't thread an explicit
+    # ``allow_system_fallback`` parameter through, so the opt-in is also
+    # exposed via the ``DMP_ALLOW_SYSTEM_DNS_FALLBACK`` env var. Setting
+    # it lets hybrid authoritative-only-pool deployments take the
+    # round-9 escape hatch without a code change. The explicit kwarg
+    # still wins when set.
+    if not allow_system_fallback:
+        env_flag = os.environ.get("DMP_ALLOW_SYSTEM_DNS_FALLBACK", "").strip().lower()
+        if env_flag in ("1", "true", "yes", "on"):
+            allow_system_fallback = True
 
     try:
         dns.inet.af_for_address(host)

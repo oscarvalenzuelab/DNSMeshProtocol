@@ -485,6 +485,47 @@ class TestNsFallbackUsesResolverPool:
             "socket.getaddrinfo"
         )
 
+    def test_env_var_opts_into_system_fallback(self, monkeypatch):
+        """Codex round-10 P2: production callers (TSIG writer + un-TSIG'd
+        claim publish) don't thread ``allow_system_fallback`` through,
+        so the opt-in MUST also be reachable via
+        ``DMP_ALLOW_SYSTEM_DNS_FALLBACK=1``. Without this, an operator
+        running a hybrid authoritative-only pool can't enable the
+        round-9 escape hatch from real call sites."""
+        sentinel_ip = "203.0.113.99"
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            if host == "ns1.envvar.example":
+                return [
+                    (
+                        socket.AF_INET,
+                        socket.SOCK_DGRAM,
+                        0,
+                        "",
+                        (sentinel_ip, 0),
+                    )
+                ]
+            raise socket.gaierror(socket.EAI_NONAME, "no")
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setenv("DMP_ALLOW_SYSTEM_DNS_FALLBACK", "1")
+
+        pool = self._StubPool(
+            address_map={
+                "envvar.example": None,
+                "ns1.envvar.example": None,
+            },
+            ns_map={"envvar.example": ["ns1.envvar.example"]},
+        )
+        # No explicit kwarg — env var alone should opt in.
+        ip = _resolve_to_ip("envvar.example", resolver_pool=pool)
+        assert ip == sentinel_ip
+
+        # Removing the env var restores strict-default behavior.
+        monkeypatch.delenv("DMP_ALLOW_SYSTEM_DNS_FALLBACK")
+        ip_strict = _resolve_to_ip("envvar.example", resolver_pool=pool)
+        assert ip_strict is None
+
     def test_allow_system_fallback_resolves_external_ns_host(self, monkeypatch):
         """Codex round-9 P1: ``allow_system_fallback=True`` is the
         explicit opt-in for hybrid split-host deployments where the
