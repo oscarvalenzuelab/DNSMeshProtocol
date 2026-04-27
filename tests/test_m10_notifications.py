@@ -603,6 +603,69 @@ class TestCodexRound1Regressions:
         assert len(bob.intro_queue.list_intros()) == 1
 
 
+class TestCodexRound6LocalDnsFallback:
+    """Codex round-6 P2: ``_make_client`` MUST seed
+    ``client.local_dns_server`` / ``local_dns_port`` even on HTTP-mode
+    configs that haven't run ``dnsmesh tsig register``. Otherwise
+    same-zone M10 publishes silently fall through to
+    ``_provider_dns_target()`` and try ``<contact.domain>:53``, which
+    fails on dev / split-host deployments where the auth DNS server
+    is only reachable via ``cfg.dns_host`` / ``cfg.dns_port``."""
+
+    def _build_client(self, tmp_path, monkeypatch, **cfg_overrides):
+        """Run cli._make_client with a minimal config override and
+        return the resulting DMPClient. Skips the network path via
+        ``requires_network=False``."""
+        from dmp import cli as _cli
+        from dmp.cli import CLIConfig
+
+        monkeypatch.setenv("DMP_CONFIG_HOME", str(tmp_path))
+        cfg = CLIConfig(
+            username="alice",
+            domain="alice.mesh",
+            kdf_salt="aa" * 32,
+            **cfg_overrides,
+        )
+        return _cli._make_client(cfg, "passphrase", requires_network=False)
+
+    def test_tsig_block_populates_local_dns(self, tmp_path, monkeypatch):
+        """Post-tsig-register: TSIG fields are the canonical source."""
+        client = self._build_client(
+            tmp_path,
+            monkeypatch,
+            tsig_dns_server="alice-node.example",
+            tsig_dns_port=5353,
+            endpoint="http://alice-node.example:8053",
+        )
+        assert client.local_dns_server == "alice-node.example"
+        assert client.local_dns_port == 5353
+
+    def test_dns_host_falls_back_when_tsig_unset(self, tmp_path, monkeypatch):
+        """HTTP-mode pre-TSIG: cfg.dns_host / cfg.dns_port populate
+        the local target when TSIG isn't configured yet."""
+        client = self._build_client(
+            tmp_path,
+            monkeypatch,
+            dns_host="127.0.0.1",
+            dns_port=5353,
+            endpoint="http://127.0.0.1:8053",
+        )
+        assert client.local_dns_server == "127.0.0.1"
+        assert client.local_dns_port == 5353
+
+    def test_endpoint_host_used_when_no_tsig_no_dns_host(self, tmp_path, monkeypatch):
+        """Pure HTTP-mode: no TSIG, no dns_host — fall back to the
+        endpoint URL host on the default DNS port."""
+        client = self._build_client(
+            tmp_path,
+            monkeypatch,
+            endpoint="http://node.example:8053",
+            dns_port=5353,
+        )
+        assert client.local_dns_server == "node.example"
+        assert client.local_dns_port == 5353
+
+
 class TestCodexRound5DomainExplicitPersistence:
     """Codex round-5 P2 #1: ``domain_explicit`` MUST survive contact
     rebuild paths in the CLI (intro-trust → identity-fetch upgrade).
@@ -1208,6 +1271,73 @@ class TestM10Server:
             f"{dns.rcode.to_text(response.rcode())}"
         )
         assert store.query_txt_record(owner.rstrip(".")) == [wire]
+
+    def test_x25519_pub_hash_filtered_by_zone_scope(self, tmp_path):
+        """Codex round-6 P1: ``registered_recipient_hashes`` MUST NOT
+        admit an x25519-derived hash unless the registering key's
+        scope actually covers the queried zone. Otherwise a multi-zone
+        keystore (or stale rows) would let a user registered under
+        one zone be admitted as a recipient under another, silently
+        re-opening the surface that ``DMP_CLAIM_PROVIDER=0`` was
+        supposed to close."""
+        from dmp.server.tsig_keystore import TSIGKeyStore
+
+        store = InMemoryDNSStore()
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        # Bob is registered under ``alpha.example`` only.
+        recipient_crypto = DMPCrypto.from_passphrase("bob", salt=b"B" * 32)
+        x_pub = recipient_crypto.get_public_key_bytes()
+        recipient_id = hashlib.sha256(x_pub).digest()
+        h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+
+        db_path = str(tmp_path / "tsig.db")
+        keystore = TSIGKeyStore(db_path)
+        keystore.put(
+            name="bob-alpha.",
+            secret=b"\x77" * 32,
+            allowed_suffixes=["alpha.example"],  # only this zone
+            registered_x25519_pub=x_pub.hex(),
+        )
+
+        # Different zone: registered_recipient_hashes("beta.example")
+        # MUST NOT include bob's hash.
+        beta_hashes = keystore.registered_recipient_hashes("beta.example")
+        assert h12 not in beta_hashes, (
+            "x_pub-derived hash leaked into the wrong zone — "
+            "round-6 P1 zone-filter regressed"
+        )
+        # Same zone: included.
+        alpha_hashes = keystore.registered_recipient_hashes("alpha.example")
+        assert h12 in alpha_hashes
+
+        # End-to-end: a server gating on beta.example with bob's
+        # claim-publish attempt → REFUSED (cross-zone leak shut).
+        port = _free_port()
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keystore=keystore,
+            allowed_zones=("beta.example",),
+            claim_publish_enabled=False,
+            receiver_claim_publish_enabled=True,
+        )
+        wire = _claim_wire(sender, recipient_id)
+        owner = f"claim-0.mb-{h12}.beta.example."
+        with server:
+            upd = dns.update.UpdateMessage("beta.example")
+            upd.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED, (
+            "server admitted a claim under beta.example for a hash "
+            "registered only on alpha.example"
+        )
 
     def test_legacy_keystore_with_old_hash_format_falls_back_to_suffix(self, tmp_path):
         """Codex round-4 P1: a keystore upgraded from a pre-M10 build

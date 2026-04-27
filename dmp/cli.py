@@ -980,10 +980,39 @@ def _make_client(
     # ``DMP_PROVIDER_DNS_PORT`` process-wide which misrouted every
     # remote claim publish whenever the operator's own node listened
     # on a non-default port (dev / 5353).
-    if config.tsig_dns_port:
-        client.local_dns_port = int(config.tsig_dns_port)
-    if config.tsig_dns_server:
-        client.local_dns_server = config.tsig_dns_server
+    #
+    # Codex round-6 P2: TSIG block is the preferred source, but
+    # HTTP-mode configs (no ``dnsmesh tsig register`` ran yet) need
+    # a fallback so same-zone M10 still works. Try in order:
+    #   1. TSIG block (post-registration default).
+    #   2. ``cfg.dns_host`` / ``cfg.dns_port`` (explicit DNS resolver).
+    #   3. ``cfg.endpoint`` host (HTTP API host) on the dns_port.
+    # Without this fallback ``recv --primary-only`` and
+    # ``recv_secondary_disable=true`` silently miss same-zone messages
+    # for HTTP-mode clients.
+    local_dns_server = ""
+    local_dns_port: Optional[int] = None
+    if config.tsig_dns_server and config.tsig_dns_port:
+        local_dns_server = config.tsig_dns_server
+        local_dns_port = int(config.tsig_dns_port)
+    elif config.dns_host:
+        local_dns_server = config.dns_host
+        local_dns_port = int(config.dns_port or 5353)
+    elif config.endpoint:
+        try:
+            from urllib.parse import urlsplit as _us
+
+            parts = _us(_normalize_endpoint(config.endpoint))
+            host = (parts.hostname or "").strip()
+        except ValueError:
+            host = ""
+        if host:
+            local_dns_server = host
+            local_dns_port = int(config.dns_port or 5353)
+    if local_dns_server:
+        client.local_dns_server = local_dns_server
+    if local_dns_port:
+        client.local_dns_port = local_dns_port
 
     # Passphrase-typo tripwire. The keypair is derived purely from
     # passphrase + kdf_salt, so any string produces some valid keypair

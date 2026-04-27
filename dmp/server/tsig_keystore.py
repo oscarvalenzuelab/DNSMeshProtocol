@@ -678,11 +678,33 @@ class TSIGKeyStore:
             return set()
         prefix = "mb-"
         suffix = "." + z
+
+        def _key_covers_zone(row) -> bool:
+            """True iff ``row``'s scope authorizes any owner inside ``z``.
+
+            A multi-zone keystore (or stale rows from a previous zone)
+            can carry registrations whose scope doesn't actually touch
+            this zone. Codex round-6 P1: gating the x_pub-derived
+            hash on this check keeps M10's per-zone isolation honest —
+            otherwise a user registered under ``alpha.example`` would
+            be admitted as a recipient under ``beta.example`` too,
+            silently re-opening the public surface that
+            ``DMP_CLAIM_PROVIDER=0`` was supposed to close.
+            """
+            for s in row.allowed_suffixes:
+                norm = (s or "").strip().lower().rstrip(".")
+                if not norm:
+                    continue
+                if norm == z or norm.endswith(suffix):
+                    return True
+            return False
+
         hashes: set = set()
         for row in self.list_active(now=now):
+            scoped_to_zone = _key_covers_zone(row)
             # Preferred path: recompute from the persisted X25519 pub.
             x_hex = (row.registered_x25519_pub or "").strip().lower()
-            if x_hex:
+            if x_hex and scoped_to_zone:
                 try:
                     x_bytes = bytes.fromhex(x_hex)
                 except ValueError:
