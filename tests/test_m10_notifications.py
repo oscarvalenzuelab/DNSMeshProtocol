@@ -640,6 +640,35 @@ class TestCodexRound6LocalDnsFallback:
         assert client.local_dns_server == "alice-node.example"
         assert client.local_dns_port == 5353
 
+    def test_explicit_local_node_dns_wins_over_tsig(self, tmp_path, monkeypatch):
+        """Schema fix: ``local_node_dns_*`` is the canonical source —
+        wins above the TSIG block. An operator who pinned the field
+        explicitly (e.g. via ``dnsmesh init`` auto-probe) gets that
+        target even if TSIG is also configured."""
+        client = self._build_client(
+            tmp_path,
+            monkeypatch,
+            local_node_dns_server="explicit.example",
+            local_node_dns_port=5353,
+            tsig_dns_server="tsig.example",
+            tsig_dns_port=53,
+            endpoint="http://endpoint.example:8053",
+        )
+        assert client.local_dns_server == "explicit.example"
+        assert client.local_dns_port == 5353
+
+    def test_tsig_block_used_when_explicit_unset(self, tmp_path, monkeypatch):
+        """Without ``local_node_dns_*``, TSIG block is the next tier."""
+        client = self._build_client(
+            tmp_path,
+            monkeypatch,
+            tsig_dns_server="tsig.example",
+            tsig_dns_port=53,
+            endpoint="http://endpoint.example:8053",
+        )
+        assert client.local_dns_server == "tsig.example"
+        assert client.local_dns_port == 53
+
     def test_endpoint_host_used_when_tsig_unset(self, tmp_path, monkeypatch):
         """HTTP-mode pre-TSIG (codex round-12 P2): the local target
         comes from ``cfg.endpoint`` (the DMP HTTP API host = the

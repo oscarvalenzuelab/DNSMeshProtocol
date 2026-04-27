@@ -180,6 +180,30 @@ class CLIConfig:
     recv_secondary_interval_seconds: int = 600
     recv_secondary_disable: bool = False
 
+    # M10 — explicit local-node DNS endpoint for SAME-ZONE recipient-zone
+    # claim publishes. This disambiguates the read-side resolver
+    # (``dns_host``, often a public recursive like 1.1.1.1) from the
+    # WRITE target (the user's own DMP node's authoritative DNS
+    # listener). Codex round 12 / 13 highlighted that conflating the
+    # two creates a silent-failure footgun in either direction:
+    #
+    #   - If we'd defaulted same-zone publishes to ``dns_host``,
+    #     operators with ``dns_host=1.1.1.1`` would have un-TSIG'd
+    #     UPDATEs leaking to a recursive resolver that REFUSES them
+    #     (potential privacy issue, definite delivery loss).
+    #   - If we'd defaulted to ``endpoint`` host, split-host
+    #     deployments where HTTP and DNS run on different subdomains
+    #     would target the wrong host.
+    #
+    # Resolution: a NEW config field that explicitly names the local
+    # node's DNS endpoint for un-TSIG'd writes. Empty (the default)
+    # means "not configured; fall through to TSIG block or endpoint
+    # host." Populated by ``dnsmesh init`` via auto-probe, by
+    # ``dnsmesh doctor`` when remediation runs, OR by the operator
+    # editing the config directly.
+    local_node_dns_server: str = ""
+    local_node_dns_port: int = 0
+
     @classmethod
     def load(cls, path: Path) -> "CLIConfig":
         if not path.exists():
@@ -257,6 +281,8 @@ class CLIConfig:
                 data.get("recv_secondary_interval_seconds", 600)
             ),
             recv_secondary_disable=bool(data.get("recv_secondary_disable", False)),
+            local_node_dns_server=data.get("local_node_dns_server", "") or "",
+            local_node_dns_port=int(data.get("local_node_dns_port", 0)),
         )
 
     def save(self, path: Path) -> None:
@@ -981,23 +1007,32 @@ def _make_client(
     # remote claim publish whenever the operator's own node listened
     # on a non-default port (dev / 5353).
     #
-    # Codex round-6 P2 / round-12 P2: TSIG block is the preferred
-    # source; HTTP-mode configs fall back to the ``cfg.endpoint``
-    # host on ``cfg.dns_port``. ``cfg.dns_host`` is the READ-side
-    # resolver (typically a recursive resolver like 1.1.1.1) and
-    # MUST NOT be used as the un-TSIG'd UPDATE target — sending an
-    # un-TSIG'd UPDATE to a recursive resolver gets refused, and
-    # phase-1-only modes silently miss every same-zone message.
-    # Order:
-    #   1. TSIG block (post-registration default).
-    #   2. ``cfg.endpoint`` host (HTTP API host = the auth DMP node)
-    #      on ``cfg.dns_port`` (the operator's local DNS port).
-    # If neither is set, no local target — same-zone publishes fall
-    # through to ``_provider_dns_target`` which tries ``<zone>:53``,
-    # which works in production zone-apex deployments.
+    # M10 — pin the local DNS endpoint for same-zone recipient-zone
+    # publishes. The fallback chain — across many codex rounds and
+    # the round-13 flip-flop — landed on this self-describing schema:
+    #
+    #   1. ``cfg.local_node_dns_server`` / ``local_node_dns_port`` —
+    #      the canonical, unambiguous source. Set explicitly by
+    #      ``dnsmesh init`` (auto-probe), ``dnsmesh doctor``, or the
+    #      operator. Empty means "not configured."
+    #   2. TSIG block (``cfg.tsig_dns_server`` / ``cfg.tsig_dns_port``)
+    #      — populated by ``dnsmesh tsig register``; canonical post-
+    #      registration when the user has TSIG'd write authority.
+    #   3. ``cfg.endpoint`` host on ``cfg.dns_port`` — last-resort
+    #      best-effort. Works for single-host deployments where the
+    #      DMP node serves both HTTP and DNS at the same hostname.
+    #      Fails silently for split-host setups; ``dnsmesh doctor``
+    #      surfaces that.
+    #
+    # ``cfg.dns_host`` is intentionally NOT used here — it's the
+    # read-side resolver, often a public recursive (1.1.1.1) which
+    # would REFUSE an un-TSIG'd UPDATE.
     local_dns_server = ""
     local_dns_port: Optional[int] = None
-    if config.tsig_dns_server and config.tsig_dns_port:
+    if config.local_node_dns_server and config.local_node_dns_port:
+        local_dns_server = config.local_node_dns_server
+        local_dns_port = int(config.local_node_dns_port)
+    elif config.tsig_dns_server and config.tsig_dns_port:
         local_dns_server = config.tsig_dns_server
         local_dns_port = int(config.tsig_dns_port)
     elif config.endpoint:
@@ -1539,8 +1574,35 @@ def cmd_init(args: argparse.Namespace) -> int:
         kdf_salt=os.urandom(32).hex(),
         identity_domain=(args.identity_domain or "").strip(),
     )
+
+    # M10 — auto-probe the local node's DNS endpoint so same-zone
+    # phase-1 publishes work out of the box on single-host
+    # deployments. The user passed --endpoint pointing at their
+    # node's HTTP API; the same node typically serves DNS at the
+    # same hostname on port 5353 (dev) or 53 (prod). Probe both;
+    # the first that answers a heartbeat TXT lookup wins. Operators
+    # whose split-host setup needs a different DNS hostname can
+    # later run ``dnsmesh doctor`` (which surfaces the silent-
+    # failure case) or hand-edit ``local_node_dns_*`` in config.
+    if cfg.endpoint and not args.no_probe_local_dns:
+        probed = _probe_local_node_dns(cfg.endpoint)
+        if probed is not None:
+            cfg.local_node_dns_server, cfg.local_node_dns_port = probed
+            print(
+                f"  probed local DNS endpoint: "
+                f"{cfg.local_node_dns_server}:{cfg.local_node_dns_port}"
+            )
+
     cfg.save(path)
     print(f"wrote config to {path}")
+    if cfg.endpoint and not cfg.local_node_dns_server:
+        print(
+            "  hint: could not auto-probe local DNS endpoint. Same-zone "
+            "M10 phase-1 publishes will fall back to the endpoint host. "
+            "Run `dnsmesh doctor` after first send to verify, or set "
+            "local_node_dns_server / local_node_dns_port manually.",
+            file=sys.stderr,
+        )
     print(
         "Next: set DMP_PASSPHRASE or create a passphrase file, then `dnsmesh identity show`."
     )
@@ -1549,6 +1611,53 @@ def cmd_init(args: argparse.Namespace) -> int:
         "recover this identity even with the passphrase."
     )
     return 0
+
+
+def _probe_local_node_dns(endpoint: str) -> Optional[Tuple[str, int]]:
+    """Probe the endpoint host's DNS port for a DMP heartbeat record.
+
+    Used by ``dnsmesh init`` and ``dnsmesh doctor`` to auto-detect
+    the local node's DNS endpoint without forcing the operator to
+    configure it manually. The probe is best-effort — failure is
+    silent and treated as "not auto-detectable; let the operator
+    configure manually." We try the dev port (5353) first since
+    that's the more common case for users hitting this path
+    (``dnsmesh init`` against a freshly-installed node), then fall
+    back to the standard DNS port (53). Both timeouts are short
+    (1.5s) — a non-responding port is the normal "no" signal.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(endpoint if "://" in endpoint else "https://" + endpoint)
+        host = (parts.hostname or "").strip()
+    except ValueError:
+        return None
+    if not host:
+        return None
+
+    import dns.message
+    import dns.query
+    import dns.rdatatype
+
+    # Try 5353 first (dev / non-privileged), then 53 (prod). Probe
+    # for a heartbeat record under what the node would have published
+    # if it's actually a DMP node — that's a near-zero-false-positive
+    # signal vs. asking some unrelated DNS server.
+    probe_name = f"_dnsmesh-heartbeat.{host}"
+    for port in (5353, 53):
+        try:
+            request = dns.message.make_query(probe_name, dns.rdatatype.TXT)
+            response = dns.query.udp(request, host, port=port, timeout=1.5)
+        except Exception:
+            continue
+        # Any answer at all (NOERROR with content OR NXDOMAIN) means
+        # the port has a DMP node listening. NXDOMAIN is fine — the
+        # node may not have heartbeat enabled yet but DNS UPDATE will
+        # work. Transport timeouts / connection refused → not this port.
+        if response.rcode() in (0, 3):  # NOERROR, NXDOMAIN
+            return (host, port)
+    return None
 
 
 def cmd_identity_show(args: argparse.Namespace) -> int:
@@ -2937,6 +3046,239 @@ def cmd_recv(args: argparse.Namespace) -> int:
         _close_client(client)
 
 
+_PUBLIC_RECURSIVE_RESOLVERS = frozenset(
+    {
+        "1.1.1.1",
+        "1.0.0.1",  # Cloudflare
+        "8.8.8.8",
+        "8.8.4.4",  # Google
+        "9.9.9.9",
+        "149.112.112.112",  # Quad9
+        "208.67.222.222",
+        "208.67.220.220",  # OpenDNS
+    }
+)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Diagnose CLI configuration drift that silently breaks DMP flows.
+
+    Walks a curated list of checks and prints PASS / WARN / FAIL for
+    each, plus an actionable hint when the check isn't clean. Exit
+    code is 0 if everything is PASS or WARN, 1 if any FAIL surfaced —
+    so ``dnsmesh doctor`` is safe to wire into a CI smoke check or a
+    pre-deploy gate.
+
+    Checks (M10 round-13 follow-up):
+
+      1. Endpoint reachability (HTTP API).
+      2. Local DNS endpoint resolution + DMP heartbeat liveness —
+         where the M10 same-zone publish target lives. Surfaces the
+         silent-miss case where the operator hasn't pinned
+         ``local_node_dns_*`` and the auto-fallback hits the wrong
+         host (split-host deployments).
+      3. ``dns_host`` ambiguity — warn when ``dns_host`` is set to a
+         well-known public recursive (1.1.1.1, 8.8.8.8, etc.) AND
+         ``local_node_dns_*`` is empty. That config silently drops
+         same-zone M10 phase-1 deliveries because the un-TSIG'd
+         UPDATE goes to the recursive resolver which REFUSES it.
+      4. TSIG registration status — informational. Suggests
+         ``dnsmesh tsig register`` if the user is in HTTP-mode and
+         hasn't registered.
+    """
+    cfg = CLIConfig.load(_config_path())
+
+    # ANSI codes only when stdout is a tty so piping into another
+    # tool stays parseable.
+    use_color = sys.stdout.isatty()
+
+    def _color(s: str, code: str) -> str:
+        if not use_color:
+            return s
+        return f"\x1b[{code}m{s}\x1b[0m"
+
+    def _pass(label: str, detail: str = "") -> None:
+        print(f"  {_color('PASS', '32')}  {label}")
+        if detail:
+            print(f"        {detail}")
+
+    def _warn(label: str, detail: str) -> None:
+        nonlocal warns
+        warns += 1
+        print(f"  {_color('WARN', '33')}  {label}")
+        print(f"        {detail}")
+
+    def _fail(label: str, detail: str) -> None:
+        nonlocal fails
+        fails += 1
+        print(f"  {_color('FAIL', '31')}  {label}")
+        print(f"        {detail}")
+
+    warns = 0
+    fails = 0
+
+    print("\nCONFIG\n------")
+    print(f"  config: {_config_path()}")
+    print(f"  username: {cfg.username or '(unset)'}")
+    print(f"  domain: {cfg.domain}")
+    print(f"  endpoint: {cfg.endpoint or '(unset)'}")
+
+    print("\nCHECKS\n------")
+
+    # 1. Endpoint reachability.
+    if not cfg.endpoint:
+        _warn(
+            "endpoint not configured",
+            "no `endpoint` in config — local-only commands will work, "
+            "but `dnsmesh send` / `recv` need a node URL. Re-run "
+            "`dnsmesh init <user> --endpoint <url>` to set one.",
+        )
+    else:
+        import requests
+
+        try:
+            r = requests.get(
+                f"{cfg.endpoint.rstrip('/')}/health",
+                timeout=4,
+            )
+            if r.status_code == 200:
+                _pass("endpoint reachable", f"HTTP 200 from {cfg.endpoint}")
+            else:
+                _warn(
+                    "endpoint reachable but unhealthy",
+                    f"HTTP {r.status_code} from {cfg.endpoint}/health — node "
+                    "may be running degraded. Check the node operator's logs.",
+                )
+        except requests.RequestException as exc:
+            _fail(
+                "endpoint unreachable",
+                f"cannot reach {cfg.endpoint}: {exc}. The node is down, "
+                "the URL is wrong, or the network is blocked.",
+            )
+
+    # 2. Local DNS endpoint — the M10 same-zone publish target.
+    if cfg.local_node_dns_server and cfg.local_node_dns_port:
+        # Operator pinned it; verify it actually answers.
+        target = (cfg.local_node_dns_server, cfg.local_node_dns_port)
+        ok = _local_dns_target_responds(target, cfg.endpoint)
+        if ok:
+            _pass(
+                "local DNS endpoint responds",
+                f"{target[0]}:{target[1]} answered a probe",
+            )
+        else:
+            _fail(
+                "local DNS endpoint not responding",
+                f"`local_node_dns_server={target[0]}` "
+                f"`local_node_dns_port={target[1]}` did not answer. "
+                "Same-zone M10 phase-1 publishes will silently miss. "
+                "Run `dnsmesh init --force` to re-probe, or fix "
+                "the server / firewall.",
+            )
+    elif cfg.endpoint:
+        # Auto-probe right now. If it works, suggest pinning it.
+        probed = _probe_local_node_dns(cfg.endpoint)
+        if probed is not None:
+            _warn(
+                "local DNS endpoint reachable but not pinned",
+                f"auto-probe found {probed[0]}:{probed[1]}. Pin it via "
+                "`dnsmesh init --force` (auto-rewrite) or by editing "
+                "`local_node_dns_server` / `local_node_dns_port` in "
+                f"{_config_path()}.",
+            )
+        else:
+            _warn(
+                "local DNS endpoint not auto-detectable",
+                "could not probe the local node's DNS port from "
+                f"{cfg.endpoint}'s host. Same-zone M10 phase-1 "
+                "publishes may silently miss. If you're on a split-"
+                "host deployment, set `local_node_dns_server` / "
+                "`local_node_dns_port` manually in the config.",
+            )
+
+    # 3. dns_host ambiguity.
+    dh = (cfg.dns_host or "").strip()
+    if dh and dh in _PUBLIC_RECURSIVE_RESOLVERS:
+        if not (cfg.local_node_dns_server and cfg.local_node_dns_port):
+            _warn(
+                "dns_host points at a public recursive resolver",
+                f"`dns_host={dh}` is fine for read queries, but the "
+                "M10 send path needs a separate auth-DNS target. "
+                "Pin `local_node_dns_server` so same-zone phase-1 "
+                "publishes don't silently fail.",
+            )
+        else:
+            _pass(
+                "dns_host (read resolver) and local_node_dns (write target) distinct",
+                f"reads via {dh}, writes via "
+                f"{cfg.local_node_dns_server}:{cfg.local_node_dns_port}",
+            )
+
+    # 4. TSIG registration status.
+    if cfg.tsig_key_name and cfg.tsig_secret_hex:
+        _pass(
+            "TSIG registered",
+            f"key={cfg.tsig_key_name} zone={cfg.tsig_zone}",
+        )
+    else:
+        _warn(
+            "TSIG not registered",
+            "you're in HTTP-mode. `dnsmesh send` and `dnsmesh "
+            "identity publish` will work via the operator HTTP API, "
+            "but cross-zone M10 sends require an auth target. Run "
+            "`dnsmesh tsig register --node <host>` once you have "
+            "credentials.",
+        )
+
+    print()
+    if fails:
+        print(_color(f"DOCTOR: {fails} FAIL, {warns} WARN", "31"))
+        return 1
+    if warns:
+        print(_color(f"DOCTOR: {warns} WARN", "33"))
+        return 0
+    print(_color("DOCTOR: clean", "32"))
+    return 0
+
+
+def _local_dns_target_responds(
+    target: Tuple[str, int],
+    endpoint_for_probe_name: str,
+) -> bool:
+    """True iff ``target`` answers a heartbeat TXT query.
+
+    Same shape as the auto-probe in ``cmd_init``, but takes an
+    explicit (host, port). Used by ``dnsmesh doctor`` to verify a
+    pinned ``local_node_dns_*`` actually resolves.
+    """
+    from urllib.parse import urlsplit
+
+    import dns.message
+    import dns.query
+    import dns.rdatatype
+
+    probe_host = target[0]
+    if endpoint_for_probe_name:
+        try:
+            parts = urlsplit(
+                endpoint_for_probe_name
+                if "://" in endpoint_for_probe_name
+                else "https://" + endpoint_for_probe_name
+            )
+            zone_host = (parts.hostname or "").strip()
+            if zone_host:
+                probe_host = zone_host
+        except ValueError:
+            pass
+    probe_name = f"_dnsmesh-heartbeat.{probe_host}"
+    try:
+        request = dns.message.make_query(probe_name, dns.rdatatype.TXT)
+        response = dns.query.udp(request, target[0], port=target[1], timeout=2.0)
+    except Exception:
+        return False
+    return response.rcode() in (0, 3)  # NOERROR, NXDOMAIN both fine
+
+
 def cmd_register(args: argparse.Namespace) -> int:
     """M5.5 phase 4: self-service registration for a per-user publish token.
 
@@ -4304,6 +4646,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument(
         "--force", action="store_true", help="overwrite existing config"
     )
+    p_init.add_argument(
+        "--no-probe-local-dns",
+        action="store_true",
+        help="Skip the auto-probe that detects the local DMP node's "
+        "DNS endpoint at init time. Use when you know your deployment "
+        "is split-host or when init is offline; you can set "
+        "local_node_dns_server / local_node_dns_port manually or run "
+        "`dnsmesh doctor` later.",
+    )
     p_init.set_defaults(func=cmd_init)
 
     # identity
@@ -4524,6 +4875,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="reason recorded alongside the denylist entry",
     )
     p_intro_block.set_defaults(func=cmd_intro_block)
+
+    # doctor — diagnose CLI configuration drift that silently breaks
+    # send / recv flows. Walks endpoint reachability, the local DNS
+    # endpoint (M10 same-zone target), dns_host ambiguity, and TSIG
+    # registration status. Exit 0 on PASS/WARN, 1 on FAIL — safe to
+    # wire into a deploy gate.
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="diagnose CLI configuration drift (endpoint, local DNS, TSIG)",
+    )
+    p_doctor.set_defaults(func=cmd_doctor)
 
     # register — mint a per-user publish token via the node's
     # /v1/registration/* endpoints (M5.5 phase 3). Saves the

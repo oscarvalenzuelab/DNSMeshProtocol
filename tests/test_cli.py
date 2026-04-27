@@ -3410,3 +3410,139 @@ class TestBootstrapCommand:
         assert cfg.cluster_base_domain == ""
         assert cfg.cluster_operator_spk == ""
         assert cfg.cluster_enabled is False
+
+
+class TestDoctor:
+    """Tests for the `dnsmesh doctor` config-drift detector."""
+
+    def test_clean_config_passes(self, config_home, monkeypatch, capsys):
+        """A config with reachable endpoint, pinned local DNS, and a
+        TSIG block produces all PASS / no FAIL."""
+        # Stub HTTP /health → 200.
+        import requests
+
+        class _OkResponse:
+            status_code = 200
+
+        monkeypatch.setattr(requests, "get", lambda *_a, **_kw: _OkResponse())
+
+        # Stub the local-DNS probe → responds.
+        from dmp import cli as _cli
+
+        monkeypatch.setattr(_cli, "_local_dns_target_responds", lambda *_a, **_kw: True)
+
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "--no-probe-local-dns",
+                "alice",
+                "--endpoint",
+                "http://node.example:8053",
+            ]
+        )
+        # Hand-edit config to populate the M10 + TSIG fields the
+        # auto-probe would normally fill.
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        cfg.local_node_dns_server = "node.example"
+        cfg.local_node_dns_port = 5353
+        cfg.tsig_key_name = "alice."
+        cfg.tsig_secret_hex = "aa" * 32
+        cfg.tsig_zone = "node.example"
+        cfg.save(config_home / "config.yaml")
+
+        rc = cli.main(["doctor"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "DOCTOR: clean" in out
+        assert "FAIL" not in out
+
+    def test_unreachable_endpoint_fails(self, config_home, monkeypatch, capsys):
+        """Endpoint that does not respond to /health surfaces as FAIL."""
+        import requests
+
+        def _raise(*_a, **_kw):
+            raise requests.RequestException("connection refused")
+
+        monkeypatch.setattr(requests, "get", _raise)
+
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "--no-probe-local-dns",
+                "alice",
+                "--endpoint",
+                "http://dead.example:8053",
+            ]
+        )
+        rc = cli.main(["doctor"])
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "FAIL" in out
+        assert "endpoint unreachable" in out
+
+    def test_dns_host_pointing_at_public_resolver_warns(
+        self, config_home, monkeypatch, capsys
+    ):
+        """`dns_host=1.1.1.1` without `local_node_dns_*` set MUST warn —
+        sending un-TSIG’d UPDATE to a recursive resolver gets
+        REFUSED, silently breaking M10 phase-1 same-zone delivery."""
+        import requests
+
+        class _OkResponse:
+            status_code = 200
+
+        monkeypatch.setattr(requests, "get", lambda *_a, **_kw: _OkResponse())
+        from dmp import cli as _cli
+
+        # Auto-probe also fails (so the local-DNS check stays in WARN
+        # state, which combines with the dns_host warning).
+        monkeypatch.setattr(_cli, "_probe_local_node_dns", lambda *_a, **_kw: None)
+
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "--no-probe-local-dns",
+                "alice",
+                "--endpoint",
+                "http://node.example:8053",
+                "--dns-host",
+                "1.1.1.1",
+            ]
+        )
+        rc = cli.main(["doctor"])
+        out = capsys.readouterr().out
+        # WARN-only → exit 0.
+        assert rc == 0
+        assert "WARN" in out
+        assert "public recursive" in out
+
+    def test_tsig_unset_warns(self, config_home, monkeypatch, capsys):
+        """HTTP-mode without TSIG registered surfaces as WARN, not FAIL —
+        local-only flows still work."""
+        import requests
+
+        class _OkResponse:
+            status_code = 200
+
+        monkeypatch.setattr(requests, "get", lambda *_a, **_kw: _OkResponse())
+        from dmp import cli as _cli
+
+        monkeypatch.setattr(_cli, "_probe_local_node_dns", lambda *_a, **_kw: None)
+
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "--no-probe-local-dns",
+                "alice",
+                "--endpoint",
+                "http://node.example:8053",
+            ]
+        )
+        rc = cli.main(["doctor"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "TSIG not registered" in out
