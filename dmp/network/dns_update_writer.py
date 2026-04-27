@@ -122,19 +122,23 @@ def _resolve_to_ip(host, resolver_pool=None):
     # auth server for its zone; chasing NS gives us its real address
     # without forcing operators to persist a per-contact endpoint.
     #
-    # Codex round-7 P2: the NS-chain MUST run through ``resolver_pool``
-    # when the caller has one. Split-horizon / pinned-recursor
-    # operators configured the pool exactly so DMP's DNS view stays
-    # consistent — falling back to the host's system resolver here
-    # would defeat that trust model. Pool first, system resolver
-    # only as a last resort for callers that didn't configure one.
+    # Codex round-7 P2 + round-8 P1: when ``resolver_pool`` is given,
+    # the NS chase MUST stay ON the pool exclusively. Pinned-recursor
+    # / split-horizon operators configured the pool precisely so DMP's
+    # DNS view never leaks to the host's system resolver — even
+    # accidentally on a transient pool failure. If the pool can't
+    # answer, fail closed (return None). Callers without a pool fall
+    # through to the system resolver as the last-resort path.
+    pooled = resolver_pool is not None and hasattr(resolver_pool, "resolve_ns_hosts")
     ns_hosts: List[str] = []
-    if resolver_pool is not None and hasattr(resolver_pool, "resolve_ns_hosts"):
+    if pooled:
         try:
             ns_hosts = list(resolver_pool.resolve_ns_hosts(host))
         except Exception:
-            ns_hosts = []
-    if not ns_hosts:
+            return None
+        if not ns_hosts:
+            return None
+    else:
         try:
             import dns.resolver as _r
 
@@ -150,16 +154,16 @@ def _resolve_to_ip(host, resolver_pool=None):
             except Exception:
                 continue
     for ns_text in ns_hosts:
-        # Resolve each NS hostname via the pool first (same trust
-        # model), falling back to the system resolver only when the
-        # pool can't answer.
-        if resolver_pool is not None and hasattr(resolver_pool, "resolve_address"):
+        if pooled and hasattr(resolver_pool, "resolve_address"):
+            # Pool-only path: never falls through to the system view.
             try:
                 ip = resolver_pool.resolve_address(ns_text)
             except Exception:
                 ip = None
             if ip:
                 return ip
+            continue  # try the next NS host through the pool
+        # Pool-less path: system resolver is the last-resort.
         try:
             ns_infos = socket.getaddrinfo(ns_text, None, type=socket.SOCK_DGRAM)
         except (socket.gaierror, UnicodeError):

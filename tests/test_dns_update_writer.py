@@ -442,3 +442,45 @@ class TestNsFallbackUsesResolverPool:
         assert (
             pool.ns_calls == []
         ), "NS-chain should not fire when the apex has an A record"
+
+    def test_pooled_chase_fails_closed_when_pool_has_no_ns(self):
+        """Codex round-8 P1: when ``resolver_pool`` is configured but
+        returns no NS records, ``_resolve_to_ip`` MUST fail closed
+        (return None) rather than fall back to the host system
+        resolver. Pinned-recursor operators chose the pool precisely
+        so DMP's DNS view doesn't leak."""
+        pool = self._StubPool(
+            address_map={
+                # Apex A/AAAA fails through the pool.
+                "lone-zone.example": None,
+            },
+            ns_map={
+                # Pool can't find NS records either.
+                "lone-zone.example": [],
+            },
+        )
+        ip = _resolve_to_ip("lone-zone.example", resolver_pool=pool)
+        assert (
+            ip is None
+        ), "pooled NS chase must fail closed, not leak to system resolver"
+
+    def test_pooled_chase_fails_closed_when_ns_host_unresolvable(self):
+        """Round-8 P1: even when the pool returns NS hostnames, if the
+        pool can't resolve those NS hosts to IPs, the function MUST
+        NOT fall through to ``socket.getaddrinfo``."""
+        pool = self._StubPool(
+            address_map={
+                # Apex fails.
+                "split-host.example": None,
+                # NS host also fails through the pool (returns None).
+                "ns1.split-host.example": None,
+            },
+            ns_map={
+                "split-host.example": ["ns1.split-host.example"],
+            },
+        )
+        ip = _resolve_to_ip("split-host.example", resolver_pool=pool)
+        assert ip is None, (
+            "pooled NS-host A lookup must fail closed, not leak to "
+            "socket.getaddrinfo"
+        )
