@@ -3546,3 +3546,99 @@ class TestDoctor:
         out = capsys.readouterr().out
         assert rc == 0
         assert "TSIG not registered" in out
+
+
+class TestDoctorRound14:
+    """Codex round-14 P1 regression coverage."""
+
+    def test_repair_pins_local_node_dns_without_clobbering_identity(
+        self, config_home, monkeypatch, capsys
+    ):
+        """`dnsmesh doctor --repair` MUST be non-destructive: it
+        only updates local_node_dns_*, leaving identity (kdf_salt),
+        TSIG block, contacts intact. The previous remediation
+        suggested `init --force` which rebuilds CLIConfig from
+        scratch and would rotate the user onto new keys."""
+        from dmp import cli as _cli
+
+        cli.main(
+            [
+                "init",
+                "--no-default-resolvers",
+                "--no-probe-local-dns",
+                "alice",
+                "--endpoint",
+                "http://node.example:8053",
+            ]
+        )
+        cfg = cli.CLIConfig.load(config_home / "config.yaml")
+        original_kdf = cfg.kdf_salt
+        # Hand-pin TSIG + contacts as if the user had registered
+        # and added contacts before the local DNS endpoint moved.
+        cfg.tsig_key_name = "alice."
+        cfg.tsig_secret_hex = "ee" * 32
+        cfg.tsig_zone = "node.example"
+        cfg.contacts = {
+            "bob": {"pub": "11" * 32, "spk": "22" * 32, "domain": "bob.example"}
+        }
+        cfg.save(config_home / "config.yaml")
+
+        monkeypatch.setattr(
+            _cli,
+            "_probe_local_node_dns",
+            lambda *_a, **_kw: ("repaired.example", 5353),
+        )
+
+        rc = cli.main(["doctor", "--repair"])
+        assert rc == 0
+
+        cfg2 = cli.CLIConfig.load(config_home / "config.yaml")
+        assert (
+            cfg2.kdf_salt == original_kdf
+        ), "kdf_salt was rotated — identity destroyed"
+        assert cfg2.tsig_key_name == "alice."
+        assert cfg2.tsig_secret_hex == "ee" * 32
+        assert "bob" in cfg2.contacts
+        # Local DNS got pinned.
+        assert cfg2.local_node_dns_server == "repaired.example"
+        assert cfg2.local_node_dns_port == 5353
+
+    def test_probe_rejects_non_dmp_dns_listener(self, monkeypatch):
+        """Codex round-14 P1: the probe must reject responses that
+        do not contain a parseable HeartbeatRecord. A recursive
+        resolver returning NOERROR with a random TXT or NXDOMAIN
+        was previously enough to bless the target — it no longer
+        is."""
+        import dns.message
+        import dns.rcode
+        from dmp import cli as _cli
+
+        class _StubResp:
+            def __init__(self, rcode_value, answers):
+                self._rcode = rcode_value
+                self.answer = answers
+
+            def rcode(self):
+                return self._rcode
+
+        # Case A: NXDOMAIN — used to pass the probe; now must fail.
+        monkeypatch.setattr(
+            "dns.query.udp",
+            lambda *_a, **_kw: _StubResp(dns.rcode.NXDOMAIN, []),
+        )
+        assert _cli._probe_local_node_dns("http://stranger.example") is None
+
+        # Case B: NOERROR but the wire is not a parseable HeartbeatRecord —
+        # also must fail.
+        class _FakeRdata:
+            strings = (b"v=dmp1;t=identity;not-a-heartbeat",)
+
+        class _FakeRrset(list):
+            pass
+
+        rrset = _FakeRrset([_FakeRdata()])
+        monkeypatch.setattr(
+            "dns.query.udp",
+            lambda *_a, **_kw: _StubResp(dns.rcode.NOERROR, [rrset]),
+        )
+        assert _cli._probe_local_node_dns("http://stranger.example") is None

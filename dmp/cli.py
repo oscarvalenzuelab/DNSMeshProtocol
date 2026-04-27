@@ -1618,13 +1618,23 @@ def _probe_local_node_dns(endpoint: str) -> Optional[Tuple[str, int]]:
 
     Used by ``dnsmesh init`` and ``dnsmesh doctor`` to auto-detect
     the local node's DNS endpoint without forcing the operator to
-    configure it manually. The probe is best-effort — failure is
-    silent and treated as "not auto-detectable; let the operator
-    configure manually." We try the dev port (5353) first since
-    that's the more common case for users hitting this path
-    (``dnsmesh init`` against a freshly-installed node), then fall
-    back to the standard DNS port (53). Both timeouts are short
-    (1.5s) — a non-responding port is the normal "no" signal.
+    configure it manually. Best-effort — failure is silent and
+    treated as "not auto-detectable; let the operator configure
+    manually."
+
+    Codex round-14 P1: the probe MUST require a real DMP signal,
+    not just any DNS listener answering. NOERROR/NXDOMAIN from a
+    recursive resolver running on the same host's port 53/5353
+    would otherwise pin a non-writable target — same-zone M10
+    publishes would land at a server that REFUSES un-TSIG'd UPDATEs.
+    We require the response to carry a parseable, signature-valid
+    ``HeartbeatRecord``; that's a DMP-specific wire shape no other
+    DNS server can fake without the operator's signing key.
+
+    Tries port 5353 first (dev / non-privileged), then 53 (prod).
+    Both timeouts are short (1.5s) — a non-responding port or a
+    server returning anything but a verifiable heartbeat is the
+    normal "no" signal.
     """
     from urllib.parse import urlsplit
 
@@ -1640,10 +1650,8 @@ def _probe_local_node_dns(endpoint: str) -> Optional[Tuple[str, int]]:
     import dns.query
     import dns.rdatatype
 
-    # Try 5353 first (dev / non-privileged), then 53 (prod). Probe
-    # for a heartbeat record under what the node would have published
-    # if it's actually a DMP node — that's a near-zero-false-positive
-    # signal vs. asking some unrelated DNS server.
+    from dmp.core.heartbeat import HeartbeatRecord
+
     probe_name = f"_dnsmesh-heartbeat.{host}"
     for port in (5353, 53):
         try:
@@ -1651,12 +1659,17 @@ def _probe_local_node_dns(endpoint: str) -> Optional[Tuple[str, int]]:
             response = dns.query.udp(request, host, port=port, timeout=1.5)
         except Exception:
             continue
-        # Any answer at all (NOERROR with content OR NXDOMAIN) means
-        # the port has a DMP node listening. NXDOMAIN is fine — the
-        # node may not have heartbeat enabled yet but DNS UPDATE will
-        # work. Transport timeouts / connection refused → not this port.
-        if response.rcode() in (0, 3):  # NOERROR, NXDOMAIN
-            return (host, port)
+        if response.rcode() != 0:  # only NOERROR with content counts
+            continue
+        for rrset in response.answer:
+            for rdata in rrset:
+                try:
+                    wire = b"".join(rdata.strings).decode("utf-8")
+                except Exception:
+                    continue
+                rec = HeartbeatRecord.parse_and_verify(wire)
+                if rec is not None:
+                    return (host, port)
     return None
 
 
@@ -3085,8 +3098,38 @@ def cmd_doctor(args: argparse.Namespace) -> int:
       4. TSIG registration status — informational. Suggests
          ``dnsmesh tsig register`` if the user is in HTTP-mode and
          hasn't registered.
+
+    ``--repair`` (codex round-14 P1): re-run the auto-probe and
+    persist ``local_node_dns_*`` if it lands. Non-destructive — only
+    those two fields change; identity / kdf_salt / TSIG block / contacts
+    are preserved. Use this instead of ``dnsmesh init --force``,
+    which rebuilds CLIConfig from scratch and would clobber the
+    operator's identity.
     """
     cfg = CLIConfig.load(_config_path())
+
+    if getattr(args, "repair", False):
+        if not cfg.endpoint:
+            print("doctor --repair: no endpoint configured; nothing to probe.")
+            return 1
+        probed = _probe_local_node_dns(cfg.endpoint)
+        if probed is None:
+            print(
+                "doctor --repair: could not probe a local DMP node at "
+                f"{cfg.endpoint}'s host. The node is offline, the DNS "
+                "port is wrong, or it's not a DMP node. Set "
+                "local_node_dns_server / local_node_dns_port manually "
+                f"in {_config_path()} if you know the right values."
+            )
+            return 1
+        cfg.local_node_dns_server, cfg.local_node_dns_port = probed
+        cfg.save(_config_path())
+        print(
+            f"doctor --repair: pinned local_node_dns_server={probed[0]} "
+            f"local_node_dns_port={probed[1]} (identity / TSIG / "
+            "contacts preserved)."
+        )
+        return 0
 
     # ANSI codes only when stdout is a tty so piping into another
     # tool stays parseable.
@@ -3170,10 +3213,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             _fail(
                 "local DNS endpoint not responding",
                 f"`local_node_dns_server={target[0]}` "
-                f"`local_node_dns_port={target[1]}` did not answer. "
-                "Same-zone M10 phase-1 publishes will silently miss. "
-                "Run `dnsmesh init --force` to re-probe, or fix "
-                "the server / firewall.",
+                f"`local_node_dns_port={target[1]}` did not answer "
+                "with a verifiable DMP heartbeat. Same-zone M10 "
+                "phase-1 publishes will silently miss. Run "
+                "`dnsmesh doctor --repair` to re-probe (non-"
+                "destructive), or fix the server / firewall.",
             )
     elif cfg.endpoint:
         # Auto-probe right now. If it works, suggest pinning it.
@@ -3181,8 +3225,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if probed is not None:
             _warn(
                 "local DNS endpoint reachable but not pinned",
-                f"auto-probe found {probed[0]}:{probed[1]}. Pin it via "
-                "`dnsmesh init --force` (auto-rewrite) or by editing "
+                f"auto-probe found {probed[0]}:{probed[1]}. Pin it "
+                "via `dnsmesh doctor --repair` (non-destructive — "
+                "preserves your identity), or by editing "
                 "`local_node_dns_server` / `local_node_dns_port` in "
                 f"{_config_path()}.",
             )
@@ -3245,17 +3290,19 @@ def _local_dns_target_responds(
     target: Tuple[str, int],
     endpoint_for_probe_name: str,
 ) -> bool:
-    """True iff ``target`` answers a heartbeat TXT query.
+    """True iff ``target`` answers with a parseable DMP heartbeat.
 
-    Same shape as the auto-probe in ``cmd_init``, but takes an
-    explicit (host, port). Used by ``dnsmesh doctor`` to verify a
-    pinned ``local_node_dns_*`` actually resolves.
+    Codex round-14 P1: same tightening as ``_probe_local_node_dns``.
+    Doctor must NOT bless a non-DMP server — only NOERROR with a
+    verifiable ``HeartbeatRecord`` counts as proof of a real DMP node.
     """
     from urllib.parse import urlsplit
 
     import dns.message
     import dns.query
     import dns.rdatatype
+
+    from dmp.core.heartbeat import HeartbeatRecord
 
     probe_host = target[0]
     if endpoint_for_probe_name:
@@ -3276,7 +3323,17 @@ def _local_dns_target_responds(
         response = dns.query.udp(request, target[0], port=target[1], timeout=2.0)
     except Exception:
         return False
-    return response.rcode() in (0, 3)  # NOERROR, NXDOMAIN both fine
+    if response.rcode() != 0:
+        return False
+    for rrset in response.answer:
+        for rdata in rrset:
+            try:
+                wire = b"".join(rdata.strings).decode("utf-8")
+            except Exception:
+                continue
+            if HeartbeatRecord.parse_and_verify(wire) is not None:
+                return True
+    return False
 
 
 def cmd_register(args: argparse.Namespace) -> int:
@@ -4884,6 +4941,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor = sub.add_parser(
         "doctor",
         help="diagnose CLI configuration drift (endpoint, local DNS, TSIG)",
+    )
+    p_doctor.add_argument(
+        "--repair",
+        action="store_true",
+        help="re-run the auto-probe and persist local_node_dns_* if a "
+        "real DMP node responds. Non-destructive: identity and TSIG "
+        "block are preserved.",
     )
     p_doctor.set_defaults(func=cmd_doctor)
 
