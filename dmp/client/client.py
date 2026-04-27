@@ -561,6 +561,7 @@ class DMPClient:
         claim_providers: Sequence[Tuple[str, str]] = (),
         claim_outcomes: Optional[List[bool]] = None,
         claim_writer: Optional[DNSRecordWriter] = None,
+        recipient_claim_outcome: Optional[List[bool]] = None,
     ) -> bool:
         """Send an encrypted message to a pinned contact.
 
@@ -740,6 +741,33 @@ class DMPClient:
                 )
                 if claim_outcomes is not None:
                     claim_outcomes.append(bool(outcome))
+
+        # M10 — receiver-zone claim notification. Best-effort second
+        # claim publish, this time at the recipient's own home zone
+        # so the recipient's `recv` phase 1 (claim-poll on own zone)
+        # discovers the message in one query rather than walking
+        # every pinned contact's slot RRsets. The wire is byte-
+        # identical to the M8.3 first-contact form; only the routing
+        # target differs (recipient zone vs provider zone).
+        #
+        # A failure here MUST NOT block delivery — chunks already
+        # landed at the sender's zone, and the recipient's phase-2
+        # slot walk recovers within `recv_secondary_interval_seconds`.
+        # Skipped when the contact predates `Contact.domain` (empty)
+        # because we have no recipient zone to address.
+        if contact.domain:
+            outcome = self.publish_claim(
+                recipient_id=recipient_id,
+                msg_id=msg_id,
+                slot=slot,
+                sender_mailbox_domain=self.domain,
+                ttl=ttl,
+                provider_zone=contact.domain,
+                provider_endpoint="",
+                provider_writer=claim_writer,
+            )
+            if recipient_claim_outcome is not None:
+                recipient_claim_outcome.append(bool(outcome))
         return True
 
     # ---- receive -----------------------------------------------------------
@@ -780,6 +808,8 @@ class DMPClient:
         self,
         *,
         claim_providers: Sequence[Tuple[str, str]] = (),
+        primary_only: bool = False,
+        skip_primary: bool = False,
     ) -> List[InboxMessage]:
         """Poll all mailbox slots; verify and decrypt any fresh messages.
 
@@ -798,9 +828,49 @@ class DMPClient:
         falls back to TOFU and delivers any signature-valid manifest — useful
         for fresh onboarding, but users should pin contacts before treating
         delivered messages as authenticated.
+
+        M10 — two-phase scheduling.
+
+        Phase 1 (primary): claim-poll on own zone. Cheap — one TXT query
+        per slot — and catches messages whose senders managed to publish
+        an M10 claim record at this client's home zone.
+
+        Phase 2 (secondary): the existing slot walk across pinned-contact
+        zones. Defense-in-depth fallback for senders who didn't / couldn't
+        publish a phase-1 claim and for own-zone operator drops.
+
+        ``primary_only=True`` runs phase 1 only — diagnostic flag for
+        isolating primary-path latency. ``skip_primary=True`` runs phase 2
+        only — diagnostic flag for spotting messages the primary path
+        missed. Both False (the default) runs the combined flow.
         """
+        if primary_only and skip_primary:
+            raise ValueError("primary_only and skip_primary are mutually exclusive")
         results: List[InboxMessage] = []
         known_spks = self._known_signing_keys()
+        # Phase 1 — receiver-zone claim poll. Done first so phase 2's
+        # replay cache benefits from any phase-1 hits in the same
+        # call (a message delivered via phase 1 is then dedup'd at
+        # phase 2).
+        #
+        # Skipped in pure TOFU mode (zero pinned signing keys). The
+        # claim-path semantics quarantine non-pinned senders into the
+        # intro queue (M8.3 contract), which would shadow phase 2's
+        # TOFU "trust any signature-valid manifest" delivery. Once
+        # the user pins any contact, phase 1 re-engages.
+        if not skip_primary and known_spks:
+            primary = self.receive_claims_from_own_zone()
+            results.extend(primary.delivered)
+            if primary_only:
+                return results
+        elif primary_only:
+            # Caller forced phase 1. Honor it even in TOFU mode —
+            # diagnostic flag is more important than the cosmetic
+            # intro-queue noise.
+            primary = self.receive_claims_from_own_zone()
+            results.extend(primary.delivered)
+            return results
+
         for zone in self._zones_to_poll():
             for slot in range(SLOT_COUNT):
                 slot_domain = self._slot_domain(self.user_id, slot, zone=zone)
@@ -984,6 +1054,39 @@ class DMPClient:
             return bool(self.writer.publish_txt_record(name, wire, ttl=int(ttl)))
         except Exception:
             return False
+
+    def receive_claims_from_own_zone(self) -> ClaimDeliveryResult:
+        """M10 — phase 1: poll the client's own zone for claim records.
+
+        Senders that have migrated to M10 publish a per-message claim
+        at ``claim-{slot}.mb-{hash12(self.user_id)}.{self.domain}``.
+        This method runs the same parse/verify/fetch pipeline as
+        ``receive_claims``, but against a single zone (own) rather than
+        a ranked list of provider zones.
+
+        Pinned-sender claims roll into ``delivered`` (an
+        :class:`InboxMessage`-equivalent payload from the same wire
+        path as ``receive_messages``). Signature-passing claims from
+        non-pinned senders land in the intro queue, same semantics as
+        the M8.2 first-contact path. Returns the
+        :class:`ClaimDeliveryResult` for the caller to merge.
+
+        ``receive_messages`` skips this phase when the client has zero
+        pinned signing keys, so pure-TOFU users keep the legacy "phase
+        2 delivers any signature-valid manifest" contract — phase 1
+        would otherwise quarantine those messages into the intro
+        queue and shadow phase 2 via the replay cache.
+
+        A receiver running phase 1 only (``recv_secondary_disable=true``,
+        ``recv --primary-only``) sees latency drop to a single round-
+        trip per delivery, at the cost of losing the slot-walk fallback
+        if the sender's claim publish failed.
+        """
+        if not self.domain:
+            return ClaimDeliveryResult(
+                delivered=[], quarantined_intro_ids=[], dropped=0, dropped_reasons={}
+            )
+        return self.receive_claims(provider_zones=[(self.domain, "")])
 
     def receive_claims(
         self,
