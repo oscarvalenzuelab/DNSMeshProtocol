@@ -714,13 +714,39 @@ class TSIGKeyStore:
                 if not norm.endswith(suffix):
                     continue
                 head = norm[: -len(suffix)]
-                # Direct ``mb-…`` anchor under this zone.
+                # Codex round-12 P1: the mailbox anchor MUST be DIRECTLY
+                # under ``z`` — not under a subzone. A row scoped to
+                # ``mb-XXX.foo.example.com`` only authorizes mailbox
+                # writes under ``foo.example.com`` and MUST NOT qualify
+                # the user as a recipient on the parent ``example.com``.
+                # Reject any head that contains an extra label (a dot).
+                if "." in head:
+                    continue
+                # Direct ``mb-{hash}.{zone}`` anchor.
                 if head.startswith(prefix):
                     return True
-                # ``slot-…`` / ``claim-…`` mailbox patterns under this zone.
-                if head.startswith("slot-") and ".mb-" in head:
-                    return True
-                if head.startswith("claim-") and ".mb-" in head:
+                # ``slot-{N}.mb-…`` / ``claim-{N}.mb-…`` patterns —
+                # these CAN'T appear directly under ``z`` without an
+                # extra label (slot- or claim- needs the .mb- segment),
+                # so the no-dots gate above already filtered them.
+                # Wildcard variants (``slot-*.mb-*.{z}`` etc.) live
+                # at depth 2 too — they're handled by checking that
+                # the head has exactly one dot AND each segment matches
+                # the expected wildcard shape.
+            # Two-label mailbox patterns: slot-*.mb-*.{z}, claim-*.mb-*.{z}.
+            # These are the M9.2.6 / M10 wildcard scopes that authorize
+            # mailbox writes for any user on this zone.
+            for s in row.allowed_suffixes:
+                norm = (s or "").strip().lower().rstrip(".")
+                if not norm.endswith(suffix):
+                    continue
+                head = norm[: -len(suffix)]
+                if head.count(".") != 1:
+                    continue
+                left, right = head.split(".", 1)
+                if not right.startswith("mb-"):
+                    continue
+                if left.startswith("slot-") or left.startswith("claim-"):
                     return True
             return False
 

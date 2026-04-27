@@ -981,23 +981,25 @@ def _make_client(
     # remote claim publish whenever the operator's own node listened
     # on a non-default port (dev / 5353).
     #
-    # Codex round-6 P2: TSIG block is the preferred source, but
-    # HTTP-mode configs (no ``dnsmesh tsig register`` ran yet) need
-    # a fallback so same-zone M10 still works. Try in order:
+    # Codex round-6 P2 / round-12 P2: TSIG block is the preferred
+    # source; HTTP-mode configs fall back to the ``cfg.endpoint``
+    # host on ``cfg.dns_port``. ``cfg.dns_host`` is the READ-side
+    # resolver (typically a recursive resolver like 1.1.1.1) and
+    # MUST NOT be used as the un-TSIG'd UPDATE target — sending an
+    # un-TSIG'd UPDATE to a recursive resolver gets refused, and
+    # phase-1-only modes silently miss every same-zone message.
+    # Order:
     #   1. TSIG block (post-registration default).
-    #   2. ``cfg.dns_host`` / ``cfg.dns_port`` (explicit DNS resolver).
-    #   3. ``cfg.endpoint`` host (HTTP API host) on the dns_port.
-    # Without this fallback ``recv --primary-only`` and
-    # ``recv_secondary_disable=true`` silently miss same-zone messages
-    # for HTTP-mode clients.
+    #   2. ``cfg.endpoint`` host (HTTP API host = the auth DMP node)
+    #      on ``cfg.dns_port`` (the operator's local DNS port).
+    # If neither is set, no local target — same-zone publishes fall
+    # through to ``_provider_dns_target`` which tries ``<zone>:53``,
+    # which works in production zone-apex deployments.
     local_dns_server = ""
     local_dns_port: Optional[int] = None
     if config.tsig_dns_server and config.tsig_dns_port:
         local_dns_server = config.tsig_dns_server
         local_dns_port = int(config.tsig_dns_port)
-    elif config.dns_host:
-        local_dns_server = config.dns_host
-        local_dns_port = int(config.dns_port or 5353)
     elif config.endpoint:
         try:
             from urllib.parse import urlsplit as _us

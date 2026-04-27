@@ -640,30 +640,38 @@ class TestCodexRound6LocalDnsFallback:
         assert client.local_dns_server == "alice-node.example"
         assert client.local_dns_port == 5353
 
-    def test_dns_host_falls_back_when_tsig_unset(self, tmp_path, monkeypatch):
-        """HTTP-mode pre-TSIG: cfg.dns_host / cfg.dns_port populate
-        the local target when TSIG isn't configured yet."""
+    def test_endpoint_host_used_when_tsig_unset(self, tmp_path, monkeypatch):
+        """HTTP-mode pre-TSIG (codex round-12 P2): the local target
+        comes from ``cfg.endpoint`` (the DMP HTTP API host = the
+        auth node), NOT from ``cfg.dns_host`` (which is a read-side
+        resolver). Sending un-TSIG'd UPDATE to a recursive resolver
+        like 1.1.1.1 would be refused; the auth node is at the
+        endpoint URL."""
         client = self._build_client(
             tmp_path,
             monkeypatch,
-            dns_host="127.0.0.1",
+            dns_host="1.1.1.1",  # recursive resolver — must NOT be used
             dns_port=5353,
-            endpoint="http://127.0.0.1:8053",
-        )
-        assert client.local_dns_server == "127.0.0.1"
-        assert client.local_dns_port == 5353
-
-    def test_endpoint_host_used_when_no_tsig_no_dns_host(self, tmp_path, monkeypatch):
-        """Pure HTTP-mode: no TSIG, no dns_host — fall back to the
-        endpoint URL host on the default DNS port."""
-        client = self._build_client(
-            tmp_path,
-            monkeypatch,
             endpoint="http://node.example:8053",
-            dns_port=5353,
         )
         assert client.local_dns_server == "node.example"
         assert client.local_dns_port == 5353
+
+    def test_dns_host_not_used_as_local_target(self, tmp_path, monkeypatch):
+        """Codex round-12 P2 (negative): no endpoint, no TSIG —
+        dns_host MUST NOT be used as the local target either. The
+        client falls through to ``_provider_dns_target`` (zone:53)
+        for same-zone publishes, which works in production zone-apex
+        deployments and silently fails in dev — but never sends
+        un-TSIG'd UPDATE to a recursive resolver."""
+        client = self._build_client(
+            tmp_path,
+            monkeypatch,
+            dns_host="1.1.1.1",
+            dns_port=5353,
+        )
+        assert client.local_dns_server is None
+        assert client.local_dns_port is None
 
 
 class TestCodexRound5DomainExplicitPersistence:
