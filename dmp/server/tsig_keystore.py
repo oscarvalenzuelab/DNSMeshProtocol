@@ -79,19 +79,31 @@ CREATE TABLE IF NOT EXISTS tsig_keys (
     expires_at       INTEGER NOT NULL DEFAULT 0,
     revoked          INTEGER NOT NULL DEFAULT 0,
     subject          TEXT NOT NULL DEFAULT '',
-    registered_spk   TEXT NOT NULL DEFAULT ''
+    registered_spk   TEXT NOT NULL DEFAULT '',
+    registered_x25519_pub TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_tsig_active ON tsig_keys(revoked, expires_at);
 CREATE INDEX IF NOT EXISTS idx_tsig_subject ON tsig_keys(subject);
 """
 
-# Schema migration for keystores created before M9 round-3. ALTER TABLE
-# IF NOT EXISTS is sqlite 3.35+, which we don't depend on, so we
-# add the columns conditionally via PRAGMA inspection. Idempotent.
+# Schema migration for keystores created before later columns landed.
+# ALTER TABLE IF NOT EXISTS is sqlite 3.35+, which we don't depend on,
+# so we add the columns idempotently via try/except. Each ADD COLUMN
+# raises OperationalError if the column already exists; swallow that
+# and continue.
 _MIGRATIONS = (
     "ALTER TABLE tsig_keys ADD COLUMN subject TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE tsig_keys ADD COLUMN registered_spk TEXT NOT NULL DEFAULT ''",
+    # Codex round-4 P1: M10's registered-recipient gate needs to
+    # recompute hash12(recipient_id) for upgraded keystores whose
+    # stored ``allowed_suffixes`` predate the corrected mailbox-hash
+    # convention. Persisting the user's X25519 pub at registration
+    # time lets the gate derive the canonical hash regardless of
+    # what suffixes the scope contains — and also covers
+    # ``DMP_TSIG_LOOSE_SCOPE=1`` users whose scope is just the bare
+    # zone (no ``mb-{hash}.{zone}`` entry to extract).
+    "ALTER TABLE tsig_keys ADD COLUMN registered_x25519_pub TEXT NOT NULL DEFAULT ''",
 )
 
 
@@ -210,6 +222,14 @@ class TSIGKey:
     # the anti-takeover check.
     subject: str = ""
     registered_spk: str = ""
+    # Codex round-4 P1: persist the user's X25519 pub (hex) at
+    # registration time so M10's registered-recipient gate can
+    # recompute the canonical mailbox hash on demand, regardless of
+    # what shape the stored ``allowed_suffixes`` happen to take
+    # (legacy single-round mailbox hashes, loose-scope bare-zone-only
+    # entries, etc.). Empty for ancient registrations that predate
+    # this column.
+    registered_x25519_pub: str = ""
 
     def is_active(self, now: Optional[int] = None) -> bool:
         if self.revoked:
@@ -270,6 +290,7 @@ class TSIGKeyStore:
         expires_at: int = 0,
         subject: str = "",
         registered_spk: str = "",
+        registered_x25519_pub: str = "",
         now: Optional[int] = None,
     ) -> TSIGKey:
         """Insert or replace a key. Replacing is intentional — the
@@ -280,7 +301,11 @@ class TSIGKeyStore:
         ``subject`` + ``registered_spk`` are persisted so the
         anti-takeover check in ``ensure_subject_owner`` can reject a
         second registrant attempting to mint a key for an already-
-        owned subject."""
+        owned subject. ``registered_x25519_pub`` (codex round-4 P1)
+        is the user's X25519 pub at registration time, stored so the
+        M10 registered-recipient gate can recompute the canonical
+        mailbox hash regardless of what shape the stored scope takes.
+        """
         canonical = _normalize_name(name)
         if not isinstance(secret, (bytes, bytearray)) or not secret:
             raise ValueError("secret must be non-empty bytes")
@@ -289,13 +314,15 @@ class TSIGKeyStore:
             raise ValueError("at least one non-empty allowed suffix is required")
         subject_norm = (subject or "").strip().lower()
         spk_norm = (registered_spk or "").strip().lower()
+        x_norm = (registered_x25519_pub or "").strip().lower()
         created_at = int(time.time() if now is None else now)
         with self._lock:
             self._conn.execute(
                 """INSERT INTO tsig_keys
                    (name, algorithm, secret, allowed_suffixes,
-                    created_at, expires_at, revoked, subject, registered_spk)
-                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    created_at, expires_at, revoked, subject,
+                    registered_spk, registered_x25519_pub)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                    ON CONFLICT(name) DO UPDATE SET
                      algorithm = excluded.algorithm,
                      secret = excluded.secret,
@@ -304,7 +331,8 @@ class TSIGKeyStore:
                      expires_at = excluded.expires_at,
                      revoked = 0,
                      subject = excluded.subject,
-                     registered_spk = excluded.registered_spk""",
+                     registered_spk = excluded.registered_spk,
+                     registered_x25519_pub = excluded.registered_x25519_pub""",
                 (
                     canonical,
                     algorithm,
@@ -314,6 +342,7 @@ class TSIGKeyStore:
                     int(expires_at),
                     subject_norm,
                     spk_norm,
+                    x_norm,
                 ),
             )
             self._conn.commit()
@@ -327,6 +356,7 @@ class TSIGKeyStore:
             revoked=False,
             subject=subject_norm,
             registered_spk=spk_norm,
+            registered_x25519_pub=x_norm,
         )
 
     def mint(
@@ -339,6 +369,7 @@ class TSIGKeyStore:
         expires_at: int = 0,
         subject: str = "",
         registered_spk: str = "",
+        registered_x25519_pub: str = "",
         now: Optional[int] = None,
     ) -> TSIGKey:
         """Generate a fresh secret and store the key. Returns the
@@ -355,6 +386,7 @@ class TSIGKeyStore:
             expires_at=expires_at,
             subject=subject,
             registered_spk=registered_spk,
+            registered_x25519_pub=registered_x25519_pub,
             now=now,
         )
 
@@ -365,6 +397,7 @@ class TSIGKeyStore:
         allowed_suffixes: Iterable[str],
         subject: str,
         registered_spk: str,
+        registered_x25519_pub: str = "",
         algorithm: str = DEFAULT_ALGORITHM,
         secret_bytes: int = DEFAULT_SECRET_BYTES,
         expires_at: int = 0,
@@ -392,6 +425,7 @@ class TSIGKeyStore:
             raise ValueError("at least one non-empty allowed suffix is required")
         subject_norm = (subject or "").strip().lower()
         spk_norm = registered_spk.strip().lower()
+        x_norm = (registered_x25519_pub or "").strip().lower()
         if not subject_norm:
             raise ValueError("subject must be non-empty for atomic mint")
         secret = secrets.token_bytes(int(secret_bytes))
@@ -411,8 +445,9 @@ class TSIGKeyStore:
             self._conn.execute(
                 """INSERT INTO tsig_keys
                    (name, algorithm, secret, allowed_suffixes,
-                    created_at, expires_at, revoked, subject, registered_spk)
-                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    created_at, expires_at, revoked, subject,
+                    registered_spk, registered_x25519_pub)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                    ON CONFLICT(name) DO UPDATE SET
                      algorithm = excluded.algorithm,
                      secret = excluded.secret,
@@ -421,7 +456,8 @@ class TSIGKeyStore:
                      expires_at = excluded.expires_at,
                      revoked = 0,
                      subject = excluded.subject,
-                     registered_spk = excluded.registered_spk""",
+                     registered_spk = excluded.registered_spk,
+                     registered_x25519_pub = excluded.registered_x25519_pub""",
                 (
                     canonical,
                     algorithm,
@@ -431,6 +467,7 @@ class TSIGKeyStore:
                     int(expires_at),
                     subject_norm,
                     spk_norm,
+                    x_norm,
                 ),
             )
             self._conn.commit()
@@ -444,6 +481,7 @@ class TSIGKeyStore:
             revoked=False,
             subject=subject_norm,
             registered_spk=spk_norm,
+            registered_x25519_pub=x_norm,
         )
 
     # ------------------------------------------------------------------
@@ -469,7 +507,7 @@ class TSIGKeyStore:
             row = self._conn.execute(
                 """SELECT name, algorithm, secret, allowed_suffixes,
                           created_at, expires_at, revoked, subject,
-                          registered_spk
+                          registered_spk, registered_x25519_pub
                    FROM tsig_keys
                    WHERE subject = ?
                      AND revoked = 0
@@ -520,7 +558,7 @@ class TSIGKeyStore:
             row = self._conn.execute(
                 """SELECT name, algorithm, secret, allowed_suffixes,
                           created_at, expires_at, revoked, subject,
-                          registered_spk
+                          registered_spk, registered_x25519_pub
                    FROM tsig_keys WHERE name = ?""",
                 (canonical,),
             ).fetchone()
@@ -532,7 +570,7 @@ class TSIGKeyStore:
             rows = self._conn.execute(
                 """SELECT name, algorithm, secret, allowed_suffixes,
                           created_at, expires_at, revoked, subject,
-                          registered_spk
+                          registered_spk, registered_x25519_pub
                    FROM tsig_keys
                    WHERE revoked = 0
                      AND (expires_at = 0 OR expires_at > ?)
@@ -546,7 +584,7 @@ class TSIGKeyStore:
             rows = self._conn.execute(
                 """SELECT name, algorithm, secret, allowed_suffixes,
                           created_at, expires_at, revoked, subject,
-                          registered_spk
+                          registered_spk, registered_x25519_pub
                    FROM tsig_keys ORDER BY created_at ASC"""
             ).fetchall()
         return [_row_to_key(r) for r in rows]
@@ -607,20 +645,34 @@ class TSIGKeyStore:
     def registered_recipient_hashes(self, zone: str, now: Optional[int] = None) -> set:
         """Return the set of mailbox hash12s registered under ``zone``.
 
-        Each user who registers via ``/v1/registration/tsig-confirm``
-        with their X25519 public key gets a TSIG scope entry of the
-        form ``mb-{hash12}.{zone}`` (see
-        ``dmp/server/registration.py``). M10 (codex round-3 P1) uses
-        this set to gate un-TSIG'd claim writes when
-        ``DMP_RECEIVER_CLAIM_NOTIFICATIONS=1`` and
+        M10 (codex round-3 P1) uses this set to gate un-TSIG'd claim
+        writes when ``DMP_RECEIVER_CLAIM_NOTIFICATIONS=1`` and
         ``DMP_CLAIM_PROVIDER=0`` — the operator opted out of the
         public first-contact write surface, so M10 must accept claim
         records ONLY for users who actually live on this node's zone.
+
+        Resolution order (codex round-4 P1 + P2 #1):
+
+          1. ``registered_x25519_pub`` — the canonical source. Recompute
+             ``hash12(sha256(x_pub))`` directly so the registered set
+             is correct regardless of what shape ``allowed_suffixes``
+             takes. Covers (a) keystores upgraded from pre-M10 builds
+             whose mailbox-hash suffix used the old single-round
+             formulation, and (b) ``DMP_TSIG_LOOSE_SCOPE=1`` users
+             whose scope is just the bare zone with no
+             ``mb-{hash}.{zone}`` entry to extract.
+          2. Fall back to scanning ``allowed_suffixes`` for
+             ``mb-{hex12}.{zone}`` entries — covers ancient keystores
+             that predate the ``registered_x25519_pub`` column AND
+             admin-issued keys that didn't go through the
+             ``/v1/registration/tsig-confirm`` flow.
 
         Returns a fresh set each call (built from the current active
         key set) so a revoke / register that happens mid-tick takes
         effect on the next packet without restarting the server.
         """
+        import hashlib
+
         z = (zone or "").strip().lower().rstrip(".")
         if not z:
             return set()
@@ -628,6 +680,19 @@ class TSIGKeyStore:
         suffix = "." + z
         hashes: set = set()
         for row in self.list_active(now=now):
+            # Preferred path: recompute from the persisted X25519 pub.
+            x_hex = (row.registered_x25519_pub or "").strip().lower()
+            if x_hex:
+                try:
+                    x_bytes = bytes.fromhex(x_hex)
+                except ValueError:
+                    x_bytes = b""
+                if len(x_bytes) == 32:
+                    recipient_id = hashlib.sha256(x_bytes).digest()
+                    hashes.add(hashlib.sha256(recipient_id).hexdigest()[:12])
+                    # Continue to scope-scanning below in case the
+                    # operator issued an extra mb-{hash}.{zone} suffix
+                    # by hand — defense in depth, not load-bearing.
             for s in row.allowed_suffixes:
                 norm = (s or "").strip().lower().rstrip(".")
                 # Look for ``mb-{hex12}.{zone}``. Skip wildcards
@@ -671,6 +736,7 @@ def _row_to_key(row) -> TSIGKey:
         revoked,
         subject,
         registered_spk,
+        registered_x25519_pub,
     ) = row
     suffixes = tuple(s for s in (suffixes_blob or "").split("\n") if s)
     return TSIGKey(
@@ -683,4 +749,5 @@ def _row_to_key(row) -> TSIGKey:
         revoked=bool(revoked),
         subject=str(subject or ""),
         registered_spk=str(registered_spk or ""),
+        registered_x25519_pub=str(registered_x25519_pub or ""),
     )

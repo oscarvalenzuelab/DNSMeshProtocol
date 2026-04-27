@@ -813,6 +813,10 @@ def mint_tsig_via_registration(
             allowed_suffixes=suffixes,
             subject=subject,
             registered_spk=spk_lower,
+            # Codex round-4 P1: persist the user's X25519 pub so M10's
+            # registered-recipient gate can recompute the canonical
+            # mailbox hash without depending on the suffix shape.
+            registered_x25519_pub=x_pub_hex,
             expires_at=expires_at,
             now=now,
         )

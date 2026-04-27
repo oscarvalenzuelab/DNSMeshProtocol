@@ -1000,6 +1000,145 @@ class TestM10Server:
         assert response.rcode() == dns.rcode.NOERROR
         assert store.query_txt_record(owner.rstrip(".")) == [wire]
 
+    def test_loose_scope_user_accepted_via_x25519_pub(self, tmp_path):
+        """Codex round-4 P2 #1: a user registered under
+        ``DMP_TSIG_LOOSE_SCOPE=1`` has only the bare zone in their TSIG
+        scope (no ``mb-{hash}.{zone}`` entry). The M10 registered-hash
+        gate MUST still admit them by recomputing the canonical hash
+        from the persisted X25519 pub. Without this, an M10-only
+        operator running loose-scope mode (typical for a dev / single-
+        user node) would have phase-1 silently fail for everyone."""
+        from dmp.server.tsig_keystore import TSIGKeyStore
+
+        store = InMemoryDNSStore()
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        # Recipient: derive their X25519 pub deterministically.
+        recipient_crypto = DMPCrypto.from_passphrase("loose-bob", salt=b"L" * 32)
+        x_pub = recipient_crypto.get_public_key_bytes()
+        recipient_id = hashlib.sha256(x_pub).digest()
+        h12 = hashlib.sha256(recipient_id).hexdigest()[:12]
+
+        # Loose-scope registration: only the bare zone, no
+        # ``mb-{hash}.{zone}`` entry — but the X25519 pub IS persisted.
+        db_path = str(tmp_path / "tsig.db")
+        keystore = TSIGKeyStore(db_path)
+        keystore.put(
+            name="loose-bob.",
+            secret=b"\x55" * 32,
+            allowed_suffixes=["dmp.example.com"],  # bare zone only
+            registered_x25519_pub=x_pub.hex(),
+        )
+
+        port = _free_port()
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keystore=keystore,
+            allowed_zones=("dmp.example.com",),
+            claim_publish_enabled=False,
+            receiver_claim_publish_enabled=True,
+        )
+        wire = _claim_wire(sender, recipient_id)
+        owner = f"claim-0.mb-{h12}.dmp.example.com."
+
+        with server:
+            upd = dns.update.UpdateMessage("dmp.example.com")
+            upd.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.NOERROR, (
+            "loose-scope user with persisted x25519_pub should pass "
+            "the M10 gate via hash recompute; got "
+            f"{dns.rcode.to_text(response.rcode())}"
+        )
+        assert store.query_txt_record(owner.rstrip(".")) == [wire]
+
+    def test_legacy_keystore_with_old_hash_format_falls_back_to_suffix(self, tmp_path):
+        """Codex round-4 P1: a keystore upgraded from a pre-M10 build
+        has rows whose ``allowed_suffixes`` carry the old single-round
+        ``mb-{sha256(x_pub)[:12]}.{zone}`` (which never matched any
+        real owner) AND no ``registered_x25519_pub``. Such users are
+        effectively un-registered for M10 — the gate's suffix-scan
+        fallback returns the wrong hash, no claim writes succeed.
+        Operators upgrading must re-register users to mint the
+        canonical mailbox-hash scope (and persist x_pub).
+
+        This test locks the migration story in: a legacy row WITHOUT
+        x_pub does NOT admit the canonical hash. Once x_pub is
+        backfilled, the gate works."""
+        from dmp.server.tsig_keystore import TSIGKeyStore
+
+        store = InMemoryDNSStore()
+        sender = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
+        recipient_crypto = DMPCrypto.from_passphrase("legacy-bob", salt=b"M" * 32)
+        x_pub = recipient_crypto.get_public_key_bytes()
+        canonical_recipient_id = hashlib.sha256(x_pub).digest()
+        canonical_h12 = hashlib.sha256(canonical_recipient_id).hexdigest()[:12]
+        # OLD suffix: single-round hash of x_pub. Doesn't match any
+        # real owner.
+        old_h12 = hashlib.sha256(x_pub).hexdigest()[:12]
+
+        db_path = str(tmp_path / "tsig.db")
+        keystore = TSIGKeyStore(db_path)
+        # Legacy row: OLD suffix, no x_pub persisted.
+        keystore.put(
+            name="legacy-bob.",
+            secret=b"\x66" * 32,
+            allowed_suffixes=[f"mb-{old_h12}.dmp.example.com"],
+        )
+
+        port = _free_port()
+        server = DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keystore=keystore,
+            allowed_zones=("dmp.example.com",),
+            claim_publish_enabled=False,
+            receiver_claim_publish_enabled=True,
+        )
+        wire = _claim_wire(sender, canonical_recipient_id)
+        owner = f"claim-0.mb-{canonical_h12}.dmp.example.com."
+
+        with server:
+            upd = dns.update.UpdateMessage("dmp.example.com")
+            upd.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.REFUSED, (
+            "legacy keystore row without x25519_pub must NOT admit "
+            "the canonical hash — operator must re-register"
+        )
+
+        # Backfill x_pub on the same row → gate now passes.
+        keystore.put(
+            name="legacy-bob.",
+            secret=b"\x66" * 32,
+            allowed_suffixes=[f"mb-{old_h12}.dmp.example.com"],
+            registered_x25519_pub=x_pub.hex(),
+        )
+        with server:
+            upd2 = dns.update.UpdateMessage("dmp.example.com")
+            upd2.add(
+                dns.name.from_text(owner),
+                300,
+                "TXT",
+                '"' + wire.replace('"', r"\"") + '"',
+            )
+            response2 = _send_update(upd2, port)
+        assert response2.rcode() == dns.rcode.NOERROR
+
     def test_bad_signature_refused(self, tmp_path):
         """A claim wire whose signature is corrupted fails verification at
         the server and the UPDATE is REFUSED — no record lands."""

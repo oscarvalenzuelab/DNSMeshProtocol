@@ -972,6 +972,20 @@ def _make_client(
     # per the M2.wire hard-rules constraint.
     client._cluster_client = cluster_client  # type: ignore[attr-defined]
 
+    # Codex round-4 P2 #2: M10 same-zone publishes go through
+    # ``_publish_claim_via_dns_update`` whose port comes from
+    # ``DMP_PROVIDER_DNS_PORT`` (default 53). On a dev / single-node
+    # setup running the local DNS server on 5353, the operator would
+    # otherwise have to remember to export that env var or every
+    # same-zone M10 publish would silently fail. Auto-set the env
+    # var from ``cfg.tsig_dns_port`` (the port the user already
+    # configured for TSIG'd writes to their own zone) when the env
+    # var hasn't been set explicitly. Production deployments using
+    # port 53 are unaffected; the env var becomes "53" which matches
+    # the default.
+    if config.tsig_dns_port and not os.environ.get("DMP_PROVIDER_DNS_PORT"):
+        os.environ["DMP_PROVIDER_DNS_PORT"] = str(config.tsig_dns_port)
+
     # Passphrase-typo tripwire. The keypair is derived purely from
     # passphrase + kdf_salt, so any string produces some valid keypair
     # — there's no built-in "wrong passphrase" detection. We compare
