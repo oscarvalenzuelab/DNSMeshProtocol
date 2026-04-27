@@ -42,6 +42,9 @@ test vectors under
   node-set for a cluster (`v=dmp1;t=cluster;`).
 - [Bootstrap record]({{ site.baseurl }}/protocol/bootstrap) — signed
   user-domain → cluster pointer (`v=dmp1;t=bootstrap;`).
+- [Claim record (notifications)]({{ site.baseurl }}/protocol/notifications)
+  — signed mailbox pointer used for first-contact reach (M8.2) and
+  receiver-zone notifications (M10) (`v=dmp1;t=claim;`).
 
 ## Adjacent documents
 
