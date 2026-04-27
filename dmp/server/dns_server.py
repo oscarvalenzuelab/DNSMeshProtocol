@@ -125,26 +125,36 @@ def _name_under_zone(name: str, zone: str) -> bool:
 
 def _is_claim_owner(owner: str, zone: str) -> bool:
     """True iff ``owner`` matches ``claim-<slot>.mb-<hash12>.<zone>``."""
+    return _claim_owner_hash12(owner, zone) is not None
+
+
+def _claim_owner_hash12(owner: str, zone: str) -> Optional[str]:
+    """Return the recipient hash12 from a claim owner, or None on shape mismatch.
+
+    Used both as the owner-shape gate (M8.3 + M10) and as the rate-limit
+    bucket key — per-recipient throttling needs the hash so a noisy
+    sender targeting one recipient can't burn the whole zone's budget.
+    """
     n = _normalize_zone(owner)
     z = _normalize_zone(zone)
     if not z or not (n == z or n.endswith("." + z)):
-        return False
+        return None
     relative = n[: -len("." + z)] if n.endswith("." + z) else ""
     parts = relative.split(".")
     if len(parts) != 2:
-        return False
+        return None
     slot_label, mailbox_label = parts
     if not slot_label.startswith("claim-"):
-        return False
+        return None
     slot = slot_label[len("claim-") :]
     if not slot.isdigit():
-        return False
+        return None
     if not mailbox_label.startswith("mb-"):
-        return False
+        return None
     h = mailbox_label[len("mb-") :]
     if len(h) != 12 or not all(c in "0123456789abcdef" for c in h):
-        return False
-    return True
+        return None
+    return h
 
 
 def _is_signed_claim_wire(value: Optional[str]) -> bool:
@@ -508,13 +518,23 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         else:
             # Un-TSIG'd path: only the self-authenticating claim
             # surface is acceptable, AND only when the operator has
-            # opted into the claim-provider role. ``DMPNode.start()``
-            # wires ``claim_publish_enabled`` from the same env-var
-            # that drives CAP_CLAIM_PROVIDER (codex round-9 P2): a
-            # node with DMP_CLAIM_PROVIDER=0 must NOT silently become
-            # an anonymous claim sink just because DNS UPDATE was
-            # turned on for its own users.
-            if not getattr(self.server, "claim_publish_enabled", False):
+            # opted into one of the two claim-acceptance roles:
+            #   - CAP_CLAIM_PROVIDER  (M8.3 first-contact provider tier;
+            #     gated on DMP_CLAIM_PROVIDER)
+            #   - M10 receiver-zone notifications (gated on
+            #     DMP_RECEIVER_CLAIM_NOTIFICATIONS)
+            #
+            # Both modes use the same owner-name shape
+            # ``claim-{slot}.mb-{hash12}.<served-zone>`` and the same
+            # signed wire — what differs is which zone the records
+            # land in (provider zone vs the recipient's home zone).
+            # A node with neither flag must NOT silently become an
+            # anonymous claim sink just because DNS UPDATE was turned
+            # on for its own TSIG'd users (codex round-9 P2).
+            if not (
+                getattr(self.server, "claim_publish_enabled", False)
+                or getattr(self.server, "receiver_claim_publish_enabled", False)
+            ):
                 response.set_rcode(dns.rcode.REFUSED)
                 return response
             if not ops:
@@ -522,12 +542,14 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                 return response
             cap = int(getattr(self.server, "claim_max_ttl", DEFAULT_CLAIM_MAX_TTL))
             now_i = int(time.time())
+            claim_limiter = getattr(self.server, "claim_rate_limiter", None)
             applied: List[Tuple[str, str, Optional[str], int]] = []
             for op, owner, value, ttl in ops:
                 if op != "add":
                     response.set_rcode(dns.rcode.REFUSED)
                     return response
-                if not _is_claim_owner(owner, zone_text):
+                hash12 = _claim_owner_hash12(owner, zone_text)
+                if hash12 is None:
                     response.set_rcode(dns.rcode.REFUSED)
                     return response
                 if not _claim_within_lifetime_cap(value, max_ttl=cap, now=now_i):
@@ -537,6 +559,21 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                     # would pin the RRset against retention policy
                     # (codex round-9 P2).
                     response.set_rcode(dns.rcode.REFUSED)
+                    return response
+                # Per-recipient-hash rate limit (M10 spec). Keyed on
+                # the hash12 in the owner name so a single noisy sender
+                # / recipient combo can't burn the whole zone's budget.
+                # Exhaustion is SERVFAIL (transient backoff signal),
+                # distinct from REFUSED for shape violations — a
+                # legitimate sender can retry later, a forgery cannot.
+                if claim_limiter is not None and not claim_limiter.allow(hash12):
+                    log.info(
+                        "claim UPDATE rate-limited for recipient hash %s "
+                        "(zone=%s) — answering SERVFAIL",
+                        hash12,
+                        zone_text,
+                    )
+                    response.set_rcode(dns.rcode.SERVFAIL)
                     return response
                 # Clamp the requested DNS TTL to the operator's cap so a
                 # client can't request a 10-year cache lifetime.
@@ -615,7 +652,9 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         allowed_zones=None,
         update_authorizer=None,
         claim_publish_enabled=False,
+        receiver_claim_publish_enabled=False,
         claim_max_ttl=DEFAULT_CLAIM_MAX_TTL,
+        claim_rate_limiter=None,
         update_max_ttl=DEFAULT_UPDATE_MAX_TTL,
         update_max_value_bytes=DEFAULT_UPDATE_MAX_VALUE_BYTES,
         update_max_values_per_name=DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
@@ -631,7 +670,9 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         self.allowed_zones = allowed_zones or ()
         self.update_authorizer = update_authorizer
         self.claim_publish_enabled = bool(claim_publish_enabled)
+        self.receiver_claim_publish_enabled = bool(receiver_claim_publish_enabled)
         self.claim_max_ttl = int(claim_max_ttl)
+        self.claim_rate_limiter = claim_rate_limiter
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
@@ -677,7 +718,9 @@ class DMPDnsServer:
         allowed_zones: Optional[Sequence[str]] = None,
         update_authorizer: Optional[UpdateAuthorizer] = None,
         claim_publish_enabled: bool = False,
+        receiver_claim_publish_enabled: bool = False,
         claim_max_ttl: int = DEFAULT_CLAIM_MAX_TTL,
+        claim_rate_limit: Optional[RateLimit] = None,
         update_max_ttl: int = DEFAULT_UPDATE_MAX_TTL,
         update_max_value_bytes: int = DEFAULT_UPDATE_MAX_VALUE_BYTES,
         update_max_values_per_name: int = DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
@@ -720,7 +763,20 @@ class DMPDnsServer:
         # accept first-contact claims from arbitrary senders leaves
         # this False and the un-TSIG'd path stays REFUSED.
         self.claim_publish_enabled = bool(claim_publish_enabled)
+        # M10 — receiver-zone claim notifications (DMP_RECEIVER_CLAIM_NOTIFICATIONS).
+        # Independent of CAP_CLAIM_PROVIDER: a node can serve M10 claims for
+        # its own users without taking on the M8.3 first-contact provider
+        # role for arbitrary recipients (or vice versa).
+        self.receiver_claim_publish_enabled = bool(receiver_claim_publish_enabled)
         self.claim_max_ttl = int(claim_max_ttl)
+        # Per-recipient-hash token bucket on un-TSIG'd claim writes
+        # (covers both M8.3 and M10 surfaces). Hash12 from the owner
+        # name is the bucket key. Disabled rate limit → no throttling.
+        self.claim_rate_limiter = (
+            TokenBucketLimiter(claim_rate_limit)
+            if claim_rate_limit and claim_rate_limit.enabled
+            else None
+        )
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
@@ -749,7 +805,9 @@ class DMPDnsServer:
             allowed_zones=self.allowed_zones,
             update_authorizer=self.update_authorizer,
             claim_publish_enabled=self.claim_publish_enabled,
+            receiver_claim_publish_enabled=self.receiver_claim_publish_enabled,
             claim_max_ttl=self.claim_max_ttl,
+            claim_rate_limiter=self.claim_rate_limiter,
             update_max_ttl=self.update_max_ttl,
             update_max_value_bytes=self.update_max_value_bytes,
             update_max_values_per_name=self.update_max_values_per_name,

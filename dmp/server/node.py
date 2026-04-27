@@ -890,12 +890,46 @@ class DMPNode:
                 )
             except ValueError:
                 claim_max_ttl = DEFAULT_CLAIM_MAX_TTL
+            # M10 — receiver-zone claim notifications. Independent
+            # opt-in: a node can accept M10 claims for users it
+            # serves without taking on the M8.3 first-contact
+            # provider role for arbitrary recipients.
+            receiver_claim_raw = (
+                os.environ.get("DMP_RECEIVER_CLAIM_NOTIFICATIONS", "").strip().lower()
+            )
+            receiver_claim_publish_enabled = receiver_claim_raw in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            # Per-recipient-hash rate limit on un-TSIG'd claim writes.
+            # Hash12 from the owner name is the bucket key. Default
+            # 0.5 req/s with burst 30 — quiet enough for legitimate
+            # senders, loud enough to stop a spammer from filling a
+            # recipient's slot RRsets.
+            try:
+                claim_rate = float(
+                    os.environ.get("DMP_CLAIM_RATE_PER_USER_PER_SEC", "0.5")
+                )
+            except ValueError:
+                claim_rate = 0.5
+            try:
+                claim_burst = float(os.environ.get("DMP_CLAIM_RATE_BURST", "30"))
+            except ValueError:
+                claim_burst = 30.0
+            claim_rate_limit = RateLimit(
+                rate_per_second=claim_rate,
+                burst=claim_burst,
+            )
             update_kwargs = {
                 "writer": self.store,
                 "tsig_keystore": self.tsig_keystore,
                 "allowed_zones": allowed_zones,
                 "claim_publish_enabled": claim_publish_enabled,
+                "receiver_claim_publish_enabled": receiver_claim_publish_enabled,
                 "claim_max_ttl": claim_max_ttl,
+                "claim_rate_limit": claim_rate_limit,
                 # Resource caps mirror the HTTP /v1/records publish
                 # path so a TSIG'd DNS UPDATE can't bypass operator
                 # storage policy (codex round-16 P1).
