@@ -1,0 +1,177 @@
+# docker-compose.m10-test.yml — M10 receiver-zone notification e2e.
+#
+# Three independent dnsmesh-node containers, each authoritative for a
+# different DNS zone:
+#
+#   - alice-node   alice.test       10.42.10.11   M10=on,  M8.3=off
+#   - bob-node     bob.test         10.42.10.12   M10=on,  M8.3=off
+#   - stranger-node stranger.test   10.42.10.13   M10=off, M8.3=off  (control)
+#
+# alice + bob accept M10 claim writes for their served zone. stranger
+# rejects everything — used to confirm the default behavior is REFUSED
+# (DMP_RECEIVER_CLAIM_NOTIFICATIONS unset).
+#
+# Bring up:
+#
+#     docker compose -f docker-compose.m10-test.yml up -d --build
+#
+# Smoke tests:
+#
+#     curl -s http://127.0.0.1:8181/v1/info | jq .role
+#     dig @127.0.0.1 -p 5181 _dnsmesh-heartbeat.alice.test TXT +short
+#
+# Drive the e2e harness:
+#
+#     ./venv/bin/python scripts/m10_e2e_test.py
+#
+# Tear down:
+#
+#     docker compose -f docker-compose.m10-test.yml down -v
+
+services:
+  alice-node:
+    image: dnsmesh-node:m10-test
+    build:
+      context: .
+    container_name: m10-alice-node
+    restart: unless-stopped
+    environment:
+      DMP_DOMAIN: alice.test
+      DMP_NODE_HOSTNAME: alice.test
+      DMP_SERVED_ZONE: alice.test
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_CLEANUP_INTERVAL: "30"
+      DMP_LOG_LEVEL: INFO
+      DMP_HEARTBEAT_ENABLED: "1"
+      DMP_HEARTBEAT_SELF_ENDPOINT: "http://alice-node:8053"
+      DMP_HEARTBEAT_OPERATOR_KEY_PATH: /etc/dmp/operator.key
+      DMP_HEARTBEAT_INTERVAL_SECONDS: "5"
+      DMP_HEARTBEAT_TTL_SECONDS: "300"
+      DMP_HEARTBEAT_SEEDS: "bob.test,stranger.test"
+      DMP_HEARTBEAT_DNS_RESOLVERS: "10.42.10.12:5353,10.42.10.13:5353"
+      # M8.3 first-contact provider role explicitly OFF so the e2e
+      # exercises the M10 surface in isolation.
+      DMP_CLAIM_PROVIDER: "0"
+      # M10 — accept un-TSIG'd UPDATE claims for users on alice.test.
+      DMP_RECEIVER_CLAIM_NOTIFICATIONS: "1"
+      # Generous rate limit for the e2e (default 0.5/s burst 30 is
+      # fine but the test publishes 2-3 claims back-to-back).
+      DMP_CLAIM_RATE_PER_USER_PER_SEC: "5"
+      DMP_CLAIM_RATE_BURST: "50"
+      DMP_DNS_UPDATE_ENABLED: "1"
+      DMP_AUTH_MODE: "multi-tenant"
+      DMP_OPERATOR_TOKEN: "alice-operator-token-for-tests"
+      DMP_REGISTRATION_ENABLED: "1"
+    volumes:
+      - alice-data:/var/lib/dmp
+      - ./docker/m10-test/alice-operator.key:/etc/dmp/operator.key:ro
+    ports:
+      - "127.0.0.1:5181:5353/udp"
+      - "127.0.0.1:8181:8053/tcp"
+    networks:
+      m10-test:
+        ipv4_address: 10.42.10.11
+
+  bob-node:
+    image: dnsmesh-node:m10-test
+    build:
+      context: .
+    container_name: m10-bob-node
+    restart: unless-stopped
+    environment:
+      DMP_DOMAIN: bob.test
+      DMP_NODE_HOSTNAME: bob.test
+      DMP_SERVED_ZONE: bob.test
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_CLEANUP_INTERVAL: "30"
+      DMP_LOG_LEVEL: INFO
+      DMP_HEARTBEAT_ENABLED: "1"
+      DMP_HEARTBEAT_SELF_ENDPOINT: "http://bob-node:8053"
+      DMP_HEARTBEAT_OPERATOR_KEY_PATH: /etc/dmp/operator.key
+      DMP_HEARTBEAT_INTERVAL_SECONDS: "5"
+      DMP_HEARTBEAT_TTL_SECONDS: "300"
+      DMP_HEARTBEAT_SEEDS: "alice.test,stranger.test"
+      DMP_HEARTBEAT_DNS_RESOLVERS: "10.42.10.11:5353,10.42.10.13:5353"
+      DMP_CLAIM_PROVIDER: "0"
+      DMP_RECEIVER_CLAIM_NOTIFICATIONS: "1"
+      DMP_CLAIM_RATE_PER_USER_PER_SEC: "5"
+      DMP_CLAIM_RATE_BURST: "50"
+      DMP_DNS_UPDATE_ENABLED: "1"
+      DMP_AUTH_MODE: "multi-tenant"
+      DMP_OPERATOR_TOKEN: "bob-operator-token-for-tests"
+      DMP_REGISTRATION_ENABLED: "1"
+    volumes:
+      - bob-data:/var/lib/dmp
+      - ./docker/m10-test/bob-operator.key:/etc/dmp/operator.key:ro
+    ports:
+      - "127.0.0.1:5182:5353/udp"
+      - "127.0.0.1:8182:8053/tcp"
+    networks:
+      m10-test:
+        ipv4_address: 10.42.10.12
+
+  stranger-node:
+    image: dnsmesh-node:m10-test
+    build:
+      context: .
+    container_name: m10-stranger-node
+    restart: unless-stopped
+    environment:
+      DMP_DOMAIN: stranger.test
+      DMP_NODE_HOSTNAME: stranger.test
+      DMP_SERVED_ZONE: stranger.test
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_DNS_TTL: "60"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_CLEANUP_INTERVAL: "30"
+      DMP_LOG_LEVEL: INFO
+      DMP_HEARTBEAT_ENABLED: "1"
+      DMP_HEARTBEAT_SELF_ENDPOINT: "http://stranger-node:8053"
+      DMP_HEARTBEAT_OPERATOR_KEY_PATH: /etc/dmp/operator.key
+      DMP_HEARTBEAT_INTERVAL_SECONDS: "5"
+      DMP_HEARTBEAT_TTL_SECONDS: "300"
+      DMP_HEARTBEAT_SEEDS: "alice.test,bob.test"
+      DMP_HEARTBEAT_DNS_RESOLVERS: "10.42.10.11:5353,10.42.10.12:5353"
+      # CONTROL: both flags off (defaults). The stranger node accepts
+      # TSIG'd UPDATEs for its own users but MUST refuse un-TSIG'd
+      # claim writes (whether M8.3 or M10).
+      DMP_CLAIM_PROVIDER: "0"
+      DMP_RECEIVER_CLAIM_NOTIFICATIONS: "0"
+      DMP_DNS_UPDATE_ENABLED: "1"
+      DMP_AUTH_MODE: "multi-tenant"
+      DMP_OPERATOR_TOKEN: "stranger-operator-token-for-tests"
+      DMP_REGISTRATION_ENABLED: "1"
+    volumes:
+      - stranger-data:/var/lib/dmp
+      - ./docker/m10-test/stranger-operator.key:/etc/dmp/operator.key:ro
+    ports:
+      - "127.0.0.1:5183:5353/udp"
+      - "127.0.0.1:8183:8053/tcp"
+    networks:
+      m10-test:
+        ipv4_address: 10.42.10.13
+
+networks:
+  m10-test:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.42.10.0/24
+
+volumes:
+  alice-data:
+  bob-data:
+  stranger-data:
