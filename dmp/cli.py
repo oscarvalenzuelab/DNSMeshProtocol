@@ -1614,27 +1614,30 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def _probe_local_node_dns(endpoint: str) -> Optional[Tuple[str, int]]:
-    """Probe the endpoint host's DNS port for a DMP heartbeat record.
+    """Probe the endpoint host's DNS port for a DMP-specific signature.
 
     Used by ``dnsmesh init`` and ``dnsmesh doctor`` to auto-detect
-    the local node's DNS endpoint without forcing the operator to
-    configure it manually. Best-effort — failure is silent and
-    treated as "not auto-detectable; let the operator configure
+    the local node's DNS endpoint. Best-effort — failure is silent
+    and treated as "not auto-detectable; let the operator configure
     manually."
 
-    Codex round-14 P1: the probe MUST require a real DMP signal,
-    not just any DNS listener answering. NOERROR/NXDOMAIN from a
-    recursive resolver running on the same host's port 53/5353
-    would otherwise pin a non-writable target — same-zone M10
-    publishes would land at a server that REFUSES un-TSIG'd UPDATEs.
-    We require the response to carry a parseable, signature-valid
-    ``HeartbeatRecord``; that's a DMP-specific wire shape no other
-    DNS server can fake without the operator's signing key.
+    Probe signal: an un-TSIG'd, non-claim UPDATE that the server
+    REFUSES (rcode 5). DMP nodes specifically REFUSE that shape on
+    their un-TSIG'd UPDATE accept path (server gates on
+    claim-record owner pattern; anything else bounces). Non-DMP
+    servers typically return NOTIMP (4) for UPDATE messages —
+    recursive resolvers don't support DNS UPDATE at all, and
+    standard authoritative servers return NOTIMP unless they're
+    configured for the zone.
+
+    This signal is heartbeat-independent (round-15 codex P1 caught
+    that heartbeat is opt-in via ``DMP_HEARTBEAT_ENABLED``, so a
+    heartbeat-required probe rejected default node configs). The
+    REFUSED-on-junk-UPDATE is a load-bearing protocol contract on
+    the DMP server side, not an operator-configurable opt-in.
 
     Tries port 5353 first (dev / non-privileged), then 53 (prod).
-    Both timeouts are short (1.5s) — a non-responding port or a
-    server returning anything but a verifiable heartbeat is the
-    normal "no" signal.
+    Both timeouts are short (1.5s).
     """
     from urllib.parse import urlsplit
 
@@ -1645,32 +1648,59 @@ def _probe_local_node_dns(endpoint: str) -> Optional[Tuple[str, int]]:
         return None
     if not host:
         return None
-
-    import dns.message
-    import dns.query
-    import dns.rdatatype
-
-    from dmp.core.heartbeat import HeartbeatRecord
-
-    probe_name = f"_dnsmesh-heartbeat.{host}"
     for port in (5353, 53):
-        try:
-            request = dns.message.make_query(probe_name, dns.rdatatype.TXT)
-            response = dns.query.udp(request, host, port=port, timeout=1.5)
-        except Exception:
-            continue
-        if response.rcode() != 0:  # only NOERROR with content counts
-            continue
-        for rrset in response.answer:
-            for rdata in rrset:
-                try:
-                    wire = b"".join(rdata.strings).decode("utf-8")
-                except Exception:
-                    continue
-                rec = HeartbeatRecord.parse_and_verify(wire)
-                if rec is not None:
-                    return (host, port)
+        if _dmp_dns_signature_at(host, port):
+            return (host, port)
     return None
+
+
+def _dmp_dns_signature_at(host: str, port: int, *, timeout: float = 1.5) -> bool:
+    """Return True iff ``host:port`` answers like a DMP DNS server.
+
+    Sends an un-TSIG'd UPDATE with a single TXT add for a non-claim
+    owner. A DMP server REFUSES (rcode 5); other DNS servers
+    return NOTIMP (4) or fail to parse the message.
+
+    Codex round-15 P1: this replaces the heartbeat-record probe.
+    Heartbeat is operator-opt-in and absent on the default node
+    config, so requiring it rejected legitimate deployments. The
+    REFUSED-to-non-claim-UPDATE shape is a server-side protocol
+    contract that fires regardless of heartbeat / claim-provider /
+    receiver-notification flags.
+    """
+    try:
+        import dns.name
+        import dns.query
+        import dns.rcode
+        import dns.update
+    except Exception:
+        return False
+    try:
+        # Probe owner is intentionally NOT in claim-{slot}.mb-{hash12}
+        # shape so the server's claim-record short-circuit doesn't
+        # accept it. ``host`` is a hostname, not a zone — we don't
+        # know the served zone, so use the host as the zone in the
+        # UPDATE message. The server's allowed-zones check will
+        # likely return NOTAUTH, but that's still a DMP-distinctive
+        # answer (recursive resolvers return NOTIMP / no response).
+        upd = dns.update.UpdateMessage(host)
+        upd.add(
+            dns.name.from_text(f"_dmp-probe.{host.rstrip('.')}."),
+            60,
+            "TXT",
+            '"v=dmp1;t=probe"',
+        )
+        response = dns.query.udp(upd, host, port=port, timeout=timeout)
+    except Exception:
+        return False
+    rcode = response.rcode()
+    # REFUSED (5) — un-TSIG'd accept path with all flags off, OR
+    #               un-TSIG'd path that saw a non-claim owner.
+    # NOTAUTH (9) — DMP server with allowed_zones not matching the
+    #               probe's zone label (still a DMP-shape answer).
+    # Either is a positive DMP signature; NOTIMP (4) / FORMERR (1)
+    # / no-response are negative.
+    return rcode in (5, 9)
 
 
 def cmd_identity_show(args: argparse.Namespace) -> int:
@@ -3290,50 +3320,16 @@ def _local_dns_target_responds(
     target: Tuple[str, int],
     endpoint_for_probe_name: str,
 ) -> bool:
-    """True iff ``target`` answers with a parseable DMP heartbeat.
+    """True iff ``target`` answers with a DMP DNS signature.
 
-    Codex round-14 P1: same tightening as ``_probe_local_node_dns``.
-    Doctor must NOT bless a non-DMP server — only NOERROR with a
-    verifiable ``HeartbeatRecord`` counts as proof of a real DMP node.
+    Codex round-15 P1: same tightening as ``_probe_local_node_dns``,
+    swapped from heartbeat-required (round-14) to UPDATE-REFUSED
+    (round-15) so heartbeat-disabled-but-otherwise-operational nodes
+    aren't false-flagged. ``endpoint_for_probe_name`` is now unused
+    but kept for back-compat with existing callers.
     """
-    from urllib.parse import urlsplit
-
-    import dns.message
-    import dns.query
-    import dns.rdatatype
-
-    from dmp.core.heartbeat import HeartbeatRecord
-
-    probe_host = target[0]
-    if endpoint_for_probe_name:
-        try:
-            parts = urlsplit(
-                endpoint_for_probe_name
-                if "://" in endpoint_for_probe_name
-                else "https://" + endpoint_for_probe_name
-            )
-            zone_host = (parts.hostname or "").strip()
-            if zone_host:
-                probe_host = zone_host
-        except ValueError:
-            pass
-    probe_name = f"_dnsmesh-heartbeat.{probe_host}"
-    try:
-        request = dns.message.make_query(probe_name, dns.rdatatype.TXT)
-        response = dns.query.udp(request, target[0], port=target[1], timeout=2.0)
-    except Exception:
-        return False
-    if response.rcode() != 0:
-        return False
-    for rrset in response.answer:
-        for rdata in rrset:
-            try:
-                wire = b"".join(rdata.strings).decode("utf-8")
-            except Exception:
-                continue
-            if HeartbeatRecord.parse_and_verify(wire) is not None:
-                return True
-    return False
+    del endpoint_for_probe_name  # signal is now UPDATE-shape, not record-content
+    return _dmp_dns_signature_at(target[0], int(target[1]), timeout=2.0)
 
 
 def cmd_register(args: argparse.Namespace) -> int:

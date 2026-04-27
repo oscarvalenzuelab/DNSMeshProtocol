@@ -3604,41 +3604,77 @@ class TestDoctorRound14:
         assert cfg2.local_node_dns_port == 5353
 
     def test_probe_rejects_non_dmp_dns_listener(self, monkeypatch):
-        """Codex round-14 P1: the probe must reject responses that
-        do not contain a parseable HeartbeatRecord. A recursive
-        resolver returning NOERROR with a random TXT or NXDOMAIN
-        was previously enough to bless the target — it no longer
-        is."""
-        import dns.message
+        """Codex round-14 P1 + round-15 P1: the probe must reject
+        servers that don't return a DMP-specific UPDATE-REFUSED
+        signature. NOTIMP (most non-DMP DNS servers' UPDATE response)
+        does NOT pass; only REFUSED (5) or NOTAUTH (9) do."""
         import dns.rcode
         from dmp import cli as _cli
 
         class _StubResp:
-            def __init__(self, rcode_value, answers):
+            def __init__(self, rcode_value):
                 self._rcode = rcode_value
-                self.answer = answers
 
             def rcode(self):
                 return self._rcode
 
-        # Case A: NXDOMAIN — used to pass the probe; now must fail.
+        # NOTIMP — typical non-auth DNS server response to UPDATE.
+        # Must NOT bless.
         monkeypatch.setattr(
             "dns.query.udp",
-            lambda *_a, **_kw: _StubResp(dns.rcode.NXDOMAIN, []),
+            lambda *_a, **_kw: _StubResp(dns.rcode.NOTIMP),
         )
         assert _cli._probe_local_node_dns("http://stranger.example") is None
 
-        # Case B: NOERROR but the wire is not a parseable HeartbeatRecord —
-        # also must fail.
-        class _FakeRdata:
-            strings = (b"v=dmp1;t=identity;not-a-heartbeat",)
-
-        class _FakeRrset(list):
-            pass
-
-        rrset = _FakeRrset([_FakeRdata()])
+        # NOERROR — would indicate the server accepted the probe
+        # write. A real DMP node REFUSES un-TSIG'd non-claim writes,
+        # so NOERROR back is wrong-shape too.
         monkeypatch.setattr(
             "dns.query.udp",
-            lambda *_a, **_kw: _StubResp(dns.rcode.NOERROR, [rrset]),
+            lambda *_a, **_kw: _StubResp(dns.rcode.NOERROR),
         )
         assert _cli._probe_local_node_dns("http://stranger.example") is None
+
+    def test_probe_accepts_dmp_node_without_heartbeat(self, monkeypatch):
+        """Codex round-15 P1 (positive): a default DMP node with
+        ``DMP_HEARTBEAT_ENABLED=0`` MUST still be detected. The
+        UPDATE-REFUSED signal fires regardless of heartbeat config —
+        REFUSED is a load-bearing protocol contract on the un-TSIG'd
+        accept path, independent of any operator opt-in."""
+        import dns.rcode
+        from dmp import cli as _cli
+
+        class _StubResp:
+            def __init__(self, rcode_value):
+                self._rcode = rcode_value
+
+            def rcode(self):
+                return self._rcode
+
+        monkeypatch.setattr(
+            "dns.query.udp",
+            lambda *_a, **_kw: _StubResp(dns.rcode.REFUSED),
+        )
+        result = _cli._probe_local_node_dns("http://node.example:8053")
+        assert result == ("node.example", 5353)
+
+    def test_probe_accepts_notauth_as_dmp_signature(self, monkeypatch):
+        """A DMP server with mismatched ``allowed_zones`` returns
+        NOTAUTH (9) — still a DMP-distinctive UPDATE answer
+        (recursive resolvers return NOTIMP). MUST be accepted."""
+        import dns.rcode
+        from dmp import cli as _cli
+
+        class _StubResp:
+            def __init__(self, rcode_value):
+                self._rcode = rcode_value
+
+            def rcode(self):
+                return self._rcode
+
+        monkeypatch.setattr(
+            "dns.query.udp",
+            lambda *_a, **_kw: _StubResp(dns.rcode.NOTAUTH),
+        )
+        result = _cli._probe_local_node_dns("http://node.example:8053")
+        assert result == ("node.example", 5353)
