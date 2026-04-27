@@ -753,16 +753,30 @@ class DMPClient:
         # A failure here MUST NOT block delivery — chunks already
         # landed at the sender's zone, and the recipient's phase-2
         # slot walk recovers within `recv_secondary_interval_seconds`.
-        # Skipped when the contact predates `Contact.domain` (empty)
-        # because we have no recipient zone to address.
         #
-        # ``force_un_tsig_d=True`` (codex round-1 P2): the M10 publish
-        # MUST exercise the recipient's home-node opt-in gate AND the
-        # per-recipient rate limit, even when sender + recipient share
-        # a zone. Without this, a same-zone deployment would write the
-        # claim through the sender's authorized TSIG writer, defeating
-        # the operator's ``DMP_RECEIVER_CLAIM_NOTIFICATIONS`` opt-out.
-        if contact.domain:
+        # Routing rules (codex round-2 P2):
+        #   - ``contact.domain`` empty → skip. The CLI hasn't recorded
+        #     a recipient zone for this contact (legacy
+        #     ``dnsmesh contacts add`` without ``identity fetch``); we
+        #     have nowhere to address the claim.
+        #   - ``contact.domain == self.domain`` → skip. Both legitimate
+        #     same-zone deployments AND legacy backfilled contacts
+        #     (``_make_client`` fills empty entry.domain with the local
+        #     effective_domain for back-compat with M5.4 prekey /
+        #     rotation lookups). Phase 2's slot walk on own zone
+        #     already covers same-zone delivery; an M10 write here
+        #     would publish claim records to the SENDER's own zone
+        #     where neither the sender's nor the recipient's recv
+        #     ever queries them.
+        #   - Cross-zone (the M10 happy path) → publish.
+        #
+        # ``force_un_tsig_d=True`` (codex round-1 P2): the cross-zone
+        # publish MUST exercise the recipient's home-node opt-in gate
+        # AND the per-recipient rate limit. Without this, a hypothetical
+        # library caller passing ``claim_writer`` would write the claim
+        # through their own authorized writer, defeating the operator's
+        # ``DMP_RECEIVER_CLAIM_NOTIFICATIONS`` opt-out.
+        if contact.domain and contact.domain != self.domain:
             outcome = self.publish_claim(
                 recipient_id=recipient_id,
                 msg_id=msg_id,
@@ -1039,7 +1053,15 @@ class DMPClient:
         except ValueError:
             return False
 
-        if provider_writer is not None:
+        # ``provider_writer`` is a test/fixture escape hatch — it bypasses
+        # the network UDP path and writes directly into a shared store.
+        # ``force_un_tsig_d`` (codex round-2 P1) takes priority over this:
+        # the M10 send path uses ``force_un_tsig_d=True`` to enforce the
+        # recipient home-node opt-in gate AND per-recipient rate limit,
+        # and a writer override would defeat both. Tests that need the
+        # M10 wire to land in a shared in-memory store must monkey-patch
+        # ``_publish_claim_via_dns_update`` instead.
+        if provider_writer is not None and not force_un_tsig_d:
             try:
                 return bool(
                     provider_writer.publish_txt_record(name, wire, ttl=int(ttl))

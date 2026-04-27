@@ -69,19 +69,48 @@ def _alice_bob_pinned(store: InMemoryDNSStore):
     return alice, bob
 
 
+@pytest.fixture
+def m10_un_tsig_d_to_store():
+    """Redirect ``_publish_claim_via_dns_update`` to the test store.
+
+    The M10 send path uses ``force_un_tsig_d=True`` so the recipient
+    home node's ``DMP_RECEIVER_CLAIM_NOTIFICATIONS`` gate fires (codex
+    round-2 P1: a writer override would defeat the gate). For unit
+    tests that don't run a real DNS server, this fixture monkey-patches
+    the un-TSIG'd UPDATE function to write directly into a shared
+    in-memory store, simulating "the recipient's node accepted the
+    publish." Tests yield ``(restore, redirector)`` where
+    ``redirector(store)`` installs the patch against a specific store
+    and ``restore()`` rolls it back.
+    """
+    from dmp.client import client as _client
+
+    original = _client._publish_claim_via_dns_update
+
+    def _redirect(store: InMemoryDNSStore):
+        def _to_store(*, zone, target, name, wire, ttl, resolver_pool=None):
+            return bool(store.publish_txt_record(name, wire, ttl=int(ttl)))
+
+        _client._publish_claim_via_dns_update = _to_store
+
+    yield _redirect
+    _client._publish_claim_via_dns_update = original
+
+
 # ---------------------------------------------------------------------------
 # Phase-1 client-side scenarios
 # ---------------------------------------------------------------------------
 
 
 class TestM10Client:
-    def test_happy_path_primary_delivery(self):
+    def test_happy_path_primary_delivery(self, m10_un_tsig_d_to_store):
         """Phase 1 picks up the M10 claim from bob's own zone and delivers
         the message to bob's inbox in a single round-trip."""
         store = InMemoryDNSStore()
+        m10_un_tsig_d_to_store(store)
         alice, bob = _alice_bob_pinned(store)
 
-        ok = alice.send_message("bob", "primary-path delivery", claim_writer=store)
+        ok = alice.send_message("bob", "primary-path delivery")
         assert ok
 
         # The M10 claim should be sitting under bob's zone now.
@@ -164,16 +193,17 @@ class TestM10Client:
         assert len(delivered) == 1
         assert delivered[0].plaintext == b"secondary-fallback delivery"
 
-    def test_dedup_across_primary_and_secondary(self):
+    def test_dedup_across_primary_and_secondary(self, m10_un_tsig_d_to_store):
         """Phase 1 and phase 2 each see a path to the same message;
         the replay cache ensures only one delivery."""
         store = InMemoryDNSStore()
+        m10_un_tsig_d_to_store(store)
         alice, bob = _alice_bob_pinned(store)
 
         # Bob's contact for alice already carries domain="alice.mesh".
         # So phase 2 walks alice.mesh slots; phase 1 walks bob.mesh
         # claims. Both find the message.
-        ok = alice.send_message("bob", "dedup test", claim_writer=store)
+        ok = alice.send_message("bob", "dedup test")
         assert ok
 
         delivered = bob.receive_messages()
@@ -268,11 +298,12 @@ class TestM10Client:
         # rather than crashing.
         assert delivered == []
 
-    def test_cross_recipient_replay(self):
+    def test_cross_recipient_replay(self, m10_un_tsig_d_to_store):
         """A captured claim re-published under a different recipient's
         hash12 is invisible: recipients only query names keyed on their
         OWN hash12."""
         store = InMemoryDNSStore()
+        m10_un_tsig_d_to_store(store)
         alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
         bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
         carol = DMPClient("carol", "carol-pass", domain="bob.mesh", store=store)
@@ -291,7 +322,7 @@ class TestM10Client:
         )
 
         # Alice sends to bob — claim lands at bob's hash12 RRset.
-        ok = alice.send_message("bob", "for bob only", claim_writer=store)
+        ok = alice.send_message("bob", "for bob only")
         assert ok
 
         # Re-publish that claim under carol's hash12 by manually crafting
@@ -321,12 +352,15 @@ class TestM10Client:
         # recipient replay → manifest-recipient-mismatch drop.
         assert delivered == []
 
-    def test_signature_passing_claim_from_non_pinned_lands_in_intro(self):
+    def test_signature_passing_claim_from_non_pinned_lands_in_intro(
+        self, m10_un_tsig_d_to_store
+    ):
         """A claim with a valid signature but from a sender bob hasn't
         pinned ends up in the intro queue, not the inbox. Bob must have
         at least one OTHER pin so phase 1 isn't skipped under the pure-
         TOFU rule."""
         store = InMemoryDNSStore()
+        m10_un_tsig_d_to_store(store)
         alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
         bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
         eve = DMPClient("eve", "eve-pass", domain="eve.mesh", store=store)
@@ -352,7 +386,7 @@ class TestM10Client:
             signing_key_hex=alice.get_signing_public_key_hex(),
         )
 
-        ok = eve.send_message("bob", "stranger says hi", claim_writer=store)
+        ok = eve.send_message("bob", "stranger says hi")
         assert ok
 
         result = bob.receive_claims_from_own_zone()
@@ -527,7 +561,7 @@ class TestCodexRound1Regressions:
         assert len(intros) == 1
         assert intros[0].plaintext == b"stranger via skip_primary"
 
-    def test_tofu_primary_only_override_engages_phase1(self):
+    def test_tofu_primary_only_override_engages_phase1(self, m10_un_tsig_d_to_store):
         """Codex P1 #2 (lower-half check): the ``primary_only`` diagnostic
         flag DOES override the TOFU skip rule — an operator who explicitly
         asks for phase 1 gets it, regardless of pin state. This
@@ -535,6 +569,7 @@ class TestCodexRound1Regressions:
         ``recv_secondary_disable`` knob from triggering the same
         override on a fresh install."""
         store = InMemoryDNSStore()
+        m10_un_tsig_d_to_store(store)
         # No pinned contacts → pure TOFU.
         bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
         alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
@@ -545,7 +580,7 @@ class TestCodexRound1Regressions:
             signing_key_hex=bob.get_signing_public_key_hex(),
         )
 
-        ok = alice.send_message("bob", "tofu primary-only", claim_writer=store)
+        ok = alice.send_message("bob", "tofu primary-only")
         assert ok
 
         # Default path (no primary_only) → phase 1 SKIPPED in pure
@@ -575,10 +610,13 @@ class TestCodexRound1ServerSameZone:
     same-zone branch fell through to ``self.writer`` (the sender's
     authorized writer), bypassing the opt-in entirely."""
 
-    def test_same_zone_send_message_un_tsig_d_path_invoked(self):
-        """Whitebox: confirm send_message routes the M10 publish
-        through ``_publish_claim_via_dns_update``, not the
-        TSIG'd writer, even when ``contact.domain == self.domain``."""
+    def test_same_zone_send_message_skips_m10_publish(self):
+        """Codex round-2 P2 #1: when ``contact.domain == self.domain``,
+        the M10 publish is skipped entirely. Phase 2's slot walk on
+        own zone already covers same-zone delivery, and writing M10
+        claims to the SENDER's own zone (which is what the legacy
+        backfill case ends up doing) is wasted effort that nobody
+        queries."""
         from dmp.client import client as _client
 
         store = InMemoryDNSStore()
@@ -597,25 +635,67 @@ class TestCodexRound1ServerSameZone:
 
         def _capture_un_tsig_d(*, zone, target, name, wire, ttl, **kw):
             captured.append({"zone": zone, "target": target, "name": name})
-            # Pretend the un-TSIG'd UPDATE succeeded so send_message
-            # returns True.
             return True
 
-        # Also stub the target resolver so we don't need real DNS.
-        _client._provider_dns_target = lambda *_a, **_k: ("127.0.0.1", 5353)
         _client._publish_claim_via_dns_update = _capture_un_tsig_d
         try:
-            ok = alice.send_message("bob", "same-zone but un-TSIG'd")
+            ok = alice.send_message("bob", "same-zone — no M10 needed")
         finally:
             _client._publish_claim_via_dns_update = original
 
-        assert ok, "send_message should still succeed"
-        assert len(captured) == 1, (
-            "M10 publish did NOT route through "
-            "_publish_claim_via_dns_update — same-zone bypass regressed"
+        assert ok, "send_message should still succeed (chunks landed)"
+        assert captured == [], (
+            f"same-zone M10 publish should be skipped, but got "
+            f"{len(captured)} call(s) to _publish_claim_via_dns_update"
         )
-        assert captured[0]["zone"] == "dmp.example.com"
-        assert captured[0]["name"].endswith(".dmp.example.com")
+
+    def test_cross_zone_send_message_routes_through_un_tsig_d(self):
+        """Codex round-2 P1: cross-zone M10 publish MUST always go
+        through the un-TSIG'd UPDATE path, never the writer override.
+        The recipient's home node enforces the opt-in gate AND
+        per-recipient rate limit, both of which only fire on the
+        un-TSIG'd accept path."""
+        from dmp.client import client as _client
+
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",  # cross-zone
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        captured: list = []
+        original = _client._publish_claim_via_dns_update
+        original_target = _client._provider_dns_target
+
+        def _capture_un_tsig_d(*, zone, target, name, wire, ttl, **kw):
+            captured.append({"zone": zone, "target": target, "name": name})
+            return True
+
+        _client._provider_dns_target = lambda *_a, **_k: ("127.0.0.1", 5353)
+        _client._publish_claim_via_dns_update = _capture_un_tsig_d
+        try:
+            # Pass an explicit ``claim_writer`` to confirm force_un_tsig_d
+            # wins over the writer override. Pre-fix this would have
+            # silently bypassed the un-TSIG'd path and written into the
+            # store directly.
+            ok = alice.send_message(
+                "bob", "cross-zone goes through gate", claim_writer=store
+            )
+        finally:
+            _client._publish_claim_via_dns_update = original
+            _client._provider_dns_target = original_target
+
+        assert ok
+        assert len(captured) == 1, (
+            "M10 publish did NOT route through _publish_claim_via_dns_update "
+            "— claim_writer override silently bypassed the gate"
+        )
+        assert captured[0]["zone"] == "bob.mesh"
+        assert captured[0]["name"].endswith(".bob.mesh")
 
     def test_same_zone_publish_refused_when_server_flag_off(self):
         """Server-level: a real DMPDnsServer with both flags off MUST

@@ -144,16 +144,34 @@ prefers an explicit endpoint URL host when given and falls back to
 zone-as-host otherwise; M10 sends pass an empty endpoint so the
 zone apex is always used.
 
-Same-zone deployments (sender + recipient share a home node) MUST
-also route through the un-TSIG'd UPDATE path — the sender does NOT
-get to write the M10 claim through their authorized TSIG writer
-just because they happen to share a zone with the recipient. The
-M10 publish is gated on the recipient operator's
-`DMP_RECEIVER_CLAIM_NOTIFICATIONS` opt-in AND the per-recipient
-rate limit, both of which only fire on the un-TSIG'd accept path.
-A same-zone bypass would silently activate M10 for any same-zone
-recipient even when the operator left the flag off, defeating the
-operator's opt-out and the rate-limit budget.
+Same-zone deployments (sender + recipient share a home node) SHOULD
+skip the M10 publish entirely. Phase 2's slot walk on the own zone
+(which is also the recipient's zone in this case) already covers
+delivery without an extra round-trip, and an M10 publish here
+would write a claim record into the SENDER's own zone where neither
+the sender's own recv (different hash12) nor the recipient's
+cross-zone recv ever queries it. The reference implementation
+gates on `contact.domain != self.domain`. This also covers the
+legacy back-compat case where pre-M5.4 contacts without a stored
+domain are backfilled to the local effective domain at client-build
+time — those contacts MUST NOT trigger an M10 publish to the
+sender's own zone.
+
+Cross-zone publishes (the M10 happy path) MUST go through the
+un-TSIG'd UPDATE path so the recipient's home node enforces the
+`DMP_RECEIVER_CLAIM_NOTIFICATIONS` opt-in gate AND the per-recipient
+rate limit. A library caller that supplies an authorized writer
+override MUST NOT bypass that path: the writer override is a test
+escape hatch for in-process fixtures, not a production contract.
+
+**Routing limitation (split-host deployments).** The current routing
+target derivation (zone apex on the configured DNS port) assumes
+the recipient's home node serves DNS at the zone apex. Operators
+running a split-host setup — zone delegated via NS records to a
+different hostname — are not yet supported by the M10 publish path;
+the un-TSIG'd UPDATE will fail to find a destination IP and the
+sender's slot-walk fallback (phase 2) covers delivery instead.
+A follow-up will add NS-chain or per-contact endpoint resolution.
 
 Implementation note: the existing
 [`_publish_claim_via_dns_update`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/dmp/client/client.py)
