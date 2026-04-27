@@ -165,6 +165,21 @@ class CLIConfig:
     tsig_dns_server: str = ""
     tsig_dns_port: int = 53
 
+    # M10 — receive-side cadence + phase toggles.
+    #
+    # ``recv_primary_interval_seconds`` (default 30) is the cadence
+    # for phase-1 claim polling on own zone. ``recv_secondary_interval_seconds``
+    # (default 600 = 10 minutes) is the slot-walk fallback cadence.
+    # The CLI itself is a one-shot per invocation; these knobs are
+    # consumed by external schedulers (cron, systemd timers) that
+    # call ``dnsmesh recv`` and ``dnsmesh recv --skip-primary`` at
+    # different rates. ``recv_secondary_disable`` skips phase 2
+    # entirely — appropriate for a high-trust deployment where the
+    # operator runs their own home node and trusts phase 1 alone.
+    recv_primary_interval_seconds: int = 30
+    recv_secondary_interval_seconds: int = 600
+    recv_secondary_disable: bool = False
+
     @classmethod
     def load(cls, path: Path) -> "CLIConfig":
         if not path.exists():
@@ -235,6 +250,13 @@ class CLIConfig:
             tsig_zone=data.get("tsig_zone", "") or "",
             tsig_dns_server=data.get("tsig_dns_server", "") or "",
             tsig_dns_port=int(data.get("tsig_dns_port", 53)),
+            recv_primary_interval_seconds=int(
+                data.get("recv_primary_interval_seconds", 30)
+            ),
+            recv_secondary_interval_seconds=int(
+                data.get("recv_secondary_interval_seconds", 600)
+            ),
+            recv_secondary_disable=bool(data.get("recv_secondary_disable", False)),
         )
 
     def save(self, path: Path) -> None:
@@ -2777,7 +2799,20 @@ def cmd_recv(args: argparse.Namespace) -> int:
         # Pass `client` for cluster-mode discovery (codex P1 round 6).
         claim_providers = _build_claim_providers(cfg, client=client)
         intro_queue_size_before = len(client.intro_queue.list_intros())
-        inbox = client.receive_messages(claim_providers=claim_providers)
+        # M10 — phase toggles. ``--primary-only`` and ``--skip-primary``
+        # are diagnostic flags wired directly onto the receive_messages
+        # call. ``recv_secondary_disable`` (config-only) drops phase 2
+        # silently for high-trust deployments — equivalent to
+        # ``--skip-primary``'s inverse, but persisted across runs.
+        primary_only = bool(getattr(args, "primary_only", False))
+        skip_primary = bool(getattr(args, "skip_primary", False))
+        if cfg.recv_secondary_disable and not skip_primary:
+            primary_only = True
+        inbox = client.receive_messages(
+            claim_providers=claim_providers,
+            primary_only=primary_only,
+            skip_primary=skip_primary,
+        )
         intro_queue_size_after = len(client.intro_queue.list_intros())
         new_intros = intro_queue_size_after - intro_queue_size_before
         if not inbox and new_intros == 0:
@@ -4335,6 +4370,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     # recv
     p_r = sub.add_parser("recv", help="poll for new messages")
+    # M10 — diagnostic phase toggles. Default is phase 1 + phase 2.
+    # The two flags are mutually exclusive at runtime; argparse
+    # enforces it via add_mutually_exclusive_group so a user typo
+    # surfaces as an argparse error rather than a silent no-op.
+    g_phases = p_r.add_mutually_exclusive_group()
+    g_phases.add_argument(
+        "--primary-only",
+        action="store_true",
+        help="run phase 1 only (claim-poll on own zone). "
+        "Diagnoses primary-path latency in isolation.",
+    )
+    g_phases.add_argument(
+        "--skip-primary",
+        action="store_true",
+        help="run phase 2 only (slot walk on contact zones). "
+        "Diagnoses missed claims by comparing the delivered set "
+        "against `recv --primary-only`.",
+    )
     p_r.set_defaults(func=cmd_recv)
 
     # intro — M8.3 first-contact quarantine queue. Claim-discovered
