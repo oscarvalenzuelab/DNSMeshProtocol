@@ -7,6 +7,59 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added — M10: receiver-zone claim notifications
+
+Latency optimization for the receive path. Pre-M10 every `dnsmesh recv`
+walks 10 slot RRsets per pinned contact per tick — the steady-state cost
+scales with the contact list. M10 collapses that to one query per tick
+plus one fetch per actual incoming message by routing a tiny signed
+pointer ("claim") to the recipient's home zone alongside the chunks on
+the sender's own zone. Reuses the M8.2 `DMPCL01` wire — no new on-zone
+record types, no new HTTP routes.
+
+- **Server**: extended ``dmp/server/dns_server.py`` un-TSIG'd UPDATE
+  accept path to recognize ``claim-{slot}.mb-{hash12}.<served-zone>``
+  when ``DMP_RECEIVER_CLAIM_NOTIFICATIONS=1``. Independent opt-in from
+  the M8.3 first-contact provider role (``DMP_CLAIM_PROVIDER``); a node
+  can serve M10 claims for its own users without taking on the open
+  provider role for arbitrary recipients. Per-recipient-hash token
+  bucket keyed on the hash12 in the owner name (``DMP_CLAIM_RATE_PER_USER_PER_SEC``
+  default 0.5, ``DMP_CLAIM_RATE_BURST`` default 30) — exhaustion is
+  SERVFAIL (transient backoff) distinct from REFUSED (shape violation).
+- **Client send**: ``send_message`` now publishes a second claim record
+  to the recipient's zone (using the contact's ``domain`` field) after
+  the chunk + manifest write to the sender's own zone. Best-effort —
+  failures don't block delivery, the recipient's slot-walk fallback
+  recovers within ``recv_secondary_interval_seconds``.
+- **Client recv**: new ``receive_claims_from_own_zone`` method runs as
+  phase 1 inside ``receive_messages``. Phase 2 (the existing slot walk)
+  follows as a defense-in-depth fallback. The replay cache dedupes
+  across both phases. Phase 1 is skipped in pure TOFU mode (zero pinned
+  signing keys) to preserve the M9 receive contract for legacy callers.
+- **CLI**: ``dnsmesh recv --primary-only`` runs phase 1 alone (diagnoses
+  primary-path latency); ``dnsmesh recv --skip-primary`` runs phase 2
+  alone (diagnoses missed claims). Three new persisted config knobs:
+  ``recv_primary_interval_seconds`` (default 30),
+  ``recv_secondary_interval_seconds`` (default 600),
+  ``recv_secondary_disable`` (default false). The CLI itself is one-shot
+  per invocation; cadences are consumed by external schedulers (cron,
+  systemd timers).
+- **Spec**: ``docs/protocol/notifications.md`` (RFC-style; covers wire
+  format, owner-name conventions, sender/receiver behavior, threat-model
+  deltas, and migration sequencing).
+- **Tests**: 14 new cases in ``tests/test_m10_notifications.py`` covering
+  the happy path, secondary fallback when claims drop, dedup across both
+  phases, recipient/sender zone unreachable, cross-recipient replay,
+  signature-passing claim from a non-pinned sender lands in intro queue,
+  bad-signature server REFUSED, rate-limit exhaustion SERVFAIL, opt-out
+  default REFUSED, M10 flag enables, ``primary_only`` /
+  ``skip_primary`` diagnostic flags, and their mutual exclusion.
+
+Migration is a no-op for existing 0.5.x deployments —
+``DMP_RECEIVER_CLAIM_NOTIFICATIONS`` defaults to off. Operators opt in
+explicitly. A pre-M10 sender that doesn't emit recipient-zone claims
+stays interoperable; recipients fall through to phase 2.
+
 ## [0.5.3] — CLI fixes: full-address contact keys + --config-home flag
 
 CLI-only release. No node-side changes; existing 0.5.x nodes stay
