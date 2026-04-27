@@ -7,6 +7,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-04-27 — M10: receiver-zone claim notifications
+
+Latency-optimized receive path. New protocol opt-in surface, new
+operator diagnostics, hardened across 15 rounds of independent
+codex review. Existing 0.5.x deployments upgrade no-op (M10 defaults
+off, schema fields default empty); operators who flip the M10 flag
+should re-register their pre-upgrade TSIG users so the new
+keystore column populates and the canonical mailbox-hash format
+takes effect.
+
 ### Added — M10: receiver-zone claim notifications
 
 Latency optimization for the receive path. Pre-M10 every `dnsmesh recv`
@@ -59,6 +69,90 @@ Migration is a no-op for existing 0.5.x deployments —
 ``DMP_RECEIVER_CLAIM_NOTIFICATIONS`` defaults to off. Operators opt in
 explicitly. A pre-M10 sender that doesn't emit recipient-zone claims
 stays interoperable; recipients fall through to phase 2.
+
+### Added — operator UX: dnsmesh doctor + auto-probe
+
+Hardening that came out of an extended codex review pass on the M10
+implementation. Fifteen rounds of independent review surfaced layered
+correctness, security, and operator-ergonomics issues across the
+server gate, the client send path, the receive scheduling, the DNS
+fallback chain, and the keystore migration story — all fixed.
+Operator-facing additions:
+
+- **`dnsmesh doctor`** — new diagnostic subcommand. Walks endpoint
+  reachability, the local DNS endpoint (M10 same-zone publish target),
+  ``dns_host`` ambiguity (warns when pointed at a public recursive
+  resolver like 1.1.1.1 without ``local_node_dns_*`` pinned), and
+  TSIG registration status. Each check produces PASS / WARN / FAIL
+  with an actionable hint. Exit 0 on PASS/WARN, 1 on FAIL — safe for
+  CI smoke gates. ``dnsmesh doctor --repair`` re-pins
+  ``local_node_dns_*`` non-destructively (preserves identity, TSIG
+  block, contacts) — use this instead of ``dnsmesh init --force``,
+  which would clobber the user's identity by rebuilding ``kdf_salt``.
+- **`dnsmesh init` auto-probe** — at init time, probes the endpoint
+  host's DNS port (5353 then 53) for a DMP-specific signature: an
+  un-TSIG'd, non-claim UPDATE that the server REFUSES. That's a
+  load-bearing protocol contract on the DMP DNS server side, so the
+  signal works on default node configs (heartbeat is opt-in and not
+  required for the probe). When found, ``local_node_dns_*`` lands in
+  config automatically. ``--no-probe-local-dns`` skips the probe for
+  offline / CI setups.
+- **`local_node_dns_server` / `local_node_dns_port` config fields** —
+  self-describing schema for the same-zone M10 publish target.
+  Disambiguates from ``dns_host`` (the read-side resolver, often a
+  public recursive). Empty by default; populated by ``dnsmesh init``
+  auto-probe or ``dnsmesh doctor --repair``. Existing configs upgrade
+  cleanly without changes.
+- **NS-chain fallback for split-host deployments** — when the zone
+  apex has no A/AAAA record (auth DNS server delegated via NS to a
+  sibling hostname), ``_resolve_to_ip`` follows NS records via the
+  configured ``ResolverPool``. Strict-by-default: when a pool is
+  given, the chase stays on the pool exclusively. Hybrid pools that
+  can answer NS records but not external A lookups can opt into a
+  system-resolver fallback via ``DMP_ALLOW_SYSTEM_DNS_FALLBACK=1``.
+
+### Hardening — codex review fixes (rounds 1–15)
+
+Server side:
+- M10 admission gate restricts un-TSIG'd writes to recipient hashes
+  registered on the served zone (``DMP_CLAIM_PROVIDER=0`` opt-out
+  stays honored when M10 is on).
+- Hash extraction uses ``registered_x25519_pub`` (new keystore
+  column, idempotent ALTER on startup) so legacy keystores upgrade
+  cleanly and ``DMP_TSIG_LOOSE_SCOPE=1`` users are admitted by
+  recomputing the canonical hash from their pubkey.
+- Mailbox-scope check requires the anchor entry to live directly
+  under the zone — a row scoped only to a child subzone no longer
+  qualifies for parent-zone admission.
+- Registration's mailbox-hash convention corrected to two sha256
+  rounds, matching the actual owner format (was one round, only
+  worked because wildcard scopes covered it).
+
+Client side:
+- M8.3 first-contact ``claim_providers`` channel survives
+  ``--primary-only`` / ``--skip-primary`` (orthogonal to M10 phase
+  toggles).
+- ``Contact.domain_explicit`` flag distinguishes legacy backfilled
+  contacts from explicit same-zone entries — explicit same-zone
+  publishes M10 (needed for ``recv --primary-only``); legacy
+  backfill skips it.
+- ``force_un_tsig_d=True`` in publish_claim takes priority over
+  ``provider_writer`` — the M10 send path always exercises the
+  recipient's home-node opt-in gate, never bypassed by a writer
+  override.
+- Same-zone M10 publishes target the explicit
+  ``local_dns_server`` / ``local_dns_port`` (set by the CLI from
+  the new config fields) — no global env-var override that would
+  misroute cross-zone publishes.
+
+Migration: any existing 0.5.x deployment upgrades cleanly. Schema
+fields default to empty / no-op. ``dnsmesh doctor`` will surface
+config drift on first run and ``--repair`` fixes it without
+touching identity. Operators on multi-tenant nodes who registered
+TSIG before this release should re-register so their keystore
+gets ``registered_x25519_pub`` populated and the canonical mailbox
+hash format — the M10 admission gate gracefully falls back to
+suffix-scanning for pre-migration rows.
 
 ## [0.5.3] — CLI fixes: full-address contact keys + --config-home flag
 

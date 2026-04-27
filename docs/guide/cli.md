@@ -653,6 +653,78 @@ dnsmesh node [--db-path PATH] [--dns-port P] [--http-port P]
 For real deployments use the docker-compose files — see
 [Deployment]({{ site.baseurl }}/deployment).
 
+### `dnsmesh doctor`
+
+Diagnose CLI configuration drift that silently breaks send / recv
+flows. Walks four checks and prints PASS / WARN / FAIL with an
+actionable hint per check. Exit 0 on PASS or WARN, 1 on FAIL — safe
+to wire into a deploy gate or CI smoke check.
+
+```
+dnsmesh doctor
+dnsmesh doctor --repair
+```
+
+What it checks:
+
+1. **Endpoint reachability.** `GET <endpoint>/health` — a node that
+   doesn't answer surfaces as FAIL with the underlying network
+   error. Most often a wrong URL or a stopped node.
+2. **Local DNS endpoint.** The same-zone M10 publish target. Probes
+   the configured `local_node_dns_server:local_node_dns_port` for a
+   DMP-specific UPDATE response. WARN when not pinned but
+   auto-detectable; FAIL when pinned but unreachable.
+3. **`dns_host` ambiguity.** WARN when `dns_host` points at a
+   well-known public recursive (Cloudflare, Google, Quad9, OpenDNS)
+   AND `local_node_dns_*` is empty. That config silently drops M10
+   phase-1 same-zone delivery — un-TSIG'd UPDATE to a recursive
+   resolver gets refused.
+4. **TSIG registration.** Informational. WARN suggests
+   `dnsmesh tsig register` if you're in HTTP-mode; cross-zone M10
+   sends require an auth target.
+
+`--repair` re-runs the auto-probe and persists `local_node_dns_*` if
+a real DMP node responds. Non-destructive: only those two fields
+change. Identity (`kdf_salt`), TSIG block, and contacts all survive.
+Use this when your node moved to a different DNS port without
+running a full `dnsmesh init --force` — the latter would rebuild
+the config from scratch and rotate your keys.
+
+Example output on a clean config:
+
+```
+$ dnsmesh doctor
+
+CONFIG
+------
+  config: ~/.dmp/config.yaml
+  username: alice
+  domain: alice.example
+  endpoint: https://node.alice.example:8053
+
+CHECKS
+------
+  PASS  endpoint reachable
+        HTTP 200 from https://node.alice.example:8053
+  PASS  local DNS endpoint responds
+        node.alice.example:5353 answered a probe
+  PASS  TSIG registered
+        key=alice. zone=alice.example
+
+DOCTOR: clean
+```
+
+When something's drifted (here: `dns_host` pointing at 1.1.1.1
+without an explicit local node target):
+
+```
+  WARN  dns_host points at a public recursive resolver
+        `dns_host=1.1.1.1` is fine for read queries, but the M10
+        send path needs a separate auth-DNS target. Pin
+        `local_node_dns_server` so same-zone phase-1 publishes
+        don't silently fail.
+```
+
 ## Environment variables
 
 | Variable | Default | Purpose |

@@ -241,6 +241,23 @@ DMP_HEARTBEAT_SEEDS=dmp.dnsmesh.io
 # (often 30+ minutes). Cloudflare + Quad9 is a deliberate two-vendor
 # pool — override if you have a preferred resolver.
 DMP_HEARTBEAT_DNS_RESOLVERS=1.1.1.1,9.9.9.9
+
+# ── M10: receiver-zone claim notifications ───────────────────────────
+# When enabled (default below), this node accepts un-TSIG'd UPDATE
+# claim records under \`claim-{slot}.mb-{hash12}.<served-zone>\` for
+# users registered on this zone. Senders publishing to your users
+# get same-zone phase-1 delivery instead of the slower slot-walk
+# fallback. Independent opt-in from CAP_CLAIM_PROVIDER (which is the
+# open first-contact provider role for unpinned strangers); enabling
+# M10 alone does NOT re-open the public claim sink — the gate
+# restricts writes to recipient hashes registered on this node.
+#
+# Per-recipient rate limit (token bucket) defaults below are quiet
+# enough for legitimate sender behavior, loud enough to stop a
+# spammer from flooding a recipient's mailbox.
+DMP_RECEIVER_CLAIM_NOTIFICATIONS=1
+DMP_CLAIM_RATE_PER_USER_PER_SEC=0.5
+DMP_CLAIM_RATE_BURST=30
 EOF
 chown root:"$DNSMESH_USER" "$ETC_DIR/node.env"
 chmod 0640 "$ETC_DIR/node.env"
