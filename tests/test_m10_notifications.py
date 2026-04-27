@@ -603,6 +603,51 @@ class TestCodexRound1Regressions:
         assert len(bob.intro_queue.list_intros()) == 1
 
 
+class TestCodexRound5DomainExplicitPersistence:
+    """Codex round-5 P2 #1: ``domain_explicit`` MUST survive contact
+    rebuild paths in the CLI (intro-trust → identity-fetch upgrade).
+    Without this, an upgraded contact silently loses its M10 explicit-
+    domain marker on the next CLI restart and same-zone phase-1
+    delivery breaks."""
+
+    def test_contact_rebuild_preserves_domain_explicit(self):
+        """Whitebox: simulate the cli ``_make_client`` rebuild path
+        (used by intro-trust → identity-fetch upgrades) and confirm
+        ``domain_explicit`` is preserved across the Contact swap."""
+        from dmp.client.client import Contact
+
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        # Add a contact with an explicit domain — what
+        # ``identity fetch user@host --add`` does.
+        alice.add_contact(
+            "intro-abc",
+            "11" * 32,
+            domain="bob.mesh",
+            signing_key_hex="22" * 32,
+        )
+        existing = alice.contacts["intro-abc"]
+        assert existing.domain_explicit is True, "precondition"
+
+        # Simulate the cli rebuild: replace the Contact with a fresh
+        # one carrying remote_username, the way the intro-trust
+        # upgrade path does.
+        alice.contacts["intro-abc"] = Contact(
+            username="bob@bob.mesh",
+            public_key_bytes=existing.public_key_bytes,
+            signing_key_bytes=existing.signing_key_bytes,
+            domain=existing.domain,
+            domain_explicit=existing.domain_explicit,
+        )
+        rebuilt = alice.contacts["intro-abc"]
+        assert rebuilt.domain_explicit is True, (
+            "domain_explicit lost on rebuild — M10 publish will skip "
+            "this contact on next CLI invocation"
+        )
+        assert rebuilt.username == "bob@bob.mesh"
+        assert rebuilt.domain == "bob.mesh"
+
+
 class TestCodexRound1ServerSameZone:
     """Codex P2 #3 server-side coverage: a same-zone M10 publish from
     ``send_message`` MUST be REFUSED when the recipient's home node
@@ -744,6 +789,111 @@ class TestCodexRound1ServerSameZone:
         )
         assert captured[0]["zone"] == "bob.mesh"
         assert captured[0]["name"].endswith(".bob.mesh")
+
+    def test_same_zone_publish_uses_local_dns_endpoint(self):
+        """Codex round-5 P2 #2: a same-zone explicit M10 publish MUST
+        target the client's pinned ``local_dns_server`` /
+        ``local_dns_port`` (the local node's DNS endpoint), NOT
+        whatever ``_provider_dns_target`` would derive from the zone.
+        This keeps cross-zone publishes routed through the standard
+        DNS chain on the operator's configured port (default 53)
+        even when the local node listens on a non-standard port —
+        without exporting a process-wide ``DMP_PROVIDER_DNS_PORT``
+        that would also misroute the cross-zone publishes."""
+        from dmp.client import client as _client
+
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="dmp.example.com", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="dmp.example.com", store=store)
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="dmp.example.com",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        # Pin the local DNS endpoint — what the CLI sets from
+        # ``cfg.tsig_dns_server`` / ``cfg.tsig_dns_port``.
+        alice.local_dns_server = "127.0.0.1"
+        alice.local_dns_port = 5353
+
+        captured: list = []
+        original = _client._publish_claim_via_dns_update
+        original_target = _client._provider_dns_target
+
+        def _capture(*, zone, target, name, wire, ttl, **kw):
+            captured.append({"zone": zone, "target": target, "name": name})
+            return True
+
+        # Sentinel: if _provider_dns_target gets called, the test
+        # caught a regression — the local override wasn't used.
+        called_target_resolver: list = []
+
+        def _sentinel_target(*_a, **_kw):
+            called_target_resolver.append(True)
+            return ("WRONG", 53)
+
+        _client._provider_dns_target = _sentinel_target
+        _client._publish_claim_via_dns_update = _capture
+        try:
+            ok = alice.send_message("bob", "same-zone explicit")
+        finally:
+            _client._publish_claim_via_dns_update = original
+            _client._provider_dns_target = original_target
+
+        assert ok
+        assert len(captured) == 1
+        assert captured[0]["target"] == ("127.0.0.1", 5353), (
+            "M10 same-zone publish did not honor local_dns_server / " "local_dns_port"
+        )
+        assert called_target_resolver == [], (
+            "_provider_dns_target was called for same-zone publish — "
+            "the local override should win"
+        )
+
+    def test_cross_zone_publish_uses_dns_target_resolver(self):
+        """Codex round-5 P2 #2 (negative): cross-zone publishes MUST
+        NOT use the local DNS override. The local port pinning is
+        scoped to same-zone only; cross-zone publishes resolve via
+        the standard ``_provider_dns_target`` path so a dev operator
+        running their own node on 5353 can still send to remote
+        zones on the standard port 53."""
+        from dmp.client import client as _client
+
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",  # cross-zone
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        # Pin a different local DNS endpoint — must NOT be used.
+        alice.local_dns_server = "127.0.0.1"
+        alice.local_dns_port = 5353
+
+        captured: list = []
+        original = _client._publish_claim_via_dns_update
+        original_target = _client._provider_dns_target
+
+        def _capture(*, zone, target, name, wire, ttl, **kw):
+            captured.append({"zone": zone, "target": target, "name": name})
+            return True
+
+        _client._provider_dns_target = lambda *_a, **_k: ("203.0.113.5", 53)
+        _client._publish_claim_via_dns_update = _capture
+        try:
+            ok = alice.send_message("bob", "cross-zone")
+        finally:
+            _client._publish_claim_via_dns_update = original
+            _client._provider_dns_target = original_target
+
+        assert ok
+        assert len(captured) == 1
+        assert captured[0]["target"] == ("203.0.113.5", 53), (
+            "cross-zone publish should resolve via _provider_dns_target, "
+            "not the local override"
+        )
 
     def test_same_zone_publish_refused_when_server_flag_off(self):
         """Server-level: a real DMPDnsServer with both flags off MUST

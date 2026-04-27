@@ -306,6 +306,20 @@ class DMPClient:
 
         self.intro_queue = IntroQueue(intro_queue_path or ":memory:")
 
+        # M10 — local DNS endpoint for SAME-ZONE recipient-zone claim
+        # publishes. The CLI sets these (from ``cfg.tsig_dns_server``
+        # / ``cfg.tsig_dns_port``) post-construction. When the M10
+        # publish target is ``self.domain`` (explicit same-zone
+        # recipient), ``send_message`` routes the un-TSIG'd UPDATE
+        # directly to (``local_dns_server``, ``local_dns_port``) so
+        # the recipient's home node — which IS the sender's home node
+        # in this case — sees the gate-enforced un-TSIG'd write
+        # without needing a process-wide ``DMP_PROVIDER_DNS_PORT``
+        # override that would also misroute cross-zone publishes
+        # (codex round-5 P2 #2).
+        self.local_dns_server: Optional[str] = None
+        self.local_dns_port: Optional[int] = None
+
     # ---- addressing helpers ------------------------------------------------
 
     @staticmethod
@@ -797,6 +811,21 @@ class DMPClient:
         # through their own authorized writer, defeating the operator's
         # ``DMP_RECEIVER_CLAIM_NOTIFICATIONS`` opt-out.
         if contact.domain and contact.domain_explicit:
+            # Same-zone target override: when the recipient lives on
+            # this client's own zone, route the un-TSIG'd UPDATE to
+            # the local DNS endpoint instead of resolving via DNS.
+            # ``local_dns_server`` / ``local_dns_port`` are populated
+            # by the CLI from ``cfg.tsig_dns_server`` /
+            # ``cfg.tsig_dns_port`` (codex round-5 P2 #2).
+            same_zone_target: Optional[Tuple[str, int]] = None
+            if contact.domain.strip().lower().rstrip(".") == (
+                self.domain or ""
+            ).strip().lower().rstrip("."):
+                if self.local_dns_server and self.local_dns_port:
+                    same_zone_target = (
+                        self.local_dns_server,
+                        int(self.local_dns_port),
+                    )
             outcome = self.publish_claim(
                 recipient_id=recipient_id,
                 msg_id=msg_id,
@@ -807,6 +836,7 @@ class DMPClient:
                 provider_endpoint="",
                 provider_writer=claim_writer,
                 force_un_tsig_d=True,
+                provider_target=same_zone_target,
             )
             if recipient_claim_outcome is not None:
                 recipient_claim_outcome.append(bool(outcome))
@@ -1003,6 +1033,7 @@ class DMPClient:
         provider_endpoint: str = "",
         provider_writer: Optional[DNSRecordWriter] = None,
         force_un_tsig_d: bool = False,
+        provider_target: Optional[Tuple[str, int]] = None,
     ) -> bool:
         """Publish one signed claim record at a single provider.
 
@@ -1107,7 +1138,15 @@ class DMPClient:
             or provider_endpoint
             or (provider_z and provider_z != own_zone)
         ):
-            target = _provider_dns_target(provider_endpoint, provider_zone)
+            # ``provider_target`` (codex round-5 P2 #2) lets the
+            # caller pin a specific (host, port) for this publish —
+            # used by ``send_message`` for SAME-ZONE M10 publishes
+            # so the local DNS endpoint (typically port 5353 in dev,
+            # 53 in prod) is hit directly, without rerouting every
+            # un-TSIG'd UPDATE in the process via a global env var.
+            target = provider_target or _provider_dns_target(
+                provider_endpoint, provider_zone
+            )
             if not target:
                 return False
             return _publish_claim_via_dns_update(

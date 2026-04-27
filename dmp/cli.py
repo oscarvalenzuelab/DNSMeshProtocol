@@ -972,19 +972,18 @@ def _make_client(
     # per the M2.wire hard-rules constraint.
     client._cluster_client = cluster_client  # type: ignore[attr-defined]
 
-    # Codex round-4 P2 #2: M10 same-zone publishes go through
-    # ``_publish_claim_via_dns_update`` whose port comes from
-    # ``DMP_PROVIDER_DNS_PORT`` (default 53). On a dev / single-node
-    # setup running the local DNS server on 5353, the operator would
-    # otherwise have to remember to export that env var or every
-    # same-zone M10 publish would silently fail. Auto-set the env
-    # var from ``cfg.tsig_dns_port`` (the port the user already
-    # configured for TSIG'd writes to their own zone) when the env
-    # var hasn't been set explicitly. Production deployments using
-    # port 53 are unaffected; the env var becomes "53" which matches
-    # the default.
-    if config.tsig_dns_port and not os.environ.get("DMP_PROVIDER_DNS_PORT"):
-        os.environ["DMP_PROVIDER_DNS_PORT"] = str(config.tsig_dns_port)
+    # Codex round-5 P2 #2: pin the LOCAL DNS endpoint onto the
+    # client so the M10 same-zone publish path can target it without
+    # affecting cross-zone (M8.3 provider, remote-recipient M10)
+    # publishes that still hit the wider DNS chain on the operator's
+    # configured port (default 53). The previous round-4 fix exported
+    # ``DMP_PROVIDER_DNS_PORT`` process-wide which misrouted every
+    # remote claim publish whenever the operator's own node listened
+    # on a non-default port (dev / 5353).
+    if config.tsig_dns_port:
+        client.local_dns_port = int(config.tsig_dns_port)
+    if config.tsig_dns_server:
+        client.local_dns_server = config.tsig_dns_server
 
     # Passphrase-typo tripwire. The keypair is derived purely from
     # passphrase + kdf_salt, so any string produces some valid keypair
@@ -1082,6 +1081,13 @@ def _make_client(
                 public_key_bytes=existing.public_key_bytes,
                 signing_key_bytes=existing.signing_key_bytes,
                 domain=existing.domain,
+                # Codex round-5 P2: preserve the M10 domain_explicit
+                # flag on rebuild — without this, an intro-trust
+                # placeholder upgraded to a real contact via
+                # `identity fetch --add` would silently lose its
+                # explicit-domain marker on the next CLI restart and
+                # M10 publishes would skip it.
+                domain_explicit=existing.domain_explicit,
             )
         elif remote_username:
             # Normal contact with an explicit remote_username
@@ -1094,6 +1100,7 @@ def _make_client(
                 public_key_bytes=existing.public_key_bytes,
                 signing_key_bytes=existing.signing_key_bytes,
                 domain=existing.domain,
+                domain_explicit=existing.domain_explicit,
             )
     return client
 
