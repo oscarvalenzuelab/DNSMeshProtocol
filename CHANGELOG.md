@@ -9,21 +9,44 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [0.6.1] — 2026-04-29 — publication-readiness pass
 
-Cleanup release on top of 0.6.0. No behavior changes; the wire
-format, on-disk schema, and all CLI surfaces are byte-identical to
-0.6.0. Operators on 0.6.0 can upgrade no-op via `pip install -U
-dnsmesh` (or pull the new Docker image). Anyone landing on the
-project for the first time gets the polished docs path plus a
-working `examples/directory_aggregator.py`.
+Cleanup release on top of 0.6.0. Wire format, on-disk schema, and
+CLI surfaces are byte-identical to 0.6.0; operators upgrade
+no-op via `pip install -U dnsmesh` followed by a service restart
+(`systemctl restart dnsmesh-node` on the native install path or a
+container restart on Docker). Anyone landing on the project for the
+first time gets the polished docs path plus a working
+`examples/directory_aggregator.py` and a fixed peer-list rendering
+on each node's `GET /` page.
 
 ### Fixed
 
+- **Heartbeat render path: peers older than 5 minutes silently
+  disappeared from the node's HTML landing page.** The render
+  call to `HeartbeatRecord.parse_and_verify(wire)` used the
+  default `ts_skew_seconds=300` while the *publish* path used
+  `10**9`. Result: a peer whose last harvested heartbeat was
+  more than 5 minutes old got rejected at render time even
+  though it was alive in the SeenStore and being republished
+  in the seen-graph RRset. Most visible as
+  `https://dnsmesh.io/` showing 1 peer (its own self-row) while
+  `https://dnsmesh.pro/` showed 2 — display luck, not a real
+  asymmetry. Render path now matches the publish path: the
+  store-level `exp > now` filter is the freshness gate; the
+  Ed25519 signature is the authenticity gate; the 300s ts-skew
+  default that protects the WRITE path against future-dated
+  forgery is dropped on the read/display path. (PR #9.)
 - **`examples/directory_aggregator.py`** ported to DNS-native.
   Was calling `GET /v1/nodes/seen` (removed in M9 / 0.5.0) and
   silently producing zero-node feeds since that release. Now
-  queries `_dnsmesh-seen.<seed-zone>` TXT via a multi-upstream
-  ResolverPool and feeds the same verification + aggregation
-  pipeline. Smoke-tested live.
+  queries BOTH `_dnsmesh-heartbeat.<seed-zone>` (the seed's own
+  self-row) AND `_dnsmesh-seen.<seed-zone>` (the seed's
+  republished view of other peers) via a multi-upstream
+  ResolverPool, feeding the same verification + aggregation
+  pipeline. The heartbeat-fetch part was added after a Codex
+  review caught that reading only the seen-graph drops the
+  seed itself when the seed has heard no peers (a healthy
+  single-node seed leaves the seen RRset empty). Smoke-tested
+  live against `dmp.dnsmesh.io` + `dmp.dnsmesh.pro`.
 - **GitHub Pages workflow.** `actions/configure-pages@v5` was
   missing `id: pages`, so `${{ steps.pages.outputs.base_path }}`
   evaluated to empty and Jekyll built every page with
@@ -45,9 +68,16 @@ working `examples/directory_aggregator.py`.
   Repo root drops from 5 → 3 docker-compose files (base, prod
   overlay, cluster sample). `git mv` preserved blame history.
 - **`directory/seeds.txt`** entries flipped from legacy
-  `https://...` form to canonical zone names (`dnsmesh.io`,
-  `dnsmesh.pro`). Added `dnsmesh.pro` alongside the existing
-  `dnsmesh.io` seed. Legacy URL form still parses.
+  `https://...` form to canonical zone names. Final shape after
+  PR #8: `dmp.dnsmesh.io` and `dmp.dnsmesh.pro` — i.e. the
+  served zones (`DMP_DOMAIN`) of the public reference nodes,
+  not their apex hostnames. Earlier in this release the seeds
+  briefly read `dnsmesh.io` / `dnsmesh.pro` (apex), but the
+  heartbeat layer publishes under the served zone, so the
+  aggregator queried the wrong RRsets and got empty results.
+  Legacy `https://...` form still parses (the host is extracted
+  as the zone) for back-compat with forks running older seed
+  files.
 - **Framing sweep across user-facing docs.** "alpha" /
   "experimental" prose references replaced with
   "non-certified" / "pre-1.0" for consistency. Code-flag
