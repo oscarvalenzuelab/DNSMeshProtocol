@@ -39,6 +39,13 @@ Self-hosting gets the same capabilities via
 `deploy/native-ubuntu/install.sh`. Both modes interoperate over DNS;
 the public node is a reference, not a dependency.
 
+A live, signature-verified directory of nodes currently advertising
+on the public DNS chain lives at
+[`/directory/`]({{ site.baseurl }}/directory/) — rebuilt every 30
+minutes from `directory/seeds.txt`. The aggregator is open source
+and federated; anyone can run their own off the same signed P2P
+data ([reference implementation](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/examples/directory_aggregator.py)).
+
 ---
 
 ## What it is

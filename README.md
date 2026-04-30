@@ -65,6 +65,14 @@ Curious what a node currently publishes:
 dig _dnsmesh-heartbeat.dmp.dnsmesh.io TXT +short
 ```
 
+A live, signature-verified directory of every DMP node currently
+advertising itself on the public DNS chain:
+**[https://ovalenzuela.com/DNSMeshProtocol/directory/](https://ovalenzuela.com/DNSMeshProtocol/directory/)**.
+Rebuilt every 30 minutes by an aggregator that queries
+`_dnsmesh-heartbeat.<seed>` + `_dnsmesh-seen.<seed>` from a
+federated seed list (`directory/seeds.txt`); anyone can run their
+own aggregator off the same data.
+
 Full walkthrough with troubleshooting in
 [Getting Started](https://oscarvalenzuelab.github.io/DNSMeshProtocol/getting-started).
 
