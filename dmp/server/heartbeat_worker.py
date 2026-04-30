@@ -217,6 +217,22 @@ class HeartbeatWorker:
         # and-verify) and deletes them before publishing the fresh
         # one. Flips after the first successful sweep.
         self._orphan_sweep_done: bool = False
+        # Same orphan-sweep story for ``_dnsmesh-seen.<own-zone>``.
+        # ``_last_seen_wires`` is process-memory only, so every
+        # restart leaves the prior tick's published wires in place
+        # with no eviction tracking. They linger until each wire's
+        # ``exp`` fires (24h default), which over a few upgrade
+        # cycles inflates the seen RRset past the recursive-resolver
+        # UDP buffer (1232 bytes EDNS) — the response then exceeds
+        # ``to_wire()``'s size budget, the UDP path raises
+        # ``dns.exception.TooBig``, and federation discovery silently
+        # breaks. First ``_publish_seen_graph`` does a one-time sweep
+        # of any wire at ``_dnsmesh-seen.<own-zone>`` that is either
+        # (a) signed by THIS operator (self never belongs in a node's
+        # own seen RRset — seen is "OTHER nodes I have heard from")
+        # or (b) a stale prior-tick wire for a peer we still see, so
+        # cluster siblings' wires under shared zones remain intact.
+        self._seen_orphan_sweep_done: bool = False
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -441,6 +457,92 @@ class HeartbeatWorker:
             )
         return deleted
 
+    def _sweep_orphan_seen_wires(
+        self, name: str, *, next_wires: Set[str], now: int
+    ) -> int:
+        """Delete prior-process orphans at ``_dnsmesh-seen.<own-zone>``.
+
+        Mirror of ``_sweep_orphan_self_wires`` for the seen RRset.
+        Two classes of wire are deleted:
+
+        1. Wires signed by THIS operator. Self never belongs in the
+           local seen RRset (seen = "OTHER nodes I have heard from").
+           Any self-wire there is leakage from a prior bootstrap path
+           that later got fixed; we clean it up unconditionally.
+
+        2. Wires for a peer ``(operator_spk, endpoint)`` that appears
+           in ``next_wires`` but with a different wire payload — the
+           existing one is our prior tick's stale copy of that peer.
+           Replacing it with the fresh ``next_wires`` entry collapses
+           the per-peer wire history into the latest signed copy.
+
+        Anything else stays. Cluster siblings publishing into a
+        shared ``_dnsmesh-seen.<shared-zone>`` keep their wires.
+        Wires we can't parse (bad sig, expired beyond skew, malformed)
+        are left alone — see ``_sweep_orphan_self_wires`` rationale.
+
+        Returns the number of orphan wires deleted.
+        """
+        reader = self._record_writer
+        if not hasattr(reader, "query_txt_record"):
+            return 0
+        try:
+            existing = reader.query_txt_record(name)
+        except Exception:
+            log.exception("orphan seen-wire sweep: query raised for %s", name)
+            return 0
+        if not existing:
+            return 0
+
+        own_spk = self._crypto.get_signing_public_key_bytes()
+        # Build a (spk_hex, endpoint) -> wire map of what we're about
+        # to publish so we can detect prior-tick stale copies of the
+        # SAME peer in the live RRset.
+        next_keyed: dict = {}
+        for w in next_wires:
+            rec = HeartbeatRecord.parse_and_verify(w, now=now, ts_skew_seconds=10**9)
+            if rec is None:
+                continue
+            next_keyed[(bytes(rec.operator_spk).hex(), rec.endpoint)] = w
+
+        deleted = 0
+        for value in existing:
+            if value in next_wires:
+                # Already what we want there — leave it.
+                continue
+            rec = HeartbeatRecord.parse_and_verify(
+                value, now=now, ts_skew_seconds=10**9
+            )
+            if rec is None:
+                continue
+            spk = bytes(rec.operator_spk)
+            should_delete = False
+            if spk == own_spk:
+                # Class 1: self in our own seen — never belongs.
+                should_delete = True
+            else:
+                # Class 2: prior-tick stale for a peer we still see.
+                key = (spk.hex(), rec.endpoint)
+                if key in next_keyed and next_keyed[key] != value:
+                    should_delete = True
+            if not should_delete:
+                continue
+            try:
+                if self._record_writer.delete_txt_record(name, value=value):
+                    deleted += 1
+            except Exception:
+                log.exception(
+                    "orphan seen-wire delete raised for %s; continuing",
+                    name,
+                )
+        if deleted:
+            log.info(
+                "swept %d orphan seen-wire(s) at %s on worker startup",
+                deleted,
+                name,
+            )
+        return deleted
+
     def _publish_seen_graph(self, now_i: int) -> int:
         """Republish recently-seen peer wires under
         ``_dnsmesh-seen.<dns_zone>`` as a multi-value TXT RRset.
@@ -479,12 +581,38 @@ class HeartbeatWorker:
         # ``_dnsmesh-seen.<shared-zone>``. We track exactly which
         # wires THIS node published last tick and evict only those —
         # peers' contributions stay intact.
+        own_spk_hex = self._crypto.get_signing_public_key_bytes().hex()
         next_wires: Set[str] = set()
         for row in rows:
             wire = getattr(row, "wire", None)
             if not isinstance(wire, str) or not wire:
                 continue
+            # Self never belongs in our own seen RRset. Seen is
+            # "OTHER nodes I have heard from" — listing ourselves
+            # there is both semantically wrong (an operator can't
+            # vouch for their own liveness via their own gossip
+            # claim) and a foot-gun: aggregators that build a
+            # discovery graph from seen-edges would draw a self-
+            # loop. Defensive filter even though ``_fetch_and_ingest``
+            # also drops self at the source — a future bootstrap
+            # path that lands self in the store via some other route
+            # (manifest re-ingest, admin import, …) shouldn't leak
+            # into DNS.
+            row_spk_hex = getattr(row, "operator_spk_hex", "") or ""
+            if row_spk_hex.lower() == own_spk_hex.lower():
+                continue
             next_wires.add(wire)
+
+        # One-shot startup sweep of orphan seen-wires from prior
+        # processes — see ``_seen_orphan_sweep_done`` docstring.
+        if not self._seen_orphan_sweep_done:
+            try:
+                self._sweep_orphan_seen_wires(name, next_wires=next_wires, now=now_i)
+            except Exception:
+                log.exception("orphan seen-wire sweep raised for %s", name)
+            # Mark done regardless of success so a persistent error
+            # in the sweep path doesn't re-run on every tick.
+            self._seen_orphan_sweep_done = True
         # Anything we published last time but won't republish now
         # has dropped out (peer aged out of SeenStore). Evict those
         # specific values from the RRset.
@@ -552,6 +680,18 @@ class HeartbeatWorker:
         except ValueError:
             pass
 
+        # Drop wires the peer is gossiping back to us about ourselves
+        # at ingest time. Without this filter, a peer that has us in
+        # its own seen-graph (which is the common case once federation
+        # converges) seeds our local SeenStore with our own wire under
+        # ``(operator_spk_hex, endpoint)`` — and then ``_publish_seen_graph``
+        # republishes it under our own ``_dnsmesh-seen.<zone>``. That
+        # creates a self-loop in the federation discovery graph and,
+        # in fleets where many peers see us, can also push the local
+        # seen RRset over the recursive-resolver UDP buffer. Drop at
+        # the source so self never lands in the store.
+        own_spk = self._crypto.get_signing_public_key_bytes()
+
         accepted = 0
         for name in names:
             try:
@@ -563,6 +703,15 @@ class HeartbeatWorker:
                 continue
             for wire in records[: self._cfg.max_gossip_per_response]:
                 if not isinstance(wire, str):
+                    continue
+                # Cheap pre-check: parse-and-verify is the same call
+                # ``SeenStore.accept`` does, but here we use it solely
+                # to read ``operator_spk`` so we can short-circuit on
+                # self before the store insert. A wire that fails
+                # verification here will also fail there; ``accept``
+                # returns None and we correctly don't count it.
+                rec = HeartbeatRecord.parse_and_verify(wire, now=now_i)
+                if rec is not None and bytes(rec.operator_spk) == own_spk:
                     continue
                 try:
                     if self._store.accept(wire, remote_addr=zone, now=now_i):
