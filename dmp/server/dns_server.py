@@ -996,28 +996,53 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
-        # Shared with the UDP server when ``DMPDnsServer`` constructs
-        # both — a single ``max_concurrency`` budget across UDP + TCP
-        # rather than one budget per transport (codex round-2 P2).
-        # The TCP path acquires the permit lazily (in the handler,
-        # after reading data) rather than at connection-accept, so
-        # idle/slow-loris connections don't block UDP service —
-        # codex round-4 P1.
+        # ``_semaphore`` (work permit, shared with UDP) caps in-flight
+        # handler work — query parsing, response building, sendall.
+        # Acquired lazily inside the handler AFTER the message body
+        # is in hand, so slow-loris connections that never finish
+        # their read don't burn permits and starve the UDP listener
+        # (codex round-4 P1).
+        #
+        # ``_accept_semaphore`` (accept slot, TCP-only) caps the
+        # number of OPEN TCP connections in any state, including
+        # threads still blocked in ``recv()`` waiting for the
+        # length prefix. Without this, slow-loris attackers could
+        # open unbounded connections and burn the host's thread /
+        # memory budget even though they hold zero work permits
+        # (codex round-5 P1). Sized at 8× max_concurrency, with a
+        # 256 floor — generous enough to absorb a normal "many
+        # legitimate clients retrying over TCP after UDP truncate"
+        # spike, finite enough that an attacker can't run the host
+        # out of RAM.
         self._semaphore = semaphore or threading.Semaphore(max_concurrency)
+        accept_cap = max(max_concurrency * 8, 256)
+        self._accept_semaphore = threading.Semaphore(accept_cap)
 
     def process_request(self, request, client_address):
-        # Spawn handler immediately. Semaphore acquisition happens
-        # inside the handler AFTER the message body is in hand —
-        # this prevents an attacker from holding ``max_concurrency``
-        # permits open with idle TCP sockets and starving the UDP
-        # listener.
+        # Hard cap on concurrently-OPEN TCP connections, regardless
+        # of whether they're doing real work yet. If we're at the
+        # cap, drop the connection on the floor — the kernel sends
+        # RST, the client retries (or, if it's an attacker,
+        # eventually gives up).
+        if not self._accept_semaphore.acquire(blocking=False):
+            try:
+                request.close()
+            except Exception:
+                pass
+            return
         t = threading.Thread(
-            target=self.process_request_thread,
+            target=self._handle_with_accept_release,
             args=(request, client_address),
             name="dmp-dns-tcp-handler",
             daemon=self.daemon_threads,
         )
         t.start()
+
+    def _handle_with_accept_release(self, request, client_address):
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            self._accept_semaphore.release()
 
     def _handle_with_release(self, request, client_address):
         try:

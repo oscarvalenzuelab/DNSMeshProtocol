@@ -212,6 +212,38 @@ class TestDMPDnsServerRateLimitAndConcurrency:
                 "by the per-IP rate limiter, not answered"
             )
 
+    def test_tcp_accept_cap_bounds_open_connections(self):
+        """Slow-loris bound: connection accept itself is bounded by
+        a separate, larger semaphore so a flood of idle TCP
+        connections can't exhaust host threads/memory.
+
+        Codex round-5 P1: under the previous implementation the
+        TCP server spawned a handler thread for every accepted
+        socket, with no cap on connection count. An attacker
+        opening 10k slow-loris connections would burn ~80 GB of
+        thread stacks. The accept-cap (8 × max_concurrency, with a
+        256 floor) bounds that.
+        """
+        store = InMemoryDNSStore()
+        port = _free_port()
+        srv = DMPDnsServer(store, host="127.0.0.1", port=port, max_concurrency=4)
+        srv.start()
+        try:
+            accept_sem = srv._tcp_server._accept_semaphore
+            # Drain the accept budget directly to confirm the cap.
+            count = 0
+            while accept_sem.acquire(blocking=False):
+                count += 1
+                if count > 1024:
+                    break
+            # max(8 * max_concurrency, 256) → 8*4=32, floor 256.
+            assert count == 256, f"expected 256 accept slots, got {count}"
+            # Restore for clean shutdown.
+            for _ in range(count):
+                accept_sem.release()
+        finally:
+            srv.stop()
+
     def test_idle_tcp_connections_dont_block_udp(self):
         """Slow-loris regression: a client opening many idle TCP
         connections must not starve the UDP listener.
