@@ -654,14 +654,26 @@ def _process_dns_query(
     same function works for either transport.
     """
     server = handler.server
-    limiter = server.rate_limiter
-    if limiter is not None and not limiter.allow(client_ip):
-        REGISTRY.counter(
-            "dmp_dns_queries_total",
-            "DMP DNS queries by outcome",
-            labels={"outcome": "rate_limited"},
-        )
-        return None
+    # Rate-limit UDP only. TCP queries are almost always either:
+    #   1. The fallback retry of a UDP query that just got TC=1 — the
+    #      client already paid a token at the UDP layer, double-
+    #      charging on the retry would silently drop the answer for
+    #      configurations with small bursts (codex round-2 P2).
+    #   2. A direct TCP query, which is bounded by the connection
+    #      concurrency semaphore (max_concurrency, shared with UDP)
+    #      so a TCP-only flood still can't overcommit threads.
+    # Skipping the per-IP rate limiter on the TCP path therefore
+    # preserves "UDP→TCP retry works under any rate-limit setting"
+    # without losing the flood-protection guarantee.
+    if transport == "udp":
+        limiter = server.rate_limiter
+        if limiter is not None and not limiter.allow(client_ip):
+            REGISTRY.counter(
+                "dmp_dns_queries_total",
+                "DMP DNS queries by outcome",
+                labels={"outcome": "rate_limited"},
+            )
+            return None
 
     # Pass the keyring into ``from_wire`` so any TSIG signature on
     # the incoming message is verified at parse time. dnspython raises:
@@ -858,6 +870,7 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         update_max_ttl=DEFAULT_UPDATE_MAX_TTL,
         update_max_value_bytes=DEFAULT_UPDATE_MAX_VALUE_BYTES,
         update_max_values_per_name=DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
+        semaphore=None,
     ):
         super().__init__(server_address, handler_cls)
         self.reader = reader
@@ -876,7 +889,13 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
-        self._semaphore = threading.Semaphore(max_concurrency)
+        # ``semaphore`` lets the caller (DMPDnsServer) hand in a
+        # shared bounded-worker budget so UDP + TCP listeners enforce
+        # ONE global cap of ``max_concurrency`` handler threads
+        # rather than one cap per transport (codex round-2 P2 — a
+        # node configured for max=128 was effectively running ~256
+        # threads under mixed UDP+TCP load).
+        self._semaphore = semaphore or threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
         if not self._semaphore.acquire(blocking=False):
@@ -937,6 +956,7 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         update_max_ttl=DEFAULT_UPDATE_MAX_TTL,
         update_max_value_bytes=DEFAULT_UPDATE_MAX_VALUE_BYTES,
         update_max_values_per_name=DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
+        semaphore=None,
     ):
         super().__init__(server_address, handler_cls)
         self.reader = reader
@@ -955,7 +975,10 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
-        self._semaphore = threading.Semaphore(max_concurrency)
+        # Shared with the UDP server when ``DMPDnsServer`` constructs
+        # both — a single ``max_concurrency`` budget across UDP + TCP
+        # rather than one budget per transport (codex round-2 P2).
+        self._semaphore = semaphore or threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
         if not self._semaphore.acquire(blocking=False):
@@ -1106,6 +1129,11 @@ class DMPDnsServer:
     def start(self) -> None:
         if self._server is not None:
             return
+        # ONE shared concurrency semaphore across UDP + TCP listeners
+        # so ``max_concurrency`` is the global handler-thread cap, not
+        # a per-transport cap. Without this, configuring max=128 would
+        # silently allow ~256 threads under mixed UDP/TCP load.
+        shared_semaphore = threading.Semaphore(self.max_concurrency)
         self._server = _ThreadingUDPServer(
             (self.host, self.port),
             _DMPRequestHandler,
@@ -1114,6 +1142,7 @@ class DMPDnsServer:
             self.rate_limiter,
             self.max_concurrency,
             **self._server_kwargs(),
+            semaphore=shared_semaphore,
         )
         # If the caller asked for port 0, pick up the actual bound port.
         self.port = self._server.server_address[1]
@@ -1139,6 +1168,7 @@ class DMPDnsServer:
                     self.rate_limiter,
                     self.max_concurrency,
                     **self._server_kwargs(),
+                    semaphore=shared_semaphore,
                 )
             except OSError as exc:
                 # TCP bind failure is non-fatal — UDP keeps running.

@@ -127,6 +127,59 @@ class TestDMPDnsServer:
             server2.stop()
 
 
+class TestDMPDnsServerRateLimitAndConcurrency:
+    """Regressions caught by codex review of the TCP listener PR.
+
+    Both are subtle correctness issues that don't crash anything but
+    weaken the protections operators expect: TCP fallback must not
+    be rate-limited out of existence, and ``max_concurrency`` has
+    to remain a single global cap across UDP + TCP."""
+
+    def test_tcp_retry_not_rate_limited(self):
+        """A resolver doing UDP→TC=1→TCP retry has already been
+        admitted at the UDP layer. The TCP retry must not double-
+        charge the per-IP rate limiter, otherwise small bursts
+        silently drop the answer for oversized RRsets."""
+        from dmp.server.rate_limit import RateLimit
+
+        store = InMemoryDNSStore()
+        # Large RRset to force the truncate path.
+        for i in range(10):
+            store.publish_txt_record("big.mesh.test", "X" * 240 + f"-{i:03d}")
+
+        port = _free_port()
+        # rate=0/s, burst=1: at most one allowed every minute.
+        # If TCP weren't exempt, the UDP query would consume the
+        # one token and the TCP retry would silently drop.
+        rl = RateLimit(rate_per_second=0.0, burst=1)
+        with DMPDnsServer(store, host="127.0.0.1", port=port, rate_limit=rl):
+            request = dns.message.make_query("big.mesh.test", dns.rdatatype.TXT)
+            response, used_tcp = dns.query.udp_with_fallback(
+                request, "127.0.0.1", port=port, timeout=2.0
+            )
+        assert used_tcp
+        assert response.rcode() == 0
+        assert len(response.answer[0]) == 10
+
+    def test_udp_and_tcp_share_one_concurrency_semaphore(self):
+        """``max_concurrency`` must be a single global cap, not
+        one cap per transport. Without sharing, a node configured
+        for max=128 silently allows ~256 handler threads."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        srv = DMPDnsServer(store, host="127.0.0.1", port=port, max_concurrency=4)
+        srv.start()
+        try:
+            assert srv._server is not None
+            assert srv._tcp_server is not None
+            assert srv._server._semaphore is srv._tcp_server._semaphore, (
+                "UDP and TCP listeners must share one Semaphore so "
+                "max_concurrency is a global cap, not per-transport"
+            )
+        finally:
+            srv.stop()
+
+
 class TestDMPDnsServerTruncation:
     """UDP truncation + TCP fallback — the actual recursor flow.
 
