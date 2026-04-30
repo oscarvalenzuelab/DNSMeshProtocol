@@ -7,6 +7,97 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-04-29 — publication-readiness pass
+
+Cleanup release on top of 0.6.0. No behavior changes; the wire
+format, on-disk schema, and all CLI surfaces are byte-identical to
+0.6.0. Operators on 0.6.0 can upgrade no-op via `pip install -U
+dnsmesh` (or pull the new Docker image). Anyone landing on the
+project for the first time gets the polished docs path plus a
+working `examples/directory_aggregator.py`.
+
+### Fixed
+
+- **`examples/directory_aggregator.py`** ported to DNS-native.
+  Was calling `GET /v1/nodes/seen` (removed in M9 / 0.5.0) and
+  silently producing zero-node feeds since that release. Now
+  queries `_dnsmesh-seen.<seed-zone>` TXT via a multi-upstream
+  ResolverPool and feeds the same verification + aggregation
+  pipeline. Smoke-tested live.
+- **GitHub Pages workflow.** `actions/configure-pages@v5` was
+  missing `id: pages`, so `${{ steps.pages.outputs.base_path }}`
+  evaluated to empty and Jekyll built every page with
+  `--baseurl ""`. Asset paths shipped as root-relative and
+  404'd on the `/DNSMeshProtocol/` subpath at the custom domain.
+  Pre-existing bug; surfaced by happenstance during this pass.
+- **CI test collection scope.** Added `pytest.ini` with
+  `testpaths = tests` so pytest stops walking `scripts/` and
+  trying to collect the m9/m10 e2e drivers as test modules.
+- **Pip CVE-2026-3219.** Bumped pip 26.0.1 → 26.1 in
+  `requirements-dev.lock` to clear the `pip-audit` strict-mode
+  finding on the dev lockfile.
+
+### Changed
+
+- **m9/m10 e2e harnesses moved.** Repo-root cleanup: the two
+  developer-only docker-compose stacks and their driver scripts
+  now live under `scripts/m9-test/` and `scripts/m10-test/`.
+  Repo root drops from 5 → 3 docker-compose files (base, prod
+  overlay, cluster sample). `git mv` preserved blame history.
+- **`directory/seeds.txt`** entries flipped from legacy
+  `https://...` form to canonical zone names (`dnsmesh.io`,
+  `dnsmesh.pro`). Added `dnsmesh.pro` alongside the existing
+  `dnsmesh.io` seed. Legacy URL form still parses.
+- **Framing sweep across user-facing docs.** "alpha" /
+  "experimental" prose references replaced with
+  "non-certified" / "pre-1.0" for consistency. Code-flag
+  references (`--experimental`) preserved as shipped CLI
+  surface.
+- **`docs/index.md` 30-second diagram** updated from the old
+  "publish over HTTP API" framing to the M9 DNS UPDATE + TSIG
+  flow. Compressed the dnsmesh.io section and the Actively
+  shipping list.
+- **`docs/design-intent/protocol.md` and
+  `implementation-requirements.md` removed.** Pre-implementation
+  LLM-flavored prose drafted before any code existed; their note
+  banners said "historical" but the bodies still read as
+  authoritative spec, contradicting the cleaner shipped docs.
+  Kept `docs/design-intent/index.md` as a single-page
+  spec-vs-shipped delta (retitled "Spec → Ship").
+- **`docs/guide/identity.md` rotation section** rewritten —
+  previously claimed M5.4 rotation hadn't shipped, when it has.
+- **`docs/design/cluster-anti-entropy-http-boundary.md`**
+  rewritten end-to-end to frame HTTP between cluster peers as
+  the architecturally correct transport for HA-scoped
+  replication, not a workaround. Issue #6 (cluster anti-entropy
+  over DNS) closed as not-planned with a decision comment
+  pointing at the boundary doc as authoritative rationale.
+
+### Added
+
+- **`docs/deployment/testing.md`** documenting the m9/m10 e2e
+  harnesses for the first time. They were previously
+  undiscoverable except by reading the workflow files.
+- **README passphrase guidance.** The 5-minute walkthrough now
+  shows a `read -rs DMP_PASSPHRASE` step and a one-paragraph
+  callout that losing the passphrase = losing the identity (no
+  recovery — the keys are derived from passphrase + per-identity
+  salt via Argon2id). Same guidance added to the node landing
+  page (`GET /`) registration block.
+- **`.github/ISSUE_TEMPLATE/{bug_report,feature_request,config}.yml`**.
+  Structured issue forms; security disclosures routed to
+  SECURITY.md instead of the public issue tracker.
+- **Repo topics** for GitHub discoverability: `dns`,
+  `messaging`, `end-to-end-encryption`, `federated`,
+  `protocol`, `tsig`, `python`, `decentralized`, `p2p`.
+
+### Removed
+
+- `info.txt` and `scripts/setup_ubuntu_server.sh` — local promo
+  scratch and a stale pre-M9 installer with a placeholder URL,
+  superseded by `deploy/native-ubuntu/install.sh` +
+  `docs/deployment/native-ubuntu.md`.
+
 ## [0.6.0] — 2026-04-27 — M10: receiver-zone claim notifications
 
 Latency-optimized receive path. New protocol opt-in surface, new
