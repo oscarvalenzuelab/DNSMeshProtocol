@@ -5,7 +5,19 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "directory/seeds.txt"
+      - "examples/directory_aggregator.py"
+      - "dmp/server/heartbeat_html.py"
       - ".github/workflows/pages.yml"
+  schedule:
+    # Refresh the directory feed on the same 30-min cadence the
+    # standalone directory-aggregator workflow used to run on,
+    # before the aggregator was folded into this build (no longer
+    # commits to main; the feed is rendered fresh into _site/ on
+    # each deploy and the committed `docs/directory/{feed.json,
+    # index.html}` is the last-known-good fallback if the
+    # aggregator step fails or is skipped).
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -20,11 +32,46 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: docs
     steps:
       - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. Refresh the directory feed (best-effort).
+      #
+      # Aggregator runs every Pages build. Output overwrites the
+      # in-tree `docs/directory/{feed.json,index.html}` which Jekyll
+      # then serves as part of the site. Failures (DNS timeout, no
+      # heartbeats reachable, …) do NOT block the docs deploy:
+      # `continue-on-error: true` lets the build proceed with whatever
+      # is committed at HEAD as the fallback. That committed copy is
+      # the last-known-good output from a prior successful refresh.
+      # ---------------------------------------------------------------
+
+      - name: Set up Python (for aggregator)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dnsmesh runtime deps (for aggregator)
+        # The aggregator imports `dmp.core.heartbeat`, which transitively
+        # pulls argon2 via `dmp.core.crypto`. `pip install -e .` brings
+        # in the runtime dependency set from setup.py without dev
+        # extras (pytest, mypy, …).
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Refresh directory feed
+        continue-on-error: true
+        run: |
+          python examples/directory_aggregator.py \
+            --seeds-file directory/seeds.txt \
+            --out-dir docs/directory
+
+      # ---------------------------------------------------------------
+      # 2. Build + publish the Jekyll site.
+      # ---------------------------------------------------------------
 
       - uses: ruby/setup-ruby@v1
         with:
@@ -36,6 +83,7 @@ jobs:
         uses: actions/configure-pages@v5
 
       - name: Build with Jekyll
+        working-directory: docs
         run: |
           bundle exec jekyll build \
             --source . \
