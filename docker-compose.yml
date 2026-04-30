@@ -8,10 +8,18 @@ services:
     # Production operators who want real port 53 can remap via:
     #   ports:
     #     - "53:5353/udp"
+    #     - "53:5353/tcp"
     # and ensure nothing else (systemd-resolved, dnsmasq) holds port 53 on the
     # host. For local dev we expose 5353 directly.
+    #
+    # 5353/tcp is required for the DNS-over-TCP fallback path (RFC
+    # 1035 §4.2.2 + RFC 7766) — recursive resolvers retry over TCP
+    # when a UDP response sets TC=1 (e.g. _dnsmesh-seen.<zone>
+    # RRsets that exceed the EDNS buffer). Without it, large RRsets
+    # don't propagate through RFC-strict resolvers.
     ports:
       - "5353:5353/udp"
+      - "5353:5353/tcp"
       - "8053:8053/tcp"
 
     environment:

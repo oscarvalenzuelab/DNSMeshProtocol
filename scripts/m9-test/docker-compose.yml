@@ -74,6 +74,7 @@ services:
       - ../../docker/m9-test/alice-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5371:5353/udp"
+      - "127.0.0.1:5371:5353/tcp"
       - "127.0.0.1:8071:8053/tcp"
     networks:
       m9-test:
@@ -112,6 +113,7 @@ services:
       - ../../docker/m9-test/bob-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5372:5353/udp"
+      - "127.0.0.1:5372:5353/tcp"
       - "127.0.0.1:8072:8053/tcp"
     networks:
       m9-test:
@@ -151,6 +153,7 @@ services:
       - ../../docker/m9-test/provider-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5373:5353/udp"
+      - "127.0.0.1:5373:5353/tcp"
       - "127.0.0.1:8073:8053/tcp"
     networks:
       m9-test:

@@ -51,6 +51,7 @@ services:
       # 127.0.0.1 bind keeps these off the public interface. Operators
       # who want remote access should front the HTTP port with TLS.
       - "127.0.0.1:5301:5353/udp"
+      - "127.0.0.1:5301:5353/tcp"
       - "127.0.0.1:8101:8053/tcp"
     networks: [dnsmesh-cluster]
     healthcheck:
@@ -71,6 +72,7 @@ services:
       - ./docker/cluster/cluster-manifest.wire:/etc/dmp/cluster-manifest.wire:ro
     ports:
       - "127.0.0.1:5302:5353/udp"
+      - "127.0.0.1:5302:5353/tcp"
       - "127.0.0.1:8102:8053/tcp"
     networks: [dnsmesh-cluster]
     healthcheck:
@@ -91,6 +93,7 @@ services:
       - ./docker/cluster/cluster-manifest.wire:/etc/dmp/cluster-manifest.wire:ro
     ports:
       - "127.0.0.1:5303:5353/udp"
+      - "127.0.0.1:5303:5353/tcp"
       - "127.0.0.1:8103:8053/tcp"
     networks: [dnsmesh-cluster]
     healthcheck:

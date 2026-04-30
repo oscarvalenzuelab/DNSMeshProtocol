@@ -78,14 +78,22 @@ class TestDMPDnsServer:
         assert response.answer == []
 
     def test_long_value_served_as_multi_string_txt(self):
-        """Values > 255 bytes get emitted as multi-string TXT records."""
+        """Values > 255 bytes get emitted as multi-string TXT records.
+
+        Uses EDNS0 with a 4 KB buffer so the response (a 600-byte
+        TXT record) fits in a single UDP datagram. Without EDNS the
+        UDP path correctly truncates to TC=1 — see
+        TestDMPDnsServerTruncation for that path."""
         store = InMemoryDNSStore()
         long_value = "B" * 600
         store.publish_txt_record("long.mesh.test", long_value)
 
         port = _free_port()
         with DMPDnsServer(store, host="127.0.0.1", port=port):
-            response = self._query("long.mesh.test", "127.0.0.1", port)
+            request = dns.message.make_query(
+                "long.mesh.test", dns.rdatatype.TXT, use_edns=0, payload=4096
+            )
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
 
         assert response.rcode() == 0
         rdata = response.answer[0][0]
@@ -117,6 +125,364 @@ class TestDMPDnsServer:
             assert response2.rcode() == 0
         finally:
             server2.stop()
+
+
+class TestDMPDnsServerRateLimitAndConcurrency:
+    """Regressions caught by codex review of the TCP listener PR.
+
+    Both are subtle correctness issues that don't crash anything but
+    weaken the protections operators expect: TCP fallback must not
+    be rate-limited out of existence, and ``max_concurrency`` has
+    to remain a single global cap across UDP + TCP."""
+
+    def test_tcp_retry_not_rate_limited(self):
+        """A resolver doing UDP→TC=1→TCP retry has already been
+        admitted at the UDP layer. The TCP retry must not double-
+        charge the per-IP rate limiter, otherwise small bursts
+        silently drop the answer for oversized RRsets."""
+        from dmp.server.rate_limit import RateLimit
+
+        store = InMemoryDNSStore()
+        # Large RRset to force the truncate path.
+        for i in range(10):
+            store.publish_txt_record("big.mesh.test", "X" * 240 + f"-{i:03d}")
+
+        port = _free_port()
+        # Small non-zero rate so RateLimit.enabled is True (it
+        # checks rate>0 AND burst>0); refill is glacial relative to
+        # the test, effectively burst=1 per IP per transport.
+        # Without per-transport buckets, the UDP query consumes the
+        # bucket's token and the TCP retry would silently drop.
+        rl = RateLimit(rate_per_second=0.001, burst=1)
+        with DMPDnsServer(store, host="127.0.0.1", port=port, rate_limit=rl):
+            request = dns.message.make_query("big.mesh.test", dns.rdatatype.TXT)
+            response, used_tcp = dns.query.udp_with_fallback(
+                request, "127.0.0.1", port=port, timeout=2.0
+            )
+        assert used_tcp
+        assert response.rcode() == 0
+        assert len(response.answer[0]) == 10
+
+    def test_direct_tcp_traffic_is_rate_limited(self):
+        """Direct TCP traffic (not a UDP→TC=1→TCP retry) must still
+        hit the per-IP throttle. Otherwise an attacker bypasses
+        rate-limiting entirely by switching to TCP.
+
+        Codex round-3 P1: an earlier fix exempted ALL TCP from the
+        limiter; this test ensures the per-transport-bucket fix
+        keeps direct TCP queries throttled at the configured rate.
+        """
+        from dmp.server.rate_limit import RateLimit
+
+        store = InMemoryDNSStore()
+        store.publish_txt_record("alice.mesh.test", "v=dmp1;t=identity")
+        port = _free_port()
+        # Burst of 1, no refill: only one TCP query per IP per minute.
+        # rate=0 disables the limiter entirely (RateLimit.enabled
+        # checks rate>0 AND burst>0). Use a small non-zero rate so
+        # the limiter is active; refill is glacial relative to the
+        # test's wall-clock duration.
+        rl = RateLimit(rate_per_second=0.001, burst=1)
+        with DMPDnsServer(store, host="127.0.0.1", port=port, rate_limit=rl):
+            # First TCP query consumes the burst-1 token.
+            r1 = dns.query.tcp(
+                dns.message.make_query("alice.mesh.test", dns.rdatatype.TXT),
+                "127.0.0.1",
+                port=port,
+                timeout=2.0,
+            )
+            assert r1.rcode() == 0
+
+            # Second TCP query from the same IP must drop (server
+            # closes connection without a response). Open a raw
+            # socket since dns.query.tcp would block waiting for an
+            # answer that never comes.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect(("127.0.0.1", port))
+                req = dns.message.make_query(
+                    "alice.mesh.test", dns.rdatatype.TXT
+                ).to_wire()
+                s.sendall(len(req).to_bytes(2, "big") + req)
+                # Server drops the rate-limited query → connection
+                # closes with no response.
+                received = s.recv(4096)
+            assert received == b"", (
+                "Direct TCP query past the burst should be dropped "
+                "by the per-IP rate limiter, not answered"
+            )
+
+    def test_tcp_accept_cap_bounds_open_connections(self):
+        """Slow-loris bound: connection accept itself is bounded by
+        a separate, larger semaphore so a flood of idle TCP
+        connections can't exhaust host threads/memory.
+
+        Codex round-5 P1: under the previous implementation the
+        TCP server spawned a handler thread for every accepted
+        socket, with no cap on connection count. An attacker
+        opening 10k slow-loris connections would burn ~80 GB of
+        thread stacks. The accept-cap (8 × max_concurrency, with a
+        256 floor) bounds that.
+        """
+        store = InMemoryDNSStore()
+        port = _free_port()
+        srv = DMPDnsServer(store, host="127.0.0.1", port=port, max_concurrency=4)
+        srv.start()
+        try:
+            accept_sem = srv._tcp_server._accept_semaphore
+            # Drain the accept budget directly to confirm the cap.
+            count = 0
+            while accept_sem.acquire(blocking=False):
+                count += 1
+                if count > 1024:
+                    break
+            # max(8 * max_concurrency, 256) → 8*4=32, floor 256.
+            assert count == 256, f"expected 256 accept slots, got {count}"
+            # Restore for clean shutdown.
+            for _ in range(count):
+                accept_sem.release()
+        finally:
+            srv.stop()
+
+    def test_idle_tcp_connections_dont_block_udp(self):
+        """Slow-loris regression: a client opening many idle TCP
+        connections must not starve the UDP listener.
+
+        Codex round-4 P1: under the previous "acquire permit at
+        connect" implementation, a client could open
+        ``max_concurrency`` TCP sockets, send no bytes, and tie up
+        every permit for the 5-second read timeout — blocking UDP
+        queries entirely during that window. Lazy acquisition (only
+        after the message body is in hand) preserves the global
+        concurrency cap without making UDP service vulnerable to
+        connect-only floods.
+        """
+        store = InMemoryDNSStore()
+        store.publish_txt_record("alice.test", "hi")
+        port = _free_port()
+        srv = DMPDnsServer(store, host="127.0.0.1", port=port, max_concurrency=2)
+        srv.start()
+        try:
+            # Open more idle TCP connections than the max_concurrency
+            # cap, send zero bytes — classic slow-loris.
+            idle_socks = []
+            for _ in range(5):
+                c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                c.connect(("127.0.0.1", port))
+                idle_socks.append(c)
+            try:
+                # UDP query should still be served.
+                request = dns.message.make_query("alice.test", dns.rdatatype.TXT)
+                response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+                assert response.rcode() == 0
+            finally:
+                for c in idle_socks:
+                    c.close()
+        finally:
+            srv.stop()
+
+    def test_udp_and_tcp_share_one_concurrency_semaphore(self):
+        """``max_concurrency`` must be a single global cap, not
+        one cap per transport. Without sharing, a node configured
+        for max=128 silently allows ~256 handler threads."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        srv = DMPDnsServer(store, host="127.0.0.1", port=port, max_concurrency=4)
+        srv.start()
+        try:
+            assert srv._server is not None
+            assert srv._tcp_server is not None
+            assert srv._server._semaphore is srv._tcp_server._semaphore, (
+                "UDP and TCP listeners must share one Semaphore so "
+                "max_concurrency is a global cap, not per-transport"
+            )
+        finally:
+            srv.stop()
+
+
+class TestDMPDnsServerTruncation:
+    """UDP truncation + TCP fallback — the actual recursor flow.
+
+    A response that exceeds the requester's advertised UDP buffer
+    (RFC 1035 default 512 bytes, or whatever EDNS0 advertised)
+    must come back as a header-only stub with TC=1. The recursor
+    then retries over TCP. Without that signal, recursors with
+    strict RFC behavior (Google 8.8.8.8, Level3) just return empty
+    to their caller. This was caught by codex review of PR #14
+    after the TCP listener landed."""
+
+    def _large_store(self) -> InMemoryDNSStore:
+        store = InMemoryDNSStore()
+        # 10 entries × 240 bytes ≈ 2.4 KB plus DNS framing — well
+        # over the 512-byte RFC 1035 floor, well over typical
+        # 1232-byte EDNS defaults too.
+        for i in range(10):
+            store.publish_txt_record("big.mesh.test", "X" * 240 + f"-{i:03d}")
+        return store
+
+    def test_udp_no_edns_oversized_returns_truncated_stub(self):
+        """No EDNS in the query → 512-byte UDP cap. Oversized
+        response should come back as TC=1 with empty answer."""
+        store = self._large_store()
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            request = dns.message.make_query("big.mesh.test", dns.rdatatype.TXT)
+            # Note: dns.query.udp() raises if it sees TC=1 by default;
+            # use ignore_trailing=True or call to_wire / from_wire
+            # directly to inspect the truncated answer.
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(2.0)
+            try:
+                sock.sendto(request.to_wire(), ("127.0.0.1", port))
+                data, _ = sock.recvfrom(4096)
+            finally:
+                sock.close()
+            response = dns.message.from_wire(data)
+
+        assert response.flags & dns.flags.TC, (
+            "TC bit should be set on oversized UDP response so the "
+            "recursor knows to retry over TCP"
+        )
+        # Header-only stub: no answers carried in the truncated reply.
+        assert response.answer == []
+
+    def test_udp_with_edns_carries_full_response(self):
+        """Query with EDNS0 advertising a 4 KB buffer → full
+        answer fits, no truncation."""
+        store = self._large_store()
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            request = dns.message.make_query(
+                "big.mesh.test", dns.rdatatype.TXT, use_edns=0, payload=4096
+            )
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert not (response.flags & dns.flags.TC)
+        assert len(response.answer) == 1
+        assert len(response.answer[0]) == 10
+
+    def test_udp_then_tcp_fallback(self):
+        """The full recursor flow: UDP query without EDNS gets a
+        truncated reply, retry over TCP succeeds with the full
+        answer. dnspython's dns.query.udp_with_fallback() exists
+        precisely to model this."""
+        store = self._large_store()
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            request = dns.message.make_query("big.mesh.test", dns.rdatatype.TXT)
+            response, used_tcp = dns.query.udp_with_fallback(
+                request, "127.0.0.1", port=port, timeout=2.0
+            )
+
+        assert used_tcp, "expected fallback to TCP after TC=1 on UDP"
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        assert len(response.answer[0]) == 10
+
+
+class TestDMPDnsServerTCP:
+    """DNS-over-TCP — RFC 1035 §4.2.2 + RFC 7766. Covers the
+    fallback path recursive resolvers take when a UDP response would
+    exceed the negotiated buffer (TC=1). Without TCP, large RRsets
+    like ``_dnsmesh-seen.<zone>`` can't propagate through any
+    RFC-strict resolver."""
+
+    def _query_tcp(self, qname: str, host: str, port: int) -> dns.message.Message:
+        request = dns.message.make_query(qname, dns.rdatatype.TXT)
+        return dns.query.tcp(request, host, port=port, timeout=2.0)
+
+    def test_tcp_resolves_txt_record(self):
+        store = InMemoryDNSStore()
+        store.publish_txt_record("alice.mesh.test", "v=dmp1;t=identity")
+
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            response = self._query_tcp("alice.mesh.test", "127.0.0.1", port)
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        rdata = response.answer[0][0]
+        assert b"".join(rdata.strings) == b"v=dmp1;t=identity"
+
+    def test_tcp_large_response_passes_through(self):
+        """The whole point of TCP support: responses that exceed the
+        UDP buffer come through cleanly over TCP. Build an RRset
+        large enough that a 512-byte UDP datagram cannot carry it,
+        then assert TCP returns the full set."""
+        store = InMemoryDNSStore()
+        # Each value ~250 bytes; ten of them well exceeds 4 KB even
+        # before DNS framing overhead.
+        for i in range(10):
+            store.publish_txt_record("big.mesh.test", "X" * 240 + f"-{i:03d}")
+
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            response = self._query_tcp("big.mesh.test", "127.0.0.1", port)
+
+        assert response.rcode() == 0
+        # All 10 values come back.
+        assert len(response.answer) == 1
+        rrset = response.answer[0]
+        assert len(rrset) == 10
+
+    def test_tcp_can_be_disabled(self):
+        """``tcp_enabled=False`` skips the TCP listener — UDP keeps
+        working, TCP connection attempts refuse cleanly."""
+        store = InMemoryDNSStore()
+        store.publish_txt_record("alice.mesh.test", "v=dmp1;t=identity")
+
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port, tcp_enabled=False):
+            # UDP still works.
+            udp_request = dns.message.make_query("alice.mesh.test", dns.rdatatype.TXT)
+            udp_response = dns.query.udp(
+                udp_request, "127.0.0.1", port=port, timeout=2.0
+            )
+            assert udp_response.rcode() == 0
+
+            # TCP is not listening — connection refused (kernel RST).
+            with pytest.raises((ConnectionRefusedError, OSError)):
+                tcp_request = dns.message.make_query(
+                    "alice.mesh.test", dns.rdatatype.TXT
+                )
+                dns.query.tcp(tcp_request, "127.0.0.1", port=port, timeout=1.0)
+
+    def test_tcp_oversized_length_prefix_dropped(self):
+        """A length prefix above MAX_MESSAGE_BYTES (65535 — though
+        DNS itself caps at that anyway) is rejected without the
+        server attempting to read the body. Open the socket
+        manually to send a hand-crafted bad frame."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect(("127.0.0.1", port))
+                # Length 0 — server should drop & close.
+                s.sendall(b"\x00\x00")
+                # Server closes the connection without a response.
+                response = s.recv(4096)
+                assert response == b""
+
+    def test_tcp_short_message_body_closes_cleanly(self):
+        """If the client announces a length but disconnects before
+        sending that many bytes, the server should not crash and
+        should not block other connections."""
+        store = InMemoryDNSStore()
+        store.publish_txt_record("alice.mesh.test", "v=dmp1;t=identity")
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            # Open a connection, send length-prefix promising 100 bytes,
+            # then close without sending them.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect(("127.0.0.1", port))
+                s.sendall((100).to_bytes(2, "big"))
+                # Don't send the 100 bytes; close.
+            # A subsequent legitimate query still succeeds — the server
+            # didn't get stuck on the truncated connection.
+            response = self._query_tcp("alice.mesh.test", "127.0.0.1", port)
+            assert response.rcode() == 0
 
 
 # ---------------------------------------------------------------------------

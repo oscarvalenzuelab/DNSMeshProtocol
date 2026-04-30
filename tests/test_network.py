@@ -274,7 +274,12 @@ class TestInMemoryDnsServerLongTxtRoundtrip:
 
         port = self._free_port()
         with DMPDnsServer(store, host="127.0.0.1", port=port):
-            request = dns.message.make_query("cluster.mesh.test", dns.rdatatype.TXT)
+            # Advertise EDNS0 4 KB buffer so the response fits in
+            # one UDP datagram. Without EDNS the server correctly
+            # truncates to TC=1 (covered in test_dns_server.py).
+            request = dns.message.make_query(
+                "cluster.mesh.test", dns.rdatatype.TXT, use_edns=0, payload=4096
+            )
             response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
 
         assert response.rcode() == 0
@@ -297,7 +302,10 @@ class TestInMemoryDnsServerLongTxtRoundtrip:
 
         port = self._free_port()
         with DMPDnsServer(store, host="127.0.0.1", port=port):
-            request = dns.message.make_query("cluster.big.test", dns.rdatatype.TXT)
+            # EDNS0 4 KB buffer for the 1200-byte payload.
+            request = dns.message.make_query(
+                "cluster.big.test", dns.rdatatype.TXT, use_edns=0, payload=4096
+            )
             response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
         assert response.rcode() == 0
         rdata = response.answer[0][0]

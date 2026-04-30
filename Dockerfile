@@ -87,7 +87,7 @@ COPY --from=builder /install /usr/local
 
 USER dmp
 VOLUME ["/var/lib/dmp"]
-EXPOSE 5353/udp 8053/tcp
+EXPOSE 5353/udp 5353/tcp 8053/tcp
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -fsS http://127.0.0.1:${DMP_HTTP_PORT}/health || exit 1

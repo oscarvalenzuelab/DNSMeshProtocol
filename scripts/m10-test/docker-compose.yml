@@ -72,6 +72,7 @@ services:
       - ../../docker/m10-test/alice-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5181:5353/udp"
+      - "127.0.0.1:5181:5353/tcp"
       - "127.0.0.1:8181:8053/tcp"
     networks:
       m10-test:
@@ -115,6 +116,7 @@ services:
       - ../../docker/m10-test/bob-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5182:5353/udp"
+      - "127.0.0.1:5182:5353/tcp"
       - "127.0.0.1:8182:8053/tcp"
     networks:
       m10-test:
@@ -159,6 +161,7 @@ services:
       - ../../docker/m10-test/stranger-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5183:5353/udp"
+      - "127.0.0.1:5183:5353/tcp"
       - "127.0.0.1:8183:8053/tcp"
     networks:
       m10-test:

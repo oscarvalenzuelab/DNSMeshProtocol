@@ -11,8 +11,12 @@
 services:
   dnsmesh-node:
     # Don't expose HTTP publicly in prod; Caddy handles it over TLS.
+    # 5353/tcp is the DNS TCP fallback path (RFC 1035 §4.2.2) —
+    # required for large-RRset propagation through RFC-strict
+    # recursive resolvers.
     ports:
       - "5353:5353/udp"
+      - "5353:5353/tcp"
     # dnsmesh-node:8053 is still reachable from within the compose network.
 
   caddy:

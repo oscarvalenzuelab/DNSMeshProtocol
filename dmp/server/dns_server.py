@@ -203,79 +203,14 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
     server: "_ThreadingUDPServer"  # set by socketserver
 
     def handle(self) -> None:
+        # Thin: framing-specific (UDP datagram → bytes). Heavy
+        # lifting (rate-limit, TSIG verify, response building) is in
+        # ``_process_dns_query`` so the TCP handler can share it.
         data, sock = self.request
-        limiter = self.server.rate_limiter
         client_ip = self.client_address[0]
-        if limiter is not None and not limiter.allow(client_ip):
-            REGISTRY.counter(
-                "dmp_dns_queries_total",
-                "DMP DNS queries by outcome",
-                labels={"outcome": "rate_limited"},
-            )
-            return  # UDP — just drop.
-
-        # Pass the keyring into ``from_wire`` so any TSIG signature on the
-        # incoming message is verified at parse time. dnspython raises:
-        #   - dns.tsig.PeerError (bad signature / time / truncation)
-        #   - dns.message.UnknownTSIGKey (key name not in keyring)
-        #   - dns.message.BadTSIG (malformed TSIG record)
-        # All three map to NOTAUTH — the request was authenticated by
-        # someone we can't or won't trust.
-        #
-        # When a keystore is wired in, build a fresh keyring per packet
-        # so newly-minted keys authorize without restarting the server.
-        # (Common case: a user just registered, dnspython needs to know
-        # their key name on the very next UPDATE.) Stored keyrings stay
-        # supported for tests that pass a static dict.
-        keystore = self.server.tsig_keystore
-        if keystore is not None:
-            keyring = keystore.build_keyring()
-        else:
-            keyring = self.server.tsig_keyring
-        try:
-            query = dns.message.from_wire(data, keyring=keyring)
-        except (
-            dns.tsig.PeerError,
-            dns.message.UnknownTSIGKey,
-            dns.message.BadTSIG,
-        ) as e:
-            log.debug("TSIG verification failed: %s", e)
-            REGISTRY.counter(
-                "dmp_dns_queries_total",
-                labels={"outcome": "tsig_failed"},
-            )
-            try:
-                bounced = self._stub_response(data, dns.rcode.NOTAUTH)
-            except Exception:
-                return
-            if bounced is not None:
-                sock.sendto(bounced, self.client_address)
-            return
-        except dns.exception.DNSException as e:
-            log.debug("unparseable DNS packet: %s", e)
-            REGISTRY.counter(
-                "dmp_dns_queries_total",
-                labels={"outcome": "malformed"},
-            )
-            return
-
-        try:
-            if query.opcode() == dns.opcode.UPDATE:
-                response = self._build_update_response(query)
-            else:
-                response = self._build_response(query)
-        except Exception:
-            log.exception("error building DNS response")
-            response = dns.message.make_response(query)
-            response.set_rcode(dns.rcode.SERVFAIL)
-
-        rcode_name = dns.rcode.to_text(response.rcode())
-        REGISTRY.counter(
-            "dmp_dns_queries_total",
-            "DMP DNS queries by outcome",
-            labels={"outcome": rcode_name.lower()},
-        )
-        sock.sendto(response.to_wire(), self.client_address)
+        response_bytes = _process_dns_query(self, data, client_ip, transport="udp")
+        if response_bytes is not None:
+            sock.sendto(response_bytes, self.client_address)
 
     @staticmethod
     def _stub_response(data: bytes, rcode_value: int) -> Optional[bytes]:
@@ -672,6 +607,262 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         return response
 
 
+def _recv_exact(sock, n: int) -> Optional[bytes]:
+    """Read exactly ``n`` bytes from a stream socket or return None on
+    EOF / short read. Caller is responsible for setting the socket
+    timeout."""
+    chunks: List[bytes] = []
+    remaining = n
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _process_dns_query(
+    handler, data: bytes, client_ip: str, *, transport: str = "udp"
+) -> Optional[bytes]:
+    """Shared core for the UDP and TCP handlers.
+
+    Validates rate limit, parses the wire (with TSIG verification when
+    a keyring is configured), routes to the appropriate response
+    builder, increments the metrics counter, and returns the
+    wire-format response bytes. Returns ``None`` when the request
+    should be silently dropped (rate-limited, malformed past the
+    point where we can build a stub response, etc.). Callers are
+    responsible for transport-specific framing — UDP sends the bytes
+    directly; TCP prefixes them with a 2-byte length.
+
+    ``transport`` distinguishes UDP from TCP. UDP responses that
+    exceed the requester's advertised payload size are truncated to
+    a header-only stub with the ``TC`` (truncation) flag set —
+    standard DNS signaling that tells RFC-compliant resolvers to
+    retry the query over TCP. Without this signal, recursors with
+    DNSSEC-validation or strict-RFC behavior (Google 8.8.8.8,
+    Level3) just see an oversized UDP datagram and return empty to
+    their caller, defeating the whole point of having a TCP
+    listener. TCP responses are never truncated — by spec, TCP
+    framing already supports up to 65535 bytes.
+
+    ``handler`` is whichever request handler is calling us. Both
+    handlers expose a compatible ``self.server`` (configured by
+    ``_ThreadingUDPServer`` / ``_ThreadingTCPServer``) and the same
+    ``_build_response`` / ``_build_update_response`` methods, so the
+    same function works for either transport.
+    """
+    server = handler.server
+    # Each transport carries its OWN TokenBucketLimiter (both
+    # initialized from the same RateLimit config by default). Per-IP
+    # state is therefore independent across UDP and TCP:
+    #
+    #   - UDP→TC=1→TCP retry: client spends 1 UDP token AND 1 TCP
+    #     token, both starting full. Even at burst=1 the retry
+    #     succeeds because it draws from the TCP bucket, not the
+    #     already-drained UDP bucket. Codex round-2 P2 fix.
+    #
+    #   - Direct TCP-only flood: drawn from the TCP bucket, which
+    #     enforces the same rate the operator configured. Codex
+    #     round-3 P1 fix — "skip the limiter for all TCP" let
+    #     attackers bypass the throttle by switching transports.
+    limiter = server.rate_limiter
+    if limiter is not None and not limiter.allow(client_ip):
+        REGISTRY.counter(
+            "dmp_dns_queries_total",
+            "DMP DNS queries by outcome",
+            labels={"outcome": "rate_limited"},
+        )
+        return None
+
+    # Pass the keyring into ``from_wire`` so any TSIG signature on
+    # the incoming message is verified at parse time. dnspython raises:
+    #   - dns.tsig.PeerError (bad signature / time / truncation)
+    #   - dns.message.UnknownTSIGKey (key name not in keyring)
+    #   - dns.message.BadTSIG (malformed TSIG record)
+    # All three map to NOTAUTH — the request was authenticated by
+    # someone we can't or won't trust.
+    #
+    # When a keystore is wired in, build a fresh keyring per packet
+    # so newly-minted keys authorize without restarting the server.
+    keystore = server.tsig_keystore
+    if keystore is not None:
+        keyring = keystore.build_keyring()
+    else:
+        keyring = server.tsig_keyring
+    try:
+        query = dns.message.from_wire(data, keyring=keyring)
+    except (
+        dns.tsig.PeerError,
+        dns.message.UnknownTSIGKey,
+        dns.message.BadTSIG,
+    ) as e:
+        log.debug("TSIG verification failed: %s", e)
+        REGISTRY.counter(
+            "dmp_dns_queries_total",
+            labels={"outcome": "tsig_failed"},
+        )
+        try:
+            return _DMPRequestHandler._stub_response(data, dns.rcode.NOTAUTH)
+        except Exception:
+            return None
+    except dns.exception.DNSException as e:
+        log.debug("unparseable DNS packet: %s", e)
+        REGISTRY.counter(
+            "dmp_dns_queries_total",
+            labels={"outcome": "malformed"},
+        )
+        return None
+
+    try:
+        if query.opcode() == dns.opcode.UPDATE:
+            response = handler._build_update_response(query)
+        else:
+            response = handler._build_response(query)
+    except Exception:
+        log.exception("error building DNS response")
+        response = dns.message.make_response(query)
+        response.set_rcode(dns.rcode.SERVFAIL)
+
+    rcode_name = dns.rcode.to_text(response.rcode())
+    REGISTRY.counter(
+        "dmp_dns_queries_total",
+        "DMP DNS queries by outcome",
+        labels={"outcome": rcode_name.lower()},
+    )
+    return _serialize_response(response, query, transport)
+
+
+def _serialize_response(
+    response: dns.message.Message, query: dns.message.Message, transport: str
+) -> bytes:
+    """Wire-serialize ``response`` with transport-aware truncation.
+
+    UDP: cap at the requester's advertised payload size (EDNS0 OPT
+    record's UDP buffer, or the RFC 1035 default of 512 bytes if no
+    OPT was present). If the full response wouldn't fit, replace it
+    with a header-only stub carrying ``TC=1`` so the requester knows
+    to retry over TCP.
+
+    TCP: no cap. DNS-over-TCP framing supports messages up to
+    65535 bytes per RFC 1035 §4.2.2.
+    """
+    if transport == "tcp":
+        # TCP wire format caps at 65535 bytes per RFC 1035 §4.2.2.
+        # If a single RRset somehow serializes past that (would
+        # take, e.g., ~250 verified peer wires under the operator's
+        # 256-values-per-name cap), fall back to SERVFAIL rather
+        # than dropping the connection. SERVFAIL surfaces the
+        # problem to the operator's logs / metrics; a silent close
+        # would just look like a network glitch to the requester.
+        try:
+            return response.to_wire()
+        except dns.exception.TooBig:
+            log.exception(
+                "TCP response for %s exceeds 65535 bytes; returning SERVFAIL. "
+                "Operator should reduce per-name RRset size.",
+                query.question[0].name if query.question else "?",
+            )
+            servfail = dns.message.make_response(query)
+            servfail.set_rcode(dns.rcode.SERVFAIL)
+            return servfail.to_wire()
+
+    # UDP. EDNS0 advertised buffer size, with sensible fallbacks.
+    udp_size = getattr(query, "payload", None)
+    if not isinstance(udp_size, int) or udp_size <= 0:
+        # No EDNS0 OPT record → RFC 1035 hard limit of 512.
+        udp_size = 512
+    try:
+        return response.to_wire(max_size=udp_size)
+    except dns.exception.TooBig:
+        truncated = dns.message.make_response(query)
+        truncated.flags |= dns.flags.TC
+        # Don't echo any answer / authority / additional — by spec
+        # the resolver should retry over TCP and ignore everything
+        # except the header.
+        return truncated.to_wire()
+
+
+class _DMPTCPRequestHandler(socketserver.BaseRequestHandler):
+    """Handles one DNS-over-TCP query per connection.
+
+    DNS over TCP (RFC 1035 §4.2.2 + RFC 7766) frames every message
+    with a 2-byte big-endian length prefix. We support the simplest
+    one-query-per-connection path: read the length prefix, read the
+    message body, route through ``_process_dns_query``, write back
+    the length-prefixed response, close.
+
+    RFC 7766 also allows pipelining multiple queries on a single
+    connection; we don't implement that — recursive resolvers fall
+    back to TCP only when UDP truncates, and in that fallback path
+    they typically issue one query per connection. Pipelining is a
+    pure-throughput optimization for the high-traffic case and not
+    on the critical path for correctness.
+    """
+
+    server: "_ThreadingTCPServer"  # set by socketserver
+
+    # Reuse the same response-building logic the UDP handler has.
+    # The build methods only read from ``self.server.*``, which both
+    # ``_ThreadingUDPServer`` and ``_ThreadingTCPServer`` expose with
+    # the same attribute names. Aliasing at class level binds them
+    # like normal methods when called on an instance.
+    _build_response = _DMPRequestHandler._build_response
+    _build_update_response = _DMPRequestHandler._build_update_response
+
+    # Bound the per-connection read so a slow / hostile client can't
+    # tie up a worker thread waiting for bytes that never come.
+    _CONNECTION_READ_TIMEOUT_S = 5.0
+    # Cap the message length we'll accept. RFC 1035 says DNS messages
+    # are at most 65535 bytes anyway; this is just defense in depth.
+    _MAX_MESSAGE_BYTES = 65535
+
+    def handle(self) -> None:
+        try:
+            self.request.settimeout(self._CONNECTION_READ_TIMEOUT_S)
+        except Exception:
+            pass
+        client_ip = self.client_address[0]
+
+        try:
+            length_prefix = _recv_exact(self.request, 2)
+        except (TimeoutError, ConnectionError, OSError):
+            return
+        if length_prefix is None or len(length_prefix) < 2:
+            return
+        length = int.from_bytes(length_prefix, "big")
+        if length == 0 or length > self._MAX_MESSAGE_BYTES:
+            return
+
+        try:
+            data = _recv_exact(self.request, length)
+        except (TimeoutError, ConnectionError, OSError):
+            return
+        if data is None or len(data) != length:
+            return
+
+        # ONLY now — after we have the full message body in hand —
+        # acquire the global concurrency permit. Idle / slow-loris
+        # connections that never sent a complete message cost a
+        # blocked recv thread but no permit, so they can't starve
+        # the UDP listener (codex round-4 P1).
+        if not self.server._semaphore.acquire(blocking=False):
+            return
+        try:
+            response_bytes = _process_dns_query(self, data, client_ip, transport="tcp")
+            if response_bytes is None:
+                return
+            try:
+                self.request.sendall(
+                    len(response_bytes).to_bytes(2, "big") + response_bytes
+                )
+            except (ConnectionError, OSError):
+                return
+        finally:
+            self.server._semaphore.release()
+
+
 class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     """Per-packet threaded UDP server with a bounded worker semaphore.
 
@@ -707,6 +898,7 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         update_max_ttl=DEFAULT_UPDATE_MAX_TTL,
         update_max_value_bytes=DEFAULT_UPDATE_MAX_VALUE_BYTES,
         update_max_values_per_name=DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
+        semaphore=None,
     ):
         super().__init__(server_address, handler_cls)
         self.reader = reader
@@ -725,7 +917,13 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
-        self._semaphore = threading.Semaphore(max_concurrency)
+        # ``semaphore`` lets the caller (DMPDnsServer) hand in a
+        # shared bounded-worker budget so UDP + TCP listeners enforce
+        # ONE global cap of ``max_concurrency`` handler threads
+        # rather than one cap per transport (codex round-2 P2 — a
+        # node configured for max=128 was effectively running ~256
+        # threads under mixed UDP+TCP load).
+        self._semaphore = semaphore or threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
         if not self._semaphore.acquire(blocking=False):
@@ -745,11 +943,151 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
             self._semaphore.release()
 
 
-class DMPDnsServer:
-    """UDP DNS server that serves TXT records from a DNSRecordReader.
+class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """Per-connection threaded TCP server.
 
-    Use as a context manager or manage start/stop directly. The server runs
-    on a background thread so it doesn't block the caller.
+    DNS over TCP exists primarily as the fallback path when a UDP
+    response would exceed the negotiated buffer (TC=1 → retry over
+    TCP). Recursive resolvers expect this to work; without it,
+    large RRsets like ``_dnsmesh-seen.<zone>`` can't propagate
+    through any RFC-strict resolver.
+
+    Mirror of ``_ThreadingUDPServer`` so callers can reuse the same
+    state attributes (``reader``, ``rate_limiter``, ``tsig_*``,
+    ``allowed_zones``, ``writer``, claim/update caps). The handler
+    classes read these attributes off ``self.server.*``, transport-
+    agnostic.
+
+    Concurrency budgeting: connection accept itself does NOT take a
+    semaphore permit, otherwise an attacker could open
+    ``max_concurrency`` idle TCP connections and starve the UDP
+    listener for the read-timeout window (codex round-3 P1). The
+    handler acquires the permit AFTER reading the message body and
+    releases it after sending the response — so the budget caps
+    "in-flight handler work" rather than "open sockets". Idle /
+    slow-loris connections occupy a thread blocked in ``recv()``
+    but not a permit, and the per-connection 5-second read timeout
+    bounds how long that costs.
+    """
+
+    allow_reuse_address = True
+    daemon_threads = True
+    # Override Python's stdlib default of 5 — too small for the
+    # "many recursive resolvers retrying the same truncated UDP
+    # answer over TCP within milliseconds" burst that this listener
+    # exists to handle. SOMAXCONN-aligned 128 gives the kernel
+    # plenty of room to queue completed handshakes while
+    # ``process_request`` runs (codex round-6 P2).
+    request_queue_size = 128
+
+    def __init__(
+        self,
+        server_address,
+        handler_cls,
+        reader,
+        ttl,
+        rate_limiter,
+        max_concurrency,
+        *,
+        writer=None,
+        tsig_keyring=None,
+        tsig_keystore=None,
+        allowed_zones=None,
+        update_authorizer=None,
+        claim_publish_enabled=False,
+        receiver_claim_publish_enabled=False,
+        claim_max_ttl=DEFAULT_CLAIM_MAX_TTL,
+        claim_rate_limiter=None,
+        update_max_ttl=DEFAULT_UPDATE_MAX_TTL,
+        update_max_value_bytes=DEFAULT_UPDATE_MAX_VALUE_BYTES,
+        update_max_values_per_name=DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
+        semaphore=None,
+    ):
+        super().__init__(server_address, handler_cls)
+        self.reader = reader
+        self.ttl = ttl
+        self.rate_limiter = rate_limiter
+        self.max_concurrency = max_concurrency
+        self.writer = writer
+        self.tsig_keyring = tsig_keyring
+        self.tsig_keystore = tsig_keystore
+        self.allowed_zones = allowed_zones or ()
+        self.update_authorizer = update_authorizer
+        self.claim_publish_enabled = bool(claim_publish_enabled)
+        self.receiver_claim_publish_enabled = bool(receiver_claim_publish_enabled)
+        self.claim_max_ttl = int(claim_max_ttl)
+        self.claim_rate_limiter = claim_rate_limiter
+        self.update_max_ttl = int(update_max_ttl)
+        self.update_max_value_bytes = int(update_max_value_bytes)
+        self.update_max_values_per_name = int(update_max_values_per_name)
+        # ``_semaphore`` (work permit, shared with UDP) caps in-flight
+        # handler work — query parsing, response building, sendall.
+        # Acquired lazily inside the handler AFTER the message body
+        # is in hand, so slow-loris connections that never finish
+        # their read don't burn permits and starve the UDP listener
+        # (codex round-4 P1).
+        #
+        # ``_accept_semaphore`` (accept slot, TCP-only) caps the
+        # number of OPEN TCP connections in any state, including
+        # threads still blocked in ``recv()`` waiting for the
+        # length prefix. Without this, slow-loris attackers could
+        # open unbounded connections and burn the host's thread /
+        # memory budget even though they hold zero work permits
+        # (codex round-5 P1). Sized at 8× max_concurrency, with a
+        # 256 floor — generous enough to absorb a normal "many
+        # legitimate clients retrying over TCP after UDP truncate"
+        # spike, finite enough that an attacker can't run the host
+        # out of RAM.
+        self._semaphore = semaphore or threading.Semaphore(max_concurrency)
+        accept_cap = max(max_concurrency * 8, 256)
+        self._accept_semaphore = threading.Semaphore(accept_cap)
+
+    def process_request(self, request, client_address):
+        # Hard cap on concurrently-OPEN TCP connections, regardless
+        # of whether they're doing real work yet. If we're at the
+        # cap, drop the connection on the floor — the kernel sends
+        # RST, the client retries (or, if it's an attacker,
+        # eventually gives up).
+        if not self._accept_semaphore.acquire(blocking=False):
+            try:
+                request.close()
+            except Exception:
+                pass
+            return
+        t = threading.Thread(
+            target=self._handle_with_accept_release,
+            args=(request, client_address),
+            name="dmp-dns-tcp-handler",
+            daemon=self.daemon_threads,
+        )
+        t.start()
+
+    def _handle_with_accept_release(self, request, client_address):
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            self._accept_semaphore.release()
+
+    def _handle_with_release(self, request, client_address):
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            self._semaphore.release()
+
+
+class DMPDnsServer:
+    """DNS server that serves TXT records from a DNSRecordReader.
+
+    Listens on UDP and (by default) TCP at the same port. UDP is the
+    primary path for almost all queries; TCP handles the fallback
+    when UDP responses are truncated (RFC 1035 §4.2.2 + RFC 7766) —
+    notably, large RRsets like ``_dnsmesh-seen.<zone>`` that exceed
+    the negotiated UDP buffer. Set ``tcp_enabled=False`` to skip the
+    TCP listener (e.g. tests that don't exercise the TCP path).
+
+    Use as a context manager or manage start/stop directly. The
+    server runs on background threads so it doesn't block the
+    caller.
     """
 
     def __init__(
@@ -773,6 +1111,7 @@ class DMPDnsServer:
         update_max_ttl: int = DEFAULT_UPDATE_MAX_TTL,
         update_max_value_bytes: int = DEFAULT_UPDATE_MAX_VALUE_BYTES,
         update_max_values_per_name: int = DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
+        tcp_enabled: bool = True,
     ):
         """``writer``, a TSIG source, and ``allowed_zones`` together
         switch on RFC 2136 UPDATE handling. With any of them missing
@@ -794,6 +1133,17 @@ class DMPDnsServer:
         self.port = port
         self.ttl = ttl
         self.rate_limiter = (
+            TokenBucketLimiter(rate_limit)
+            if rate_limit and rate_limit.enabled
+            else None
+        )
+        # SEPARATE per-transport rate limiter for TCP. Same RateLimit
+        # config, independent per-IP token state. UDP→TC=1→TCP retry
+        # therefore draws from the (still-full) TCP bucket on the
+        # retry leg even when the UDP bucket is drained — the codex
+        # round-2 P2 case. Direct TCP-only floods still get throttled
+        # by this bucket — the codex round-3 P1 case.
+        self.tcp_rate_limiter = (
             TokenBucketLimiter(rate_limit)
             if rate_limit and rate_limit.enabled
             else None
@@ -829,8 +1179,11 @@ class DMPDnsServer:
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
+        self.tcp_enabled = bool(tcp_enabled)
         self._server: Optional[_ThreadingUDPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self._tcp_server: Optional[_ThreadingTCPServer] = None
+        self._tcp_thread: Optional[threading.Thread] = None
 
     @property
     def server_address(self) -> tuple[str, int]:
@@ -838,9 +1191,33 @@ class DMPDnsServer:
             return (self.host, self.port)
         return self._server.server_address  # type: ignore[return-value]
 
+    def _server_kwargs(self) -> dict:
+        """Common ``__init__`` kwargs shared by the UDP + TCP server
+        constructors. Both reuse the same state attributes that the
+        request handlers read off ``self.server.*``."""
+        return {
+            "writer": self.writer,
+            "tsig_keyring": self.tsig_keyring,
+            "tsig_keystore": self.tsig_keystore,
+            "allowed_zones": self.allowed_zones,
+            "update_authorizer": self.update_authorizer,
+            "claim_publish_enabled": self.claim_publish_enabled,
+            "receiver_claim_publish_enabled": self.receiver_claim_publish_enabled,
+            "claim_max_ttl": self.claim_max_ttl,
+            "claim_rate_limiter": self.claim_rate_limiter,
+            "update_max_ttl": self.update_max_ttl,
+            "update_max_value_bytes": self.update_max_value_bytes,
+            "update_max_values_per_name": self.update_max_values_per_name,
+        }
+
     def start(self) -> None:
         if self._server is not None:
             return
+        # ONE shared concurrency semaphore across UDP + TCP listeners
+        # so ``max_concurrency`` is the global handler-thread cap, not
+        # a per-transport cap. Without this, configuring max=128 would
+        # silently allow ~256 threads under mixed UDP/TCP load.
+        shared_semaphore = threading.Semaphore(self.max_concurrency)
         self._server = _ThreadingUDPServer(
             (self.host, self.port),
             _DMPRequestHandler,
@@ -848,18 +1225,8 @@ class DMPDnsServer:
             self.ttl,
             self.rate_limiter,
             self.max_concurrency,
-            writer=self.writer,
-            tsig_keyring=self.tsig_keyring,
-            tsig_keystore=self.tsig_keystore,
-            allowed_zones=self.allowed_zones,
-            update_authorizer=self.update_authorizer,
-            claim_publish_enabled=self.claim_publish_enabled,
-            receiver_claim_publish_enabled=self.receiver_claim_publish_enabled,
-            claim_max_ttl=self.claim_max_ttl,
-            claim_rate_limiter=self.claim_rate_limiter,
-            update_max_ttl=self.update_max_ttl,
-            update_max_value_bytes=self.update_max_value_bytes,
-            update_max_values_per_name=self.update_max_values_per_name,
+            **self._server_kwargs(),
+            semaphore=shared_semaphore,
         )
         # If the caller asked for port 0, pick up the actual bound port.
         self.port = self._server.server_address[1]
@@ -869,7 +1236,56 @@ class DMPDnsServer:
             daemon=True,
         )
         self._thread.start()
-        log.info("DMP DNS server listening on %s:%d/udp", self.host, self.port)
+
+        if self.tcp_enabled:
+            # TCP listens on the same host:port. The OS allows UDP +
+            # TCP to coexist on the same port — they're separate
+            # protocol families. We bind to the resolved port so that
+            # if the caller passed port=0 we use whatever UDP picked
+            # (otherwise we'd get two random ports).
+            #
+            # The TCP server gets its OWN rate limiter (separate
+            # per-IP buckets from the UDP server's). See the
+            # tcp_rate_limiter field for the rationale.
+            try:
+                self._tcp_server = _ThreadingTCPServer(
+                    (self.host, self.port),
+                    _DMPTCPRequestHandler,
+                    self.reader,
+                    self.ttl,
+                    self.tcp_rate_limiter,
+                    self.max_concurrency,
+                    **self._server_kwargs(),
+                    semaphore=shared_semaphore,
+                )
+            except OSError as exc:
+                # TCP bind failure is non-fatal — UDP keeps running.
+                # Operators with TCP 53 explicitly blocked at a lower
+                # layer (kernel, container, firewall doing in-kernel
+                # filtering) shouldn't have the whole node fail to
+                # start. Log and continue.
+                log.warning(
+                    "DMP DNS TCP listener failed to bind on %s:%d (%s); "
+                    "continuing with UDP only. Recursive resolvers that "
+                    "fall back to TCP for large RRsets will get empty "
+                    "answers.",
+                    self.host,
+                    self.port,
+                    exc,
+                )
+                self._tcp_server = None
+            else:
+                self._tcp_thread = threading.Thread(
+                    target=self._tcp_server.serve_forever,
+                    name="dmp-dns-tcp-server",
+                    daemon=True,
+                )
+                self._tcp_thread.start()
+
+        listening = "udp+tcp" if self._tcp_server is not None else "udp"
+        log.info(
+            "DMP DNS server listening on %s:%d/%s", self.host, self.port, listening
+        )
 
     def stop(self) -> None:
         if self._server is None:
@@ -880,6 +1296,13 @@ class DMPDnsServer:
             self._thread.join(timeout=5)
         self._server = None
         self._thread = None
+        if self._tcp_server is not None:
+            self._tcp_server.shutdown()
+            self._tcp_server.server_close()
+            if self._tcp_thread is not None:
+                self._tcp_thread.join(timeout=5)
+            self._tcp_server = None
+            self._tcp_thread = None
 
     def __enter__(self) -> "DMPDnsServer":
         self.start()
