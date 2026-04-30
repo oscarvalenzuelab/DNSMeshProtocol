@@ -55,7 +55,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dmp.core.heartbeat import HeartbeatRecord  # noqa: E402
 from dmp.network.resolver_pool import ResolverPool  # noqa: E402
-from dmp.server.heartbeat_worker import seen_rrset_name  # noqa: E402
+from dmp.server.heartbeat_worker import (  # noqa: E402
+    heartbeat_rrset_name,
+    seen_rrset_name,
+)
 
 log = logging.getLogger("dmp-directory-aggregator")
 
@@ -95,28 +98,41 @@ def _normalize_seed_to_zone(seed: str) -> Optional[str]:
     return s.rstrip("/").lower()
 
 
-def _fetch_seen_wires(reader: ResolverPool, zone: str) -> Iterable[str]:
-    """Query ``_dnsmesh-seen.<zone>`` TXT and yield each value verbatim.
+def _fetch_zone_wires(reader: ResolverPool, zone: str) -> Iterable[str]:
+    """Yield every HeartbeatRecord wire reachable from ``zone`` —
+    BOTH the seed's own self-row at ``_dnsmesh-heartbeat.<zone>``
+    AND the seed's republished seen-graph at
+    ``_dnsmesh-seen.<zone>``.
 
-    Each TXT value is a base64-or-similar HeartbeatRecord wire; the
-    caller verifies every wire before trusting the contents.
+    Why both: the seen-graph republishes only OTHER peers the seed
+    has heard from. A healthy single-node seed (or a seed during a
+    partition where it hears nobody) leaves the seen RRset empty,
+    so reading only that path silently drops the seed itself from
+    the directory. The heartbeat RRset is where the seed publishes
+    its own self-signed wire on every tick. Reading both is what
+    the old HTTP ``/v1/nodes/seen`` endpoint did before M9 removed
+    it.
     """
-    try:
-        name = seen_rrset_name(zone)
-    except ValueError:
-        log.info("invalid seed zone: %r", zone)
-        return
-    try:
-        values = reader.query_txt_record(name)
-    except Exception as exc:
-        log.info("DNS query for %s failed: %s", name, exc)
-        return
-    if not values:
-        log.info("no _dnsmesh-seen records at %s", name)
-        return
-    for v in values:
-        if isinstance(v, str):
-            yield v
+    for name_fn, label in (
+        (heartbeat_rrset_name, "_dnsmesh-heartbeat"),
+        (seen_rrset_name, "_dnsmesh-seen"),
+    ):
+        try:
+            name = name_fn(zone)
+        except ValueError:
+            log.info("invalid seed zone: %r", zone)
+            continue
+        try:
+            values = reader.query_txt_record(name)
+        except Exception as exc:
+            log.info("DNS query for %s failed: %s", name, exc)
+            continue
+        if not values:
+            log.info("no %s records at %s", label, name)
+            continue
+        for v in values:
+            if isinstance(v, str):
+                yield v
 
 
 def aggregate(seeds: List[str], *, now: Optional[int] = None) -> List[AggregatedNode]:
@@ -137,7 +153,7 @@ def aggregate(seeds: List[str], *, now: Optional[int] = None) -> List[Aggregated
         zone = _normalize_seed_to_zone(seed)
         if zone is None:
             continue
-        for wire in _fetch_seen_wires(reader, zone):
+        for wire in _fetch_zone_wires(reader, zone):
             record = HeartbeatRecord.parse_and_verify(wire, now=now_i)
             if record is None:
                 continue
