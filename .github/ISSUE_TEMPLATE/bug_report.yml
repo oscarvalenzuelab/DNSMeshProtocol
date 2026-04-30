@@ -1,0 +1,67 @@
+name: Bug report
+description: Report something that isn't working as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing. Before you report, please check whether
+        the issue still reproduces against `main` — this project
+        moves fast and a fix may already be in flight.
+
+        **Security issues should NOT go here.** Send them to
+        `oscar.valenzuela.b@gmail.com` per
+        [SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `dnsmesh --version` (or commit SHA if running from source).
+      placeholder: "0.6.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface?
+      options:
+        - CLI (dnsmesh)
+        - Node (dnsmesh-node Docker / native install)
+        - Python library (`import dmp`)
+        - Cluster / federation
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, config snippets, or code that triggers the bug. Minimal is better than complete.
+      placeholder: |
+        1. `dnsmesh init alice@example.com`
+        2. `dnsmesh send bob@... "hi"`
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+      description: Paste error messages, stack traces, or log output verbatim. Strip or redact anything sensitive (TSIG secrets, passphrases, IPs you don't want public).
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS + Python version. For node bugs, also include relevant `DMP_*` env vars (with secrets redacted).
+      placeholder: |
+        macOS 14.5, Python 3.12.4
+        DMP_DOMAIN=dmp.example.com, DMP_DNS_UPDATE_ENABLED=1

@@ -1,0 +1,47 @@
+name: Feature request
+description: Propose a new capability or an improvement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything bigger than a small ergonomics tweak, please
+        describe the **problem** first. "I want a flag that does X"
+        is harder to evaluate than "When I do Y, the protocol forces
+        me into Z; here's why that hurts."
+
+        Large protocol changes should reference the relevant section
+        of [the spec](https://oscarvalenzuelab.github.io/DNSMeshProtocol/protocol)
+        and the [threat model](https://oscarvalenzuelab.github.io/DNSMeshProtocol/protocol/threat-model)
+        if applicable.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what's blocking you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Concrete shape of the change. Wire format / CLI flag / config field / new module — whatever applies.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried. Approaches you ruled out and why.
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - Protocol-breaking (wire format change)
+        - Protocol-additive (new record type, no break)
+        - CLI / library ergonomics
+        - Operator surface (env vars, deploy)
+        - Docs only
+    validations:
+      required: true

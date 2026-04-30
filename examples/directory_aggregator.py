@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Simple directory aggregator for M5.8 heartbeats.
+"""Simple directory aggregator for M5.8 heartbeats (DNS-native, post-M9).
 
-Reads a list of seed node URLs, queries each ``/v1/nodes/seen``,
-verifies every returned HeartbeatRecord, unions them by
-(operator_spk, endpoint), and emits:
+Reads a list of seed zone names, queries ``_dnsmesh-seen.<zone>``
+for each over the public recursive DNS chain, verifies every
+returned HeartbeatRecord, unions them by (operator_spk, endpoint),
+and emits:
 
   - A signed JSON feed at ``$OUT_DIR/feed.json``.
   - A static HTML index at ``$OUT_DIR/index.html`` grouping nodes by
@@ -14,6 +15,12 @@ wires produces byte-identical outputs. Anyone can run one off the
 same signed P2P data, so the operator-hosted central directory is
 one consumer, not a trust anchor.
 
+This used to fetch ``GET /v1/nodes/seen`` over HTTPS; M9 (0.5.0)
+removed that route and moved the seen-graph onto the DNS side at
+``_dnsmesh-seen.<zone>`` (multi-value TXT, each value a signed
+HeartbeatRecord wire). This script is the matching DNS-native
+consumer.
+
 Typical deployment: cron or systemd timer calls this every N
 minutes, writes the output to a directory served by your static
 hosting of choice (GitHub Pages, S3, nginx).
@@ -21,11 +28,14 @@ hosting of choice (GitHub Pages, S3, nginx).
 Usage:
 
   python examples/directory_aggregator.py \\
-      --seed https://dmp.example.com \\
-      --seed https://other.example.org \\
+      --seed dmp.example.com \\
+      --seed other.example.org \\
       --out-dir ./public
 
-Run ``--help`` for the full argument list.
+Run ``--help`` for the full argument list. Seeds may also be given
+in legacy ``https://...`` form for back-compat with older
+``directory/seeds.txt`` files; the host part is extracted as the
+zone.
 """
 
 from __future__ import annotations
@@ -38,13 +48,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-
-import requests
+from urllib.parse import urlparse
 
 # Allow running from a checkout without installing.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dmp.core.heartbeat import HeartbeatRecord  # noqa: E402
+from dmp.network.resolver_pool import ResolverPool  # noqa: E402
+from dmp.server.heartbeat_worker import seen_rrset_name  # noqa: E402
 
 log = logging.getLogger("dmp-directory-aggregator")
 
@@ -70,54 +81,63 @@ class AggregatedNode:
 # ---------------------------------------------------------------------------
 
 
-def _fetch(seed: str, timeout: float = 10.0) -> Optional[dict]:
-    """GET <seed>/v1/nodes/seen. Returns decoded JSON or None."""
-    url = seed.rstrip("/") + "/v1/nodes/seen"
-    try:
-        r = requests.get(url, timeout=timeout)
-    except requests.RequestException as exc:
-        log.info("fetch failed for %s: %s", url, exc)
+def _normalize_seed_to_zone(seed: str) -> Optional[str]:
+    """Accept either a zone (``dmp.example.com``) or the legacy URL
+    form (``https://dmp.example.com``) and return the canonical zone
+    name. Returns None if the input doesn't look like either."""
+    s = seed.strip()
+    if not s:
         return None
-    if r.status_code != 200:
-        log.info("non-200 from %s: %d", url, r.status_code)
-        return None
+    if "://" in s:
+        host = urlparse(s).hostname
+        return host.lower() if host else None
+    # Strip a trailing slash if someone wrote `dmp.example.com/`.
+    return s.rstrip("/").lower()
+
+
+def _fetch_seen_wires(reader: ResolverPool, zone: str) -> Iterable[str]:
+    """Query ``_dnsmesh-seen.<zone>`` TXT and yield each value verbatim.
+
+    Each TXT value is a base64-or-similar HeartbeatRecord wire; the
+    caller verifies every wire before trusting the contents.
+    """
     try:
-        body = r.json()
+        name = seen_rrset_name(zone)
     except ValueError:
-        log.info("non-JSON from %s", url)
-        return None
-    if not isinstance(body, dict):
-        return None
-    return body
-
-
-def _extract_wires(body: dict) -> Iterable[str]:
-    """Yield every candidate wire string from a /v1/nodes/seen body."""
-    seen = body.get("seen")
-    if not isinstance(seen, list):
+        log.info("invalid seed zone: %r", zone)
         return
-    for entry in seen:
-        if isinstance(entry, dict):
-            w = entry.get("wire")
-            if isinstance(w, str):
-                yield w
-        elif isinstance(entry, str):
-            # Tolerant of a flat string list just in case.
-            yield entry
+    try:
+        values = reader.query_txt_record(name)
+    except Exception as exc:
+        log.info("DNS query for %s failed: %s", name, exc)
+        return
+    if not values:
+        log.info("no _dnsmesh-seen records at %s", name)
+        return
+    for v in values:
+        if isinstance(v, str):
+            yield v
 
 
 def aggregate(seeds: List[str], *, now: Optional[int] = None) -> List[AggregatedNode]:
-    """Query seeds, verify, union. Returns the deduped node list."""
+    """Query seed zones via DNS, verify, union. Returns the deduped
+    node list."""
     now_i = int(now) if now is not None else int(time.time())
     # Map (operator_spk_hex, endpoint) -> AggregatedNode (keep the
     # newest-ts wire on dedupe).
     pool: Dict[Tuple[str, str], AggregatedNode] = {}
 
+    # Public-resolver pool — Cloudflare + Google + Quad9. The
+    # aggregator queries _dnsmesh-seen.<seed-zone> over the public
+    # recursive chain; using a multi-upstream pool means a flaky
+    # resolver doesn't take down a refresh cycle.
+    reader = ResolverPool(["1.1.1.1", "8.8.8.8", "9.9.9.9"])
+
     for seed in seeds:
-        body = _fetch(seed)
-        if body is None:
+        zone = _normalize_seed_to_zone(seed)
+        if zone is None:
             continue
-        for wire in _extract_wires(body):
+        for wire in _fetch_seen_wires(reader, zone):
             record = HeartbeatRecord.parse_and_verify(wire, now=now_i)
             if record is None:
                 continue
@@ -132,7 +152,7 @@ def aggregate(seeds: List[str], *, now: Optional[int] = None) -> List[Aggregated
                     ts=record.ts,
                     exp=record.exp,
                     wire=wire,
-                    last_seen_via=[seed],
+                    last_seen_via=[zone],
                 )
             else:
                 # If this source reports a NEWER ts for the same
@@ -140,8 +160,8 @@ def aggregate(seeds: List[str], *, now: Optional[int] = None) -> List[Aggregated
                 # source seed so the HTML can show "heard via N
                 # sources".
                 sources = list(existing.last_seen_via)
-                if seed not in sources:
-                    sources.append(seed)
+                if zone not in sources:
+                    sources.append(zone)
                 if record.ts > existing.ts:
                     pool[key] = AggregatedNode(
                         operator_spk_hex=spk_hex,
@@ -269,13 +289,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--seed",
         action="append",
         default=[],
-        help="seed node HTTPS URL (repeatable). Each seed's "
-        "/v1/nodes/seen is fetched; results are unioned and verified.",
+        help="seed node DNS zone, e.g. ``dmp.example.com`` (repeatable). "
+        "Each seed's ``_dnsmesh-seen.<zone>`` TXT RRset is queried; "
+        "results are unioned and verified. Legacy ``https://...`` form "
+        "also accepted for back-compat — the host is extracted.",
     )
     p.add_argument(
         "--seeds-file",
         type=Path,
-        help="text file with one seed URL per line. Lines starting with "
+        help="text file with one seed zone per line. Lines starting with "
         "'#' and blank lines are ignored. Stacks with --seed.",
     )
     p.add_argument(

@@ -1,24 +1,27 @@
 # Public seed list for the canonical DMP directory aggregator.
 #
-# One node HTTP base URL per line. Lines starting with '#' and blank
-# lines are ignored. Each URL must respond to GET /v1/nodes/seen with
-# a verified heartbeat feed.
+# One DNS zone per line. Lines starting with '#' and blank lines are
+# ignored. The aggregator queries _dnsmesh-seen.<zone> TXT for each
+# seed via the public recursive DNS chain (M9 — no HTTP), unions the
+# verified HeartbeatRecord wires, and renders feed.json + index.html.
+# Legacy https://... entries are still parsed (the host part is
+# extracted as the zone) so existing forks don't break on upgrade.
 #
 # To add your node:
 #   1. Stand it up with the heartbeat layer enabled. See
 #      https://ovalenzuela.com/DNSMeshProtocol/deployment/heartbeat
-#   2. Open a PR adding your node's HTTPS URL below.
+#   2. Open a PR adding your node's zone below.
 #   3. The next scheduled run of the directory workflow rebuilds
 #      https://ovalenzuela.com/DNSMeshProtocol/directory/ with your
-#      node included. From there, anti-entropy gossip across nodes
-#      (each node /v1/nodes/seen lists the peers IT has heard) lets
-#      the aggregator find every node reachable from a seed without
-#      having to enumerate them all here.
+#      node included. From there, transitive discovery across the
+#      seen-graph (each node's _dnsmesh-seen.<zone> lists the peers
+#      it has heard) lets the aggregator find every node reachable
+#      from a seed without having to enumerate them all here.
 #
 # This file is intentionally federated, not authoritative: anyone can
 # run their own aggregator off any subset of seeds. The version under
 # this repo just gives the project a public "first directory" so a
 # fresh operator has somewhere to look immediately.
 
-https://dnsmesh.io
-https://dnsmesh.pro
+dnsmesh.io
+dnsmesh.pro
