@@ -33,6 +33,13 @@ If DNS works on your network, DMP works on your network.
 ```bash
 pipx install dnsmesh
 
+# Set a passphrase. This is the ONLY thing protecting your identity
+# keys — back it up like you'd back up an SSH key. The CLI reads it
+# from $DMP_PASSPHRASE first, then a file at the path you set in
+# config (~/.dmp/passphrase, mode 0400), then an interactive prompt.
+read -rs DMP_PASSPHRASE                      # silent — not in shell history
+export DMP_PASSPHRASE
+
 dnsmesh init alice --domain dmp.dnsmesh.io --endpoint https://dnsmesh.io
 dnsmesh tsig register --node dnsmesh.io     # one HTTPS hop, mints a TSIG key
 dnsmesh identity publish                     # DNS UPDATE + TSIG, no more HTTPS
@@ -45,6 +52,12 @@ dnsmesh identity fetch bob@dmp.dnsmesh.io --add
 dnsmesh send bob@dmp.dnsmesh.io "hi bob"
 dnsmesh recv
 ```
+
+The passphrase derives your Ed25519 + X25519 keypair via Argon2id.
+Lose it and you lose the identity — there is no recovery. Persist
+it in a password manager or a 0400-permission file. See
+[Getting Started → "Set a passphrase"](https://oscarvalenzuelab.github.io/DNSMeshProtocol/getting-started#2-set-a-passphrase)
+for the file-based and persistent setups.
 
 Curious what a node currently publishes:
 
