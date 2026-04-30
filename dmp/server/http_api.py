@@ -333,9 +333,7 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         merged: dict = {}
         for r in rows:
             try:
-                rec = HeartbeatRecord.parse_and_verify(
-                    r.wire, ts_skew_seconds=10**9
-                )
+                rec = HeartbeatRecord.parse_and_verify(r.wire, ts_skew_seconds=10**9)
             except Exception:
                 continue
             if rec is None:
