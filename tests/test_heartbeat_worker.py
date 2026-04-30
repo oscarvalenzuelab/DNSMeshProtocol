@@ -1013,6 +1013,281 @@ class TestSeenGraphPublish:
         }
 
 
+class TestSeenGraphSelfFilterAndOrphanSweep:
+    """Self never belongs in a node's own ``_dnsmesh-seen.<zone>``
+    RRset. Seen is "OTHER nodes I have heard from" — listing self
+    creates a discovery-graph self-loop and inflates the RRset toward
+    the recursive-resolver UDP buffer cap.
+
+    Two layers of protection:
+      1. Drop self-wires at ingest in ``_fetch_and_ingest`` so they
+         never land in the local SeenStore.
+      2. Filter self when building ``next_wires`` in
+         ``_publish_seen_graph`` — defense-in-depth if a future
+         bootstrap path leaks self into the store via some other
+         route.
+
+    Plus a one-shot orphan sweep on first tick to clean up
+    accumulated wires from prior process lifetimes (mirrors the
+    round-22 sweep added for the heartbeat RRset).
+    """
+
+    def test_self_wire_in_store_not_republished_in_seen(
+        self, store, transport, now
+    ) -> None:
+        """If self somehow lands in the local SeenStore, the publish
+        path must filter it out — a node never lists itself in its
+        own seen RRset."""
+        own = _signer("operator-A", salt=b"A" * 32)
+        # Inject self directly into the store, simulating a stale
+        # bootstrap path that put it there (e.g. older builds that
+        # didn't filter at ingest).
+        own_hb = HeartbeatRecord(
+            endpoint="https://self.example.com",
+            operator_spk=own.get_signing_public_key_bytes(),
+            version="0.5.0",
+            ts=now - 10,
+            exp=now + 86400,
+        )
+        store.accept(own_hb.sign(own), now=now)
+        # Plus a real peer so the test exercises the "publish only
+        # the non-self entry" path, not the empty-set branch.
+        _publish_peer_heartbeat(
+            transport,
+            _signer("peer-a", salt=b"P" * 32),
+            "peer-a.example",
+            endpoint="https://peer-a.example.com",
+            ts=now,
+        )
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.6.2",
+            dns_zone="self.example",
+            seed_zones=("peer-a.example",),
+        )
+        worker = HeartbeatWorker(
+            cfg, own, store, record_writer=transport, dns_reader=transport
+        )
+        worker.tick_once(now=now)
+
+        published = transport.query_txt_record(seen_rrset_name("self.example")) or []
+        own_spk_hex = own.get_signing_public_key_bytes().hex()
+        for wire in published:
+            rec = HeartbeatRecord.parse_and_verify(wire, now=now)
+            assert rec is not None
+            assert (
+                bytes(rec.operator_spk).hex() != own_spk_hex
+            ), "self-wire leaked into our own _dnsmesh-seen RRset"
+        # And the legitimate peer IS there.
+        assert len(published) == 1
+
+    def test_peer_gossiping_us_back_does_not_seed_self(
+        self, store, transport, now
+    ) -> None:
+        """Root-cause check: when a peer's ``_dnsmesh-seen.<peer-zone>``
+        RRset includes our own wire (a peer that has heard from us
+        and republishes), ``_fetch_and_ingest`` must drop it before
+        ``SeenStore.accept`` so self never enters the local store.
+        Otherwise step 2 (publish filter) is the only thing keeping
+        self out of DNS, and any future bug there leaks immediately.
+        """
+        own = _signer("operator-A", salt=b"A" * 32)
+        peer = _signer("peer-B", salt=b"B" * 32)
+
+        # Peer's heartbeat zone — normal, peer's own wire.
+        _publish_peer_heartbeat(
+            transport,
+            peer,
+            "peer.example",
+            endpoint="https://peer.example.com",
+            ts=now,
+        )
+        # Peer's seen-graph zone — peer is gossiping our wire back.
+        own_hb = HeartbeatRecord(
+            endpoint="https://self.example.com",
+            operator_spk=own.get_signing_public_key_bytes(),
+            version="0.6.0",
+            ts=now - 5,
+            exp=now + 86400,
+        )
+        transport.publish_txt_record(seen_rrset_name("peer.example"), own_hb.sign(own))
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.6.2",
+            dns_zone="self.example",
+            seed_zones=("peer.example",),
+        )
+        worker = HeartbeatWorker(
+            cfg, own, store, record_writer=transport, dns_reader=transport
+        )
+        worker.tick_once(now=now)
+
+        # The local store should hold the peer's wire but NOT our
+        # own — even though the peer's gossip path served it.
+        own_spk_hex = own.get_signing_public_key_bytes().hex()
+        for row in store.list_recent(now=now):
+            assert (
+                row.operator_spk_hex != own_spk_hex
+            ), "self-wire ingested into local SeenStore via peer gossip"
+        # Peer's wire IS there.
+        assert any(
+            row.operator_spk_hex == peer.get_signing_public_key_bytes().hex()
+            for row in store.list_recent(now=now)
+        )
+
+    def test_first_tick_sweeps_prior_process_seen_orphans(
+        self, store, transport, now
+    ) -> None:
+        """Pre-seed ``_dnsmesh-seen.<own-zone>`` with stale self-
+        wires from earlier process lifetimes (a real-world failure
+        mode caused by self-leak + process-memory eviction tracking).
+        The first tick must clean them up so the published RRset
+        shrinks back to a single entry per peer.
+        """
+        own = _signer("operator-A", salt=b"A" * 32)
+        zone = "self.example"
+        # Three orphan self-wires at the seen RRset, simulating
+        # multiple prior lifetimes that all leaked self.
+        for offset in (-300, -120, -30):
+            old = HeartbeatRecord(
+                endpoint="https://self.example.com",
+                operator_spk=own.get_signing_public_key_bytes(),
+                version="0.6.0",
+                ts=now + offset,
+                exp=now + offset + 86400,
+            )
+            transport.publish_txt_record(seen_rrset_name(zone), old.sign(own))
+        # And one legitimate peer wire we want to keep.
+        peer = _signer("peer-B", salt=b"B" * 32)
+        peer_wire = _publish_peer_heartbeat(
+            transport,
+            peer,
+            "peer.example",
+            endpoint="https://peer.example.com",
+            ts=now,
+        )
+        # Peer is in our store via the harvest below; pre-publish
+        # it directly into the seen RRset so the sweep has a real
+        # peer to keep.
+        transport.publish_txt_record(seen_rrset_name(zone), peer_wire)
+        assert len(transport.query_txt_record(seen_rrset_name(zone))) == 4
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.6.2",
+            dns_zone=zone,
+            seed_zones=("peer.example",),
+        )
+        worker = HeartbeatWorker(
+            cfg, own, store, record_writer=transport, dns_reader=transport
+        )
+        worker.tick_once(now=now)
+
+        records = transport.query_txt_record(seen_rrset_name(zone)) or []
+        own_spk_hex = own.get_signing_public_key_bytes().hex()
+        # No self left.
+        for w in records:
+            rec = HeartbeatRecord.parse_and_verify(w, now=now)
+            assert rec is not None
+            assert bytes(rec.operator_spk).hex() != own_spk_hex
+        # Peer wire still there (untouched by the sweep — we never
+        # delete other operators' wires).
+        assert peer_wire in records
+
+    def test_seen_sweep_does_not_touch_other_operators(
+        self, store, transport, now
+    ) -> None:
+        """A shared zone (cluster siblings publishing into the same
+        ``_dnsmesh-seen.<shared-zone>``) must keep peers' wires
+        intact through the sweep. Only THIS operator's self-leakage
+        + our own prior stale copies of currently-seen peers are
+        targets. Codex round-19 P1 carry-over behavior.
+        """
+        own = _signer("operator-A", salt=b"A" * 32)
+        zone = "shared.example"
+
+        # A sibling node has published a wire at the shared zone.
+        sibling_signer = _signer("sibling", salt=b"S" * 32)
+        sibling_peer_wire = _publish_peer_heartbeat(
+            transport,
+            sibling_signer,
+            "sib-peer.example",
+            endpoint="https://sib-peer.example.com",
+            ts=now - 30,
+        )
+        # Sibling published the sib-peer wire into the shared seen
+        # RRset directly (simulating cluster co-publish).
+        transport.publish_txt_record(seen_rrset_name(zone), sibling_peer_wire)
+
+        # Plant a self-orphan from an earlier process lifetime.
+        own_old = HeartbeatRecord(
+            endpoint="https://self.example.com",
+            operator_spk=own.get_signing_public_key_bytes(),
+            version="0.6.0",
+            ts=now - 200,
+            exp=now - 200 + 86400,
+        )
+        transport.publish_txt_record(seen_rrset_name(zone), own_old.sign(own))
+        assert len(transport.query_txt_record(seen_rrset_name(zone))) == 2
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.6.2",
+            dns_zone=zone,
+        )
+        worker = HeartbeatWorker(
+            cfg, own, store, record_writer=transport, dns_reader=transport
+        )
+        worker.tick_once(now=now)
+
+        records = transport.query_txt_record(seen_rrset_name(zone)) or []
+        # Sibling's wire SURVIVED.
+        assert sibling_peer_wire in records
+        # Self-orphan deleted.
+        own_spk_hex = own.get_signing_public_key_bytes().hex()
+        for w in records:
+            rec = HeartbeatRecord.parse_and_verify(w, now=now)
+            assert rec is not None
+            assert bytes(rec.operator_spk).hex() != own_spk_hex
+
+    def test_seen_sweep_only_runs_once(self, store, transport, now) -> None:
+        """Subsequent ticks shouldn't re-sweep — the in-process
+        ``_last_seen_wires`` tracking handles eviction from there
+        forward. Re-querying the RRset every tick is wasted I/O and
+        could mask a legitimate operator-side write that should be
+        treated as authoritative."""
+        own = _signer("operator-A", salt=b"A" * 32)
+        zone = "self.example"
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.6.2",
+            dns_zone=zone,
+        )
+        worker = HeartbeatWorker(
+            cfg, own, store, record_writer=transport, dns_reader=transport
+        )
+        worker.tick_once(now=now)
+        assert worker._seen_orphan_sweep_done is True
+
+        # Plant a fake self-orphan AFTER tick 1. Subsequent ticks
+        # must NOT touch it (the flag gates the one-time behavior).
+        rogue = HeartbeatRecord(
+            endpoint="https://self.example.com",
+            operator_spk=own.get_signing_public_key_bytes(),
+            version="0.6.0",
+            ts=now - 60,
+            exp=now - 60 + 86400,
+        )
+        rogue_wire = rogue.sign(own)
+        transport.publish_txt_record(seen_rrset_name(zone), rogue_wire)
+
+        worker.tick_once(now=now + 60)
+        records = transport.query_txt_record(seen_rrset_name(zone)) or []
+        assert rogue_wire in records, "post-sweep planted wire must NOT be re-cleaned"
+
+
 class TestLifecycle:
     def test_start_stop(self, store, transport) -> None:
         cfg = HeartbeatWorkerConfig(
