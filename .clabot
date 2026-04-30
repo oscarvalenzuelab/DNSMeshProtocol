@@ -1,0 +1,9 @@
+{
+  "message": "Thank you for your contribution to AInvirion! Before we can review and merge your pull request, we need you to sign our Contributor Assignment Agreement (CAA).\n\n**To sign the CAA:**\n\n1. Review the agreement: [AInvirion Contributor Assignment Agreement](https://gist.github.com/oscarvalenzuelab/1d635e89f93b86338985b7cebb1596ac)\n2. Reply to this PR with the following statement:\n\n> I have read the Contributor Assignment Agreement and I hereby accept the terms.\n\n**Important:** By posting this statement, you certify that:\n- You have read and understood the CAA\n- You agree to assign all intellectual property rights in your contributions to AInvirion LLC\n- You have the legal right to make this assignment\n- If employed, your employer has waived rights or you are contributing outside the scope of employment\n\nOnce you post your acceptance, we'll review your contribution. Thank you!\n\n---\n\nQuestions? Contact legal@ainvirion.com",
+  "label": "caa-signed",
+  "recheckComment": "recheck",
+  "contributors": [
+    "oscarvalenzuelab",
+    "dependabot[bot]"
+  ]
+}
