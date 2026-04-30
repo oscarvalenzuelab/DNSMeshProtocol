@@ -199,8 +199,9 @@ non-certified-yet for confidentiality-critical traffic.
 
 Actively shipping:
 
-- Command-line client (`dnsmesh`, source install; PyPI release pending
-  the beta gate).
+- Command-line client (`dnsmesh`, installable via
+  [`pip install dnsmesh`](https://pypi.org/project/dnsmesh/) or
+  from source).
 - Dockerized node with sqlite storage, metrics, rate limiting.
 - Forward-secret messaging via one-time prekeys (prekey-consumed
   messages only; long-term-key fallback does not get forward secrecy).
