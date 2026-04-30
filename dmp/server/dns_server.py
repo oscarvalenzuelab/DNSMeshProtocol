@@ -208,7 +208,7 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         # ``_process_dns_query`` so the TCP handler can share it.
         data, sock = self.request
         client_ip = self.client_address[0]
-        response_bytes = _process_dns_query(self, data, client_ip)
+        response_bytes = _process_dns_query(self, data, client_ip, transport="udp")
         if response_bytes is not None:
             sock.sendto(response_bytes, self.client_address)
 
@@ -622,7 +622,9 @@ def _recv_exact(sock, n: int) -> Optional[bytes]:
     return b"".join(chunks)
 
 
-def _process_dns_query(handler, data: bytes, client_ip: str) -> Optional[bytes]:
+def _process_dns_query(
+    handler, data: bytes, client_ip: str, *, transport: str = "udp"
+) -> Optional[bytes]:
     """Shared core for the UDP and TCP handlers.
 
     Validates rate limit, parses the wire (with TSIG verification when
@@ -633,6 +635,17 @@ def _process_dns_query(handler, data: bytes, client_ip: str) -> Optional[bytes]:
     point where we can build a stub response, etc.). Callers are
     responsible for transport-specific framing — UDP sends the bytes
     directly; TCP prefixes them with a 2-byte length.
+
+    ``transport`` distinguishes UDP from TCP. UDP responses that
+    exceed the requester's advertised payload size are truncated to
+    a header-only stub with the ``TC`` (truncation) flag set —
+    standard DNS signaling that tells RFC-compliant resolvers to
+    retry the query over TCP. Without this signal, recursors with
+    DNSSEC-validation or strict-RFC behavior (Google 8.8.8.8,
+    Level3) just see an oversized UDP datagram and return empty to
+    their caller, defeating the whole point of having a TCP
+    listener. TCP responses are never truncated — by spec, TCP
+    framing already supports up to 65535 bytes.
 
     ``handler`` is whichever request handler is calling us. Both
     handlers expose a compatible ``self.server`` (configured by
@@ -705,7 +718,40 @@ def _process_dns_query(handler, data: bytes, client_ip: str) -> Optional[bytes]:
         "DMP DNS queries by outcome",
         labels={"outcome": rcode_name.lower()},
     )
-    return response.to_wire()
+    return _serialize_response(response, query, transport)
+
+
+def _serialize_response(
+    response: dns.message.Message, query: dns.message.Message, transport: str
+) -> bytes:
+    """Wire-serialize ``response`` with transport-aware truncation.
+
+    UDP: cap at the requester's advertised payload size (EDNS0 OPT
+    record's UDP buffer, or the RFC 1035 default of 512 bytes if no
+    OPT was present). If the full response wouldn't fit, replace it
+    with a header-only stub carrying ``TC=1`` so the requester knows
+    to retry over TCP.
+
+    TCP: no cap. DNS-over-TCP framing supports messages up to
+    65535 bytes per RFC 1035 §4.2.2.
+    """
+    if transport == "tcp":
+        return response.to_wire()
+
+    # UDP. EDNS0 advertised buffer size, with sensible fallbacks.
+    udp_size = getattr(query, "payload", None)
+    if not isinstance(udp_size, int) or udp_size <= 0:
+        # No EDNS0 OPT record → RFC 1035 hard limit of 512.
+        udp_size = 512
+    try:
+        return response.to_wire(max_size=udp_size)
+    except dns.exception.TooBig:
+        truncated = dns.message.make_response(query)
+        truncated.flags |= dns.flags.TC
+        # Don't echo any answer / authority / additional — by spec
+        # the resolver should retry over TCP and ignore everything
+        # except the header.
+        return truncated.to_wire()
 
 
 class _DMPTCPRequestHandler(socketserver.BaseRequestHandler):
@@ -766,7 +812,7 @@ class _DMPTCPRequestHandler(socketserver.BaseRequestHandler):
         if data is None or len(data) != length:
             return
 
-        response_bytes = _process_dns_query(self, data, client_ip)
+        response_bytes = _process_dns_query(self, data, client_ip, transport="tcp")
         if response_bytes is None:
             return
         try:

@@ -78,14 +78,22 @@ class TestDMPDnsServer:
         assert response.answer == []
 
     def test_long_value_served_as_multi_string_txt(self):
-        """Values > 255 bytes get emitted as multi-string TXT records."""
+        """Values > 255 bytes get emitted as multi-string TXT records.
+
+        Uses EDNS0 with a 4 KB buffer so the response (a 600-byte
+        TXT record) fits in a single UDP datagram. Without EDNS the
+        UDP path correctly truncates to TC=1 — see
+        TestDMPDnsServerTruncation for that path."""
         store = InMemoryDNSStore()
         long_value = "B" * 600
         store.publish_txt_record("long.mesh.test", long_value)
 
         port = _free_port()
         with DMPDnsServer(store, host="127.0.0.1", port=port):
-            response = self._query("long.mesh.test", "127.0.0.1", port)
+            request = dns.message.make_query(
+                "long.mesh.test", dns.rdatatype.TXT, use_edns=0, payload=4096
+            )
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
 
         assert response.rcode() == 0
         rdata = response.answer[0][0]
@@ -117,6 +125,86 @@ class TestDMPDnsServer:
             assert response2.rcode() == 0
         finally:
             server2.stop()
+
+
+class TestDMPDnsServerTruncation:
+    """UDP truncation + TCP fallback — the actual recursor flow.
+
+    A response that exceeds the requester's advertised UDP buffer
+    (RFC 1035 default 512 bytes, or whatever EDNS0 advertised)
+    must come back as a header-only stub with TC=1. The recursor
+    then retries over TCP. Without that signal, recursors with
+    strict RFC behavior (Google 8.8.8.8, Level3) just return empty
+    to their caller. This was caught by codex review of PR #14
+    after the TCP listener landed."""
+
+    def _large_store(self) -> InMemoryDNSStore:
+        store = InMemoryDNSStore()
+        # 10 entries × 240 bytes ≈ 2.4 KB plus DNS framing — well
+        # over the 512-byte RFC 1035 floor, well over typical
+        # 1232-byte EDNS defaults too.
+        for i in range(10):
+            store.publish_txt_record("big.mesh.test", "X" * 240 + f"-{i:03d}")
+        return store
+
+    def test_udp_no_edns_oversized_returns_truncated_stub(self):
+        """No EDNS in the query → 512-byte UDP cap. Oversized
+        response should come back as TC=1 with empty answer."""
+        store = self._large_store()
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            request = dns.message.make_query("big.mesh.test", dns.rdatatype.TXT)
+            # Note: dns.query.udp() raises if it sees TC=1 by default;
+            # use ignore_trailing=True or call to_wire / from_wire
+            # directly to inspect the truncated answer.
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(2.0)
+            try:
+                sock.sendto(request.to_wire(), ("127.0.0.1", port))
+                data, _ = sock.recvfrom(4096)
+            finally:
+                sock.close()
+            response = dns.message.from_wire(data)
+
+        assert response.flags & dns.flags.TC, (
+            "TC bit should be set on oversized UDP response so the "
+            "recursor knows to retry over TCP"
+        )
+        # Header-only stub: no answers carried in the truncated reply.
+        assert response.answer == []
+
+    def test_udp_with_edns_carries_full_response(self):
+        """Query with EDNS0 advertising a 4 KB buffer → full
+        answer fits, no truncation."""
+        store = self._large_store()
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            request = dns.message.make_query(
+                "big.mesh.test", dns.rdatatype.TXT, use_edns=0, payload=4096
+            )
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert not (response.flags & dns.flags.TC)
+        assert len(response.answer) == 1
+        assert len(response.answer[0]) == 10
+
+    def test_udp_then_tcp_fallback(self):
+        """The full recursor flow: UDP query without EDNS gets a
+        truncated reply, retry over TCP succeeds with the full
+        answer. dnspython's dns.query.udp_with_fallback() exists
+        precisely to model this."""
+        store = self._large_store()
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            request = dns.message.make_query("big.mesh.test", dns.rdatatype.TXT)
+            response, used_tcp = dns.query.udp_with_fallback(
+                request, "127.0.0.1", port=port, timeout=2.0
+            )
+
+        assert used_tcp, "expected fallback to TCP after TC=1 on UDP"
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        assert len(response.answer[0]) == 10
 
 
 class TestDMPDnsServerTCP:
