@@ -1,4 +1,4 @@
-# docker-compose.m10-test.yml — M10 receiver-zone notification e2e.
+# scripts/m10-test/docker-compose.yml — M10 receiver-zone notification e2e.
 #
 # Three independent dnsmesh-node containers, each authoritative for a
 # different DNS zone:
@@ -13,7 +13,7 @@
 #
 # Bring up:
 #
-#     docker compose -f docker-compose.m10-test.yml up -d --build
+#     docker compose -f scripts/m10-test/docker-compose.yml up -d --build
 #
 # Smoke tests:
 #
@@ -22,17 +22,17 @@
 #
 # Drive the e2e harness:
 #
-#     ./venv/bin/python scripts/m10_e2e_test.py
+#     ./venv/bin/python scripts/m10-test/e2e_test.py
 #
 # Tear down:
 #
-#     docker compose -f docker-compose.m10-test.yml down -v
+#     docker compose -f scripts/m10-test/docker-compose.yml down -v
 
 services:
   alice-node:
     image: dnsmesh-node:m10-test
     build:
-      context: .
+      context: ../..
     container_name: m10-alice-node
     restart: unless-stopped
     environment:
@@ -69,7 +69,7 @@ services:
       DMP_REGISTRATION_ENABLED: "1"
     volumes:
       - alice-data:/var/lib/dmp
-      - ./docker/m10-test/alice-operator.key:/etc/dmp/operator.key:ro
+      - ../../docker/m10-test/alice-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5181:5353/udp"
       - "127.0.0.1:8181:8053/tcp"
@@ -80,7 +80,7 @@ services:
   bob-node:
     image: dnsmesh-node:m10-test
     build:
-      context: .
+      context: ../..
     container_name: m10-bob-node
     restart: unless-stopped
     environment:
@@ -112,7 +112,7 @@ services:
       DMP_REGISTRATION_ENABLED: "1"
     volumes:
       - bob-data:/var/lib/dmp
-      - ./docker/m10-test/bob-operator.key:/etc/dmp/operator.key:ro
+      - ../../docker/m10-test/bob-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5182:5353/udp"
       - "127.0.0.1:8182:8053/tcp"
@@ -123,7 +123,7 @@ services:
   stranger-node:
     image: dnsmesh-node:m10-test
     build:
-      context: .
+      context: ../..
     container_name: m10-stranger-node
     restart: unless-stopped
     environment:
@@ -156,7 +156,7 @@ services:
       DMP_REGISTRATION_ENABLED: "1"
     volumes:
       - stranger-data:/var/lib/dmp
-      - ./docker/m10-test/stranger-operator.key:/etc/dmp/operator.key:ro
+      - ../../docker/m10-test/stranger-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5183:5353/udp"
       - "127.0.0.1:8183:8053/tcp"

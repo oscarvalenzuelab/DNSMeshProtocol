@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test for the M9 DNS-only federation stack.
 
-Drives the running ``docker-compose.m9-test.yml`` stack from the host:
+Drives the running ``scripts/m9-test/docker-compose.yml`` stack from the host:
 
   1. Confirms each of the three nodes published its own heartbeat at
      ``_dnsmesh-heartbeat.<own-zone>``.
@@ -19,8 +19,8 @@ Drives the running ``docker-compose.m9-test.yml`` stack from the host:
   6. Cross-check: queries alice's identity from bob-node's perspective
      to confirm DNS chain access works between containers.
 
-Prereqs: docker compose -f docker-compose.m9-test.yml up -d
-Run:     ./venv/bin/python scripts/m9_e2e_test.py
+Prereqs: docker compose -f scripts/m9-test/docker-compose.yml up -d
+Run:     ./venv/bin/python scripts/m9-test/e2e_test.py
 """
 
 from __future__ import annotations

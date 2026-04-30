@@ -13,14 +13,16 @@ nav_order: 9
 
 The repository ships two self-contained docker-compose stacks plus
 matching driver scripts that exercise the full DNS-native federation
-path against real containers. They're the same harnesses used to
-validate every M9 and M10 release; running them locally is the
-quickest way to confirm a build works end-to-end on your machine
-before deploying.
+path against real containers. They live under `scripts/m9-test/`
+and `scripts/m10-test/`. Running them locally is the quickest way
+to confirm a build works end-to-end on your machine before
+deploying.
 
-These are developer-facing harnesses — they're not wired into CI and
-don't run as part of `pytest`. The unit and integration suites under
-`tests/` cover the same logic with mocked containers.
+These are developer-facing harnesses — they're not wired into CI
+and don't run as part of `pytest`. The unit and integration suites
+under `tests/` cover the same logic with mocked containers.
+
+All commands below are run from the repo root.
 
 ## M9 — DNS-only federation stack
 
@@ -29,8 +31,8 @@ UPDATE write path. Validates that the only HTTPS hop on the protocol
 path is the one-time TSIG registration.
 
 ```bash
-docker compose -f docker-compose.m9-test.yml up -d
-./venv/bin/python scripts/m9_e2e_test.py
+docker compose -f scripts/m9-test/docker-compose.yml up -d
+./venv/bin/python scripts/m9-test/e2e_test.py
 ```
 
 What the driver covers, in order:
@@ -47,7 +49,7 @@ What the driver covers, in order:
 6. Cross-node read — query alice's identity from bob-node to
    confirm container-to-container DNS works.
 
-Tear down with `docker compose -f docker-compose.m9-test.yml down`.
+Tear down with `docker compose -f scripts/m9-test/docker-compose.yml down -v`.
 
 ## M10 — receiver-zone claim notifications
 
@@ -57,8 +59,8 @@ opted-in node) and the negative control (claim REFUSED on a node
 that hasn't enabled `DMP_RECEIVER_CLAIM_NOTIFICATIONS`).
 
 ```bash
-docker compose -f docker-compose.m10-test.yml up -d --build
-./venv/bin/python scripts/m10_e2e_test.py
+docker compose -f scripts/m10-test/docker-compose.yml up -d --build
+./venv/bin/python scripts/m10-test/e2e_test.py
 ```
 
 What the driver covers:
@@ -73,7 +75,7 @@ What the driver covers:
 5. Negative control: same un-TSIG'd UPDATE against a
    non-opted-in stranger-node returns REFUSED.
 
-Tear down with `docker compose -f docker-compose.m10-test.yml down`.
+Tear down with `docker compose -f scripts/m10-test/docker-compose.yml down -v`.
 
 ## When to use which
 

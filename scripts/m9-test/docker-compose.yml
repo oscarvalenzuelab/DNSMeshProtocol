@@ -1,4 +1,4 @@
-# docker-compose.m9-test.yml — multi-node DNS-only federation e2e (M9).
+# scripts/m9-test/docker-compose.yml — multi-node DNS-only federation e2e (M9).
 #
 # Three independent dnsmesh-node containers, each authoritative for a
 # different DNS zone:
@@ -21,7 +21,7 @@
 #
 # Bring up:
 #
-#     docker compose -f docker-compose.m9-test.yml up -d --build
+#     docker compose -f scripts/m9-test/docker-compose.yml up -d --build
 #
 # Smoke test:
 #
@@ -31,7 +31,7 @@
 #
 # Tear down:
 #
-#     docker compose -f docker-compose.m9-test.yml down -v
+#     docker compose -f scripts/m9-test/docker-compose.yml down -v
 
 services:
   alice-node:
@@ -71,7 +71,7 @@ services:
       # node here serves its own zone, so the default is correct.
     volumes:
       - alice-data:/var/lib/dmp
-      - ./docker/m9-test/alice-operator.key:/etc/dmp/operator.key:ro
+      - ../../docker/m9-test/alice-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5371:5353/udp"
       - "127.0.0.1:8071:8053/tcp"
@@ -109,7 +109,7 @@ services:
       DMP_REGISTRATION_ENABLED: "1"
     volumes:
       - bob-data:/var/lib/dmp
-      - ./docker/m9-test/bob-operator.key:/etc/dmp/operator.key:ro
+      - ../../docker/m9-test/bob-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5372:5353/udp"
       - "127.0.0.1:8072:8053/tcp"
@@ -148,7 +148,7 @@ services:
       DMP_REGISTRATION_ENABLED: "1"
     volumes:
       - provider-data:/var/lib/dmp
-      - ./docker/m9-test/provider-operator.key:/etc/dmp/operator.key:ro
+      - ../../docker/m9-test/provider-operator.key:/etc/dmp/operator.key:ro
     ports:
       - "127.0.0.1:5373:5353/udp"
       - "127.0.0.1:8073:8053/tcp"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test for the M10 receiver-zone notification path.
 
-Drives the running ``docker-compose.m10-test.yml`` stack from the host:
+Drives the running ``scripts/m10-test/docker-compose.yml`` stack from the host:
 
   1. Confirms each of the three nodes published its own heartbeat.
   2. Runs a real send → recv between alice@alice.test and bob@bob.test:
@@ -23,10 +23,10 @@ Drives the running ``docker-compose.m10-test.yml`` stack from the host:
      The server MUST answer REFUSED.
 
 Prereqs:
-    docker compose -f docker-compose.m10-test.yml up -d --build
+    docker compose -f scripts/m10-test/docker-compose.yml up -d --build
 
 Run:
-    ./venv/bin/python scripts/m10_e2e_test.py
+    ./venv/bin/python scripts/m10-test/e2e_test.py
 """
 
 from __future__ import annotations
@@ -48,8 +48,9 @@ import dns.rdatatype
 import dns.update
 
 # Make sure we run against the in-tree dmp package, not a stale install.
+# scripts/m10-test/e2e_test.py → repo root is two levels up.
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, ROOT)
 
 from dmp.client.client import DMPClient  # noqa: E402
