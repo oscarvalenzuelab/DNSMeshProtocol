@@ -31,14 +31,19 @@ for confidentiality-critical traffic.
 
 ## Reporting a vulnerability
 
-Email: oscar.valenzuela.b@gmail.com
+Use
+[GitHub's private vulnerability reporting](https://github.com/oscarvalenzuelab/DNSMeshProtocol/security/advisories/new)
+to file privately. The advisory thread stays confidential between
+reporter and maintainers until it's resolved and disclosed.
 
-Include:
-- Affected version (commit SHA).
+Include in the report:
+- Affected version (commit SHA, release tag, or PyPI version).
 - Minimum reproduction.
 - Your assessment of impact.
 
-Please do not open a public GitHub issue for unpatched security bugs.
+For non-security questions, open a regular GitHub issue. Please
+don't open a public issue for an unpatched security bug — the
+private advisory channel above is what to use instead.
 
 ## Threat model
 

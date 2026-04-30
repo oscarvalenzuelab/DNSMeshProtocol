@@ -9,9 +9,9 @@ body:
         the issue still reproduces against `main` — this project
         moves fast and a fix may already be in flight.
 
-        **Security issues should NOT go here.** Send them to
-        `oscar.valenzuela.b@gmail.com` per
-        [SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md).
+        **Security issues should NOT go here.** Use
+        [GitHub's private vulnerability reporting](https://github.com/oscarvalenzuelab/DNSMeshProtocol/security/advisories/new)
+        per [SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md).
   - type: input
     id: version
     attributes:

@@ -44,6 +44,8 @@ making any trust decision.
 
 ## Reporting a vulnerability
 
-Email `oscar.valenzuela.b@gmail.com` with a minimum repro and your
-assessment of impact. Please don't open a public GitHub issue for
-unpatched security bugs.
+File via
+[GitHub's private vulnerability reporting](https://github.com/oscarvalenzuelab/DNSMeshProtocol/security/advisories/new)
+with a minimum repro and your assessment of impact. The advisory
+thread stays confidential until it's resolved. Please don't open a
+public GitHub issue for an unpatched security bug.

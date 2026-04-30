@@ -105,5 +105,6 @@ not `test_parse_and_verify_2`. Future-you will thank you.
 
 ## Questions
 
-Open an issue. Or email the author (oscar.valenzuela.b@gmail.com) if
-the question is security-sensitive.
+Open a GitHub issue. For security-sensitive matters, use
+[GitHub's private vulnerability reporting](https://github.com/oscarvalenzuelab/DNSMeshProtocol/security/advisories/new)
+so the report stays private until it's resolved.
