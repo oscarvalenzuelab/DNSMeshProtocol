@@ -165,9 +165,11 @@ class _DnsReader:
         import dns.query
         import dns.rdatatype
 
-        request = dns.message.make_query(name, dns.rdatatype.TXT)
+        request = dns.message.make_query(name, dns.rdatatype.TXT, use_edns=0, payload=4096)
         try:
-            response = dns.query.udp(request, self._host, port=self._port, timeout=3.0)
+            response, _used_tcp = dns.query.udp_with_fallback(
+                request, self._host, port=self._port, timeout=3.0
+            )
         except Exception:
             return None
         if response.rcode() != 0 or not response.answer:
