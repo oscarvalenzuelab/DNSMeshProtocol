@@ -313,7 +313,8 @@ ok "$CADDYFILE configured for $DMP_NODE_HOSTNAME"
 
 if ufw status | grep -q "Status: active"; then
     step "Opening firewall ports (ufw active)"
-    ufw allow 53/udp comment 'dnsmesh authoritative DNS' >/dev/null
+    ufw allow 53/udp comment 'dnsmesh authoritative DNS (UDP)' >/dev/null
+    ufw allow 53/tcp comment 'dnsmesh DNS TCP fallback' >/dev/null
     ufw allow 80/tcp comment 'ACME HTTP-01 challenge' >/dev/null
     ufw allow 443/tcp comment 'dnsmesh HTTPS publish API' >/dev/null
     ufw allow 443/udp comment 'dnsmesh HTTPS / HTTP-3' >/dev/null

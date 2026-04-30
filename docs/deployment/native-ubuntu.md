@@ -52,8 +52,8 @@ When to pick Docker instead:
   UDP 53).
 - Caddy fronting the HTTP API on TCP 443 with auto Let's Encrypt.
 - Persistent state at `/var/lib/dmp/dmp.db`.
-- ufw rules for `UDP 53`, `TCP 80`, `TCP 443`, `UDP 443` (when ufw is
-  active).
+- ufw rules for `UDP 53`, `TCP 53`, `TCP 80`, `TCP 443`, `UDP 443`
+  (when ufw is active).
 
 ## Prerequisites
 
@@ -61,10 +61,30 @@ When to pick Docker instead:
 2. **A DNS A (and ideally AAAA) record** pointing at the machine's
    public IP. Caddy uses the HTTP-01 ACME challenge, so the hostname
    has to resolve here *before* the script runs.
-3. **Open inbound:** `UDP 53`, `TCP 80`, `TCP 443`, `UDP 443`. The
-   script handles `ufw` automatically; cloud-firewall layers
-   (DigitalOcean Cloud Firewall, AWS Security Group, etc.) you set
-   yourself.
+3. **Open inbound:** `TCP 22` (SSH), `UDP 53`, `TCP 53`, `TCP 80`,
+   `TCP 443`, `UDP 443`. The install script handles `ufw`
+   automatically; cloud-firewall layers (DigitalOcean Cloud
+   Firewall, AWS Security Group, etc.) you set yourself.
+
+   If you want to configure the firewall *separately* from the
+   install (e.g. on a host that already has a node running, or to
+   set it up on a fresh box before installing), there's a small
+   helper script:
+
+   ```bash
+   sudo /opt/dnsmesh/firewall.sh --check    # report current state
+   sudo /opt/dnsmesh/firewall.sh            # add the rules
+   sudo /opt/dnsmesh/firewall.sh --enable   # also `ufw enable`
+   ```
+
+   Or run it from the source repo before any `pip install`:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/oscarvalenzuelab/DNSMeshProtocol/main/deploy/native-ubuntu/firewall.sh \
+       | sudo bash
+   ```
+
+   It's idempotent — safe to re-run at any point.
 
 ## Run the install
 
