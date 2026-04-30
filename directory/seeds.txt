@@ -23,5 +23,5 @@
 # this repo just gives the project a public "first directory" so a
 # fresh operator has somewhere to look immediately.
 
-dnsmesh.io
-dnsmesh.pro
+dmp.dnsmesh.io
+dmp.dnsmesh.pro
