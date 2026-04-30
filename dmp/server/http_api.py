@@ -321,10 +321,19 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
         rows = store.list_recent(limit=limit)
 
         # (operator_spk, endpoint) -> DirectoryRow, keeping the highest ts.
+        # ts_skew_seconds=10**9 matches the seen-graph publish path
+        # in heartbeat_worker._publish_seen_graph: store.list_recent
+        # already filtered on `exp > now`, so any wire we're rendering
+        # is by construction unexpired. Without the override, the
+        # default 300s skew rejected peer wires whose `ts` was more
+        # than 5 minutes ago — a node with a slower harvest cadence
+        # than 5 min would render an empty peer list (or only its
+        # own self-row, since the self-row is synthesized below) even
+        # though _dnsmesh-seen.<zone> showed the full peer set.
         merged: dict = {}
         for r in rows:
             try:
-                rec = HeartbeatRecord.parse_and_verify(r.wire)
+                rec = HeartbeatRecord.parse_and_verify(r.wire, ts_skew_seconds=10**9)
             except Exception:
                 continue
             if rec is None:
