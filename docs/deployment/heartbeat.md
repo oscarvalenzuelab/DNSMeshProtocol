@@ -37,6 +37,15 @@ re-exports at `GET /v1/nodes/seen` so any aggregator (including
 a central directory website) can union the public state
 deterministically.
 
+The canonical project-hosted directory rendered off this signed
+P2P data is at
+[https://ovalenzuela.com/DNSMeshProtocol/directory/](https://ovalenzuela.com/DNSMeshProtocol/directory/),
+refreshed every 30 minutes by a workflow running
+[`examples/directory_aggregator.py`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/examples/directory_aggregator.py)
+against [`directory/seeds.txt`](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/directory/seeds.txt).
+For a node to appear there, get listed in any node's seen-graph
+that's reachable from a seed (or PR a new seed yourself).
+
 If you don't want to be listed in any public directory: don't
 enable heartbeat. The feature is fully opt-in and nothing on the
 protocol's critical path depends on it.
