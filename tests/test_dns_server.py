@@ -212,6 +212,43 @@ class TestDMPDnsServerRateLimitAndConcurrency:
                 "by the per-IP rate limiter, not answered"
             )
 
+    def test_idle_tcp_connections_dont_block_udp(self):
+        """Slow-loris regression: a client opening many idle TCP
+        connections must not starve the UDP listener.
+
+        Codex round-4 P1: under the previous "acquire permit at
+        connect" implementation, a client could open
+        ``max_concurrency`` TCP sockets, send no bytes, and tie up
+        every permit for the 5-second read timeout — blocking UDP
+        queries entirely during that window. Lazy acquisition (only
+        after the message body is in hand) preserves the global
+        concurrency cap without making UDP service vulnerable to
+        connect-only floods.
+        """
+        store = InMemoryDNSStore()
+        store.publish_txt_record("alice.test", "hi")
+        port = _free_port()
+        srv = DMPDnsServer(store, host="127.0.0.1", port=port, max_concurrency=2)
+        srv.start()
+        try:
+            # Open more idle TCP connections than the max_concurrency
+            # cap, send zero bytes — classic slow-loris.
+            idle_socks = []
+            for _ in range(5):
+                c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                c.connect(("127.0.0.1", port))
+                idle_socks.append(c)
+            try:
+                # UDP query should still be served.
+                request = dns.message.make_query("alice.test", dns.rdatatype.TXT)
+                response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+                assert response.rcode() == 0
+            finally:
+                for c in idle_socks:
+                    c.close()
+        finally:
+            srv.stop()
+
     def test_udp_and_tcp_share_one_concurrency_semaphore(self):
         """``max_concurrency`` must be a single global cap, not
         one cap per transport. Without sharing, a node configured

@@ -29,7 +29,14 @@ services:
       # on the host should be holding :53 — typical blockers are
       # systemd-resolved's stub listener (disable with
       # `systemctl disable --now systemd-resolved`) or dnsmasq.
+      #
+      # Both UDP and TCP must be mapped: TCP is the RFC 1035 §4.2.2
+      # fallback path that recursive resolvers use when a UDP
+      # response is truncated (TC=1). Without TCP, large RRsets like
+      # ``_dnsmesh-seen.<zone>`` fail through RFC-strict resolvers
+      # such as Google 8.8.8.8 and Level3.
       - "53:5353/udp"
+      - "53:5353/tcp"
       # HTTP API stays INTERNAL — Caddy terminates TLS on 443 and reverse-
       # proxies to dnsmesh-node:8053 on the compose network. No `8053:8053`
       # host mapping here on purpose.

@@ -825,15 +825,25 @@ class _DMPTCPRequestHandler(socketserver.BaseRequestHandler):
         if data is None or len(data) != length:
             return
 
-        response_bytes = _process_dns_query(self, data, client_ip, transport="tcp")
-        if response_bytes is None:
+        # ONLY now — after we have the full message body in hand —
+        # acquire the global concurrency permit. Idle / slow-loris
+        # connections that never sent a complete message cost a
+        # blocked recv thread but no permit, so they can't starve
+        # the UDP listener (codex round-4 P1).
+        if not self.server._semaphore.acquire(blocking=False):
             return
         try:
-            self.request.sendall(
-                len(response_bytes).to_bytes(2, "big") + response_bytes
-            )
-        except (ConnectionError, OSError):
-            return
+            response_bytes = _process_dns_query(self, data, client_ip, transport="tcp")
+            if response_bytes is None:
+                return
+            try:
+                self.request.sendall(
+                    len(response_bytes).to_bytes(2, "big") + response_bytes
+                )
+            except (ConnectionError, OSError):
+                return
+        finally:
+            self.server._semaphore.release()
 
 
 class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
@@ -917,8 +927,7 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
 
 
 class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    """Per-connection threaded TCP server with the same bounded
-    worker semaphore as the UDP variant.
+    """Per-connection threaded TCP server.
 
     DNS over TCP exists primarily as the fallback path when a UDP
     response would exceed the negotiated buffer (TC=1 → retry over
@@ -931,6 +940,17 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     ``allowed_zones``, ``writer``, claim/update caps). The handler
     classes read these attributes off ``self.server.*``, transport-
     agnostic.
+
+    Concurrency budgeting: connection accept itself does NOT take a
+    semaphore permit, otherwise an attacker could open
+    ``max_concurrency`` idle TCP connections and starve the UDP
+    listener for the read-timeout window (codex round-3 P1). The
+    handler acquires the permit AFTER reading the message body and
+    releases it after sending the response — so the budget caps
+    "in-flight handler work" rather than "open sockets". Idle /
+    slow-loris connections occupy a thread blocked in ``recv()``
+    but not a permit, and the per-connection 5-second read timeout
+    bounds how long that costs.
     """
 
     allow_reuse_address = True
@@ -979,17 +999,20 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         # Shared with the UDP server when ``DMPDnsServer`` constructs
         # both — a single ``max_concurrency`` budget across UDP + TCP
         # rather than one budget per transport (codex round-2 P2).
+        # The TCP path acquires the permit lazily (in the handler,
+        # after reading data) rather than at connection-accept, so
+        # idle/slow-loris connections don't block UDP service —
+        # codex round-4 P1.
         self._semaphore = semaphore or threading.Semaphore(max_concurrency)
 
     def process_request(self, request, client_address):
-        if not self._semaphore.acquire(blocking=False):
-            try:
-                request.close()
-            except Exception:
-                pass
-            return
+        # Spawn handler immediately. Semaphore acquisition happens
+        # inside the handler AFTER the message body is in hand —
+        # this prevents an attacker from holding ``max_concurrency``
+        # permits open with idle TCP sockets and starving the UDP
+        # listener.
         t = threading.Thread(
-            target=self._handle_with_release,
+            target=self.process_request_thread,
             args=(request, client_address),
             name="dmp-dns-tcp-handler",
             daemon=self.daemon_threads,
