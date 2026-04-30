@@ -654,26 +654,27 @@ def _process_dns_query(
     same function works for either transport.
     """
     server = handler.server
-    # Rate-limit UDP only. TCP queries are almost always either:
-    #   1. The fallback retry of a UDP query that just got TC=1 — the
-    #      client already paid a token at the UDP layer, double-
-    #      charging on the retry would silently drop the answer for
-    #      configurations with small bursts (codex round-2 P2).
-    #   2. A direct TCP query, which is bounded by the connection
-    #      concurrency semaphore (max_concurrency, shared with UDP)
-    #      so a TCP-only flood still can't overcommit threads.
-    # Skipping the per-IP rate limiter on the TCP path therefore
-    # preserves "UDP→TCP retry works under any rate-limit setting"
-    # without losing the flood-protection guarantee.
-    if transport == "udp":
-        limiter = server.rate_limiter
-        if limiter is not None and not limiter.allow(client_ip):
-            REGISTRY.counter(
-                "dmp_dns_queries_total",
-                "DMP DNS queries by outcome",
-                labels={"outcome": "rate_limited"},
-            )
-            return None
+    # Each transport carries its OWN TokenBucketLimiter (both
+    # initialized from the same RateLimit config by default). Per-IP
+    # state is therefore independent across UDP and TCP:
+    #
+    #   - UDP→TC=1→TCP retry: client spends 1 UDP token AND 1 TCP
+    #     token, both starting full. Even at burst=1 the retry
+    #     succeeds because it draws from the TCP bucket, not the
+    #     already-drained UDP bucket. Codex round-2 P2 fix.
+    #
+    #   - Direct TCP-only flood: drawn from the TCP bucket, which
+    #     enforces the same rate the operator configured. Codex
+    #     round-3 P1 fix — "skip the limiter for all TCP" let
+    #     attackers bypass the throttle by switching transports.
+    limiter = server.rate_limiter
+    if limiter is not None and not limiter.allow(client_ip):
+        REGISTRY.counter(
+            "dmp_dns_queries_total",
+            "DMP DNS queries by outcome",
+            labels={"outcome": "rate_limited"},
+        )
+        return None
 
     # Pass the keyring into ``from_wire`` so any TSIG signature on
     # the incoming message is verified at parse time. dnspython raises:
@@ -1064,6 +1065,17 @@ class DMPDnsServer:
             if rate_limit and rate_limit.enabled
             else None
         )
+        # SEPARATE per-transport rate limiter for TCP. Same RateLimit
+        # config, independent per-IP token state. UDP→TC=1→TCP retry
+        # therefore draws from the (still-full) TCP bucket on the
+        # retry leg even when the UDP bucket is drained — the codex
+        # round-2 P2 case. Direct TCP-only floods still get throttled
+        # by this bucket — the codex round-3 P1 case.
+        self.tcp_rate_limiter = (
+            TokenBucketLimiter(rate_limit)
+            if rate_limit and rate_limit.enabled
+            else None
+        )
         self.max_concurrency = int(max_concurrency)
         self.writer = writer
         self.tsig_keyring = tsig_keyring
@@ -1159,13 +1171,17 @@ class DMPDnsServer:
             # protocol families. We bind to the resolved port so that
             # if the caller passed port=0 we use whatever UDP picked
             # (otherwise we'd get two random ports).
+            #
+            # The TCP server gets its OWN rate limiter (separate
+            # per-IP buckets from the UDP server's). See the
+            # tcp_rate_limiter field for the rationale.
             try:
                 self._tcp_server = _ThreadingTCPServer(
                     (self.host, self.port),
                     _DMPTCPRequestHandler,
                     self.reader,
                     self.ttl,
-                    self.rate_limiter,
+                    self.tcp_rate_limiter,
                     self.max_concurrency,
                     **self._server_kwargs(),
                     semaphore=shared_semaphore,

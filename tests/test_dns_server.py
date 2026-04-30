@@ -148,10 +148,12 @@ class TestDMPDnsServerRateLimitAndConcurrency:
             store.publish_txt_record("big.mesh.test", "X" * 240 + f"-{i:03d}")
 
         port = _free_port()
-        # rate=0/s, burst=1: at most one allowed every minute.
-        # If TCP weren't exempt, the UDP query would consume the
-        # one token and the TCP retry would silently drop.
-        rl = RateLimit(rate_per_second=0.0, burst=1)
+        # Small non-zero rate so RateLimit.enabled is True (it
+        # checks rate>0 AND burst>0); refill is glacial relative to
+        # the test, effectively burst=1 per IP per transport.
+        # Without per-transport buckets, the UDP query consumes the
+        # bucket's token and the TCP retry would silently drop.
+        rl = RateLimit(rate_per_second=0.001, burst=1)
         with DMPDnsServer(store, host="127.0.0.1", port=port, rate_limit=rl):
             request = dns.message.make_query("big.mesh.test", dns.rdatatype.TXT)
             response, used_tcp = dns.query.udp_with_fallback(
@@ -160,6 +162,55 @@ class TestDMPDnsServerRateLimitAndConcurrency:
         assert used_tcp
         assert response.rcode() == 0
         assert len(response.answer[0]) == 10
+
+    def test_direct_tcp_traffic_is_rate_limited(self):
+        """Direct TCP traffic (not a UDP→TC=1→TCP retry) must still
+        hit the per-IP throttle. Otherwise an attacker bypasses
+        rate-limiting entirely by switching to TCP.
+
+        Codex round-3 P1: an earlier fix exempted ALL TCP from the
+        limiter; this test ensures the per-transport-bucket fix
+        keeps direct TCP queries throttled at the configured rate.
+        """
+        from dmp.server.rate_limit import RateLimit
+
+        store = InMemoryDNSStore()
+        store.publish_txt_record("alice.mesh.test", "v=dmp1;t=identity")
+        port = _free_port()
+        # Burst of 1, no refill: only one TCP query per IP per minute.
+        # rate=0 disables the limiter entirely (RateLimit.enabled
+        # checks rate>0 AND burst>0). Use a small non-zero rate so
+        # the limiter is active; refill is glacial relative to the
+        # test's wall-clock duration.
+        rl = RateLimit(rate_per_second=0.001, burst=1)
+        with DMPDnsServer(store, host="127.0.0.1", port=port, rate_limit=rl):
+            # First TCP query consumes the burst-1 token.
+            r1 = dns.query.tcp(
+                dns.message.make_query("alice.mesh.test", dns.rdatatype.TXT),
+                "127.0.0.1",
+                port=port,
+                timeout=2.0,
+            )
+            assert r1.rcode() == 0
+
+            # Second TCP query from the same IP must drop (server
+            # closes connection without a response). Open a raw
+            # socket since dns.query.tcp would block waiting for an
+            # answer that never comes.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect(("127.0.0.1", port))
+                req = dns.message.make_query(
+                    "alice.mesh.test", dns.rdatatype.TXT
+                ).to_wire()
+                s.sendall(len(req).to_bytes(2, "big") + req)
+                # Server drops the rate-limited query → connection
+                # closes with no response.
+                received = s.recv(4096)
+            assert received == b"", (
+                "Direct TCP query past the burst should be dropped "
+                "by the per-IP rate limiter, not answered"
+            )
 
     def test_udp_and_tcp_share_one_concurrency_semaphore(self):
         """``max_concurrency`` must be a single global cap, not
