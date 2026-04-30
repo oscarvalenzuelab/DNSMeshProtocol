@@ -4,7 +4,7 @@ Thanks for considering a patch. A few ground rules.
 
 ## Before you start
 
-- This is alpha software. Protocol and API can change. Expect to revisit
+- This is pre-1.0 software. Protocol and API can change. Expect to revisit
   a PR if the thing you're changing is itself under active design.
 - For anything larger than a bug fix or a small feature, open an issue
   first so we can agree on the shape before you sink time into code.

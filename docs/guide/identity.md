@@ -109,12 +109,38 @@ as an explicit TOFU exception.
 
 ## Rotation
 
-There is no automatic rotation. If a key leaks:
+Rotation shipped in M5.4. Two record types live at
+`rotate.dmp.<user>.<domain>`:
 
-1. Generate a new identity with a fresh config (`dnsmesh init --force` or
-   a new `$DMP_CONFIG_HOME`).
-2. Publish the new identity.
-3. Contact everyone out of band, tell them to re-`dnsmesh identity fetch`.
+- **`RotationRecord`** — co-signed by the old and new key, asserts
+  that the holder of the old key authorizes the new one as its
+  successor. Routine rotations publish only this.
+- **`RevocationRecord`** — self-signed by the revoked key, declares
+  it dead. Used for compromise scenarios where an attacker may also
+  hold the key; rotation-aware fetchers refuse the revoked key
+  forever.
 
-Proper key-rotation records are on the roadmap but not shipping in
-the current alpha.
+Run a routine rotation:
+
+```bash
+dnsmesh identity rotate --experimental
+```
+
+Run a compromise rotation (publishes both records):
+
+```bash
+dnsmesh identity rotate --experimental --reason compromise
+```
+
+Contacts who pinned you with `rotation_chain_enabled=True` chain-walk
+the rotation RRset on every fetch and pick up the new key
+automatically. Pre-M5.4 contacts and contacts pinned without
+rotation-chain support need an out-of-band re-pin
+(`dnsmesh identity fetch <user> --add`).
+
+The wire format is a draft (`v=dmp1;t=rotation;`) and may bump to
+`v=dmp2;t=rotation;` after the external audit (M4.2-M4.4). The
+`--experimental` flag is intentional: it gates publication so a
+v0.3.0+ flag-flip is needed before rotated keys ride into a stable
+release. See [`docs/protocol/rotation.md`]({{ site.baseurl }}/protocol/rotation)
+for the wire format, co-signing rationale, and walk algorithm.

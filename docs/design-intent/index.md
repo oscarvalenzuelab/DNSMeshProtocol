@@ -1,39 +1,19 @@
 ---
-title: Design Intent
+title: Spec → Ship
 layout: default
 nav_order: 7
-has_children: true
 permalink: /design-intent
 ---
 
-# Design Intent
+# Spec → Ship
 
-{: .note }
-The documents under this section are the **original project spec** —
-written before any code existed. Much of what they describe has since
-been built; some has been replaced with a different mechanism in the
-same spirit; a few items are deliberately deferred. The per-bullet
-status below tells you which is which. For ground-truth on what ships
-today, use the links in ["For what ships today"](#for-what-ships-today).
-
-For what ships today
-{: #for-what-ships-today }
-
-- [How It Works]({{ site.baseurl }}/how-it-works) — mental model +
-  deployment paths (current implementation, not draft).
-- [Getting Started]({{ site.baseurl }}/getting-started) — hands-on
-  install + first message.
-- [Protocol]({{ site.baseurl }}/protocol) — wire format + crypto as
-  implemented.
-- [CHANGELOG.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/CHANGELOG.md) —
-  release-by-release log of what shipped, with commit references.
-- [SECURITY.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md) —
-  honest list of what's protected and what isn't.
-
-## The documents
-
-- [Protocol overview (historical spec)]({{ site.baseurl }}/design-intent/protocol)
-- [Implementation requirements (historical spec)]({{ site.baseurl }}/design-intent/implementation-requirements)
+What the original DMP spec proposed (written before any code
+existed) versus what actually shipped. Some items shipped as
+specified, some shipped under a different mechanism in the same
+spirit, and some were deliberately deferred. Use this page to map
+between the original design language and the current implementation;
+for ground-truth on what ships today, follow the per-item links into
+the protocol docs and CHANGELOG.
 
 ## Spec → ship delta
 

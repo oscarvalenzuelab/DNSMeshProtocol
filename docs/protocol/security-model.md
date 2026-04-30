@@ -39,7 +39,7 @@ making any trust decision.
   mesh domain.
 - **Username ownership under the shared mesh domain.** TOFU only. Use
   zone-anchored identity for real squat resistance.
-- **Unreviewed cryptography.** This is alpha — the protocol hasn't
+- **Unreviewed cryptography.** Non-certified — the protocol hasn't
   been through a third-party audit yet.
 
 ## Reporting a vulnerability

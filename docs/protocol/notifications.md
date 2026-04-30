@@ -8,13 +8,13 @@ nav_order: 8
 # Notifications — receiver-zone claim records (M10)
 {: .no_toc }
 
-A protocol-level mechanism for receivers to learn that they have new
-mail without polling every pinned contact's zone on every tick. The
-sender writes a tiny signed pointer ("claim") to the receiver's home
-node alongside the actual chunks on the sender's own zone. The
+A protocol-level mechanism for receivers to learn that they have
+new mail without polling every pinned contact's zone on every tick.
+The sender writes a tiny signed pointer ("claim") to the receiver's
+home node alongside the actual chunks on the sender's own zone. The
 receiver's home node becomes the canonical "any new mail for me?"
-lookup. No new HTTP between operators; no push primitive. Pure DNS,
-end-to-end signed, best-effort.
+lookup. Reuses the M8.2 `DMPCL01` wire — no new HTTP routes, no
+new on-zone record types.
 
 This page is the wire-level + operational spec.
 

@@ -23,7 +23,10 @@ internet already runs on.
 ## Use dnsmesh.io as your starting point
 
 You don't need to run your own node to try DMP. The reference public
-node at **`https://dnsmesh.io`** is open to anyone:
+node at `https://dnsmesh.io` is open registration — one HTTPS call
+mints your per-user TSIG key, every write after is DNS UPDATE — and
+serves the claim-provider and bootstrap-seed roles other nodes
+default to.
 
 ```bash
 pipx install dnsmesh
@@ -32,31 +35,9 @@ dnsmesh tsig register --node dnsmesh.io      # one-shot HTTPS, mints TSIG key
 dnsmesh identity publish                      # DNS UPDATE under that key
 ```
 
-What that node currently advertises
-(`dig @dnsmesh.io _dnsmesh-heartbeat.dnsmesh.io TXT +short`):
-
-- **Open registration over TSIG.** Anyone can mint a per-user TSIG
-  key via `dnsmesh tsig register --node dnsmesh.io` — no operator
-  approval, no account, no email. The TSIG key is what authorizes
-  every subsequent record publish. The `tsig register` step is the
-  only HTTPS exchange in the protocol; everything after is DNS
-  UPDATE (RFC 2136 + RFC 8945).
-- **Claim-provider role.** Strangers who know your address can reach
-  you on a first message even before you've pinned them as a contact
-  (M8 first-contact layer). Your CLI quarantines them in an `intro`
-  queue that you review with `dnsmesh intro list / accept / trust /
-  block`. Records hosted are tiny signed pointers — the ciphertext
-  stays in the sender's zone.
-- **Canonical bootstrap seed.** Other DMP nodes use `dnsmesh.io` as
-  their default heartbeat-discovery seed, so federation works out of
-  the box without operators having to coordinate.
-- **Multi-node federation source.** Clients that pin `dnsmesh.io`'s
-  `_dmp.<your-zone>` bootstrap record can resolve a cluster manifest
-  via the two-hop trust chain.
-
-If you'd rather self-host, the same capabilities are one
-`deploy/native-ubuntu/install.sh` away — the public node is a
-reference, not a dependency. **Both modes interoperate over DNS.**
+Self-hosting gets the same capabilities via
+`deploy/native-ubuntu/install.sh`. Both modes interoperate over DNS;
+the public node is a reference, not a dependency.
 
 ---
 
@@ -137,11 +118,11 @@ post-compromise recovery, shared-mesh-domain squatting) is in
 ## How it works (30-second version)
 
 ```
-┌────────────┐    1. encrypt          ┌────────────────┐
+┌────────────┐  1. encrypt + sign     ┌────────────────┐
 │  Alice's   │───────────────────────▶│  Alice's DMP   │
-│    CLI     │    2. publish over     │     node       │
-│            │       HTTP API         │  (Docker, on   │
-│            │                        │   her server)  │
+│    CLI     │  2. DNS UPDATE + TSIG  │     node       │
+│            │                        │  (auth DNS for │
+│            │                        │   her zone)    │
 └────────────┘                        └───────┬────────┘
                                               │
                                     3. DNS TXT records
@@ -162,14 +143,18 @@ post-compromise recovery, shared-mesh-domain squatting) is in
 └────────────┘                        └────────────────┘
 ```
 
-1. Alice's command-line tool encrypts the message for Bob and signs it.
-2. It publishes the ciphertext as a batch of DNS TXT records on her node.
+1. Alice's CLI encrypts the message for Bob and signs it with her
+   identity key.
+2. It publishes the ciphertext as a batch of DNS TXT records via
+   RFC 2136 DNS UPDATE, signed with the per-user TSIG key minted at
+   registration. No HTTP between Alice and her node for the write
+   path.
 3. Those records propagate through the normal global DNS system.
-4. Bob's CLI polls for records addressed to him.
+4. Bob's CLI polls DNS for records addressed to him.
 5. It verifies Alice's signature, decrypts, and displays the message.
 
-There is **no central DMP server**. If every node but Bob's disappeared,
-Bob could still run one and receive mail.
+There is **no central DMP server**. If every node but Bob's
+disappeared, Bob could still run one and receive mail.
 
 ## What it costs to run
 
@@ -186,7 +171,7 @@ is a few thousand lines of Python plus SQLite.
 ## Current maturity
 
 {: .warning }
-DMP is **alpha, pre-external-audit software**. The protocol and API
+DMP is **non-certified, pre-external-audit software**. The protocol and API
 are unstable. **Don't route secrets through DMP until the external
 cryptographic audit is done.** The codebase has had ~40+ rounds of
 automated code review (via OpenAI Codex) across all milestones, which
@@ -199,49 +184,30 @@ non-certified-yet for confidentiality-critical traffic.
 
 Actively shipping:
 
-- Command-line client (`dnsmesh`, installable via
-  [`pip install dnsmesh`](https://pypi.org/project/dnsmesh/) or
-  from source).
-- Dockerized node with sqlite storage, metrics, rate limiting.
-- Forward-secret messaging via one-time prekeys (prekey-consumed
-  messages only; long-term-key fallback does not get forward secrecy).
-- Zone-anchored identity addresses (`user@zone.example.com`).
-- Ed25519 signature verification pinned to contacts.
-- Reed-Solomon erasure coding so lost chunks still reconstruct.
-- **Resolver resilience** — a `ResolverPool` with oracle-based
-  demotion survives a subset of upstream DNS resolvers lying about
-  DMP-shaped names.
-- **Multi-node federation** (client AND node side) — `dnsmesh cluster
-  pin / enable` switches the client onto a signed `ClusterManifest`;
-  writes quorum across the node set, reads union with dedup, refresh
-  is atomic across reader + writer. Nodes run pull-based anti-entropy
-  against their peers so records propagate across the cluster even
-  after a node restart. `docker-compose.cluster.yml` is a
+- **Command-line client** (`pip install dnsmesh`) and Dockerized node
+  with sqlite storage, metrics, rate limiting.
+- **End-to-end via DNS UPDATE + TSIG** — every protocol write is
+  RFC 2136 DNS UPDATE signed with RFC 8945 TSIG. Forward secrecy
+  via one-time prekeys; Ed25519 signatures pinned to contacts.
+  Reed-Solomon + zfec erasure so lost chunks still reconstruct.
+- **Multi-node federation** — quorum-write fanout, union reads,
+  pull-based anti-entropy. `docker-compose.cluster.yml` is a
   checked-in 3-node operator starting point.
-- **Bootstrap discovery** — `dnsmesh bootstrap discover me@my-domain
-  --auto-pin` resolves the cluster from a user domain via a signed
-  `_dmp.<user_domain>` TXT record, verifies the two-hop trust chain
-  (bootstrap signer → cluster operator), and cuts over atomically.
-- **Cross-zone receive + first-message claim layer (M8 / 0.4.0).**
-  Restores the original DMP property that a sender publishes to
-  *their own* DNS zone and the recipient pulls via the recursive
-  resolver chain — no shared mesh required, just pin a contact's
-  zone. For unpinned strangers, signed claim records hosted on
-  capability-advertising nodes (`CAP_CLAIM_PROVIDER` bit in the
-  heartbeat) give a working first-contact path without putting the
-  recipient's home node on the open-write hot path. Claim records
-  are tiny signed pointers; ciphertext stays in the sender's zone.
-  Quarantined intros land in `dnsmesh intro list` for review.
-- **Formal protocol specification** at
+- **Cross-zone reach** — sender publishes to their own zone;
+  recipient walks pinned senders' zones via the recursive resolver
+  chain. Unpinned strangers reach you via signed claim pointers
+  hosted on capability-advertising nodes; intros land in
+  `dnsmesh intro list` for review.
+- **Formal spec** at
   [`docs/protocol/`]({{ site.baseurl }}/protocol/) — wire format,
-  routing, end-to-end flows, and threat model, designed so an
-  independent implementer can build interoperable clients.
+  routing, flows, threat model, designed for independent
+  implementers.
 
 Certification backlog — work on the path to `v1.0`, tracked as [GitHub issues](https://github.com/oscarvalenzuelab/DNSMeshProtocol/issues?q=is%3Aissue+label%3Acertification-backlog):
 
 - **External cryptographic audit** (M4.2–M4.4). The gate for tagging
-  `v0.2.0-beta` and for treating DMP as anything other than alpha
-  software.
+  `v0.2.0-beta` and for treating DMP as anything other than
+  non-certified software.
 - **Mobile client** (M5.2), **web/WASM client** (M5.3).
 - **Traffic-analysis resistance** (M6) — random publish delays, dummy
   chunks, chunk-order randomization. Best-effort research track.

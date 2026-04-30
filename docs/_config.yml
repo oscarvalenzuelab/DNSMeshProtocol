@@ -40,7 +40,7 @@ aux_links_new_tab: true
 footer_content: >-
   Content licensed under
   <a href="https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/LICENSE">
-  AGPL-3.0</a>. Alpha / pre-audit — see
+  AGPL-3.0</a>. Non-certified, pre-audit — see
   <a href="https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md">SECURITY.md</a>.
 
 # Show "Edit this page on GitHub" links.

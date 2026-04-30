@@ -276,8 +276,9 @@ the squatter's record. Mitigations:
 
 ### Unreviewed cryptography
 
-DMP is **alpha** software. The protocol has not been through a
-third-party audit. Do not rely on it for life-safety communications.
+DMP is **non-certified** software. The protocol has not been
+through a third-party audit. Do not rely on it for life-safety
+communications.
 
 ## Out of scope (explicit)
 

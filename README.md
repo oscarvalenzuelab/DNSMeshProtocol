@@ -9,7 +9,7 @@ internet already runs on.**
 [**Protocol spec**](https://oscarvalenzuelab.github.io/DNSMeshProtocol/protocol) ·
 [**5-min training deck**](https://oscarvalenzuelab.github.io/DNSMeshProtocol/how-resolution-works.html)
 
-> **Status: alpha, pre-external-audit.** Wire format, federation,
+> **Status: non-certified yet, pre-external-audit.** Wire format, federation,
 > identity / key rotation, multi-tenant auth, and the formal protocol
 > spec are shipped. Don't route confidentiality-critical traffic
 > through DMP until the cryptographic audit lands. See
@@ -99,7 +99,8 @@ format and crypto details: [Protocol → Wire format](https://oscarvalenzuelab.g
 ## Contributing
 
 See [CONTRIBUTING.md](https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/CONTRIBUTING.md).
-1357+ tests; security-sensitive changes get an extra review round.
+Substantial test suite; security-sensitive changes get an extra
+review round.
 
 ## License
 

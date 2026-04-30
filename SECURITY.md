@@ -1,6 +1,6 @@
 # Security
 
-This is **alpha, pre-external-audit software**. **Don't route secrets
+This is **non-certified, pre-external-audit software**. **Don't route secrets
 through DMP until the external cryptographic audit is done.**
 
 The codebase has had ~40+ rounds of automated code review (OpenAI Codex)
@@ -26,8 +26,8 @@ auditor catches a different class of defect:
   composition is unusual for a messaging protocol. Original research
   surface that only human cryptanalysis covers.
 
-Until the external audit is published, treat DMP as experimental for
-confidentiality-critical traffic.
+Until the external audit is published, treat DMP as non-certified
+for confidentiality-critical traffic.
 
 ## Reporting a vulnerability
 

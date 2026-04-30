@@ -21,3 +21,4 @@
 # fresh operator has somewhere to look immediately.
 
 https://dnsmesh.io
+https://dnsmesh.pro
