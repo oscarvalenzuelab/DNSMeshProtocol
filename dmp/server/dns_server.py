@@ -749,7 +749,24 @@ def _serialize_response(
     65535 bytes per RFC 1035 §4.2.2.
     """
     if transport == "tcp":
-        return response.to_wire()
+        # TCP wire format caps at 65535 bytes per RFC 1035 §4.2.2.
+        # If a single RRset somehow serializes past that (would
+        # take, e.g., ~250 verified peer wires under the operator's
+        # 256-values-per-name cap), fall back to SERVFAIL rather
+        # than dropping the connection. SERVFAIL surfaces the
+        # problem to the operator's logs / metrics; a silent close
+        # would just look like a network glitch to the requester.
+        try:
+            return response.to_wire()
+        except dns.exception.TooBig:
+            log.exception(
+                "TCP response for %s exceeds 65535 bytes; returning SERVFAIL. "
+                "Operator should reduce per-name RRset size.",
+                query.question[0].name if query.question else "?",
+            )
+            servfail = dns.message.make_response(query)
+            servfail.set_rcode(dns.rcode.SERVFAIL)
+            return servfail.to_wire()
 
     # UDP. EDNS0 advertised buffer size, with sensible fallbacks.
     udp_size = getattr(query, "payload", None)
@@ -955,6 +972,13 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     allow_reuse_address = True
     daemon_threads = True
+    # Override Python's stdlib default of 5 — too small for the
+    # "many recursive resolvers retrying the same truncated UDP
+    # answer over TCP within milliseconds" burst that this listener
+    # exists to handle. SOMAXCONN-aligned 128 gives the kernel
+    # plenty of room to queue completed handshakes while
+    # ``process_request`` runs (codex round-6 P2).
+    request_queue_size = 128
 
     def __init__(
         self,
