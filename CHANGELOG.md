@@ -7,6 +7,73 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-05-01 — apex SOA + NS records for strict-resolver delegations
+
+Continuation of the strict-resolver compatibility work that started
+in 0.6.3. Apex A alone wasn't enough on Google + Level3: those
+resolvers also validate the delegation by querying the auth for SOA
++ NS at the zone apex. If either query returned NOERROR with an
+empty answer (which 0.6.3 and earlier did — DMP only served TXT
+plus the apex A from PR #18), the resolver concluded the auth
+didn't own the zone, marked it "lame delegation", and NXDOMAINed
+every name under it. Cloudflare and Quad9 skip that validation
+which is why this hid until Google was involved.
+
+Hit in production on dnsmesh.de — fresh delegation set up correctly
+out-of-bailiwick (`dmp.dnsmesh.de NS ns1.dnsmesh.de`), apex A served
+correctly via 0.6.3, ns1.dnsmesh.de A reachable from Google. Yet
+Google still NXDOMAINing every subname despite resolving the apex A.
+Diagnosis traced back to empty SOA + NS responses from the DMP
+server.
+
+Operators upgrade in place via
+`pip install -U dnsmesh && systemctl restart dnsmesh-node`
+(native install) or `docker compose pull && docker compose up -d`
+(Docker). Wire format, on-disk schema, and CLI surfaces are
+byte-identical to 0.6.3.
+
+### Fixed
+
+- **DMP DNS server now answers SOA + NS at the zone apex.** The
+  server claimed authoritative (aa flag set) but returned empty
+  answers for both — the standard pattern strict resolvers use to
+  detect a lame delegation. Server now serves both when the
+  required env vars are set, with sensible defaults for the SOA
+  timing fields. (PR #23.)
+
+### Added
+
+- **`DMP_DNS_APEX_NS`** env var. The NS hostname served at the
+  zone apex (e.g., `ns1.dnsmesh.de`). Should match what the
+  parent zone delegates to. Used both as the apex NS RR target
+  and as the SOA `MNAME` field. (PR #23.)
+- **`DMP_DNS_APEX_SOA_RNAME`** env var. The SOA `RNAME` field —
+  operator email-as-DNS-name format (e.g., `hostmaster.dnsmesh.de`
+  for `hostmaster@dnsmesh.de`). The SOA RR is only emitted when
+  both this AND `DMP_DNS_APEX_NS` are set, since RFC 1035 §3.3.13
+  requires both fields for a valid SOA. (PR #23.)
+- **Operator-facing doc:** new "Apex SOA + NS for strict resolvers
+  (0.6.4+)" section in `docs/deployment/dns-delegation.md`. Lives
+  right after the apex A doc, with diagnosis pattern + verification
+  dig commands + Google flush-cache pointer. (PR #23.)
+
+### SOA defaults
+
+Operators don't typically tune these but they're documented for
+the curious. The SERIAL is per-second wall clock (monotonic for
+the next ~70 years inside RFC 1982 serial-number arithmetic),
+matching how a fresh BIND zone tends to be set up:
+
+  - SERIAL  = epoch-seconds at query time
+  - REFRESH = 3600 (1 hour)
+  - RETRY   = 600 (10 min)
+  - EXPIRE  = 604800 (7 days)
+  - MINIMUM = `DMP_DNS_TTL` (default 60s)
+
+We don't have AXFR slaves so most of these are cosmetic; they're
+chosen to look "right" to anyone running `dig SOA <zone>` to
+sanity-check the configuration.
+
 ## [0.6.3] — 2026-05-01 — apex A/AAAA records for self-glued delegations
 
 Single-fix release. Strict recursive resolvers (Google 8.8.8.8,
