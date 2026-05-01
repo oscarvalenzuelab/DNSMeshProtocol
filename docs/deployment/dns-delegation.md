@@ -241,6 +241,54 @@ most modern panels add this automatically when you create an NS
 record pointing at a name under the delegated zone. If your panel
 doesn't, delegate to `example.com.` instead (no glue needed).
 
+## Self-glued delegation: `DMP_DNS_APEX_A` (0.6.3+)
+
+DigitalOcean's "create DNS subdomain" flow produces a **self-glued**
+delegation by default: when you point `mesh.example.com` at the box,
+the panel writes
+
+```
+mesh.example.com.   3600 IN NS   mesh.example.com.   ; self-referential
+mesh.example.com.   3600 IN A    203.0.113.42         ; glue
+```
+
+The `NS` record names itself as the authoritative server, and a
+parent-side `A` record at the same name acts as glue.
+
+Lenient resolvers (Cloudflare 1.1.1.1, Quad9 9.9.9.9) trust the
+glue and resolve names under `mesh.example.com` correctly. **Strict
+resolvers (Google 8.8.8.8, Level3 4.2.2.x) re-resolve the
+NS-target name out-of-bailiwick** rather than trusting the parent
+zone's glue. They ask *the DMP node itself* "what's the A for
+`mesh.example.com`?" and, since the node by default only serves
+TXT, get nothing back. Result: NXDOMAIN for every name under the
+zone, federation discovery silently breaks for ~33% of the
+public-resolver fleet.
+
+The 0.6.3+ fix is operator-side: set `DMP_DNS_APEX_A` (and
+`DMP_DNS_APEX_AAAA` if the box has IPv6) in `/etc/dnsmesh/node.env`
+to your VPS's public address. The node then answers
+`<DMP_DOMAIN> A` and `<DMP_DOMAIN> AAAA` queries with that value,
+and strict resolvers stop NXDOMAINing.
+
+```bash
+# /etc/dnsmesh/node.env
+DMP_DNS_APEX_A=203.0.113.42
+# DMP_DNS_APEX_AAAA=2001:db8::42  # only if you have v6
+```
+
+```bash
+sudo systemctl restart dnsmesh-node
+
+# Verify with each strict resolver — expect NOERROR with an answer:
+dig @8.8.8.8 mesh.example.com A
+dig @4.2.2.2 mesh.example.com A
+```
+
+The cleaner alternative is to flip the delegation pattern at the
+registrar (out-of-bailiwick NS like `mesh.example NS ns1.example`,
+no glue needed). The apex A is the no-touch-the-DNS-panel path.
+
 ## DNS server settings on the node
 
 The DMP node needs to:

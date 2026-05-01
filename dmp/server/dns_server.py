@@ -51,6 +51,8 @@ import dns.rcode
 import dns.rdataclass
 import dns.rdatatype
 import dns.rdtypes.ANY.TXT
+import dns.rdtypes.IN.A
+import dns.rdtypes.IN.AAAA
 import dns.rrset
 import dns.tsig
 
@@ -246,6 +248,52 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         # Only handle the first question (standard DNS behavior).
         question = query.question[0]
         qname = question.name.to_text(omit_final_dot=True)
+
+        # Apex A/AAAA — answer the served-zone apex with the operator's
+        # configured public address(es). Strict recursive resolvers
+        # (Google 8.8.8.8, Level3 4.2.2.x) re-resolve the NS-target
+        # name out-of-bailiwick rather than trusting the parent zone's
+        # glue. With self-glued delegations like
+        # ``dmp.example NS dmp.example`` (the standard DigitalOcean
+        # subzone-delegation pattern), strict resolvers ask US for the
+        # A record of our own apex; without an answer they return
+        # NXDOMAIN for every name under the zone. Lenient resolvers
+        # (Cloudflare, Quad9) trust the glue and never ask, which
+        # masks the bug in casual testing. Configured via
+        # ``DMP_DNS_APEX_A`` + ``DMP_DNS_APEX_AAAA`` on DMPNode.
+        apex_zone = getattr(self.server, "apex_zone", None) or ""
+        if apex_zone and qname.lower() == apex_zone.lower():
+            ttl = self.server.ttl
+            if question.rdtype == dns.rdatatype.A:
+                apex_a = getattr(self.server, "apex_a", None)
+                if apex_a:
+                    response.answer.append(
+                        dns.rrset.from_rdata(
+                            question.name,
+                            ttl,
+                            dns.rdtypes.IN.A.A(
+                                rdclass=dns.rdataclass.IN,
+                                rdtype=dns.rdatatype.A,
+                                address=apex_a,
+                            ),
+                        )
+                    )
+                return response
+            if question.rdtype == dns.rdatatype.AAAA:
+                apex_aaaa = getattr(self.server, "apex_aaaa", None)
+                if apex_aaaa:
+                    response.answer.append(
+                        dns.rrset.from_rdata(
+                            question.name,
+                            ttl,
+                            dns.rdtypes.IN.AAAA.AAAA(
+                                rdclass=dns.rdataclass.IN,
+                                rdtype=dns.rdatatype.AAAA,
+                                address=apex_aaaa,
+                            ),
+                        )
+                    )
+                return response
 
         if question.rdtype != dns.rdatatype.TXT:
             # We only serve TXT. Everything else → NOERROR with empty answer.
@@ -898,6 +946,9 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         update_max_ttl=DEFAULT_UPDATE_MAX_TTL,
         update_max_value_bytes=DEFAULT_UPDATE_MAX_VALUE_BYTES,
         update_max_values_per_name=DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
+        apex_zone=None,
+        apex_a=None,
+        apex_aaaa=None,
         semaphore=None,
     ):
         super().__init__(server_address, handler_cls)
@@ -917,6 +968,12 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
+        # Apex A/AAAA records — see `_DMPRequestHandler._build_response`
+        # for the full rationale. Operator-configured via
+        # `DMP_DNS_APEX_A` / `DMP_DNS_APEX_AAAA`.
+        self.apex_zone = apex_zone or None
+        self.apex_a = apex_a or None
+        self.apex_aaaa = apex_aaaa or None
         # ``semaphore`` lets the caller (DMPDnsServer) hand in a
         # shared bounded-worker budget so UDP + TCP listeners enforce
         # ONE global cap of ``max_concurrency`` handler threads
@@ -1001,6 +1058,9 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         update_max_ttl=DEFAULT_UPDATE_MAX_TTL,
         update_max_value_bytes=DEFAULT_UPDATE_MAX_VALUE_BYTES,
         update_max_values_per_name=DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
+        apex_zone=None,
+        apex_a=None,
+        apex_aaaa=None,
         semaphore=None,
     ):
         super().__init__(server_address, handler_cls)
@@ -1020,6 +1080,12 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
+        # Apex A/AAAA — see _ThreadingUDPServer for rationale. TCP
+        # listener exposes the same fields so strict resolvers using
+        # the TCP path see the same authoritative apex address.
+        self.apex_zone = apex_zone or None
+        self.apex_a = apex_a or None
+        self.apex_aaaa = apex_aaaa or None
         # ``_semaphore`` (work permit, shared with UDP) caps in-flight
         # handler work — query parsing, response building, sendall.
         # Acquired lazily inside the handler AFTER the message body
@@ -1111,6 +1177,9 @@ class DMPDnsServer:
         update_max_ttl: int = DEFAULT_UPDATE_MAX_TTL,
         update_max_value_bytes: int = DEFAULT_UPDATE_MAX_VALUE_BYTES,
         update_max_values_per_name: int = DEFAULT_UPDATE_MAX_VALUES_PER_NAME,
+        apex_zone: Optional[str] = None,
+        apex_a: Optional[str] = None,
+        apex_aaaa: Optional[str] = None,
         tcp_enabled: bool = True,
     ):
         """``writer``, a TSIG source, and ``allowed_zones`` together
@@ -1179,6 +1248,16 @@ class DMPDnsServer:
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
+        # Apex A/AAAA. Operators on a self-glued subzone delegation
+        # (parent zone publishes ``<sub> NS <sub>`` plus glue A) need
+        # the node to answer A queries for its own apex name so
+        # strict recursive resolvers (Google 8.8.8.8, Level3 4.2.2.x)
+        # accept the delegation. Operators on a more conventional
+        # ``<sub> NS <sub-of-parent>`` setup don't need this and can
+        # leave it None.
+        self.apex_zone = apex_zone or None
+        self.apex_a = apex_a or None
+        self.apex_aaaa = apex_aaaa or None
         self.tcp_enabled = bool(tcp_enabled)
         self._server: Optional[_ThreadingUDPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -1208,6 +1287,9 @@ class DMPDnsServer:
             "update_max_ttl": self.update_max_ttl,
             "update_max_value_bytes": self.update_max_value_bytes,
             "update_max_values_per_name": self.update_max_values_per_name,
+            "apex_zone": self.apex_zone,
+            "apex_a": self.apex_a,
+            "apex_aaaa": self.apex_aaaa,
         }
 
     def start(self) -> None:

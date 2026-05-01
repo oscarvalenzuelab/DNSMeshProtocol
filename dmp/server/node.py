@@ -20,6 +20,14 @@ Environment variables (all optional, sensible defaults for dev):
     DMP_DNS_TTL            TTL seconds advertised in DNS     default: 60
     DMP_DNS_RATE           DNS queries per second per IP     default: 0 (disabled)
     DMP_DNS_BURST          DNS burst budget per IP           default: 0
+    DMP_DNS_APEX_A         IPv4 address served at the zone   default: none
+                           apex (DMP_DOMAIN). Required for
+                           self-glued subzone delegations
+                           (parent zone uses ``<sub> NS <sub>``
+                           with glue A) so strict resolvers
+                           accept the delegation.
+    DMP_DNS_APEX_AAAA      IPv6 address served at the zone   default: none
+                           apex. Same use case as DMP_DNS_APEX_A.
     DMP_HTTP_HOST          bind host for HTTP API            default: 0.0.0.0
     DMP_HTTP_PORT          TCP port for HTTP API             default: 8053
     DMP_HTTP_TOKEN         bearer token for /v1/*            default: none (open)
@@ -648,6 +656,18 @@ class DMPNodeConfig:
     # new connections/packets rather than spawning unbounded threads.
     http_max_concurrency: int = 64
     dns_max_concurrency: int = 128
+    # Apex A/AAAA records. Set on operators whose parent-zone delegation
+    # uses self-glue (``<sub> NS <sub>`` + glue A on the parent). Strict
+    # recursive resolvers (Google 8.8.8.8, Level3 4.2.2.x) re-resolve the
+    # NS-target out-of-bailiwick rather than trusting the glue, and that
+    # second lookup hits OUR DNS server asking for the A of our own
+    # zone-apex name. Without an answer they return NXDOMAIN for every
+    # name under the zone — the federation discovery path silently
+    # breaks for a chunk of the resolver fleet (~33% in our 6-resolver
+    # reachability matrix). When set, the DNS server answers
+    # ``<dns_zone> A`` and ``<dns_zone> AAAA`` with these values.
+    dns_apex_a: Optional[str] = None
+    dns_apex_aaaa: Optional[str] = None
     cleanup_interval: float = 60.0
     log_level: str = "INFO"
     log_format: str = "text"  # "text" or "json"
@@ -779,6 +799,8 @@ class DMPNodeConfig:
             dns_max_concurrency=int(
                 os.environ.get("DMP_DNS_MAX_CONCURRENCY", cls.dns_max_concurrency)
             ),
+            dns_apex_a=os.environ.get("DMP_DNS_APEX_A") or None,
+            dns_apex_aaaa=os.environ.get("DMP_DNS_APEX_AAAA") or None,
             cleanup_interval=float(
                 os.environ.get("DMP_CLEANUP_INTERVAL", cls.cleanup_interval)
             ),
@@ -937,6 +959,16 @@ class DMPNode:
                 "update_max_value_bytes": int(self.config.max_value_bytes),
                 "update_max_values_per_name": int(self.config.max_values_per_name),
             }
+        # Apex A/AAAA — the served zone is the apex name we'll answer
+        # for. Falls through to whatever the caller set on the env var
+        # (DMP_DOMAIN / DMP_CLUSTER_BASE_DOMAIN / claim-provider zone)
+        # via _load_served_zone. If neither apex value is set we pass
+        # apex_zone=None too so the dispatcher fast-path stays inactive.
+        _apex_zone = (
+            _load_served_zone()
+            if (self.config.dns_apex_a or self.config.dns_apex_aaaa)
+            else None
+        )
         self.dns = DMPDnsServer(
             self.store,
             host=self.config.dns_host,
@@ -947,6 +979,9 @@ class DMPNode:
                 burst=self.config.dns_burst,
             ),
             max_concurrency=self.config.dns_max_concurrency,
+            apex_zone=_apex_zone,
+            apex_a=self.config.dns_apex_a,
+            apex_aaaa=self.config.dns_apex_aaaa,
             **update_kwargs,
         )
         # Derive the cluster base domain for the gossip endpoint — same
