@@ -1,6 +1,467 @@
 {
-  "version": 1,
-  "generated_at": 1777186040,
-  "node_count": 0,
-  "nodes": []
+  "version": 2,
+  "generated_at": 1777671406,
+  "node_count": 3,
+  "nodes": [
+    {
+      "operator_spk_hex": "fbe5081430bdefb75f02b794edb6b35bb3428bdbd99e50811fe91f7d3692cdd9",
+      "endpoint": "https://dnsmesh.de",
+      "version": "0.6.6",
+      "ts": 1777671327,
+      "exp": 1777757727,
+      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMwASaHR0cHM6Ly9kbnNtZXNoLmRl++UIFDC977dfAreU7bazW7NCi9vZnlCBH+kffTaSzdkFMC42LjYAAQ5kbXAuZG5zbWVzaC5kZQAAAABp9RyfAAAAAGn2bh8i5+FVTUzkghzafSFdokqz0iEA3L1eH2OCLLBBE/zFPhuvrtm3FZFMC1he9KCXiQrie2QfMNTxYifq0FObrxAB",
+      "last_seen_via": [
+        "dmp.dnsmesh.de"
+      ],
+      "geo": {
+        "ip": "178.104.241.208",
+        "country": "Germany",
+        "country_code": "DE",
+        "region": "Bavaria",
+        "city": "Nuremberg",
+        "lat": 49.4543,
+        "lon": 11.0746,
+        "isp": "Hetzner Online GmbH",
+        "org": "Hetzner",
+        "asn": "AS24940 Hetzner Online GmbH"
+      },
+      "host": {
+        "ip": "178.104.241.208",
+        "isp": "Hetzner Online GmbH",
+        "org": "Hetzner",
+        "asn": "AS24940 Hetzner Online GmbH"
+      }
+    },
+    {
+      "operator_spk_hex": "55dd5085bb16dbf5adaf24d53a13bbd50c8f9f93e026b194059235a3fd82bfef",
+      "endpoint": "https://dnsmesh.pro",
+      "version": "0.6.6",
+      "ts": 1777671321,
+      "exp": 1777757721,
+      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMwATaHR0cHM6Ly9kbnNtZXNoLnByb1XdUIW7Ftv1ra8k1ToTu9UMj5+T4CaxlAWSNaP9gr/vBTAuNi42AAEPZG1wLmRuc21lc2gucHJvAAAAAGn1HJkAAAAAafZuGUQnn0QCsnPHRnJcM8rzvFEcgFX1AUTlfwxr5oLs7WBWOWlKG3zCMLuwmMdQ6cMUTnvbHsHjdLMQ27WZrq72bwI=",
+      "last_seen_via": [
+        "dmp.dnsmesh.pro",
+        "dmp.dnsmesh.de"
+      ],
+      "geo": {
+        "ip": "45.7.229.112",
+        "country": "Chile",
+        "country_code": "CL",
+        "region": "Maule Region",
+        "city": "Curic\u00f3",
+        "lat": -34.978,
+        "lon": -71.2529,
+        "isp": "ZAM LTDA.",
+        "org": "OPENCLOUD SpA",
+        "asn": "AS52368 ZAM LTDA."
+      },
+      "host": {
+        "ip": "45.7.229.112",
+        "isp": "ZAM LTDA.",
+        "org": "OPENCLOUD SpA",
+        "asn": "AS52368 ZAM LTDA."
+      }
+    },
+    {
+      "operator_spk_hex": "c0e5385eb53c1cdb62c5c5a726f1a552480fc345c600c8e45f2ef047fa2032c2",
+      "endpoint": "https://dnsmesh.io",
+      "version": "0.6.6",
+      "ts": 1777671311,
+      "exp": 1777757711,
+      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMwASaHR0cHM6Ly9kbnNtZXNoLmlvwOU4XrU8HNtixcWnJvGlUkgPw0XGAMjkXy7wR/ogMsIFMC42LjYAAQ5kbXAuZG5zbWVzaC5pbwAAAABp9RyPAAAAAGn2bg9auCg/aX5lKU5wjjmcsggM1QimjqkEH0TgF/rBD7NBWqpl5XDFc/+qrH5+yutl5wP5C58wLET4rrS7bzafHpoO",
+      "last_seen_via": [
+        "dmp.dnsmesh.io",
+        "dmp.dnsmesh.pro",
+        "dmp.dnsmesh.de"
+      ],
+      "geo": {
+        "ip": "24.199.107.165",
+        "country": "United States",
+        "country_code": "US",
+        "region": "California",
+        "city": "Santa Clara",
+        "lat": 37.3931,
+        "lon": -121.962,
+        "isp": "DigitalOcean, LLC",
+        "org": "DigitalOcean, LLC",
+        "asn": "AS14061 DigitalOcean, LLC"
+      },
+      "host": {
+        "ip": "24.199.107.165",
+        "isp": "DigitalOcean, LLC",
+        "org": "DigitalOcean, LLC",
+        "asn": "AS14061 DigitalOcean, LLC"
+      }
+    }
+  ],
+  "seen_edges": [
+    {
+      "from_spk": "55dd5085bb16dbf5adaf24d53a13bbd50c8f9f93e026b194059235a3fd82bfef",
+      "to_spk": "c0e5385eb53c1cdb62c5c5a726f1a552480fc345c600c8e45f2ef047fa2032c2",
+      "last_seen_ts": 1777671311
+    },
+    {
+      "from_spk": "fbe5081430bdefb75f02b794edb6b35bb3428bdbd99e50811fe91f7d3692cdd9",
+      "to_spk": "55dd5085bb16dbf5adaf24d53a13bbd50c8f9f93e026b194059235a3fd82bfef",
+      "last_seen_ts": 1777671321
+    },
+    {
+      "from_spk": "fbe5081430bdefb75f02b794edb6b35bb3428bdbd99e50811fe91f7d3692cdd9",
+      "to_spk": "c0e5385eb53c1cdb62c5c5a726f1a552480fc345c600c8e45f2ef047fa2032c2",
+      "last_seen_ts": 1777671311
+    }
+  ],
+  "resolvers": [
+    {
+      "name": "Cloudflare",
+      "addr": "1.1.1.1",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 9,
+      "detail": "ok"
+    },
+    {
+      "name": "Cloudflare",
+      "addr": "1.1.1.1",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 228,
+      "detail": "ok"
+    },
+    {
+      "name": "Cloudflare",
+      "addr": "1.1.1.1",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 334,
+      "detail": "ok"
+    },
+    {
+      "name": "Google",
+      "addr": "8.8.8.8",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 45,
+      "detail": "ok"
+    },
+    {
+      "name": "Google",
+      "addr": "8.8.8.8",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 218,
+      "detail": "ok"
+    },
+    {
+      "name": "Google",
+      "addr": "8.8.8.8",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 206,
+      "detail": "ok"
+    },
+    {
+      "name": "Quad9",
+      "addr": "9.9.9.9",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 95,
+      "detail": "ok"
+    },
+    {
+      "name": "Quad9",
+      "addr": "9.9.9.9",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 513,
+      "detail": "ok"
+    },
+    {
+      "name": "Quad9",
+      "addr": "9.9.9.9",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 440,
+      "detail": "ok"
+    },
+    {
+      "name": "OpenDNS",
+      "addr": "208.67.222.222",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 101,
+      "detail": "ok"
+    },
+    {
+      "name": "OpenDNS",
+      "addr": "208.67.222.222",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 352,
+      "detail": "ok"
+    },
+    {
+      "name": "OpenDNS",
+      "addr": "208.67.222.222",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 397,
+      "detail": "ok"
+    },
+    {
+      "name": "Comodo",
+      "addr": "8.26.56.26",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 197,
+      "detail": "ok"
+    },
+    {
+      "name": "Comodo",
+      "addr": "8.26.56.26",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 496,
+      "detail": "ok"
+    },
+    {
+      "name": "Comodo",
+      "addr": "8.26.56.26",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 451,
+      "detail": "ok"
+    },
+    {
+      "name": "Level3",
+      "addr": "4.2.2.1",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": null,
+      "ok": false,
+      "latency_ms": 10206,
+      "detail": "empty answer"
+    },
+    {
+      "name": "Level3",
+      "addr": "4.2.2.1",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 334,
+      "detail": "ok"
+    },
+    {
+      "name": "Level3",
+      "addr": "4.2.2.1",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 343,
+      "detail": "ok"
+    },
+    {
+      "name": "Hurricane Electric",
+      "addr": "74.82.42.42",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 77,
+      "detail": "ok"
+    },
+    {
+      "name": "Hurricane Electric",
+      "addr": "74.82.42.42",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 340,
+      "detail": "ok"
+    },
+    {
+      "name": "Hurricane Electric",
+      "addr": "74.82.42.42",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 183,
+      "detail": "ok"
+    },
+    {
+      "name": "Verisign",
+      "addr": "64.6.64.6",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 46,
+      "detail": "ok"
+    },
+    {
+      "name": "Verisign",
+      "addr": "64.6.64.6",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 377,
+      "detail": "ok"
+    },
+    {
+      "name": "Verisign",
+      "addr": "64.6.64.6",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 365,
+      "detail": "ok"
+    },
+    {
+      "name": "AdGuard",
+      "addr": "94.140.14.14",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 310,
+      "detail": "ok"
+    },
+    {
+      "name": "AdGuard",
+      "addr": "94.140.14.14",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 474,
+      "detail": "ok"
+    },
+    {
+      "name": "AdGuard",
+      "addr": "94.140.14.14",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 1033,
+      "detail": "ok"
+    },
+    {
+      "name": "Yandex",
+      "addr": "77.88.8.8",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 721,
+      "detail": "ok"
+    },
+    {
+      "name": "Yandex",
+      "addr": "77.88.8.8",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 804,
+      "detail": "ok"
+    },
+    {
+      "name": "Yandex",
+      "addr": "77.88.8.8",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 479,
+      "detail": "ok"
+    },
+    {
+      "name": "Alibaba",
+      "addr": "223.5.5.5",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 185,
+      "detail": "ok"
+    },
+    {
+      "name": "Alibaba",
+      "addr": "223.5.5.5",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 584,
+      "detail": "ok"
+    },
+    {
+      "name": "Alibaba",
+      "addr": "223.5.5.5",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 781,
+      "detail": "ok"
+    },
+    {
+      "name": "DNSPod",
+      "addr": "119.29.29.29",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 108,
+      "detail": "ok"
+    },
+    {
+      "name": "DNSPod",
+      "addr": "119.29.29.29",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 535,
+      "detail": "ok"
+    },
+    {
+      "name": "DNSPod",
+      "addr": "119.29.29.29",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 558,
+      "detail": "ok"
+    },
+    {
+      "name": "KT Korea",
+      "addr": "168.126.63.1",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 485,
+      "detail": "ok"
+    },
+    {
+      "name": "KT Korea",
+      "addr": "168.126.63.1",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 760,
+      "detail": "ok"
+    },
+    {
+      "name": "KT Korea",
+      "addr": "168.126.63.1",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 537,
+      "detail": "ok"
+    }
+  ]
 }

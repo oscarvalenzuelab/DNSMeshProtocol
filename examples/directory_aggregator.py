@@ -496,86 +496,88 @@ def emit_json(result: AggregateResult, out: Path, *, now: int) -> None:
     out.write_text(json.dumps(feed, indent=2) + "\n")
 
 
-_HTML_TEMPLATE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DMP node directory</title>
+# Jekyll front matter at the top — Just-the-Docs picks up `title` for the
+# sidebar entry, `nav_order` controls position, `layout: default` wraps the
+# generated content in the standard chrome (sidebar, header, footer).
+# `permalink` keeps the URL at /directory/ regardless of how the source file
+# is named so existing links don't break.
+#
+# All page-specific styles are scoped to ``.dmp-directory`` so they don't
+# fight with Just-the-Docs's body / typography rules. Content lives inside
+# a single wrapper div for the same reason.
+_HTML_TEMPLATE = """---
+title: Directory
+layout: default
+nav_order: 8
+permalink: /directory/
+---
 <style>
-:root {{
-  --fg: #1a1a1a; --muted: #666; --bg: #fafafa; --card: #fff;
-  --border: #ddd; --accent: #0066cc; --green: #1a7f37;
-  --amber: #9a6700; --red: #cf222e;
+.dmp-directory {{
+  --dir-fg: #1a1a1a; --dir-muted: #666; --dir-card: #fff;
+  --dir-border: #ddd; --dir-accent: #0066cc; --dir-green: #1a7f37;
+  --dir-amber: #9a6700; --dir-red: #cf222e;
 }}
 @media (prefers-color-scheme: dark) {{
-  :root {{
-    --fg: #e6edf3; --muted: #8b949e; --bg: #0d1117; --card: #161b22;
-    --border: #30363d; --accent: #58a6ff; --green: #3fb950;
-    --amber: #d29922; --red: #f85149;
+  .dmp-directory {{
+    --dir-fg: #e6edf3; --dir-muted: #8b949e; --dir-card: #161b22;
+    --dir-border: #30363d; --dir-accent: #58a6ff; --dir-green: #3fb950;
+    --dir-amber: #d29922; --dir-red: #f85149;
   }}
 }}
-* {{ box-sizing: border-box; }}
-body {{
-  font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
-  max-width: 1080px; margin: 2em auto; padding: 0 1.2em;
-  color: var(--fg); background: var(--bg);
-}}
-h1 {{ margin: 0 0 0.2em; font-size: 1.7em; }}
-h2 {{ margin: 1.6em 0 0.4em; font-size: 1.15em; }}
-h2 small {{ font-weight: normal; color: var(--muted); margin-left: 0.5em; }}
-small {{ color: var(--muted); }}
-a {{ color: var(--accent); text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
-code {{
+.dmp-directory {{ font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--dir-fg); }}
+.dmp-directory h2 {{ margin: 1.6em 0 0.4em; font-size: 1.15em; }}
+.dmp-directory h2 small {{ font-weight: normal; color: var(--dir-muted); margin-left: 0.5em; }}
+.dmp-directory small {{ color: var(--dir-muted); }}
+.dmp-directory a {{ color: var(--dir-accent); text-decoration: none; }}
+.dmp-directory a:hover {{ text-decoration: underline; }}
+.dmp-directory code {{
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.9em; background: var(--card); padding: 1px 4px;
-  border-radius: 3px; border: 1px solid var(--border);
+  font-size: 0.9em; background: var(--dir-card); padding: 1px 4px;
+  border-radius: 3px; border: 1px solid var(--dir-border);
 }}
-.cards {{
+.dmp-directory .cards {{
   display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 0.8em;
 }}
-.card {{
-  background: var(--card); border: 1px solid var(--border);
+.dmp-directory .card {{
+  background: var(--dir-card); border: 1px solid var(--dir-border);
   border-radius: 6px; padding: 0.9em 1em;
 }}
-.card h3 {{ margin: 0 0 0.4em; font-size: 1em; }}
-.card .row {{ display: flex; justify-content: space-between; gap: 1em; margin: 0.18em 0; font-size: 0.92em; }}
-.card .label {{ color: var(--muted); flex-shrink: 0; }}
-.card .val {{ text-align: right; word-break: break-all; }}
-.card .pill {{ font-size: 0.8em; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); }}
-.pill.fresh {{ color: var(--green); border-color: currentColor; }}
-.pill.stale {{ color: var(--amber); border-color: currentColor; }}
-.pill.expired {{ color: var(--red); border-color: currentColor; }}
-table {{
+.dmp-directory .card h3 {{ margin: 0 0 0.4em; font-size: 1em; }}
+.dmp-directory .card .row {{ display: flex; justify-content: space-between; gap: 1em; margin: 0.18em 0; font-size: 0.92em; }}
+.dmp-directory .card .label {{ color: var(--dir-muted); flex-shrink: 0; }}
+.dmp-directory .card .val {{ text-align: right; word-break: break-all; }}
+.dmp-directory .card .pill {{ font-size: 0.8em; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--dir-border); }}
+.dmp-directory .pill.fresh {{ color: var(--dir-green); border-color: currentColor; }}
+.dmp-directory .pill.stale {{ color: var(--dir-amber); border-color: currentColor; }}
+.dmp-directory .pill.expired {{ color: var(--dir-red); border-color: currentColor; }}
+.dmp-directory table {{
   border-collapse: collapse; width: 100%; margin-top: 0.6em;
   font-size: 0.92em;
 }}
-th, td {{
-  border: 1px solid var(--border); padding: 0.4em 0.7em;
+.dmp-directory th, .dmp-directory td {{
+  border: 1px solid var(--dir-border); padding: 0.4em 0.7em;
   text-align: left;
 }}
-th {{ background: var(--card); font-weight: 600; }}
-td.ok {{ color: var(--green); }}
-td.fail {{ color: var(--red); }}
-.svg-wrap {{
-  background: var(--card); border: 1px solid var(--border);
+.dmp-directory th {{ background: var(--dir-card); font-weight: 600; }}
+.dmp-directory td.ok {{ color: var(--dir-green); }}
+.dmp-directory td.fail {{ color: var(--dir-red); }}
+.dmp-directory .svg-wrap {{
+  background: var(--dir-card); border: 1px solid var(--dir-border);
   border-radius: 6px; padding: 1em; margin-top: 0.4em;
   text-align: center; overflow-x: auto;
 }}
-svg.topology text {{ fill: var(--fg); font: 11px ui-monospace, monospace; }}
-svg.topology circle.node {{ fill: var(--card); stroke: var(--accent); stroke-width: 2; }}
-svg.topology line {{ stroke: var(--accent); stroke-width: 1.4; opacity: 0.65; }}
-svg.topology .label {{ font: 11px system-ui, sans-serif; fill: var(--fg); }}
-svg.topology .arrow {{ fill: var(--accent); }}
-.legend {{ font-size: 0.85em; color: var(--muted); margin-top: 0.5em; }}
-.section-note {{ font-size: 0.88em; color: var(--muted); margin-top: 0.3em; }}
+.dmp-directory svg.topology text {{ fill: var(--dir-fg); font: 11px ui-monospace, monospace; }}
+.dmp-directory svg.topology circle.node {{ fill: var(--dir-card); stroke: var(--dir-accent); stroke-width: 2; }}
+.dmp-directory svg.topology line {{ stroke: var(--dir-accent); stroke-width: 1.4; opacity: 0.65; }}
+.dmp-directory svg.topology .label {{ font: 11px system-ui, sans-serif; fill: var(--dir-fg); }}
+.dmp-directory svg.topology .arrow {{ fill: var(--dir-accent); }}
+.dmp-directory .legend {{ font-size: 0.85em; color: var(--dir-muted); margin-top: 0.5em; }}
+.dmp-directory .section-note {{ font-size: 0.88em; color: var(--dir-muted); margin-top: 0.3em; }}
 </style>
-</head>
-<body>
 
-<h1>DMP node directory</h1>
+<div class="dmp-directory">
+
 <p>
   <small>Generated {generated} · {node_count} known nodes ·
   <a href="feed.json">feed.json</a> carries the raw signed wires
@@ -617,8 +619,7 @@ svg.topology .arrow {{ fill: var(--accent); }}
   internet-connected DNS resolver can perform the same query.
 </p>
 
-</body>
-</html>
+</div>
 """
 
 
