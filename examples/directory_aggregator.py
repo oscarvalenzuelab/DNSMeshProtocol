@@ -63,20 +63,40 @@ from dmp.server.heartbeat_worker import (  # noqa: E402
 log = logging.getLogger("dmp-directory-aggregator")
 
 
-# Curated public resolvers for the reachability matrix. These are the
-# best-known anycast public DNS services; any client behind a network
-# that allows DNS at all can reach at least one of them. The matrix
-# demonstrates that DMP records resolve correctly through the public
-# recursive chain; it is NOT meant to imply this list is "the
-# resolver network" (it isn't — every internet-connected resolver
-# can do the same query).
+# Curated public resolvers for the reachability matrix. The set is
+# picked for geographic + operator diversity, not "best resolvers"
+# — the point is to show DMP records resolve through the public
+# recursive chain regardless of where in the world the client is or
+# which provider they trust. Any internet-connected resolver can do
+# the same query; this list is illustrative, not exhaustive.
+#
+# Layout:
+#   - Major US-anycast (Cloudflare, Google, Quad9, OpenDNS, Comodo,
+#     Level3, Hurricane Electric, Verisign)
+#   - Europe (Yandex, AdGuard)
+#   - Asia (Alibaba, DNSPod / Tencent, KT Korea)
+#
+# Each entry is the canonical public IP. Resolver fleets are anycast,
+# so the actual POP answering depends on where THIS aggregator is
+# running — operators can re-render from a different VPS and watch
+# the latency column shift accordingly. Level3 uses 4.2.2.1 rather
+# than 4.2.2.2 — the former tracks delegation changes faster across
+# their POP fleet (we observed 4.2.2.2 lagging by ~30 min on a
+# delegation cleanup that 4.2.2.1 picked up immediately).
 _RESOLVERS: List[Tuple[str, str]] = [
     ("Cloudflare", "1.1.1.1"),
     ("Google", "8.8.8.8"),
     ("Quad9", "9.9.9.9"),
     ("OpenDNS", "208.67.222.222"),
-    ("Level3", "4.2.2.2"),
+    ("Comodo", "8.26.56.26"),
+    ("Level3", "4.2.2.1"),
+    ("Hurricane Electric", "74.82.42.42"),
+    ("Verisign", "64.6.64.6"),
+    ("AdGuard", "94.140.14.14"),
     ("Yandex", "77.88.8.8"),
+    ("Alibaba", "223.5.5.5"),
+    ("DNSPod", "119.29.29.29"),
+    ("KT Korea", "168.126.63.1"),
 ]
 
 
