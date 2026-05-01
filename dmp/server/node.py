@@ -28,6 +28,17 @@ Environment variables (all optional, sensible defaults for dev):
                            accept the delegation.
     DMP_DNS_APEX_AAAA      IPv6 address served at the zone   default: none
                            apex. Same use case as DMP_DNS_APEX_A.
+    DMP_DNS_APEX_NS        NS hostname served at the zone    default: none
+                           apex (e.g. "ns1.dnsmesh.de"). Required
+                           in addition to DMP_DNS_APEX_A for strict
+                           resolvers (Google 8.8.8.8, Level3 4.2.2.x)
+                           to accept the delegation as non-lame.
+                           Used as MNAME in the SOA RR too.
+    DMP_DNS_APEX_SOA_RNAME SOA RNAME at the zone apex        default: none
+                           (operator email-as-DNS-name, e.g.
+                           "hostmaster.dnsmesh.de"). The SOA RR
+                           is only emitted when both this AND
+                           DMP_DNS_APEX_NS are set.
     DMP_HTTP_HOST          bind host for HTTP API            default: 0.0.0.0
     DMP_HTTP_PORT          TCP port for HTTP API             default: 8053
     DMP_HTTP_TOKEN         bearer token for /v1/*            default: none (open)
@@ -668,6 +679,18 @@ class DMPNodeConfig:
     # ``<dns_zone> A`` and ``<dns_zone> AAAA`` with these values.
     dns_apex_a: Optional[str] = None
     dns_apex_aaaa: Optional[str] = None
+    # Apex NS + SOA RNAME. Set together when the operator wants
+    # strict resolvers (Google 8.8.8.8, Level3 4.2.2.x) to accept the
+    # delegation as non-lame: those resolvers query the auth for SOA
+    # and NS at its own apex; an empty NOERROR back is the trigger
+    # for marking the zone as broken. ``dns_apex_ns`` is a hostname
+    # (e.g. "ns1.dnsmesh.de") served at the apex NS RR and used as
+    # MNAME inside the SOA. ``dns_apex_soa_rname`` is the SOA RNAME
+    # (operator email-as-DNS-name, e.g. "hostmaster.dnsmesh.de").
+    # The SOA RR is only emitted when both are set; the NS RR fires
+    # whenever ``dns_apex_ns`` is set.
+    dns_apex_ns: Optional[str] = None
+    dns_apex_soa_rname: Optional[str] = None
     cleanup_interval: float = 60.0
     log_level: str = "INFO"
     log_format: str = "text"  # "text" or "json"
@@ -801,6 +824,8 @@ class DMPNodeConfig:
             ),
             dns_apex_a=os.environ.get("DMP_DNS_APEX_A") or None,
             dns_apex_aaaa=os.environ.get("DMP_DNS_APEX_AAAA") or None,
+            dns_apex_ns=os.environ.get("DMP_DNS_APEX_NS") or None,
+            dns_apex_soa_rname=os.environ.get("DMP_DNS_APEX_SOA_RNAME") or None,
             cleanup_interval=float(
                 os.environ.get("DMP_CLEANUP_INTERVAL", cls.cleanup_interval)
             ),
@@ -959,16 +984,21 @@ class DMPNode:
                 "update_max_value_bytes": int(self.config.max_value_bytes),
                 "update_max_values_per_name": int(self.config.max_values_per_name),
             }
-        # Apex A/AAAA — the served zone is the apex name we'll answer
-        # for. Falls through to whatever the caller set on the env var
-        # (DMP_DOMAIN / DMP_CLUSTER_BASE_DOMAIN / claim-provider zone)
-        # via _load_served_zone. If neither apex value is set we pass
-        # apex_zone=None too so the dispatcher fast-path stays inactive.
-        _apex_zone = (
-            _load_served_zone()
-            if (self.config.dns_apex_a or self.config.dns_apex_aaaa)
-            else None
+        # Apex A/AAAA/NS/SOA — the served zone is the apex name we'll
+        # answer for. Falls through to whatever the caller set on the
+        # env var (DMP_DOMAIN / DMP_CLUSTER_BASE_DOMAIN /
+        # claim-provider zone) via _load_served_zone. If NO apex
+        # values are configured we pass apex_zone=None so the
+        # dispatcher fast-path stays inactive (backward compat).
+        _any_apex = any(
+            [
+                self.config.dns_apex_a,
+                self.config.dns_apex_aaaa,
+                self.config.dns_apex_ns,
+                self.config.dns_apex_soa_rname,
+            ]
         )
+        _apex_zone = _load_served_zone() if _any_apex else None
         self.dns = DMPDnsServer(
             self.store,
             host=self.config.dns_host,
@@ -982,6 +1012,8 @@ class DMPNode:
             apex_zone=_apex_zone,
             apex_a=self.config.dns_apex_a,
             apex_aaaa=self.config.dns_apex_aaaa,
+            apex_ns=self.config.dns_apex_ns,
+            apex_soa_rname=self.config.dns_apex_soa_rname,
             **update_kwargs,
         )
         # Derive the cluster base domain for the gossip endpoint — same

@@ -292,6 +292,210 @@ class TestDMPDnsServerApexAddressRecords:
         assert str(response.answer[0][0]) == "203.0.113.42"
 
 
+class TestDMPDnsServerApexSoaNs:
+    """Strict recursive resolvers (Google 8.8.8.8, Level3 4.2.2.x)
+    validate a delegation by querying the configured authoritative
+    server for SOA + NS at the zone apex. If either query returns
+    NOERROR with an empty answer, they conclude the auth doesn't
+    actually own the zone, mark it "lame delegation", and NXDOMAIN
+    every name under it. Lenient resolvers (Cloudflare, Quad9) skip
+    this check, which is why the bug hides until Google's involved.
+
+    DMP_DNS_APEX_NS + DMP_DNS_APEX_SOA_RNAME flip this on. SOA needs
+    both (RFC 1035 §3.3.13 requires MNAME and RNAME); NS only needs
+    apex_ns. Without either, the dispatcher falls through to the
+    legacy NOERROR-empty branch.
+    """
+
+    def test_apex_ns_returned_for_zone_apex(self):
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_ns="ns1.mesh.test",
+        ):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.NS)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        rdata = response.answer[0][0]
+        assert rdata.rdtype == dns.rdatatype.NS
+        # NS target is dnspython Name; compare lowercase no-trailing-dot.
+        assert rdata.target.to_text(omit_final_dot=True).lower() == "ns1.mesh.test"
+
+    def test_apex_soa_returned_for_zone_apex(self):
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_ns="ns1.mesh.test",
+            apex_soa_rname="hostmaster.mesh.test",
+        ):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.SOA)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        soa = response.answer[0][0]
+        assert soa.rdtype == dns.rdatatype.SOA
+        assert soa.mname.to_text(omit_final_dot=True).lower() == "ns1.mesh.test"
+        assert soa.rname.to_text(omit_final_dot=True).lower() == "hostmaster.mesh.test"
+        # SERIAL is wall-clock based; just verify it's a sane recent value.
+        assert soa.serial > 1_700_000_000  # after 2023-11-15
+        assert soa.refresh == 3600
+        assert soa.retry == 600
+        assert soa.expire == 604800
+
+    def test_apex_soa_unconfigured_rname_returns_empty(self):
+        """SOA RFC requires both MNAME (apex_ns) AND RNAME
+        (apex_soa_rname). If only one is set we DON'T half-construct
+        an SOA — return NOERROR-empty so the resolver doesn't cache
+        a malformed record."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_ns="ns1.mesh.test",
+            # apex_soa_rname intentionally unset
+        ):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.SOA)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+
+    def test_apex_ns_unconfigured_returns_empty(self):
+        """No apex_ns → NS query at apex returns NOERROR-empty."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store, host="127.0.0.1", port=port, apex_zone="dmp.mesh.test"
+        ):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.NS)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+
+    def test_ns_at_non_apex_returns_empty(self):
+        """NS at a sub-name (not the apex) returns empty, not the
+        apex NS. We only serve NS at exactly the configured apex."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_ns="ns1.mesh.test",
+        ):
+            request = dns.message.make_query(
+                "_dnsmesh-heartbeat.dmp.mesh.test", dns.rdatatype.NS
+            )
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+
+    def test_soa_at_non_apex_returns_empty(self):
+        """Same property for SOA — only at the apex name."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_ns="ns1.mesh.test",
+            apex_soa_rname="hostmaster.mesh.test",
+        ):
+            request = dns.message.make_query(
+                "_dnsmesh-heartbeat.dmp.mesh.test", dns.rdatatype.SOA
+            )
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+
+    def test_apex_records_combined_a_ns_soa(self):
+        """A node with the full apex bundle answers all three RR
+        types correctly at the same name. Sanity check that no two
+        config paths fight each other."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_a="203.0.113.42",
+            apex_ns="ns1.mesh.test",
+            apex_soa_rname="hostmaster.mesh.test",
+        ):
+            for rdtype, expected_present in [
+                (dns.rdatatype.A, True),
+                (dns.rdatatype.NS, True),
+                (dns.rdatatype.SOA, True),
+                (dns.rdatatype.AAAA, False),  # no apex_aaaa configured
+            ]:
+                request = dns.message.make_query("dmp.mesh.test", rdtype)
+                response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+                assert response.rcode() == 0
+                if expected_present:
+                    assert (
+                        len(response.answer) == 1
+                    ), f"{dns.rdatatype.to_text(rdtype)} expected 1 answer, got {len(response.answer)}"
+                else:
+                    assert (
+                        response.answer == []
+                    ), f"{dns.rdatatype.to_text(rdtype)} unexpected answer"
+
+    def test_apex_soa_serial_is_monotonic(self):
+        """SOA SERIAL must increase across queries so slaves (or
+        operators sanity-checking the zone) see a fresh value. We
+        don't have AXFR slaves but a manually-tuned tooling chain
+        depends on the property."""
+        import time as _time
+
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_ns="ns1.mesh.test",
+            apex_soa_rname="hostmaster.mesh.test",
+        ):
+            r1 = dns.query.udp(
+                dns.message.make_query("dmp.mesh.test", dns.rdatatype.SOA),
+                "127.0.0.1",
+                port=port,
+                timeout=2.0,
+            )
+            _time.sleep(1.05)
+            r2 = dns.query.udp(
+                dns.message.make_query("dmp.mesh.test", dns.rdatatype.SOA),
+                "127.0.0.1",
+                port=port,
+                timeout=2.0,
+            )
+
+        s1 = r1.answer[0][0].serial
+        s2 = r2.answer[0][0].serial
+        assert s2 > s1, f"SOA serial should advance: {s1} -> {s2}"
+
+
 class TestDMPDnsServerRateLimitAndConcurrency:
     """Regressions caught by codex review of the TCP listener PR.
 

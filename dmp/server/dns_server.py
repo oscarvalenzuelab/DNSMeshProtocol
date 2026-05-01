@@ -50,6 +50,8 @@ import dns.opcode
 import dns.rcode
 import dns.rdataclass
 import dns.rdatatype
+import dns.rdtypes.ANY.NS
+import dns.rdtypes.ANY.SOA
 import dns.rdtypes.ANY.TXT
 import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
@@ -249,18 +251,22 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         question = query.question[0]
         qname = question.name.to_text(omit_final_dot=True)
 
-        # Apex A/AAAA — answer the served-zone apex with the operator's
-        # configured public address(es). Strict recursive resolvers
-        # (Google 8.8.8.8, Level3 4.2.2.x) re-resolve the NS-target
-        # name out-of-bailiwick rather than trusting the parent zone's
-        # glue. With self-glued delegations like
-        # ``dmp.example NS dmp.example`` (the standard DigitalOcean
-        # subzone-delegation pattern), strict resolvers ask US for the
-        # A record of our own apex; without an answer they return
-        # NXDOMAIN for every name under the zone. Lenient resolvers
-        # (Cloudflare, Quad9) trust the glue and never ask, which
-        # masks the bug in casual testing. Configured via
-        # ``DMP_DNS_APEX_A`` + ``DMP_DNS_APEX_AAAA`` on DMPNode.
+        # Apex address + zone-meta records — answer at the served-zone
+        # apex with operator-configured values. Strict recursive
+        # resolvers (Google 8.8.8.8, Level3 4.2.2.x) re-resolve the
+        # NS-target name out-of-bailiwick rather than trusting the
+        # parent zone's glue, AND validate that the auth advertises
+        # SOA + NS at its own apex. If either of those queries comes
+        # back empty (NOERROR/0-answer), they mark the whole zone as
+        # a "lame delegation" and NXDOMAIN every name under it.
+        # Lenient resolvers (Cloudflare, Quad9) skip the validation
+        # step, which is why this bug hides in casual testing.
+        #
+        # Operator config (all optional, all gated on the served zone
+        # being known via DMP_DOMAIN):
+        #   DMP_DNS_APEX_A / DMP_DNS_APEX_AAAA — public address(es)
+        #   DMP_DNS_APEX_NS                    — NS hostname (e.g. ns1.<parent>)
+        #   DMP_DNS_APEX_SOA_RNAME             — SOA RNAME (operator email-as-name)
         apex_zone = getattr(self.server, "apex_zone", None) or ""
         if apex_zone and qname.lower() == apex_zone.lower():
             ttl = self.server.ttl
@@ -290,6 +296,50 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                                 rdclass=dns.rdataclass.IN,
                                 rdtype=dns.rdatatype.AAAA,
                                 address=apex_aaaa,
+                            ),
+                        )
+                    )
+                return response
+            if question.rdtype == dns.rdatatype.NS:
+                apex_ns = getattr(self.server, "apex_ns", None)
+                if apex_ns:
+                    response.answer.append(
+                        dns.rrset.from_rdata(
+                            question.name,
+                            ttl,
+                            dns.rdtypes.ANY.NS.NS(
+                                rdclass=dns.rdataclass.IN,
+                                rdtype=dns.rdatatype.NS,
+                                target=dns.name.from_text(apex_ns),
+                            ),
+                        )
+                    )
+                return response
+            if question.rdtype == dns.rdatatype.SOA:
+                apex_ns = getattr(self.server, "apex_ns", None)
+                apex_rname = getattr(self.server, "apex_soa_rname", None)
+                if apex_ns and apex_rname:
+                    # SOA RFC 1035 §3.3.13. Defaults match a typical
+                    # authoritative-only zone with no AXFR slaves —
+                    # SERIAL is per-second wall clock (monotonic
+                    # for the next ~70 years inside the 32-bit
+                    # serial-number arithmetic window of RFC 1982),
+                    # REFRESH/RETRY/EXPIRE are the BIND operator
+                    # defaults, MINIMUM matches our standard TTL.
+                    response.answer.append(
+                        dns.rrset.from_rdata(
+                            question.name,
+                            ttl,
+                            dns.rdtypes.ANY.SOA.SOA(
+                                rdclass=dns.rdataclass.IN,
+                                rdtype=dns.rdatatype.SOA,
+                                mname=dns.name.from_text(apex_ns),
+                                rname=dns.name.from_text(apex_rname),
+                                serial=int(time.time()),
+                                refresh=3600,
+                                retry=600,
+                                expire=604800,
+                                minimum=ttl,
                             ),
                         )
                     )
@@ -949,6 +999,8 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         apex_zone=None,
         apex_a=None,
         apex_aaaa=None,
+        apex_ns=None,
+        apex_soa_rname=None,
         semaphore=None,
     ):
         super().__init__(server_address, handler_cls)
@@ -968,12 +1020,16 @@ class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
-        # Apex A/AAAA records — see `_DMPRequestHandler._build_response`
-        # for the full rationale. Operator-configured via
-        # `DMP_DNS_APEX_A` / `DMP_DNS_APEX_AAAA`.
+        # Apex A/AAAA/NS/SOA records — see
+        # ``_DMPRequestHandler._build_response`` for the full
+        # rationale. Operator-configured via ``DMP_DNS_APEX_A``,
+        # ``DMP_DNS_APEX_AAAA``, ``DMP_DNS_APEX_NS``,
+        # ``DMP_DNS_APEX_SOA_RNAME``.
         self.apex_zone = apex_zone or None
         self.apex_a = apex_a or None
         self.apex_aaaa = apex_aaaa or None
+        self.apex_ns = apex_ns or None
+        self.apex_soa_rname = apex_soa_rname or None
         # ``semaphore`` lets the caller (DMPDnsServer) hand in a
         # shared bounded-worker budget so UDP + TCP listeners enforce
         # ONE global cap of ``max_concurrency`` handler threads
@@ -1061,6 +1117,8 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         apex_zone=None,
         apex_a=None,
         apex_aaaa=None,
+        apex_ns=None,
+        apex_soa_rname=None,
         semaphore=None,
     ):
         super().__init__(server_address, handler_cls)
@@ -1080,12 +1138,14 @@ class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
-        # Apex A/AAAA — see _ThreadingUDPServer for rationale. TCP
-        # listener exposes the same fields so strict resolvers using
-        # the TCP path see the same authoritative apex address.
+        # Apex A/AAAA/NS/SOA — see _ThreadingUDPServer for rationale.
+        # TCP listener exposes the same fields so strict resolvers
+        # using the TCP path see identical authoritative apex records.
         self.apex_zone = apex_zone or None
         self.apex_a = apex_a or None
         self.apex_aaaa = apex_aaaa or None
+        self.apex_ns = apex_ns or None
+        self.apex_soa_rname = apex_soa_rname or None
         # ``_semaphore`` (work permit, shared with UDP) caps in-flight
         # handler work — query parsing, response building, sendall.
         # Acquired lazily inside the handler AFTER the message body
@@ -1180,6 +1240,8 @@ class DMPDnsServer:
         apex_zone: Optional[str] = None,
         apex_a: Optional[str] = None,
         apex_aaaa: Optional[str] = None,
+        apex_ns: Optional[str] = None,
+        apex_soa_rname: Optional[str] = None,
         tcp_enabled: bool = True,
     ):
         """``writer``, a TSIG source, and ``allowed_zones`` together
@@ -1248,16 +1310,26 @@ class DMPDnsServer:
         self.update_max_ttl = int(update_max_ttl)
         self.update_max_value_bytes = int(update_max_value_bytes)
         self.update_max_values_per_name = int(update_max_values_per_name)
-        # Apex A/AAAA. Operators on a self-glued subzone delegation
-        # (parent zone publishes ``<sub> NS <sub>`` plus glue A) need
-        # the node to answer A queries for its own apex name so
-        # strict recursive resolvers (Google 8.8.8.8, Level3 4.2.2.x)
-        # accept the delegation. Operators on a more conventional
-        # ``<sub> NS <sub-of-parent>`` setup don't need this and can
-        # leave it None.
+        # Apex A/AAAA/NS/SOA. Operators whose parent-zone delegation
+        # uses self-glue or any pattern where strict recursors will
+        # ask the auth for its own apex records need to set these so
+        # Google 8.8.8.8 / Level3 4.2.2.x accept the delegation.
+        # Without them strict resolvers mark the zone as a "lame
+        # delegation" and NXDOMAIN every name under it.
+        #   - apex_a     — IPv4 served at <apex_zone> A
+        #   - apex_aaaa  — IPv6 served at <apex_zone> AAAA
+        #   - apex_ns    — NS hostname served at <apex_zone> NS, also
+        #                  used as MNAME in the SOA RR
+        #   - apex_soa_rname — SOA RNAME (operator email-as-DNS-name,
+        #                      e.g. "hostmaster.<parent>")
+        # SOA is served only when both apex_ns AND apex_soa_rname are
+        # configured (the SOA needs both a primary nameserver and a
+        # responsible-party email per RFC 1035).
         self.apex_zone = apex_zone or None
         self.apex_a = apex_a or None
         self.apex_aaaa = apex_aaaa or None
+        self.apex_ns = apex_ns or None
+        self.apex_soa_rname = apex_soa_rname or None
         self.tcp_enabled = bool(tcp_enabled)
         self._server: Optional[_ThreadingUDPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -1290,6 +1362,8 @@ class DMPDnsServer:
             "apex_zone": self.apex_zone,
             "apex_a": self.apex_a,
             "apex_aaaa": self.apex_aaaa,
+            "apex_ns": self.apex_ns,
+            "apex_soa_rname": self.apex_soa_rname,
         }
 
     def start(self) -> None:
