@@ -7,6 +7,63 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-05-01 — RFC 2308 + RFC 8020 negative responses
+
+Third (and actual) round of strict-resolver compatibility fixes.
+0.6.3 added apex A/AAAA. 0.6.4 added apex SOA + NS. Both were
+necessary, neither was sufficient — Google Public DNS was still
+NXDOMAINing every name under healthy DMP zones for **9+ hours**
+after the 0.6.4 deploy. Diagnosis traced to two intertwined bugs
+in the negative-response path that this release closes.
+
+Validated independently via codex review of RFC 2308, RFC 8020,
+and Google Public DNS security docs.
+
+Wire format, on-disk schema, and CLI surfaces are byte-identical
+to 0.6.4. Operators upgrade in place via
+`pip install -U dnsmesh && systemctl restart dnsmesh-node`
+(native install) or `docker compose pull && docker compose up -d`
+(Docker).
+
+### Fixed
+
+- **NXDOMAIN at the zone apex for missing record types poisoned
+  the entire zone via RFC 8020 NXDOMAIN-cut.** When a TXT lookup
+  at the apex name (e.g. ``dmp.dnsmesh.io TXT``) found no record,
+  the server returned NXDOMAIN. But the apex *exists* — the zone
+  has SOA/NS/A records there from 0.6.4. The correct answer is
+  NODATA (NOERROR + 0 answer), not NXDOMAIN. Per RFC 8020, a
+  strict resolver caches NXDOMAIN at any ancestor and SYNTHESIZES
+  NXDOMAIN for every descendant without re-querying — so a single
+  bad apex NXDOMAIN poisoned every owner name under the zone.
+  Server now returns NODATA at the apex regardless of which
+  record type was queried, and only returns NXDOMAIN for genuine
+  sub-name TXT-not-found cases. (PR #25.)
+- **Naked NXDOMAIN and NODATA — no SOA in AUTHORITY.** RFC 2308
+  §3 requires the zone SOA in the AUTHORITY section of every
+  negative response so the resolver knows the negative-caching
+  TTL. Without it RFC 2308 §5 says the response SHOULD NOT be
+  cached, and Google specifically treats the exchange as
+  malformed. Server now appends the apex SOA to NXDOMAIN AND
+  NODATA responses when ``DMP_DNS_APEX_NS`` and
+  ``DMP_DNS_APEX_SOA_RNAME`` are configured. Backward compat:
+  legacy operators without the env vars get the unchanged "naked"
+  behavior — RFC-non-compliant, no regression. (PR #25.)
+- **Sub-name non-TXT queries return NODATA, not NXDOMAIN.** We
+  don't track non-TXT records under sub-names, so we can't tell
+  whether a sub-name "exists" for some other type. The
+  conservative answer (NODATA) is safer than NXDOMAIN, which
+  would propagate via NXDOMAIN-cut to TXT lookups under the same
+  prefix. (PR #25.)
+
+### Operator note
+
+After upgrading, Google's poisoned NXDOMAIN cache for the apex
+names will need to expire OR be flushed at
+``https://dns.google/cache``. Once a fresh query lands, the new
+NODATA-with-SOA response replaces the cached NXDOMAIN and the
+zone unlocks for descendant queries.
+
 ## [0.6.4] — 2026-05-01 — apex SOA + NS records for strict-resolver delegations
 
 Continuation of the strict-resolver compatibility work that started
