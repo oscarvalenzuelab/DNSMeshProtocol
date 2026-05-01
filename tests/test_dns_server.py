@@ -60,6 +60,29 @@ class TestDMPDnsServer:
         rdata = response.answer[0][0]
         assert b"".join(rdata.strings) == b"v=dmp1;t=identity"
 
+    def test_txt_lookup_is_case_insensitive(self):
+        """Recursive resolvers may apply DNS 0x20 case randomization.
+
+        Owner names are case-insensitive, so an authoritative lookup
+        for a mixed-case QNAME must hit the lower-case stored record
+        instead of returning NXDOMAIN.
+        """
+        store = InMemoryDNSStore()
+        store.publish_txt_record(
+            "_dnsmesh-heartbeat.dmp.dnsmesh.io", "v=dmp1;t=heartbeat"
+        )
+
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            response = self._query(
+                "_DNSMESH-HEARTBEAT.dMp.DnSmEsH.iO", "127.0.0.1", port
+            )
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        rdata = response.answer[0][0]
+        assert b"".join(rdata.strings) == b"v=dmp1;t=heartbeat"
+
     def test_missing_name_returns_nxdomain(self):
         store = InMemoryDNSStore()
         port = _free_port()
