@@ -7,6 +7,60 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-05-01 — apex A/AAAA records for self-glued delegations
+
+Single-fix release. Strict recursive resolvers (Google 8.8.8.8,
+Level3 4.2.2.x) were NXDOMAINing every name under a DMP node's
+served zone when the parent zone used a self-glued delegation —
+the standard pattern produced by DigitalOcean's "create
+subdomain" panel (`<sub> NS <sub>` with parent-side glue A).
+
+Lenient resolvers (Cloudflare 1.1.1.1, Quad9 9.9.9.9) trust the
+glue and never asked the node for its own apex A. Strict
+resolvers re-resolve the NS-target name out-of-bailiwick — they
+ask the DMP node itself "what's the A for `<DMP_DOMAIN>`?", and
+the node, only serving TXT, returned nothing. Federation
+discovery silently broke for ~33% of the public-resolver fleet
+(2/6 in the directory page's reachability matrix). Symptom:
+`dig @8.8.8.8 _dnsmesh-heartbeat.dmp.<your-zone>` returns
+NXDOMAIN even though `dig @1.1.1.1 ...` works fine.
+
+### Added
+
+- **`DMP_DNS_APEX_A` / `DMP_DNS_APEX_AAAA`** env vars.
+  When set, the DMP DNS server answers A and AAAA queries for
+  the served-zone apex (`DMP_DOMAIN`) with the configured
+  address(es). Strict resolvers stop NXDOMAINing the zone.
+  Operators on a conventional out-of-bailiwick NS delegation
+  (`mesh.example NS ns1.example` with no glue dependency) don't
+  need this and can leave both unset — the apex fast-path stays
+  inactive when neither value is configured. (PR #18.)
+- **Operator-facing doc:** new "Self-glued delegation:
+  `DMP_DNS_APEX_A`" section in
+  `docs/deployment/dns-delegation.md` — symptoms, lenient-vs-
+  strict resolver split, the env-var fix, and verification dig
+  commands. Lives right after the existing glue-record edge
+  case so operators looking up a related symptom land on the
+  fix.
+
+### Fixed
+
+- **DNS server returns `NOERROR` (not `NXDOMAIN`) for A/AAAA at
+  the apex when only one address family is configured.** Type-
+  vs-name DNS semantics: a name that exists for one record type
+  but not another shouldn't NXDOMAIN. Matters when an operator
+  sets only `DMP_DNS_APEX_A` (no IPv6 box) — an AAAA query at
+  apex returns `NOERROR` with empty answer, not NXDOMAIN, so a
+  resolver doesn't poison its negative cache for the whole
+  zone. (PR #18.)
+
+### Changed
+
+- **Apex TXT queries still route to the record store.** The
+  apex fast-path only short-circuits A and AAAA. Operators
+  publishing TXT records at `DMP_DOMAIN` (e.g. `v=spf1 -all`)
+  see them served as before. (PR #18.)
+
 ## [0.6.2] — 2026-04-30 — federation discovery fix
 
 Targeted patch release. The seen-graph DNS path
