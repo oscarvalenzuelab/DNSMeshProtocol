@@ -1,9 +1,0 @@
-// Just-the-Docs picks up `_sass/custom/custom.scss` automatically and
-// compiles it into the main CSS bundle. Site-wide overrides go here.
-
-// Hide the `<hr>` separator the default layout inserts between the main
-// page content and the per-page footer row (the "Edit this page on
-// GitHub" link). The visual break wasn't adding information.
-#main-content > hr {
-    display: none;
-}
