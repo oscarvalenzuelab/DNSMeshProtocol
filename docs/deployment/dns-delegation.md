@@ -289,6 +289,50 @@ The cleaner alternative is to flip the delegation pattern at the
 registrar (out-of-bailiwick NS like `mesh.example NS ns1.example`,
 no glue needed). The apex A is the no-touch-the-DNS-panel path.
 
+## Apex SOA + NS for strict resolvers (0.6.4+)
+
+Apex A alone isn't enough on Google + Level3. Strict resolvers also
+**validate the delegation** by querying the configured authoritative
+server for SOA + NS at the zone apex. If either query returns
+`NOERROR` with an empty answer (which is what 0.6.3 and earlier did
+— DMP only served TXT), the resolver concludes the auth doesn't own
+the zone, marks it "lame delegation", and NXDOMAINs every name under
+it. Cloudflare and Quad9 skip this validation, which is why they
+still resolve correctly while Google and Level3 don't.
+
+0.6.4 adds two env vars that flip this on:
+
+```bash
+# /etc/dnsmesh/node.env
+DMP_DNS_APEX_NS=ns1.example.com               # NS host (matches what the parent zone delegates to)
+DMP_DNS_APEX_SOA_RNAME=hostmaster.example.com # operator email-as-DNS-name
+```
+
+When both are set, the DMP DNS server answers:
+
+- `<DMP_DOMAIN> NS` → the configured NS hostname
+- `<DMP_DOMAIN> SOA` → SOA with MNAME=apex_ns, RNAME=apex_soa_rname,
+  SERIAL=epoch-seconds, REFRESH=3600, RETRY=600, EXPIRE=604800,
+  MINIMUM=`DMP_DNS_TTL`
+
+Strict resolvers stop NXDOMAINing the zone.
+
+```bash
+sudo systemctl restart dnsmesh-node
+
+# Verify Google + Level3:
+dig @8.8.8.8 SOA mesh.example.com
+dig @8.8.8.8 NS  mesh.example.com
+dig @8.8.8.8 TXT _dnsmesh-heartbeat.mesh.example.com
+dig @4.2.2.2 TXT _dnsmesh-heartbeat.mesh.example.com
+```
+
+The first time you set this on a long-running node, Google's lame-
+delegation cache is sticky — you may need to wait up to a few hours
+or use `https://dns.google/cache` to manually flush
+`<DMP_DOMAIN> SOA` (type 6) and `<DMP_DOMAIN> NS` (type 2) for the
+new state to be picked up.
+
 ## DNS server settings on the node
 
 The DMP node needs to:
