@@ -652,10 +652,11 @@ def _render_node_cards(nodes: List[AggregatedNode], *, now: int) -> str:
         spk_short = n.operator_spk_hex[:8] + "…" + n.operator_spk_hex[-4:]
         host_text = ""
         if n.host:
-            host_text = f"{html_escape(n.host.get('org') or n.host.get('isp') or '')}"
-            asn = n.host.get("asn") or ""
-            if asn:
-                host_text += f" <small>({html_escape(asn)})</small>"
+            # Just the short org / ISP name. The ASN block (e.g.
+            # "AS24940 Hetzner Online GmbH") was visually noisy and
+            # didn't add information beyond the short name. Operators
+            # who want the full ASN can pull it from feed.json.
+            host_text = html_escape(n.host.get("org") or n.host.get("isp") or "")
         geo_text = ""
         if n.geo:
             parts = [
