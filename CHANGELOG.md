@@ -7,6 +7,91 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-04-30 — federation discovery fix
+
+Targeted patch release. The seen-graph DNS path
+(`_dnsmesh-seen.<zone>`) was crashing on the public reference
+nodes once a few heartbeat ticks had run, breaking federation
+discovery for any RFC-strict recursive resolver. Three
+independent bugs combined to produce the symptom; this release
+fixes all three. Operators upgrade in place via
+`pip install -U dnsmesh && systemctl restart dnsmesh-node`
+(native install) or `docker compose pull && docker compose up -d`
+(Docker). Wire format, on-disk schema, and CLI surfaces are
+byte-identical to 0.6.1.
+
+### Fixed
+
+- **DNS server crashed on `dns.exception.TooBig` for oversized
+  UDP responses.** When the response RRset exceeded the
+  resolver's negotiated EDNS buffer (1232 bytes by default),
+  `dns.message.to_wire()` raised, Python's socketserver swallowed
+  the exception, and the UDP socket sent nothing. Recursive
+  resolvers saw "no answer" and returned SERVFAIL with EDE=23
+  ("Network Error") — silently breaking discovery. Server now
+  catches `TooBig` on the UDP path and emits a valid TC=1
+  truncated stub per RFC 1035 §4.2.2 so resolvers fall back to
+  TCP. (PR #14.)
+- **Authoritative DNS server didn't accept TCP at all.** The
+  RFC 1035 §4.2.2 / RFC 7766 fallback path is mandatory for
+  RFC-strict resolvers (Google 8.8.8.8, Level3 4.2.2.x). Without
+  it, any TC=1 truncated UDP response was a dead end. New
+  threading TCP listener at the same port as UDP, with
+  bounded per-connection concurrency, slow-loris mitigation
+  (lazy work-permit acquire after the message body is read,
+  separate accept-cap semaphore for open sockets), and
+  `request_queue_size = 128` so the kernel can absorb the
+  "many recursors retrying TCP within milliseconds" burst.
+  Six rounds of Codex review baked in. (PR #14.)
+- **Self-wire leaked into the local SeenStore via peer
+  gossip.** Once federation converged and a peer included our
+  wire in its own `_dnsmesh-seen.<peer-zone>` RRset,
+  `_fetch_and_ingest` accepted it and stored a self row.
+  `_publish_seen_graph` then republished it under our own
+  seen-zone, creating a discovery-graph self-loop and bloating
+  the RRset toward the EDNS buffer cap (which then tripped
+  the TooBig crash above). Fix: parse-and-verify each ingested
+  wire and drop ones whose `operator_spk` matches our own
+  before `SeenStore.accept`. (PR #16.)
+- **Process-memory `_last_seen_wires` lost on restart.** The
+  worker tracks "wires we published last tick" so it knows
+  what to evict on the next tick. The map is
+  process-memory only, so a worker restart left every prior
+  wire in place — and `publish_txt_record` is append-with-
+  content-keyed-dedup, so each tick layered fresh wires on top
+  without removing the stale ones. Across upgrade cycles the
+  RRset grew unbounded until each wire's exp fired (24h
+  default). One-shot orphan sweep on first
+  `_publish_seen_graph` invocation cleans them up — mirrors
+  the round-22 sweep added for `_publish_own`. Cluster
+  siblings' wires under a shared `_dnsmesh-seen.<shared-zone>`
+  are left intact (matched by `(operator_spk, endpoint)` to
+  avoid touching anything that isn't ours). (PR #16.)
+
+### Added
+
+- **`deploy/native-ubuntu/firewall.sh`** — optional helper that
+  configures `ufw` for the canonical DMP port set: SSH 22, DNS
+  53/udp+tcp, HTTP 80, HTTPS 443/tcp+udp. Idempotent. Three
+  modes: `--check` (audit only), default (apply rules), `--enable`
+  (apply + ufw enable). Driven by an operator note that the inline
+  ufw block in `install.sh` was missing TCP 53. (PR #15.)
+
+### Changed
+
+- **All Docker compose files now publish both UDP and TCP for
+  port 53.** Mandatory for RFC 1035 §4.2.2 fallback to work
+  through the host port mapping. Affects `docker-compose.yml`,
+  `docker-compose.prod.yml`, `docker-compose.cluster.yml`,
+  `deploy/docker/compose.yml`, and the m9/m10 test harnesses
+  under `scripts/`. (PR #14.)
+- **`Dockerfile` `EXPOSE`** updated to declare `5353/udp`,
+  `5353/tcp`, and `8053/tcp`. (PR #14.)
+- **Container integration test reader** switched from
+  `dns.query.udp()` to `dns.query.udp_with_fallback()` with EDNS0
+  4096-byte buffer advertised, modeling what a real RFC-strict
+  client does instead of the bare 512-byte default. (PR #14.)
+
 ## [0.6.1] — 2026-04-29 — publication-readiness pass
 
 Cleanup release on top of 0.6.0. Wire format, on-disk schema, and
