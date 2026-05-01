@@ -127,6 +127,171 @@ class TestDMPDnsServer:
             server2.stop()
 
 
+class TestDMPDnsServerApexAddressRecords:
+    """Operators on a self-glued subzone delegation
+    (``<sub> NS <sub>`` with parent-side glue A) need the node to
+    answer A queries for its OWN apex name. Strict resolvers
+    (Google 8.8.8.8, Level3 4.2.2.x) re-resolve the NS-target
+    out-of-bailiwick rather than trusting the parent-zone glue;
+    if we don't answer, they NXDOMAIN every name under the zone.
+
+    Without ``apex_zone``+``apex_a`` configured, behavior is
+    unchanged from prior releases (A → NOERROR with empty answer).
+    """
+
+    def test_apex_a_returned_for_zone_apex(self):
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_a="203.0.113.42",
+        ):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.A)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        assert str(response.answer[0][0]) == "203.0.113.42"
+
+    def test_apex_aaaa_returned_for_zone_apex(self):
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_aaaa="2001:db8::42",
+        ):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.AAAA)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        assert str(response.answer[0][0]) == "2001:db8::42"
+
+    def test_apex_a_case_insensitive(self):
+        """DNS names are case-insensitive — a query for ``DMP.Mesh.Test``
+        must hit the same apex code path as ``dmp.mesh.test``."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_a="203.0.113.42",
+        ):
+            request = dns.message.make_query("DMP.Mesh.Test", dns.rdatatype.A)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        assert str(response.answer[0][0]) == "203.0.113.42"
+
+    def test_a_query_for_non_apex_name_returns_empty(self):
+        """A records are ONLY served at the configured apex. A query
+        for any other name under the zone (e.g. a TXT-bearing owner
+        like ``_dnsmesh-heartbeat.dmp.mesh.test``) gets the legacy
+        NOERROR-empty response — we don't accidentally start serving
+        every name in the world."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_a="203.0.113.42",
+        ):
+            request = dns.message.make_query(
+                "_dnsmesh-heartbeat.dmp.mesh.test", dns.rdatatype.A
+            )
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+
+    def test_aaaa_at_apex_without_aaaa_config_returns_empty(self):
+        """Apex configured with A only — AAAA query at apex returns
+        NOERROR-empty (not NXDOMAIN). DNS protocol semantics: a name
+        that exists with one type but not another should NOT NXDOMAIN."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_a="203.0.113.42",
+        ):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.AAAA)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+
+    def test_apex_txt_still_routes_to_store(self):
+        """Apex A configuration must NOT mask TXT queries at the same
+        apex name. TXT continues to dispatch through the record store
+        — operators may publish records at the zone apex (e.g.
+        ``v=spf1 -all``) and we must serve them."""
+        store = InMemoryDNSStore()
+        store.publish_txt_record("dmp.mesh.test", "v=spf1 -all")
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_a="203.0.113.42",
+        ):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.TXT)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        rdata = response.answer[0][0]
+        assert b"".join(rdata.strings) == b"v=spf1 -all"
+
+    def test_apex_unconfigured_a_returns_empty_answer(self):
+        """Without apex_zone configured, an A query at the would-be
+        apex name returns the legacy NOERROR-empty — the apex
+        fast-path stays disabled. Backward-compat invariant for
+        operators on a conventional NS-out-of-bailiwick delegation."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        # No apex_zone / apex_a passed → fast-path inactive.
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.A)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+
+    def test_apex_a_via_tcp(self):
+        """A queries arriving over TCP (recursors that go straight
+        to TCP, or after TC=1) must hit the same apex path."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_a="203.0.113.42",
+        ):
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.A)
+            response = dns.query.tcp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        assert str(response.answer[0][0]) == "203.0.113.42"
+
+
 class TestDMPDnsServerRateLimitAndConcurrency:
     """Regressions caught by codex review of the TCP listener PR.
 
