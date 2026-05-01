@@ -496,6 +496,197 @@ class TestDMPDnsServerApexSoaNs:
         assert s2 > s1, f"SOA serial should advance: {s1} -> {s2}"
 
 
+class TestDMPDnsServerNegativeResponses:
+    """RFC 2308 + RFC 8020 compliance.
+
+    Hit in production: Google Public DNS NXDOMAIN'd every name under
+    a healthy DMP zone for 9+ hours after a delegation cleanup. Root
+    cause turned out to be two intertwined bugs:
+
+    1. The DMP server returned NXDOMAIN at the zone apex for
+       record types it didn't have (e.g., TXT at apex when no TXT
+       records exist there). The apex name DOES exist (the zone
+       has SOA/NS/A there), so the correct response is NODATA
+       (NOERROR with empty answer), not NXDOMAIN. Per RFC 8020
+       "NXDOMAIN cut", a strict resolver caches NXDOMAIN at an
+       ancestor and SYNTHESIZES NXDOMAIN for every descendant
+       without re-querying — so a single bad NXDOMAIN at the apex
+       poisons the entire zone for the resolver's cache lifetime.
+
+    2. NXDOMAIN AND NODATA responses lacked the apex SOA in their
+       AUTHORITY section. RFC 2308 §3 requires SOA in negative
+       responses so the resolver knows the negative-caching TTL.
+       Without it, RFC 2308 §5 says the response SHOULD NOT be
+       cached, and Google in particular treats the whole exchange
+       as suspect.
+
+    Both fixes ship together — there's no point fixing one without
+    the other since the symptom requires both to manifest.
+    """
+
+    def _apex_server(self):
+        return DMPDnsServer(
+            InMemoryDNSStore(),
+            host="127.0.0.1",
+            port=_free_port(),
+            apex_zone="dmp.mesh.test",
+            apex_a="203.0.113.42",
+            apex_ns="ns1.mesh.test",
+            apex_soa_rname="hostmaster.mesh.test",
+        )
+
+    def test_apex_txt_with_no_records_returns_nodata_not_nxdomain(self):
+        """The exact bug that caused 9+ hours of Google NXDOMAINing.
+        Apex name exists (we serve A/NS/SOA there), so a TXT query
+        at the apex with no TXT records should be NODATA (NOERROR +
+        0 answer), NOT NXDOMAIN."""
+        with self._apex_server() as srv:
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.TXT)
+            response = dns.query.udp(request, "127.0.0.1", port=srv.port, timeout=2.0)
+
+        assert (
+            response.rcode() == 0
+        ), "MUST be NOERROR; NXDOMAIN poisons zone via RFC 8020 cut"
+        assert response.answer == []
+
+    def test_apex_unconfigured_type_returns_nodata(self):
+        """Same property for any other type the operator hasn't
+        configured at the apex. CAA, MX, etc. → NODATA."""
+        with self._apex_server() as srv:
+            for rdtype in (dns.rdatatype.CAA, dns.rdatatype.MX, dns.rdatatype.SRV):
+                request = dns.message.make_query("dmp.mesh.test", rdtype)
+                response = dns.query.udp(
+                    request, "127.0.0.1", port=srv.port, timeout=2.0
+                )
+                assert (
+                    response.rcode() == 0
+                ), f"{dns.rdatatype.to_text(rdtype)} at apex MUST NOT NXDOMAIN"
+                assert response.answer == []
+
+    def test_nxdomain_response_includes_soa_in_authority(self):
+        """RFC 2308 §3 — negative responses MUST carry the zone SOA
+        in AUTHORITY for negative-caching TTL. Without it RFC 2308
+        §5 says the answer SHOULD NOT be cached."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_ns="ns1.mesh.test",
+            apex_soa_rname="hostmaster.mesh.test",
+        ):
+            request = dns.message.make_query("_typo.dmp.mesh.test", dns.rdatatype.TXT)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        # Genuine sub-name nonexistence → NXDOMAIN.
+        assert response.rcode() == 3
+        # And SOA in authority.
+        assert len(response.authority) == 1
+        soa = response.authority[0][0]
+        assert soa.rdtype == dns.rdatatype.SOA
+        assert soa.mname.to_text(omit_final_dot=True).lower() == "ns1.mesh.test"
+
+    def test_nodata_response_includes_soa_in_authority(self):
+        """RFC 2308 §3 also covers NOERROR-empty (NODATA) responses.
+        A non-TXT query on a sub-name (where we don't track non-TXT
+        records) returns NODATA + SOA, not naked NOERROR-empty."""
+        store = InMemoryDNSStore()
+        store.publish_txt_record(
+            "_dnsmesh-heartbeat.dmp.mesh.test", "v=dmp1;t=heartbeat;..."
+        )
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_ns="ns1.mesh.test",
+            apex_soa_rname="hostmaster.mesh.test",
+        ):
+            # AAAA on a name we have TXT for → NODATA.
+            request = dns.message.make_query(
+                "_dnsmesh-heartbeat.dmp.mesh.test", dns.rdatatype.AAAA
+            )
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+        assert len(response.authority) == 1
+        assert response.authority[0][0].rdtype == dns.rdatatype.SOA
+
+    def test_apex_nodata_includes_soa_in_authority(self):
+        """The apex case from bug #1 also needs SOA — the response
+        is NODATA, and RFC 2308 §3 still applies."""
+        with self._apex_server() as srv:
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.TXT)
+            response = dns.query.udp(request, "127.0.0.1", port=srv.port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+        assert len(response.authority) == 1
+        assert response.authority[0][0].rdtype == dns.rdatatype.SOA
+
+    def test_subname_non_txt_returns_nodata_not_nxdomain(self):
+        """A query for AAAA at a random sub-name like
+        ``_typo.dmp.mesh.test`` returns NODATA, not NXDOMAIN —
+        because we can't tell whether the name "exists" for some
+        type we don't manage. The conservative answer (NODATA) is
+        safer than NXDOMAIN, which would propagate via NXDOMAIN-cut
+        to any TXT lookups under the same prefix."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_ns="ns1.mesh.test",
+            apex_soa_rname="hostmaster.mesh.test",
+        ):
+            request = dns.message.make_query("_typo.dmp.mesh.test", dns.rdatatype.AAAA)
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert response.answer == []
+        # SOA still required.
+        assert len(response.authority) == 1
+        assert response.authority[0][0].rdtype == dns.rdatatype.SOA
+
+    def test_negative_responses_unconfigured_apex_no_soa(self):
+        """Backward compat: when the operator hasn't set
+        ``apex_zone``/``apex_ns``/``apex_soa_rname``, the server has
+        no SOA to attach. Negative responses fall back to the legacy
+        naked behavior — RFC-non-compliant, but no regression
+        relative to 0.6.4 and earlier for operators who haven't
+        opted into the new env vars."""
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            request = dns.message.make_query(
+                "_typo.unmanaged.example", dns.rdatatype.TXT
+            )
+            response = dns.query.udp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        # Sub-name with no records, no apex configured → NXDOMAIN
+        # with no SOA (legacy behavior).
+        assert response.rcode() == 3
+        assert response.authority == []
+
+    def test_apex_soa_query_unaffected_by_no_records(self):
+        """SOA at the apex must still ANSWER (not return NODATA).
+        Sanity check that the apex-meta path isn't accidentally
+        falling through to the negative branch."""
+        with self._apex_server() as srv:
+            request = dns.message.make_query("dmp.mesh.test", dns.rdatatype.SOA)
+            response = dns.query.udp(request, "127.0.0.1", port=srv.port, timeout=2.0)
+
+        assert response.rcode() == 0
+        assert len(response.answer) == 1
+        assert response.answer[0][0].rdtype == dns.rdatatype.SOA
+
+
 class TestDMPDnsServerRateLimitAndConcurrency:
     """Regressions caught by codex review of the TCP listener PR.
 

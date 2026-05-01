@@ -238,6 +238,60 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         flag1 = rcode_value & 0x0F
         return bytes(msg_id) + bytes([flag0, flag1, 0, 0, 0, 0, 0, 0, 0, 0])
 
+    def _build_apex_soa_rrset(self, owner_name: dns.name.Name):
+        """Construct the apex SOA RR or return None when the operator
+        hasn't configured both ``apex_ns`` and ``apex_soa_rname``.
+
+        Used in two places:
+          1. As the ANSWER for an SOA query at the apex.
+          2. In the AUTHORITY section of every NXDOMAIN / NODATA
+             response (RFC 2308 §3 — required so resolvers know how
+             long to negative-cache the answer; without it strict
+             resolvers like Google may treat the response as
+             malformed and propagate the negative state up the tree
+             via RFC 8020 NXDOMAIN-cut, poisoning every descendant
+             name).
+        """
+        apex_ns = getattr(self.server, "apex_ns", None)
+        apex_rname = getattr(self.server, "apex_soa_rname", None)
+        if not apex_ns or not apex_rname:
+            return None
+        ttl = self.server.ttl
+        # SOA RFC 1035 §3.3.13. SERIAL is per-second wall clock
+        # (monotonic for the next ~70 years inside the 32-bit
+        # serial-number arithmetic window of RFC 1982), REFRESH/
+        # RETRY/EXPIRE are BIND operator defaults, MINIMUM matches
+        # our standard TTL — and per RFC 2308 §5 also caps the
+        # negative-caching window for NXDOMAIN/NODATA answers.
+        return dns.rrset.from_rdata(
+            owner_name,
+            ttl,
+            dns.rdtypes.ANY.SOA.SOA(
+                rdclass=dns.rdataclass.IN,
+                rdtype=dns.rdatatype.SOA,
+                mname=dns.name.from_text(apex_ns),
+                rname=dns.name.from_text(apex_rname),
+                serial=int(time.time()),
+                refresh=3600,
+                retry=600,
+                expire=604800,
+                minimum=ttl,
+            ),
+        )
+
+    def _attach_negative_authority(self, response: dns.message.Message) -> None:
+        """Append the apex SOA to a negative response's AUTHORITY
+        section. RFC 2308 §3 requires this for both NXDOMAIN and
+        NODATA. Skipped silently when no apex zone is configured —
+        in that mode the server is operating in "TXT-only legacy"
+        and there's no SOA to point at."""
+        apex_zone = getattr(self.server, "apex_zone", None) or ""
+        if not apex_zone:
+            return
+        soa = self._build_apex_soa_rrset(dns.name.from_text(apex_zone))
+        if soa is not None:
+            response.authority.append(soa)
+
     def _build_response(self, query: dns.message.Message) -> dns.message.Message:
         reader: DNSRecordReader = self.server.reader
         response = dns.message.make_response(query)
@@ -268,7 +322,8 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         #   DMP_DNS_APEX_NS                    — NS hostname (e.g. ns1.<parent>)
         #   DMP_DNS_APEX_SOA_RNAME             — SOA RNAME (operator email-as-name)
         apex_zone = getattr(self.server, "apex_zone", None) or ""
-        if apex_zone and qname.lower() == apex_zone.lower():
+        is_apex = bool(apex_zone) and qname.lower() == apex_zone.lower()
+        if is_apex:
             ttl = self.server.ttl
             if question.rdtype == dns.rdatatype.A:
                 apex_a = getattr(self.server, "apex_a", None)
@@ -284,8 +339,9 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                             ),
                         )
                     )
-                return response
-            if question.rdtype == dns.rdatatype.AAAA:
+                    return response
+                # Fall through to NODATA below.
+            elif question.rdtype == dns.rdatatype.AAAA:
                 apex_aaaa = getattr(self.server, "apex_aaaa", None)
                 if apex_aaaa:
                     response.answer.append(
@@ -299,8 +355,8 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                             ),
                         )
                     )
-                return response
-            if question.rdtype == dns.rdatatype.NS:
+                    return response
+            elif question.rdtype == dns.rdatatype.NS:
                 apex_ns = getattr(self.server, "apex_ns", None)
                 if apex_ns:
                     response.answer.append(
@@ -314,44 +370,59 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
                             ),
                         )
                     )
-                return response
-            if question.rdtype == dns.rdatatype.SOA:
-                apex_ns = getattr(self.server, "apex_ns", None)
-                apex_rname = getattr(self.server, "apex_soa_rname", None)
-                if apex_ns and apex_rname:
-                    # SOA RFC 1035 §3.3.13. Defaults match a typical
-                    # authoritative-only zone with no AXFR slaves —
-                    # SERIAL is per-second wall clock (monotonic
-                    # for the next ~70 years inside the 32-bit
-                    # serial-number arithmetic window of RFC 1982),
-                    # REFRESH/RETRY/EXPIRE are the BIND operator
-                    # defaults, MINIMUM matches our standard TTL.
-                    response.answer.append(
-                        dns.rrset.from_rdata(
-                            question.name,
-                            ttl,
-                            dns.rdtypes.ANY.SOA.SOA(
-                                rdclass=dns.rdataclass.IN,
-                                rdtype=dns.rdatatype.SOA,
-                                mname=dns.name.from_text(apex_ns),
-                                rname=dns.name.from_text(apex_rname),
-                                serial=int(time.time()),
-                                refresh=3600,
-                                retry=600,
-                                expire=604800,
-                                minimum=ttl,
-                            ),
-                        )
-                    )
-                return response
+                    return response
+            elif question.rdtype == dns.rdatatype.SOA:
+                soa = self._build_apex_soa_rrset(question.name)
+                if soa is not None:
+                    response.answer.append(soa)
+                    return response
+
+        # Below this point we're answering NEGATIVELY (no records or
+        # wrong type for this name). Pick NXDOMAIN vs NODATA carefully:
+        #
+        #   - NODATA (NOERROR + 0 answer): the NAME exists in our zone
+        #     but has no records of the requested type. Required for
+        #     the zone apex (which always exists when apex_zone is
+        #     configured — we serve A/NS/SOA there) AND for any name
+        #     where TXT records exist but the resolver asked for a
+        #     different type.
+        #
+        #   - NXDOMAIN (RCODE 3): the NAME doesn't exist at all in
+        #     our zone. Strict resolvers cache this aggressively
+        #     (RFC 8020 NXDOMAIN-cut: a cached NXDOMAIN at any
+        #     ancestor lets the resolver synthesize NXDOMAIN for
+        #     EVERY descendant without re-querying us). So NXDOMAIN
+        #     at the apex is catastrophic — it poisons every owner
+        #     name under the zone. We only return it for genuinely-
+        #     nonexistent sub-names (no TXT record on disk).
+        #
+        # Both responses MUST carry the apex SOA in AUTHORITY per
+        # RFC 2308 §3 so the resolver knows the negative-caching TTL.
+        # Without it, Google specifically discards the response or
+        # treats the entire zone as broken.
 
         if question.rdtype != dns.rdatatype.TXT:
-            # We only serve TXT. Everything else → NOERROR with empty answer.
+            # Non-TXT queries on names we don't serve other types for
+            # → NODATA, never NXDOMAIN. Even a sub-name like
+            # ``_typo.dmp.example A`` returns NODATA because the cost
+            # of being wrong (poisoning TXT lookups via NXDOMAIN-cut)
+            # is much higher than the cost of a slightly-incorrect
+            # NODATA on a name that actually doesn't exist.
+            self._attach_negative_authority(response)
             return response
 
         values = reader.query_txt_record(qname)
         if not values:
+            if is_apex:
+                # Apex name exists; just no TXT here. NODATA.
+                self._attach_negative_authority(response)
+                return response
+            # Genuine NXDOMAIN. SOA in AUTHORITY for negative-caching
+            # TTL (RFC 2308 §3) — without this Google treats the
+            # response as malformed AND, if cached, RFC 8020 cut
+            # would poison the whole zone. Both fixes in one call.
             response.set_rcode(dns.rcode.NXDOMAIN)
+            self._attach_negative_authority(response)
             return response
 
         ttl = self.server.ttl
