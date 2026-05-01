@@ -7,6 +7,67 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-05-01 — DNS 0x20 + free port 53 in installer
+
+Fourth and (genuinely this time) final round of strict-resolver
+compatibility fixes. After 0.6.3 (apex A), 0.6.4 (apex SOA + NS),
+and 0.6.5 (RFC 2308/8020 negative responses), Google was *still*
+NXDOMAINing every name under our zones. Codex CLI caught the actual
+root cause on a third diagnostic pass: **DNS 0x20 case
+randomization**. We were looking up TXT records with the QNAME
+as-received, which broke whenever Google sent a case-randomized
+qname (RFC 9018-style cache-poisoning defense, on by default).
+
+Plus an operational follow-on: install.sh and upgrade.sh didn't
+disable systemd-resolved, so on stock Ubuntu the DMP DNS server's
+TCP/53 listener silently lost the bind to resolved's loopback
+listener, and PR #14's RFC 1035 §4.2.2 fallback path was
+half-effective on every fresh install.
+
+Wire format, on-disk schema, and CLI surfaces are byte-identical to
+0.6.5.
+
+### Fixed
+
+- **Case-insensitive TXT lookup.** RFC 1035 §2.3.3: DNS owner names
+  are case-insensitive. Our auth was looking up records using the
+  raw QNAME, which broke under DNS 0x20 case randomization (Google
+  Public DNS does this by default). The fix normalizes the lookup
+  key to lower-case while preserving the original case in the
+  response (the 0x20 protocol relies on the auth echoing the query
+  name byte-for-byte). Live proof of the bug from production:
+
+      $ dig @<auth-ip> _dnsmesh-heartbeat.dmp.dnsmesh.io TXT
+      → NOERROR + the heartbeat
+      $ dig @<auth-ip> _DNSMESH-HEARTBEAT.dMp.DnSmEsH.iO TXT
+      → NXDOMAIN
+
+  This is what triggered the 9-hour Google NXDOMAIN saga. Google
+  was getting the case-randomized NXDOMAIN response, treating it
+  as authoritative, caching the apex SOA from 0.6.4/0.6.5, and
+  using RFC 8020 NXDOMAIN-cut to synthesize NXDOMAIN for every
+  descendant. The auth was doing the right thing for every probe
+  that didn't hit Google's case-randomization layer. Diagnosis
+  credit: codex CLI. (PR #27.)
+
+- **install.sh / upgrade.sh now disable systemd-resolved.** Ubuntu
+  ships resolved enabled by default, binding 127.0.0.53:53/tcp on
+  loopback. The DMP DNS server's 0.0.0.0:53/tcp bind collides with
+  that loopback listener and fails with EADDRINUSE — the server
+  falls back to UDP-only, silently breaking the RFC 1035 §4.2.2
+  TCP fallback path strict resolvers (Google, Level3) need for any
+  RRset that exceeds the EDNS buffer. Both scripts now:
+    * skip if `DMP_KEEP_SYSTEMD_RESOLVED=1` (opt-out)
+    * skip if resolved isn't installed
+    * skip if resolved already inactive
+    * otherwise: disable + stop, replace `/etc/resolv.conf` with
+      static 1.1.1.1 + 9.9.9.9 (handles the symlink-to-stub-resolv
+      case so the rewrite touches the real file)
+    * idempotent — re-running is a no-op
+  Both `dnsmesh.io` and `dnsmesh.pro` were UDP-only-by-accident
+  for the entire 0.6.x series because install.sh never freed the
+  port. (PR #27.)
+
 ## [0.6.5] — 2026-05-01 — RFC 2308 + RFC 8020 negative responses
 
 Third (and actual) round of strict-resolver compatibility fixes.
