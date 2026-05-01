@@ -304,6 +304,7 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         # Only handle the first question (standard DNS behavior).
         question = query.question[0]
         qname = question.name.to_text(omit_final_dot=True)
+        qname_lookup = _normalize_zone(qname)
 
         # Apex address + zone-meta records — answer at the served-zone
         # apex with operator-configured values. Strict recursive
@@ -322,7 +323,7 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         #   DMP_DNS_APEX_NS                    — NS hostname (e.g. ns1.<parent>)
         #   DMP_DNS_APEX_SOA_RNAME             — SOA RNAME (operator email-as-name)
         apex_zone = getattr(self.server, "apex_zone", None) or ""
-        is_apex = bool(apex_zone) and qname.lower() == apex_zone.lower()
+        is_apex = bool(apex_zone) and qname_lookup == _normalize_zone(apex_zone)
         if is_apex:
             ttl = self.server.ttl
             if question.rdtype == dns.rdatatype.A:
@@ -411,7 +412,7 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             self._attach_negative_authority(response)
             return response
 
-        values = reader.query_txt_record(qname)
+        values = reader.query_txt_record(qname_lookup)
         if not values:
             if is_apex:
                 # Apex name exists; just no TXT here. NODATA.
