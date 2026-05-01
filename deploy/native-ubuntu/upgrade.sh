@@ -87,6 +87,41 @@ chown -R root:root "$INSTALL_DIR"
 chmod -R go+rX "$INSTALL_DIR"
 
 # ──────────────────────────────────────────────────────────────────────
+# Free port 53 (disable systemd-resolved)
+#
+# Backfill for nodes installed before install.sh learned to do this.
+# See install.sh for the full rationale — the short version is that
+# resolved holds 127.0.0.53:53/tcp on loopback, which collides with
+# our 0.0.0.0:53/tcp bind and quietly knocks out the RFC 1035 §4.2.2
+# fallback path strict resolvers (Google, Level3) need.
+#
+# Idempotent. Set DMP_KEEP_SYSTEMD_RESOLVED=1 to opt out.
+# ──────────────────────────────────────────────────────────────────────
+
+step "Freeing port 53 (disabling systemd-resolved)"
+
+if [[ "${DMP_KEEP_SYSTEMD_RESOLVED:-0}" = "1" ]]; then
+    warn "DMP_KEEP_SYSTEMD_RESOLVED=1 set — leaving resolved alone."
+elif ! systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
+    ok "systemd-resolved not present"
+elif ! systemctl is-active systemd-resolved >/dev/null 2>&1; then
+    ok "systemd-resolved already inactive"
+else
+    systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+    if [[ -L /etc/resolv.conf ]]; then
+        rm -f /etc/resolv.conf
+    fi
+    cat >/etc/resolv.conf <<EOF
+# Written by deploy/native-ubuntu/upgrade.sh after disabling
+# systemd-resolved so the DMP DNS server can bind 0.0.0.0:53/tcp.
+# Edit freely — this file is unmanaged from here on.
+nameserver 1.1.1.1
+nameserver 9.9.9.9
+EOF
+    ok "systemd-resolved disabled, /etc/resolv.conf points at 1.1.1.1 + 9.9.9.9"
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # Refresh the systemd unit
 # ──────────────────────────────────────────────────────────────────────
 

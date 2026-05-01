@@ -137,6 +137,56 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────
+# Free port 53 (disable systemd-resolved)
+#
+# Ubuntu ships ``systemd-resolved`` enabled by default; it binds
+# 127.0.0.53:53/tcp and 127.0.0.54:53/tcp on loopback. The DMP DNS
+# server wants to bind 0.0.0.0:53 for both UDP and TCP. UDP-on-
+# 0.0.0.0 coexists fine with the resolved-on-loopback binding (UDP
+# sockets are address-specific), but TCP-on-0.0.0.0 collides with
+# resolved's loopback TCP listener and fails with EADDRINUSE — the
+# DMP server falls back to UDP-only and silently drops the RFC 1035
+# §4.2.2 fallback path that recursive resolvers (Google,
+# Level3, …) need for any RRset that exceeds the EDNS buffer.
+#
+# We disable resolved and write a static /etc/resolv.conf so the
+# host's own outbound name resolution (apt updates, the heartbeat
+# worker hitting 1.1.1.1 / 9.9.9.9, etc.) keeps working without it.
+# Operators who genuinely want resolved can opt out by setting
+# DMP_KEEP_SYSTEMD_RESOLVED=1 — they accept TCP-only-via-UDP-port-
+# binding-luck behavior and the matching loss of large-RRset
+# fallback. This step is idempotent.
+# ──────────────────────────────────────────────────────────────────────
+
+step "Freeing port 53 (disabling systemd-resolved)"
+
+if [[ "${DMP_KEEP_SYSTEMD_RESOLVED:-0}" = "1" ]]; then
+    warn "DMP_KEEP_SYSTEMD_RESOLVED=1 set — leaving resolved alone."
+    warn "TCP/53 may not bind; large-RRset fallback won't work."
+elif ! systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
+    ok "systemd-resolved not present on this distro"
+elif ! systemctl is-active systemd-resolved >/dev/null 2>&1; then
+    ok "systemd-resolved already inactive"
+else
+    systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+    # /etc/resolv.conf is usually a symlink to
+    # /run/systemd/resolve/stub-resolv.conf — remove the symlink
+    # before overwriting so we touch the real file rather than the
+    # stub (which resolved owns and would re-create on next start).
+    if [[ -L /etc/resolv.conf ]]; then
+        rm -f /etc/resolv.conf
+    fi
+    cat >/etc/resolv.conf <<EOF
+# Written by deploy/native-ubuntu/install.sh after disabling
+# systemd-resolved so the DMP DNS server can bind 0.0.0.0:53/tcp.
+# Edit freely — this file is unmanaged from here on.
+nameserver 1.1.1.1
+nameserver 9.9.9.9
+EOF
+    ok "systemd-resolved disabled, /etc/resolv.conf points at 1.1.1.1 + 9.9.9.9"
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # System user + directories
 # ──────────────────────────────────────────────────────────────────────
 
