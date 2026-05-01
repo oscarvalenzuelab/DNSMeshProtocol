@@ -571,18 +571,6 @@ permalink: /directory/
   for independent re-verification.</small>
 </p>
 
-<h2>Known nodes <small>· geo + hosting</small></h2>
-<div class="dir-cards">
-{node_cards}
-</div>
-<p class="dir-section-note">
-  Geo and ASN data via ip-api.com lookup at build time. Each node is
-  the same self-signed <code>HeartbeatRecord</code> wire that lives at
-  <code>_dnsmesh-heartbeat.&lt;zone&gt;</code> on the public DNS
-  chain — the geo block is descriptive metadata for humans and is
-  NOT signed.
-</p>
-
 <h2>Federation topology <small>· heartbeat-discovery, not message traffic</small></h2>
 <div class="dir-svg-wrap">
 {topology_svg}
@@ -604,6 +592,18 @@ permalink: /directory/
   with a wire that verifies under Ed25519. Your client can do the
   same lookup with the same result. The list is illustrative — every
   internet-connected DNS resolver can perform the same query.
+</p>
+
+<h2>Known nodes <small>· geo + hosting</small></h2>
+<div class="dir-cards">
+{node_cards}
+</div>
+<p class="dir-section-note">
+  Geo and ASN data via ip-api.com lookup at build time. Each node is
+  the same self-signed <code>HeartbeatRecord</code> wire that lives at
+  <code>_dnsmesh-heartbeat.&lt;zone&gt;</code> on the public DNS
+  chain — the geo block is descriptive metadata for humans and is
+  NOT signed.
 </p>
 
 </div>
