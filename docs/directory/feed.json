@@ -1,15 +1,15 @@
 {
   "version": 2,
-  "generated_at": 1777672650,
+  "generated_at": 1777674315,
   "node_count": 3,
   "nodes": [
     {
       "operator_spk_hex": "fbe5081430bdefb75f02b794edb6b35bb3428bdbd99e50811fe91f7d3692cdd9",
       "endpoint": "https://dnsmesh.de",
       "version": "0.6.6",
-      "ts": 1777672533,
-      "exp": 1777758933,
-      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMwASaHR0cHM6Ly9kbnNtZXNoLmRl++UIFDC977dfAreU7bazW7NCi9vZnlCBH+kffTaSzdkFMC42LjYAAQ5kbXAuZG5zbWVzaC5kZQAAAABp9SFVAAAAAGn2ctWEdfkNKdc+5f6u0tsfs13MFY0sWuuDC9+rHiB54K9dtmRVISZNswFA6fkdgczOclrtzz5fgvIaCsm2rFGSXosB",
+      "ts": 1777674040,
+      "exp": 1777760440,
+      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMwASaHR0cHM6Ly9kbnNtZXNoLmRl++UIFDC977dfAreU7bazW7NCi9vZnlCBH+kffTaSzdkFMC42LjYAAQ5kbXAuZG5zbWVzaC5kZQAAAABp9Sc4AAAAAGn2eLiqUbny8ujsF+g/mnfrVyW/VVuvh9UVrAm93gfyHVc+MAJjHvNXRXIXDY7/VxpzKGvrY2UFY4wishp9AarAxCUD",
       "last_seen_via": [
         "dmp.dnsmesh.de"
       ],
@@ -36,9 +36,9 @@
       "operator_spk_hex": "55dd5085bb16dbf5adaf24d53a13bbd50c8f9f93e026b194059235a3fd82bfef",
       "endpoint": "https://dnsmesh.pro",
       "version": "0.6.6",
-      "ts": 1777672527,
-      "exp": 1777758927,
-      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMwATaHR0cHM6Ly9kbnNtZXNoLnByb1XdUIW7Ftv1ra8k1ToTu9UMj5+T4CaxlAWSNaP9gr/vBTAuNi42AAEPZG1wLmRuc21lc2gucHJvAAAAAGn1IU8AAAAAafZyzyFPtFM8s0OREDZZVXkChSaCn9ZiUBlaLMX2vDkIHNfvKBFpTL7UpjLAUPvaNf3syujZoZSXOLny5uu+wmDSZQA=",
+      "ts": 1777674036,
+      "exp": 1777760436,
+      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMwATaHR0cHM6Ly9kbnNtZXNoLnByb1XdUIW7Ftv1ra8k1ToTu9UMj5+T4CaxlAWSNaP9gr/vBTAuNi42AAEPZG1wLmRuc21lc2gucHJvAAAAAGn1JzQAAAAAafZ4tETGR+dLwaHpGWgjyQGGjt6hP306SjrKKrGO9zzv4/fNuF6mtQzy2Axa3qen6BhN94EUqdonNSIAzjg0nOkxXQM=",
       "last_seen_via": [
         "dmp.dnsmesh.pro",
         "dmp.dnsmesh.de"
@@ -66,9 +66,9 @@
       "operator_spk_hex": "c0e5385eb53c1cdb62c5c5a726f1a552480fc345c600c8e45f2ef047fa2032c2",
       "endpoint": "https://dnsmesh.io",
       "version": "0.6.6",
-      "ts": 1777672516,
-      "exp": 1777758916,
-      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMwASaHR0cHM6Ly9kbnNtZXNoLmlvwOU4XrU8HNtixcWnJvGlUkgPw0XGAMjkXy7wR/ogMsIFMC42LjYAAQ5kbXAuZG5zbWVzaC5pbwAAAABp9SFEAAAAAGn2csThdl6F0+l93aGfrIrUqXs//accs0ruDzRZUud+g/RjQ5CMiGKLNNo2a5uHgDJac09GeicScyRLzWNHNMP4naUD",
+      "ts": 1777674023,
+      "exp": 1777760423,
+      "wire": "v=dmp1;t=heartbeat;RE1QSEIwMwASaHR0cHM6Ly9kbnNtZXNoLmlvwOU4XrU8HNtixcWnJvGlUkgPw0XGAMjkXy7wR/ogMsIFMC42LjYAAQ5kbXAuZG5zbWVzaC5pbwAAAABp9ScnAAAAAGn2eKfsqaUzWESSmWkChK6UD3Smvnal0Z1Vj6hkZrJOQWV+LhrLpBHP1RLiYejaImBgutLTPuRVlyNj1qeBz4YTbGQD",
       "last_seen_via": [
         "dmp.dnsmesh.io",
         "dmp.dnsmesh.pro",
@@ -98,17 +98,17 @@
     {
       "from_spk": "55dd5085bb16dbf5adaf24d53a13bbd50c8f9f93e026b194059235a3fd82bfef",
       "to_spk": "c0e5385eb53c1cdb62c5c5a726f1a552480fc345c600c8e45f2ef047fa2032c2",
-      "last_seen_ts": 1777672516
+      "last_seen_ts": 1777674023
     },
     {
       "from_spk": "fbe5081430bdefb75f02b794edb6b35bb3428bdbd99e50811fe91f7d3692cdd9",
       "to_spk": "55dd5085bb16dbf5adaf24d53a13bbd50c8f9f93e026b194059235a3fd82bfef",
-      "last_seen_ts": 1777672527
+      "last_seen_ts": 1777674036
     },
     {
       "from_spk": "fbe5081430bdefb75f02b794edb6b35bb3428bdbd99e50811fe91f7d3692cdd9",
       "to_spk": "c0e5385eb53c1cdb62c5c5a726f1a552480fc345c600c8e45f2ef047fa2032c2",
-      "last_seen_ts": 1777672516
+      "last_seen_ts": 1777674023
     }
   ],
   "resolvers": [
@@ -118,70 +118,70 @@
       "zone": "dmp.dnsmesh.io",
       "endpoint": "https://dnsmesh.io",
       "ok": true,
+      "latency_ms": 97,
+      "detail": "ok"
+    },
+    {
+      "name": "Cloudflare",
+      "addr": "1.1.1.1",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 233,
+      "detail": "ok"
+    },
+    {
+      "name": "Cloudflare",
+      "addr": "1.1.1.1",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 330,
+      "detail": "ok"
+    },
+    {
+      "name": "Google",
+      "addr": "8.8.8.8",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 92,
+      "detail": "ok"
+    },
+    {
+      "name": "Google",
+      "addr": "8.8.8.8",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 153,
+      "detail": "ok"
+    },
+    {
+      "name": "Google",
+      "addr": "8.8.8.8",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
+      "ok": true,
+      "latency_ms": 326,
+      "detail": "ok"
+    },
+    {
+      "name": "Quad9",
+      "addr": "9.9.9.9",
+      "zone": "dmp.dnsmesh.io",
+      "endpoint": "https://dnsmesh.io",
+      "ok": true,
       "latency_ms": 68,
       "detail": "ok"
     },
     {
-      "name": "Cloudflare",
-      "addr": "1.1.1.1",
-      "zone": "dmp.dnsmesh.pro",
-      "endpoint": "https://dnsmesh.pro",
-      "ok": true,
-      "latency_ms": 225,
-      "detail": "ok"
-    },
-    {
-      "name": "Cloudflare",
-      "addr": "1.1.1.1",
-      "zone": "dmp.dnsmesh.de",
-      "endpoint": "https://dnsmesh.de",
-      "ok": true,
-      "latency_ms": 343,
-      "detail": "ok"
-    },
-    {
-      "name": "Google",
-      "addr": "8.8.8.8",
-      "zone": "dmp.dnsmesh.io",
-      "endpoint": "https://dnsmesh.io",
-      "ok": true,
-      "latency_ms": 35,
-      "detail": "ok"
-    },
-    {
-      "name": "Google",
-      "addr": "8.8.8.8",
-      "zone": "dmp.dnsmesh.pro",
-      "endpoint": "https://dnsmesh.pro",
-      "ok": true,
-      "latency_ms": 152,
-      "detail": "ok"
-    },
-    {
-      "name": "Google",
-      "addr": "8.8.8.8",
-      "zone": "dmp.dnsmesh.de",
-      "endpoint": "https://dnsmesh.de",
-      "ok": true,
-      "latency_ms": 318,
-      "detail": "ok"
-    },
-    {
-      "name": "Quad9",
-      "addr": "9.9.9.9",
-      "zone": "dmp.dnsmesh.io",
-      "endpoint": "https://dnsmesh.io",
-      "ok": true,
-      "latency_ms": 79,
-      "detail": "ok"
-    },
-    {
       "name": "Quad9",
       "addr": "9.9.9.9",
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 220,
+      "latency_ms": 199,
       "detail": "ok"
     },
     {
@@ -190,7 +190,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 357,
+      "latency_ms": 367,
       "detail": "ok"
     },
     {
@@ -199,7 +199,7 @@
       "zone": "dmp.dnsmesh.io",
       "endpoint": "https://dnsmesh.io",
       "ok": true,
-      "latency_ms": 181,
+      "latency_ms": 107,
       "detail": "ok"
     },
     {
@@ -208,7 +208,7 @@
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 370,
+      "latency_ms": 341,
       "detail": "ok"
     },
     {
@@ -217,7 +217,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 266,
+      "latency_ms": 492,
       "detail": "ok"
     },
     {
@@ -226,7 +226,7 @@
       "zone": "dmp.dnsmesh.io",
       "endpoint": "https://dnsmesh.io",
       "ok": true,
-      "latency_ms": 161,
+      "latency_ms": 155,
       "detail": "ok"
     },
     {
@@ -235,7 +235,7 @@
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 348,
+      "latency_ms": 606,
       "detail": "ok"
     },
     {
@@ -244,7 +244,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 337,
+      "latency_ms": 497,
       "detail": "ok"
     },
     {
@@ -262,7 +262,7 @@
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 332,
+      "latency_ms": 446,
       "detail": "ok"
     },
     {
@@ -271,7 +271,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 345,
+      "latency_ms": 506,
       "detail": "ok"
     },
     {
@@ -289,7 +289,7 @@
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 210,
+      "latency_ms": 209,
       "detail": "ok"
     },
     {
@@ -298,7 +298,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 161,
+      "latency_ms": 154,
       "detail": "ok"
     },
     {
@@ -307,7 +307,7 @@
       "zone": "dmp.dnsmesh.io",
       "endpoint": "https://dnsmesh.io",
       "ok": true,
-      "latency_ms": 54,
+      "latency_ms": 48,
       "detail": "ok"
     },
     {
@@ -316,7 +316,7 @@
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 361,
+      "latency_ms": 511,
       "detail": "ok"
     },
     {
@@ -325,7 +325,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 542,
+      "latency_ms": 366,
       "detail": "ok"
     },
     {
@@ -334,7 +334,7 @@
       "zone": "dmp.dnsmesh.io",
       "endpoint": "https://dnsmesh.io",
       "ok": true,
-      "latency_ms": 113,
+      "latency_ms": 200,
       "detail": "ok"
     },
     {
@@ -343,7 +343,7 @@
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 690,
+      "latency_ms": 764,
       "detail": "ok"
     },
     {
@@ -352,7 +352,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 658,
+      "latency_ms": 811,
       "detail": "ok"
     },
     {
@@ -361,7 +361,7 @@
       "zone": "dmp.dnsmesh.io",
       "endpoint": "https://dnsmesh.io",
       "ok": true,
-      "latency_ms": 799,
+      "latency_ms": 683,
       "detail": "ok"
     },
     {
@@ -370,7 +370,7 @@
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 805,
+      "latency_ms": 775,
       "detail": "ok"
     },
     {
@@ -379,7 +379,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 439,
+      "latency_ms": 427,
       "detail": "ok"
     },
     {
@@ -387,35 +387,35 @@
       "addr": "223.5.5.5",
       "zone": "dmp.dnsmesh.io",
       "endpoint": "https://dnsmesh.io",
+      "ok": true,
+      "latency_ms": 202,
+      "detail": "ok"
+    },
+    {
+      "name": "Alibaba",
+      "addr": "223.5.5.5",
+      "zone": "dmp.dnsmesh.pro",
+      "endpoint": "https://dnsmesh.pro",
+      "ok": true,
+      "latency_ms": 186,
+      "detail": "ok"
+    },
+    {
+      "name": "Alibaba",
+      "addr": "223.5.5.5",
+      "zone": "dmp.dnsmesh.de",
+      "endpoint": "https://dnsmesh.de",
       "ok": true,
       "latency_ms": 183,
       "detail": "ok"
     },
     {
-      "name": "Alibaba",
-      "addr": "223.5.5.5",
-      "zone": "dmp.dnsmesh.pro",
-      "endpoint": "https://dnsmesh.pro",
-      "ok": true,
-      "latency_ms": 184,
-      "detail": "ok"
-    },
-    {
-      "name": "Alibaba",
-      "addr": "223.5.5.5",
-      "zone": "dmp.dnsmesh.de",
-      "endpoint": "https://dnsmesh.de",
-      "ok": true,
-      "latency_ms": 566,
-      "detail": "ok"
-    },
-    {
       "name": "DNSPod",
       "addr": "119.29.29.29",
       "zone": "dmp.dnsmesh.io",
       "endpoint": "https://dnsmesh.io",
       "ok": true,
-      "latency_ms": 110,
+      "latency_ms": 94,
       "detail": "ok"
     },
     {
@@ -424,7 +424,7 @@
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 565,
+      "latency_ms": 530,
       "detail": "ok"
     },
     {
@@ -433,7 +433,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 563,
+      "latency_ms": 549,
       "detail": "ok"
     },
     {
@@ -442,7 +442,7 @@
       "zone": "dmp.dnsmesh.io",
       "endpoint": "https://dnsmesh.io",
       "ok": true,
-      "latency_ms": 570,
+      "latency_ms": 504,
       "detail": "ok"
     },
     {
@@ -451,7 +451,7 @@
       "zone": "dmp.dnsmesh.pro",
       "endpoint": "https://dnsmesh.pro",
       "ok": true,
-      "latency_ms": 660,
+      "latency_ms": 740,
       "detail": "ok"
     },
     {
@@ -460,7 +460,7 @@
       "zone": "dmp.dnsmesh.de",
       "endpoint": "https://dnsmesh.de",
       "ok": true,
-      "latency_ms": 541,
+      "latency_ms": 623,
       "detail": "ok"
     }
   ]

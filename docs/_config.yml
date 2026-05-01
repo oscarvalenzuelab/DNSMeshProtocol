@@ -36,12 +36,10 @@ aux_links:
     - "https://github.com/oscarvalenzuelab/DNSMeshProtocol"
 aux_links_new_tab: true
 
-# Footer content appears under the page table-of-contents on every page.
-footer_content: >-
-  Content licensed under
-  <a href="https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/LICENSE">
-  AGPL-3.0</a>. Non-certified, pre-audit — see
-  <a href="https://github.com/oscarvalenzuelab/DNSMeshProtocol/blob/main/SECURITY.md">SECURITY.md</a>.
+# Footer content removed — was rendering "Content licensed under AGPL-3.0.
+# Non-certified, pre-audit — see SECURITY.md." plus an <hr> separator
+# under every page. Licensing + SECURITY.md are still linked from the
+# README and the repo root, which is where most readers expect them.
 
 # Show "Edit this page on GitHub" links.
 gh_edit_link: true
