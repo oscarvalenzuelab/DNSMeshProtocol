@@ -502,9 +502,14 @@ def emit_json(result: AggregateResult, out: Path, *, now: int) -> None:
 # `permalink` keeps the URL at /directory/ regardless of how the source file
 # is named so existing links don't break.
 #
-# All page-specific styles are scoped to ``.dmp-directory`` so they don't
-# fight with Just-the-Docs's body / typography rules. Content lives inside
-# a single wrapper div for the same reason.
+# All HTML class names are prefixed ``dir-`` to avoid colliding with
+# Just-the-Docs's own classes — most painfully ``.label``, which the theme
+# uses for its blue pill badges and which previously turned every
+# ``Status / Version / Operator key / …`` row-label into a glaring blue
+# button. Colors inherit from the parent theme via ``inherit`` /
+# ``currentColor`` where possible so the directory page follows whatever
+# color scheme the docs site is configured for (currently ``dark`` per
+# ``docs/_config.yml``).
 _HTML_TEMPLATE = """---
 title: Directory
 layout: default
@@ -512,68 +517,50 @@ nav_order: 8
 permalink: /directory/
 ---
 <style>
-.dmp-directory {{
-  --dir-fg: #1a1a1a; --dir-muted: #666; --dir-card: #fff;
-  --dir-border: #ddd; --dir-accent: #0066cc; --dir-green: #1a7f37;
-  --dir-amber: #9a6700; --dir-red: #cf222e;
-}}
-@media (prefers-color-scheme: dark) {{
-  .dmp-directory {{
-    --dir-fg: #e6edf3; --dir-muted: #8b949e; --dir-card: #161b22;
-    --dir-border: #30363d; --dir-accent: #58a6ff; --dir-green: #3fb950;
-    --dir-amber: #d29922; --dir-red: #f85149;
-  }}
-}}
-.dmp-directory {{ font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--dir-fg); }}
 .dmp-directory h2 {{ margin: 1.6em 0 0.4em; font-size: 1.15em; }}
-.dmp-directory h2 small {{ font-weight: normal; color: var(--dir-muted); margin-left: 0.5em; }}
-.dmp-directory small {{ color: var(--dir-muted); }}
-.dmp-directory a {{ color: var(--dir-accent); text-decoration: none; }}
-.dmp-directory a:hover {{ text-decoration: underline; }}
-.dmp-directory code {{
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.9em; background: var(--dir-card); padding: 1px 4px;
-  border-radius: 3px; border: 1px solid var(--dir-border);
-}}
-.dmp-directory .cards {{
+.dmp-directory h2 small {{ font-weight: normal; opacity: 0.75; margin-left: 0.5em; }}
+.dmp-directory small {{ opacity: 0.75; }}
+.dmp-directory .dir-cards {{
   display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 0.8em;
 }}
-.dmp-directory .card {{
-  background: var(--dir-card); border: 1px solid var(--dir-border);
+.dmp-directory .dir-card {{
+  border: 1px solid currentColor; border-color: rgba(127,127,127,0.3);
   border-radius: 6px; padding: 0.9em 1em;
 }}
-.dmp-directory .card h3 {{ margin: 0 0 0.4em; font-size: 1em; }}
-.dmp-directory .card .row {{ display: flex; justify-content: space-between; gap: 1em; margin: 0.18em 0; font-size: 0.92em; }}
-.dmp-directory .card .label {{ color: var(--dir-muted); flex-shrink: 0; }}
-.dmp-directory .card .val {{ text-align: right; word-break: break-all; }}
-.dmp-directory .card .pill {{ font-size: 0.8em; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--dir-border); }}
-.dmp-directory .pill.fresh {{ color: var(--dir-green); border-color: currentColor; }}
-.dmp-directory .pill.stale {{ color: var(--dir-amber); border-color: currentColor; }}
-.dmp-directory .pill.expired {{ color: var(--dir-red); border-color: currentColor; }}
+.dmp-directory .dir-card h3 {{ margin: 0 0 0.4em; font-size: 1em; }}
+.dmp-directory .dir-row {{ display: flex; justify-content: space-between; gap: 1em; margin: 0.18em 0; font-size: 0.92em; }}
+.dmp-directory .dir-row-label {{ opacity: 0.7; flex-shrink: 0; font-weight: normal; }}
+.dmp-directory .dir-row-val {{ text-align: right; word-break: break-all; }}
+.dmp-directory .dir-pill {{
+  font-size: 0.8em; padding: 1px 8px; border-radius: 10px;
+  border: 1px solid currentColor; display: inline-block;
+}}
+.dmp-directory .dir-pill.fresh {{ color: #3fb950; }}
+.dmp-directory .dir-pill.stale {{ color: #d29922; }}
+.dmp-directory .dir-pill.expired {{ color: #f85149; }}
 .dmp-directory table {{
   border-collapse: collapse; width: 100%; margin-top: 0.6em;
   font-size: 0.92em;
 }}
 .dmp-directory th, .dmp-directory td {{
-  border: 1px solid var(--dir-border); padding: 0.4em 0.7em;
-  text-align: left;
+  border: 1px solid rgba(127,127,127,0.3);
+  padding: 0.4em 0.7em; text-align: left;
 }}
-.dmp-directory th {{ background: var(--dir-card); font-weight: 600; }}
-.dmp-directory td.ok {{ color: var(--dir-green); }}
-.dmp-directory td.fail {{ color: var(--dir-red); }}
-.dmp-directory .svg-wrap {{
-  background: var(--dir-card); border: 1px solid var(--dir-border);
+.dmp-directory th {{ font-weight: 600; }}
+.dmp-directory td.dir-ok {{ color: #3fb950; }}
+.dmp-directory td.dir-fail {{ color: #f85149; }}
+.dmp-directory .dir-svg-wrap {{
+  border: 1px solid rgba(127,127,127,0.3);
   border-radius: 6px; padding: 1em; margin-top: 0.4em;
   text-align: center; overflow-x: auto;
 }}
-.dmp-directory svg.topology text {{ fill: var(--dir-fg); font: 11px ui-monospace, monospace; }}
-.dmp-directory svg.topology circle.node {{ fill: var(--dir-card); stroke: var(--dir-accent); stroke-width: 2; }}
-.dmp-directory svg.topology line {{ stroke: var(--dir-accent); stroke-width: 1.4; opacity: 0.65; }}
-.dmp-directory svg.topology .label {{ font: 11px system-ui, sans-serif; fill: var(--dir-fg); }}
-.dmp-directory svg.topology .arrow {{ fill: var(--dir-accent); }}
-.dmp-directory .legend {{ font-size: 0.85em; color: var(--dir-muted); margin-top: 0.5em; }}
-.dmp-directory .section-note {{ font-size: 0.88em; color: var(--dir-muted); margin-top: 0.3em; }}
+.dmp-directory svg.dir-topology text {{ fill: currentColor; font: 11px ui-monospace, monospace; }}
+.dmp-directory svg.dir-topology circle.dir-node {{ fill: transparent; stroke: currentColor; stroke-width: 2; opacity: 0.8; }}
+.dmp-directory svg.dir-topology line {{ stroke: currentColor; stroke-width: 1.4; opacity: 0.55; }}
+.dmp-directory svg.dir-topology .dir-svg-label {{ font: 11px system-ui, sans-serif; fill: currentColor; }}
+.dmp-directory svg.dir-topology .dir-arrow {{ fill: currentColor; opacity: 0.7; }}
+.dmp-directory .dir-section-note {{ font-size: 0.88em; opacity: 0.75; margin-top: 0.3em; }}
 </style>
 
 <div class="dmp-directory">
@@ -585,10 +572,10 @@ permalink: /directory/
 </p>
 
 <h2>Known nodes <small>· geo + hosting</small></h2>
-<div class="cards">
+<div class="dir-cards">
 {node_cards}
 </div>
-<p class="section-note">
+<p class="dir-section-note">
   Geo and ASN data via ip-api.com lookup at build time. Each node is
   the same self-signed <code>HeartbeatRecord</code> wire that lives at
   <code>_dnsmesh-heartbeat.&lt;zone&gt;</code> on the public DNS
@@ -597,10 +584,10 @@ permalink: /directory/
 </p>
 
 <h2>Federation topology <small>· heartbeat-discovery, not message traffic</small></h2>
-<div class="svg-wrap">
+<div class="dir-svg-wrap">
 {topology_svg}
 </div>
-<p class="section-note">
+<p class="dir-section-note">
   An arrow from A → B means A's seen-graph
   (<code>_dnsmesh-seen.&lt;A-zone&gt;</code>) carries a verified
   heartbeat from B. This is the federation discovery view —
@@ -610,7 +597,7 @@ permalink: /directory/
 
 <h2>Public-resolver reachability <small>· can major resolvers find these nodes?</small></h2>
 {resolver_table}
-<p class="section-note">
+<p class="dir-section-note">
   Tested at build time from a GitHub Actions runner: each row is a
   curated public DNS resolver, each column is a node. A green cell
   means the resolver answered <code>_dnsmesh-heartbeat.&lt;zone&gt;</code>
@@ -657,7 +644,7 @@ def _liveness_pill(age_seconds: int, exp: int, now: int) -> Tuple[str, str]:
 
 def _render_node_cards(nodes: List[AggregatedNode], *, now: int) -> str:
     if not nodes:
-        return '<div class="card"><em>(no nodes seen)</em></div>'
+        return '<div class="dir-card"><em>(no nodes seen)</em></div>'
     out: List[str] = []
     for n in nodes:
         age = now - n.ts
@@ -678,15 +665,15 @@ def _render_node_cards(nodes: List[AggregatedNode], *, now: int) -> str:
             ]
             geo_text = ", ".join(p for p in parts if p)
         endpoint_safe = html_escape(n.endpoint)
-        out.append(f"""<div class="card">
+        out.append(f"""<div class="dir-card">
 <h3><a href="{endpoint_safe}">{endpoint_safe}</a></h3>
-<div class="row"><span class="label">Status</span><span class="val"><span class="pill {cls}">{html_escape(label)}</span></span></div>
-<div class="row"><span class="label">Version</span><span class="val">{html_escape(n.version or '?')}</span></div>
-<div class="row"><span class="label">Operator key</span><span class="val"><code>{html_escape(spk_short)}</code></span></div>
-<div class="row"><span class="label">Hosting</span><span class="val">{host_text or '<em>—</em>'}</span></div>
-<div class="row"><span class="label">Region</span><span class="val">{html_escape(geo_text) or '<em>—</em>'}</span></div>
-<div class="row"><span class="label">IP</span><span class="val"><code>{html_escape((n.host or dict()).get('ip', '') or '—')}</code></span></div>
-<div class="row"><span class="label">Heard via</span><span class="val">{', '.join(html_escape(z) for z in n.last_seen_via) or '—'}</span></div>
+<div class="dir-row"><span class="dir-row-label">Status</span><span class="dir-row-val"><span class="dir-pill {cls}">{html_escape(label)}</span></span></div>
+<div class="dir-row"><span class="dir-row-label">Version</span><span class="dir-row-val">{html_escape(n.version or '?')}</span></div>
+<div class="dir-row"><span class="dir-row-label">Operator key</span><span class="dir-row-val"><code>{html_escape(spk_short)}</code></span></div>
+<div class="dir-row"><span class="dir-row-label">Hosting</span><span class="dir-row-val">{host_text or '<em>—</em>'}</span></div>
+<div class="dir-row"><span class="dir-row-label">Region</span><span class="dir-row-val">{html_escape(geo_text) or '<em>—</em>'}</span></div>
+<div class="dir-row"><span class="dir-row-label">IP</span><span class="dir-row-val"><code>{html_escape((n.host or dict()).get('ip', '') or '—')}</code></span></div>
+<div class="dir-row"><span class="dir-row-label">Heard via</span><span class="dir-row-val">{', '.join(html_escape(z) for z in n.last_seen_via) or '—'}</span></div>
 </div>""")
     return "\n".join(out)
 
@@ -713,12 +700,12 @@ def _render_topology_svg(
     # don't collide.
     coords: Dict[str, Tuple[int, int]] = {}
     parts: List[str] = [
-        f'<svg class="topology" width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">'
+        f'<svg class="dir-topology" width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">'
     ]
     parts.append(
         '<defs><marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" '
         'markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
-        '<path d="M 0 0 L 10 5 L 0 10 z" class="arrow"/></marker></defs>'
+        '<path d="M 0 0 L 10 5 L 0 10 z" class="dir-arrow"/></marker></defs>'
     )
     for i, n in enumerate(nodes):
         x = int(margin_x + i * spacing) if len(nodes) > 1 else width // 2
@@ -745,12 +732,12 @@ def _render_topology_svg(
         host = urlparse(n.endpoint).hostname or n.endpoint
         country = (n.geo or {}).get("country_code") or ""
         parts.append(
-            f'<circle class="node" cx="{x}" cy="{y}" r="22"/>'
-            f'<text class="label" x="{x}" y="{y + 4}" text-anchor="middle" '
+            f'<circle class="dir-node" cx="{x}" cy="{y}" r="22"/>'
+            f'<text class="dir-svg-label" x="{x}" y="{y + 4}" text-anchor="middle" '
             f'font-size="11">{html_escape((country or "?"))}</text>'
-            f'<text class="label" x="{x}" y="{y + 42}" text-anchor="middle" '
+            f'<text class="dir-svg-label" x="{x}" y="{y + 42}" text-anchor="middle" '
             f'font-size="11">{html_escape(host)}</text>'
-            f'<text class="label" x="{x}" y="{y + 56}" text-anchor="middle" '
+            f'<text class="dir-svg-label" x="{x}" y="{y + 56}" text-anchor="middle" '
             f'font-size="10" opacity="0.7">{html_escape(n.version or "")}</text>'
         )
     parts.append("</svg>")
@@ -791,10 +778,12 @@ def _render_resolver_table(
                 continue
             if c.ok:
                 lat = f"{c.latency_ms} ms" if c.latency_ms is not None else ""
-                parts.append(f'<td class="ok">✓ <small>{html_escape(lat)}</small></td>')
+                parts.append(
+                    f'<td class="dir-ok">✓ <small>{html_escape(lat)}</small></td>'
+                )
             else:
                 parts.append(
-                    f'<td class="fail">✗ <small>{html_escape(c.detail)}</small></td>'
+                    f'<td class="dir-fail">✗ <small>{html_escape(c.detail)}</small></td>'
                 )
         parts.append("</tr>")
     parts.append("</tbody></table>")

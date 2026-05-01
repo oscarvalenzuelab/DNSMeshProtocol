@@ -5,112 +5,94 @@ nav_order: 8
 permalink: /directory/
 ---
 <style>
-.dmp-directory {
-  --dir-fg: #1a1a1a; --dir-muted: #666; --dir-card: #fff;
-  --dir-border: #ddd; --dir-accent: #0066cc; --dir-green: #1a7f37;
-  --dir-amber: #9a6700; --dir-red: #cf222e;
-}
-@media (prefers-color-scheme: dark) {
-  .dmp-directory {
-    --dir-fg: #e6edf3; --dir-muted: #8b949e; --dir-card: #161b22;
-    --dir-border: #30363d; --dir-accent: #58a6ff; --dir-green: #3fb950;
-    --dir-amber: #d29922; --dir-red: #f85149;
-  }
-}
-.dmp-directory { font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--dir-fg); }
 .dmp-directory h2 { margin: 1.6em 0 0.4em; font-size: 1.15em; }
-.dmp-directory h2 small { font-weight: normal; color: var(--dir-muted); margin-left: 0.5em; }
-.dmp-directory small { color: var(--dir-muted); }
-.dmp-directory a { color: var(--dir-accent); text-decoration: none; }
-.dmp-directory a:hover { text-decoration: underline; }
-.dmp-directory code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.9em; background: var(--dir-card); padding: 1px 4px;
-  border-radius: 3px; border: 1px solid var(--dir-border);
-}
-.dmp-directory .cards {
+.dmp-directory h2 small { font-weight: normal; opacity: 0.75; margin-left: 0.5em; }
+.dmp-directory small { opacity: 0.75; }
+.dmp-directory .dir-cards {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 0.8em;
 }
-.dmp-directory .card {
-  background: var(--dir-card); border: 1px solid var(--dir-border);
+.dmp-directory .dir-card {
+  border: 1px solid currentColor; border-color: rgba(127,127,127,0.3);
   border-radius: 6px; padding: 0.9em 1em;
 }
-.dmp-directory .card h3 { margin: 0 0 0.4em; font-size: 1em; }
-.dmp-directory .card .row { display: flex; justify-content: space-between; gap: 1em; margin: 0.18em 0; font-size: 0.92em; }
-.dmp-directory .card .label { color: var(--dir-muted); flex-shrink: 0; }
-.dmp-directory .card .val { text-align: right; word-break: break-all; }
-.dmp-directory .card .pill { font-size: 0.8em; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--dir-border); }
-.dmp-directory .pill.fresh { color: var(--dir-green); border-color: currentColor; }
-.dmp-directory .pill.stale { color: var(--dir-amber); border-color: currentColor; }
-.dmp-directory .pill.expired { color: var(--dir-red); border-color: currentColor; }
+.dmp-directory .dir-card h3 { margin: 0 0 0.4em; font-size: 1em; }
+.dmp-directory .dir-row { display: flex; justify-content: space-between; gap: 1em; margin: 0.18em 0; font-size: 0.92em; }
+.dmp-directory .dir-row-label { opacity: 0.7; flex-shrink: 0; font-weight: normal; }
+.dmp-directory .dir-row-val { text-align: right; word-break: break-all; }
+.dmp-directory .dir-pill {
+  font-size: 0.8em; padding: 1px 8px; border-radius: 10px;
+  border: 1px solid currentColor; display: inline-block;
+}
+.dmp-directory .dir-pill.fresh { color: #3fb950; }
+.dmp-directory .dir-pill.stale { color: #d29922; }
+.dmp-directory .dir-pill.expired { color: #f85149; }
 .dmp-directory table {
   border-collapse: collapse; width: 100%; margin-top: 0.6em;
   font-size: 0.92em;
 }
 .dmp-directory th, .dmp-directory td {
-  border: 1px solid var(--dir-border); padding: 0.4em 0.7em;
-  text-align: left;
+  border: 1px solid rgba(127,127,127,0.3);
+  padding: 0.4em 0.7em; text-align: left;
 }
-.dmp-directory th { background: var(--dir-card); font-weight: 600; }
-.dmp-directory td.ok { color: var(--dir-green); }
-.dmp-directory td.fail { color: var(--dir-red); }
-.dmp-directory .svg-wrap {
-  background: var(--dir-card); border: 1px solid var(--dir-border);
+.dmp-directory th { font-weight: 600; }
+.dmp-directory td.dir-ok { color: #3fb950; }
+.dmp-directory td.dir-fail { color: #f85149; }
+.dmp-directory .dir-svg-wrap {
+  border: 1px solid rgba(127,127,127,0.3);
   border-radius: 6px; padding: 1em; margin-top: 0.4em;
   text-align: center; overflow-x: auto;
 }
-.dmp-directory svg.topology text { fill: var(--dir-fg); font: 11px ui-monospace, monospace; }
-.dmp-directory svg.topology circle.node { fill: var(--dir-card); stroke: var(--dir-accent); stroke-width: 2; }
-.dmp-directory svg.topology line { stroke: var(--dir-accent); stroke-width: 1.4; opacity: 0.65; }
-.dmp-directory svg.topology .label { font: 11px system-ui, sans-serif; fill: var(--dir-fg); }
-.dmp-directory svg.topology .arrow { fill: var(--dir-accent); }
-.dmp-directory .legend { font-size: 0.85em; color: var(--dir-muted); margin-top: 0.5em; }
-.dmp-directory .section-note { font-size: 0.88em; color: var(--dir-muted); margin-top: 0.3em; }
+.dmp-directory svg.dir-topology text { fill: currentColor; font: 11px ui-monospace, monospace; }
+.dmp-directory svg.dir-topology circle.dir-node { fill: transparent; stroke: currentColor; stroke-width: 2; opacity: 0.8; }
+.dmp-directory svg.dir-topology line { stroke: currentColor; stroke-width: 1.4; opacity: 0.55; }
+.dmp-directory svg.dir-topology .dir-svg-label { font: 11px system-ui, sans-serif; fill: currentColor; }
+.dmp-directory svg.dir-topology .dir-arrow { fill: currentColor; opacity: 0.7; }
+.dmp-directory .dir-section-note { font-size: 0.88em; opacity: 0.75; margin-top: 0.3em; }
 </style>
 
 <div class="dmp-directory">
 
 <p>
-  <small>Generated 2026-05-01 21:36:46 UTC · 3 known nodes ·
+  <small>Generated 2026-05-01 21:51:17 UTC · 3 known nodes ·
   <a href="feed.json">feed.json</a> carries the raw signed wires
   for independent re-verification.</small>
 </p>
 
 <h2>Known nodes <small>· geo + hosting</small></h2>
-<div class="cards">
-<div class="card">
+<div class="dir-cards">
+<div class="dir-card">
 <h3><a href="https://dnsmesh.de">https://dnsmesh.de</a></h3>
-<div class="row"><span class="label">Status</span><span class="val"><span class="pill fresh">1m ago</span></span></div>
-<div class="row"><span class="label">Version</span><span class="val">0.6.6</span></div>
-<div class="row"><span class="label">Operator key</span><span class="val"><code>fbe50814…cdd9</code></span></div>
-<div class="row"><span class="label">Hosting</span><span class="val">Hetzner <small>(AS24940 Hetzner Online GmbH)</small></span></div>
-<div class="row"><span class="label">Region</span><span class="val">Nuremberg, Bavaria, Germany</span></div>
-<div class="row"><span class="label">IP</span><span class="val"><code>178.104.241.208</code></span></div>
-<div class="row"><span class="label">Heard via</span><span class="val">dmp.dnsmesh.de</span></div>
+<div class="dir-row"><span class="dir-row-label">Status</span><span class="dir-row-val"><span class="dir-pill fresh">45s ago</span></span></div>
+<div class="dir-row"><span class="dir-row-label">Version</span><span class="dir-row-val">0.6.6</span></div>
+<div class="dir-row"><span class="dir-row-label">Operator key</span><span class="dir-row-val"><code>fbe50814…cdd9</code></span></div>
+<div class="dir-row"><span class="dir-row-label">Hosting</span><span class="dir-row-val">Hetzner <small>(AS24940 Hetzner Online GmbH)</small></span></div>
+<div class="dir-row"><span class="dir-row-label">Region</span><span class="dir-row-val">Nuremberg, Bavaria, Germany</span></div>
+<div class="dir-row"><span class="dir-row-label">IP</span><span class="dir-row-val"><code>178.104.241.208</code></span></div>
+<div class="dir-row"><span class="dir-row-label">Heard via</span><span class="dir-row-val">dmp.dnsmesh.de</span></div>
 </div>
-<div class="card">
+<div class="dir-card">
 <h3><a href="https://dnsmesh.pro">https://dnsmesh.pro</a></h3>
-<div class="row"><span class="label">Status</span><span class="val"><span class="pill fresh">1m ago</span></span></div>
-<div class="row"><span class="label">Version</span><span class="val">0.6.6</span></div>
-<div class="row"><span class="label">Operator key</span><span class="val"><code>55dd5085…bfef</code></span></div>
-<div class="row"><span class="label">Hosting</span><span class="val">OPENCLOUD SpA <small>(AS52368 ZAM LTDA.)</small></span></div>
-<div class="row"><span class="label">Region</span><span class="val">Curicó, Maule Region, Chile</span></div>
-<div class="row"><span class="label">IP</span><span class="val"><code>45.7.229.112</code></span></div>
-<div class="row"><span class="label">Heard via</span><span class="val">dmp.dnsmesh.pro, dmp.dnsmesh.de</span></div>
+<div class="dir-row"><span class="dir-row-label">Status</span><span class="dir-row-val"><span class="dir-pill fresh">50s ago</span></span></div>
+<div class="dir-row"><span class="dir-row-label">Version</span><span class="dir-row-val">0.6.6</span></div>
+<div class="dir-row"><span class="dir-row-label">Operator key</span><span class="dir-row-val"><code>55dd5085…bfef</code></span></div>
+<div class="dir-row"><span class="dir-row-label">Hosting</span><span class="dir-row-val">OPENCLOUD SpA <small>(AS52368 ZAM LTDA.)</small></span></div>
+<div class="dir-row"><span class="dir-row-label">Region</span><span class="dir-row-val">Curicó, Maule Region, Chile</span></div>
+<div class="dir-row"><span class="dir-row-label">IP</span><span class="dir-row-val"><code>45.7.229.112</code></span></div>
+<div class="dir-row"><span class="dir-row-label">Heard via</span><span class="dir-row-val">dmp.dnsmesh.pro, dmp.dnsmesh.de</span></div>
 </div>
-<div class="card">
+<div class="dir-card">
 <h3><a href="https://dnsmesh.io">https://dnsmesh.io</a></h3>
-<div class="row"><span class="label">Status</span><span class="val"><span class="pill fresh">1m ago</span></span></div>
-<div class="row"><span class="label">Version</span><span class="val">0.6.6</span></div>
-<div class="row"><span class="label">Operator key</span><span class="val"><code>c0e5385e…32c2</code></span></div>
-<div class="row"><span class="label">Hosting</span><span class="val">DigitalOcean, LLC <small>(AS14061 DigitalOcean, LLC)</small></span></div>
-<div class="row"><span class="label">Region</span><span class="val">Santa Clara, California, United States</span></div>
-<div class="row"><span class="label">IP</span><span class="val"><code>24.199.107.165</code></span></div>
-<div class="row"><span class="label">Heard via</span><span class="val">dmp.dnsmesh.io, dmp.dnsmesh.pro, dmp.dnsmesh.de</span></div>
+<div class="dir-row"><span class="dir-row-label">Status</span><span class="dir-row-val"><span class="dir-pill fresh">1m ago</span></span></div>
+<div class="dir-row"><span class="dir-row-label">Version</span><span class="dir-row-val">0.6.6</span></div>
+<div class="dir-row"><span class="dir-row-label">Operator key</span><span class="dir-row-val"><code>c0e5385e…32c2</code></span></div>
+<div class="dir-row"><span class="dir-row-label">Hosting</span><span class="dir-row-val">DigitalOcean, LLC <small>(AS14061 DigitalOcean, LLC)</small></span></div>
+<div class="dir-row"><span class="dir-row-label">Region</span><span class="dir-row-val">Santa Clara, California, United States</span></div>
+<div class="dir-row"><span class="dir-row-label">IP</span><span class="dir-row-val"><code>24.199.107.165</code></span></div>
+<div class="dir-row"><span class="dir-row-label">Heard via</span><span class="dir-row-val">dmp.dnsmesh.io, dmp.dnsmesh.pro, dmp.dnsmesh.de</span></div>
 </div>
 </div>
-<p class="section-note">
+<p class="dir-section-note">
   Geo and ASN data via ip-api.com lookup at build time. Each node is
   the same self-signed <code>HeartbeatRecord</code> wire that lives at
   <code>_dnsmesh-heartbeat.&lt;zone&gt;</code> on the public DNS
@@ -119,10 +101,10 @@ permalink: /directory/
 </p>
 
 <h2>Federation topology <small>· heartbeat-discovery, not message traffic</small></h2>
-<div class="svg-wrap">
-<svg class="topology" width="720" height="220" viewBox="0 0 720 220" xmlns="http://www.w3.org/2000/svg"><defs><marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" class="arrow"/></marker></defs><path d="M 360 135 Q 495 140 630 85" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.55" marker-end="url(#arrowhead)"/><path d="M 90 85 Q 225 140 360 135" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.55" marker-end="url(#arrowhead)"/><path d="M 90 85 Q 360 115 630 85" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.55" marker-end="url(#arrowhead)"/><circle class="node" cx="90" cy="85" r="22"/><text class="label" x="90" y="89" text-anchor="middle" font-size="11">DE</text><text class="label" x="90" y="127" text-anchor="middle" font-size="11">dnsmesh.de</text><text class="label" x="90" y="141" text-anchor="middle" font-size="10" opacity="0.7">0.6.6</text><circle class="node" cx="360" cy="135" r="22"/><text class="label" x="360" y="139" text-anchor="middle" font-size="11">CL</text><text class="label" x="360" y="177" text-anchor="middle" font-size="11">dnsmesh.pro</text><text class="label" x="360" y="191" text-anchor="middle" font-size="10" opacity="0.7">0.6.6</text><circle class="node" cx="630" cy="85" r="22"/><text class="label" x="630" y="89" text-anchor="middle" font-size="11">US</text><text class="label" x="630" y="127" text-anchor="middle" font-size="11">dnsmesh.io</text><text class="label" x="630" y="141" text-anchor="middle" font-size="10" opacity="0.7">0.6.6</text></svg>
+<div class="dir-svg-wrap">
+<svg class="dir-topology" width="720" height="220" viewBox="0 0 720 220" xmlns="http://www.w3.org/2000/svg"><defs><marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" class="dir-arrow"/></marker></defs><path d="M 360 135 Q 495 140 630 85" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.55" marker-end="url(#arrowhead)"/><path d="M 90 85 Q 225 140 360 135" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.55" marker-end="url(#arrowhead)"/><path d="M 90 85 Q 360 115 630 85" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.55" marker-end="url(#arrowhead)"/><circle class="dir-node" cx="90" cy="85" r="22"/><text class="dir-svg-label" x="90" y="89" text-anchor="middle" font-size="11">DE</text><text class="dir-svg-label" x="90" y="127" text-anchor="middle" font-size="11">dnsmesh.de</text><text class="dir-svg-label" x="90" y="141" text-anchor="middle" font-size="10" opacity="0.7">0.6.6</text><circle class="dir-node" cx="360" cy="135" r="22"/><text class="dir-svg-label" x="360" y="139" text-anchor="middle" font-size="11">CL</text><text class="dir-svg-label" x="360" y="177" text-anchor="middle" font-size="11">dnsmesh.pro</text><text class="dir-svg-label" x="360" y="191" text-anchor="middle" font-size="10" opacity="0.7">0.6.6</text><circle class="dir-node" cx="630" cy="85" r="22"/><text class="dir-svg-label" x="630" y="89" text-anchor="middle" font-size="11">US</text><text class="dir-svg-label" x="630" y="127" text-anchor="middle" font-size="11">dnsmesh.io</text><text class="dir-svg-label" x="630" y="141" text-anchor="middle" font-size="10" opacity="0.7">0.6.6</text></svg>
 </div>
-<p class="section-note">
+<p class="dir-section-note">
   An arrow from A → B means A's seen-graph
   (<code>_dnsmesh-seen.&lt;A-zone&gt;</code>) carries a verified
   heartbeat from B. This is the federation discovery view —
@@ -131,8 +113,8 @@ permalink: /directory/
 </p>
 
 <h2>Public-resolver reachability <small>· can major resolvers find these nodes?</small></h2>
-<table><thead><tr><th>Resolver</th><th>dmp.dnsmesh.de</th><th>dmp.dnsmesh.io</th><th>dmp.dnsmesh.pro</th></tr></thead><tbody><tr><td><strong>Cloudflare</strong> <small><code>1.1.1.1</code></small></td><td class="ok">✓ <small>334 ms</small></td><td class="ok">✓ <small>9 ms</small></td><td class="ok">✓ <small>228 ms</small></td></tr><tr><td><strong>Google</strong> <small><code>8.8.8.8</code></small></td><td class="ok">✓ <small>206 ms</small></td><td class="ok">✓ <small>45 ms</small></td><td class="ok">✓ <small>218 ms</small></td></tr><tr><td><strong>Quad9</strong> <small><code>9.9.9.9</code></small></td><td class="ok">✓ <small>440 ms</small></td><td class="ok">✓ <small>95 ms</small></td><td class="ok">✓ <small>513 ms</small></td></tr><tr><td><strong>OpenDNS</strong> <small><code>208.67.222.222</code></small></td><td class="ok">✓ <small>397 ms</small></td><td class="ok">✓ <small>101 ms</small></td><td class="ok">✓ <small>352 ms</small></td></tr><tr><td><strong>Comodo</strong> <small><code>8.26.56.26</code></small></td><td class="ok">✓ <small>451 ms</small></td><td class="ok">✓ <small>197 ms</small></td><td class="ok">✓ <small>496 ms</small></td></tr><tr><td><strong>Level3</strong> <small><code>4.2.2.1</code></small></td><td class="ok">✓ <small>343 ms</small></td><td class="fail">✗ <small>empty answer</small></td><td class="ok">✓ <small>334 ms</small></td></tr><tr><td><strong>Hurricane Electric</strong> <small><code>74.82.42.42</code></small></td><td class="ok">✓ <small>183 ms</small></td><td class="ok">✓ <small>77 ms</small></td><td class="ok">✓ <small>340 ms</small></td></tr><tr><td><strong>Verisign</strong> <small><code>64.6.64.6</code></small></td><td class="ok">✓ <small>365 ms</small></td><td class="ok">✓ <small>46 ms</small></td><td class="ok">✓ <small>377 ms</small></td></tr><tr><td><strong>AdGuard</strong> <small><code>94.140.14.14</code></small></td><td class="ok">✓ <small>1033 ms</small></td><td class="ok">✓ <small>310 ms</small></td><td class="ok">✓ <small>474 ms</small></td></tr><tr><td><strong>Yandex</strong> <small><code>77.88.8.8</code></small></td><td class="ok">✓ <small>479 ms</small></td><td class="ok">✓ <small>721 ms</small></td><td class="ok">✓ <small>804 ms</small></td></tr><tr><td><strong>Alibaba</strong> <small><code>223.5.5.5</code></small></td><td class="ok">✓ <small>781 ms</small></td><td class="ok">✓ <small>185 ms</small></td><td class="ok">✓ <small>584 ms</small></td></tr><tr><td><strong>DNSPod</strong> <small><code>119.29.29.29</code></small></td><td class="ok">✓ <small>558 ms</small></td><td class="ok">✓ <small>108 ms</small></td><td class="ok">✓ <small>535 ms</small></td></tr><tr><td><strong>KT Korea</strong> <small><code>168.126.63.1</code></small></td><td class="ok">✓ <small>537 ms</small></td><td class="ok">✓ <small>485 ms</small></td><td class="ok">✓ <small>760 ms</small></td></tr></tbody></table>
-<p class="section-note">
+<table><thead><tr><th>Resolver</th><th>dmp.dnsmesh.de</th><th>dmp.dnsmesh.io</th><th>dmp.dnsmesh.pro</th></tr></thead><tbody><tr><td><strong>Cloudflare</strong> <small><code>1.1.1.1</code></small></td><td class="dir-ok">✓ <small>336 ms</small></td><td class="dir-ok">✓ <small>68 ms</small></td><td class="dir-ok">✓ <small>178 ms</small></td></tr><tr><td><strong>Google</strong> <small><code>8.8.8.8</code></small></td><td class="dir-ok">✓ <small>157 ms</small></td><td class="dir-ok">✓ <small>104 ms</small></td><td class="dir-ok">✓ <small>343 ms</small></td></tr><tr><td><strong>Quad9</strong> <small><code>9.9.9.9</code></small></td><td class="dir-ok">✓ <small>364 ms</small></td><td class="dir-ok">✓ <small>78 ms</small></td><td class="dir-ok">✓ <small>215 ms</small></td></tr><tr><td><strong>OpenDNS</strong> <small><code>208.67.222.222</code></small></td><td class="dir-ok">✓ <small>349 ms</small></td><td class="dir-ok">✓ <small>81 ms</small></td><td class="dir-ok">✓ <small>332 ms</small></td></tr><tr><td><strong>Comodo</strong> <small><code>8.26.56.26</code></small></td><td class="dir-ok">✓ <small>354 ms</small></td><td class="dir-ok">✓ <small>55 ms</small></td><td class="dir-ok">✓ <small>350 ms</small></td></tr><tr><td><strong>Level3</strong> <small><code>4.2.2.1</code></small></td><td class="dir-ok">✓ <small>349 ms</small></td><td class="dir-fail">✗ <small>empty answer</small></td><td class="dir-ok">✓ <small>330 ms</small></td></tr><tr><td><strong>Hurricane Electric</strong> <small><code>74.82.42.42</code></small></td><td class="dir-ok">✓ <small>153 ms</small></td><td class="dir-ok">✓ <small>35 ms</small></td><td class="dir-ok">✓ <small>210 ms</small></td></tr><tr><td><strong>Verisign</strong> <small><code>64.6.64.6</code></small></td><td class="dir-ok">✓ <small>481 ms</small></td><td class="dir-ok">✓ <small>42 ms</small></td><td class="dir-ok">✓ <small>365 ms</small></td></tr><tr><td><strong>AdGuard</strong> <small><code>94.140.14.14</code></small></td><td class="dir-ok">✓ <small>666 ms</small></td><td class="dir-ok">✓ <small>266 ms</small></td><td class="dir-ok">✓ <small>808 ms</small></td></tr><tr><td><strong>Yandex</strong> <small><code>77.88.8.8</code></small></td><td class="dir-ok">✓ <small>442 ms</small></td><td class="dir-ok">✓ <small>677 ms</small></td><td class="dir-ok">✓ <small>856 ms</small></td></tr><tr><td><strong>Alibaba</strong> <small><code>223.5.5.5</code></small></td><td class="dir-ok">✓ <small>189 ms</small></td><td class="dir-ok">✓ <small>184 ms</small></td><td class="dir-ok">✓ <small>183 ms</small></td></tr><tr><td><strong>DNSPod</strong> <small><code>119.29.29.29</code></small></td><td class="dir-ok">✓ <small>574 ms</small></td><td class="dir-ok">✓ <small>111 ms</small></td><td class="dir-ok">✓ <small>569 ms</small></td></tr><tr><td><strong>KT Korea</strong> <small><code>168.126.63.1</code></small></td><td class="dir-ok">✓ <small>535 ms</small></td><td class="dir-ok">✓ <small>484 ms</small></td><td class="dir-ok">✓ <small>757 ms</small></td></tr></tbody></table>
+<p class="dir-section-note">
   Tested at build time from a GitHub Actions runner: each row is a
   curated public DNS resolver, each column is a node. A green cell
   means the resolver answered <code>_dnsmesh-heartbeat.&lt;zone&gt;</code>
