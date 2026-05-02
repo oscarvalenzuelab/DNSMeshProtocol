@@ -1,0 +1,17 @@
+{% comment %}
+  Just-the-Docs ships an empty `head_custom.html` that gets injected into
+  every page's `<head>`. Drop site-wide CSS overrides here. Using this
+  include rather than `_sass/custom/custom.scss` because we run
+  Just-the-Docs as a `remote_theme` — the SCSS pipeline doesn't pick up
+  custom partials in that mode, but `<head>` includes are honored.
+
+  Currently:
+    - Hides the `<hr>` separator the default layout drops between the
+      page content and the per-page footer row (the "Edit this page on
+      GitHub" link). After we removed `footer_content` from the site
+      config the `<hr>` was a visual break with nothing on either side
+      of it.
+{% endcomment %}
+<style>
+  #main-content > hr { display: none; }
+</style>
