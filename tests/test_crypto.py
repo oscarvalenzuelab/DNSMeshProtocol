@@ -244,9 +244,9 @@ class TestDMPCrypto:
         # Must be rejected against any message — pick a few representative
         # payloads to make the "every message" property visible in the test.
         for msg in (b"", b"forgery target", b"\x00" * 1024, os.urandom(64)):
-            assert not DMPCrypto.verify_signature(msg, forgery_sig, identity_pub), (
-                f"identity-point forgery accepted on message of len {len(msg)}"
-            )
+            assert not DMPCrypto.verify_signature(
+                msg, forgery_sig, identity_pub
+            ), f"identity-point forgery accepted on message of len {len(msg)}"
 
     def test_verify_signature_rejects_low_order_vectors_bytes(self):
         """Each known low-order encoding must be rejected when passed as raw
@@ -259,12 +259,12 @@ class TestDMPCrypto:
         zero_sig = b"\x00" * 64
         for hex_pub in self._LOW_ORDER_VECTORS:
             pub_bytes = bytes.fromhex(hex_pub)
-            assert not DMPCrypto.verify_signature(msg, forgery_sig, pub_bytes), (
-                f"low-order pubkey {hex_pub} accepted with identity-forgery sig"
-            )
-            assert not DMPCrypto.verify_signature(msg, zero_sig, pub_bytes), (
-                f"low-order pubkey {hex_pub} accepted with zero sig"
-            )
+            assert not DMPCrypto.verify_signature(
+                msg, forgery_sig, pub_bytes
+            ), f"low-order pubkey {hex_pub} accepted with identity-forgery sig"
+            assert not DMPCrypto.verify_signature(
+                msg, zero_sig, pub_bytes
+            ), f"low-order pubkey {hex_pub} accepted with zero sig"
 
     def test_verify_signature_rejects_low_order_vectors_instance(self):
         """Same rejection when an Ed25519PublicKey instance is passed instead
@@ -281,9 +281,9 @@ class TestDMPCrypto:
                 # time by the underlying library; the bytes-form test above
                 # already exercises those.
                 continue
-            assert not DMPCrypto.verify_signature(msg, forgery_sig, pk_instance), (
-                f"low-order pubkey instance {hex_pub} accepted"
-            )
+            assert not DMPCrypto.verify_signature(
+                msg, forgery_sig, pk_instance
+            ), f"low-order pubkey instance {hex_pub} accepted"
 
     def test_verify_signature_block_list_includes_all_known_vectors(self):
         """The independent vector list MUST be a subset of the production
@@ -293,9 +293,9 @@ class TestDMPCrypto:
         """
         for hex_pub in self._LOW_ORDER_VECTORS:
             pub_bytes = bytes.fromhex(hex_pub)
-            assert pub_bytes in LOW_ORDER_ED25519_PUBKEYS, (
-                f"vector {hex_pub} missing from LOW_ORDER_ED25519_PUBKEYS"
-            )
+            assert (
+                pub_bytes in LOW_ORDER_ED25519_PUBKEYS
+            ), f"vector {hex_pub} missing from LOW_ORDER_ED25519_PUBKEYS"
 
     def test_verify_signature_wrong_length_pubkey_rejected(self):
         """Defense in depth: bytes pubkeys of the wrong length must fail
