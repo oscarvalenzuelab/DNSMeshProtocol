@@ -360,3 +360,80 @@ class TestForget:
         spk_hex = signer.get_signing_public_key_bytes().hex()
         store.forget(spk_hex, "https://dmp.example.com")
         assert store.forget(spk_hex, "https://dmp.example.com") is False
+
+
+class TestSchemaVersioning:
+    """``PRAGMA user_version`` migration ladder for SeenStore.
+
+    Per-node singleton with a single schema version so far; the ladder
+    is in place for future bumps and to refuse newer-on-older opens.
+    """
+
+    def test_fresh_db_is_stamped_at_current_version(self, tmp_path):
+        from dmp.server.heartbeat_store import _SCHEMA_VERSION, SeenStore
+
+        store = SeenStore(str(tmp_path / "fresh.db"))
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == _SCHEMA_VERSION
+        finally:
+            store.close()
+
+    def test_legacy_unversioned_db_is_migrated(self, tmp_path):
+        """A pre-versioning database (current schema, user_version=0)
+        opens cleanly, gets the current version stamped, and existing
+        rows survive — the migration is no-op data-wise."""
+        import sqlite3
+
+        from dmp.server.heartbeat_store import SeenStore, _SCHEMA_V1
+
+        path = str(tmp_path / "legacy.db")
+        legacy = sqlite3.connect(path)
+        legacy.executescript(_SCHEMA_V1)
+        legacy.execute(
+            "INSERT INTO heartbeats_seen("
+            "operator_spk_hex, endpoint, wire, ts, exp, version,"
+            "received_at, remote_addr"
+            ") VALUES(?,?,?,?,?,?,?,?)",
+            (
+                "aa" * 32,
+                "https://x.test",
+                "v=dmp1;t=hb;d=AAAA",
+                1000,
+                9_999_999_999,
+                "0.0.1",
+                1500,
+                "127.0.0.1",
+            ),
+        )
+        legacy.commit()
+        legacy.close()
+
+        store = SeenStore(path)
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == 1
+            row = store._conn.execute(
+                "SELECT operator_spk_hex FROM heartbeats_seen"
+            ).fetchone()
+            assert row[0] == "aa" * 32
+        finally:
+            store.close()
+
+    def test_future_version_db_refuses_to_open(self, tmp_path):
+        """A db stamped HIGHER than this binary understands raises —
+        running an older binary against newer data risks dropping
+        fields silently."""
+        import sqlite3
+
+        from dmp.server.heartbeat_store import SeenStore, _SCHEMA_V1, _SCHEMA_VERSION
+
+        path = str(tmp_path / "future.db")
+        future = sqlite3.connect(path)
+        future.executescript(_SCHEMA_V1)
+        future.execute(f"PRAGMA user_version = {_SCHEMA_VERSION + 5}")
+        future.commit()
+        future.close()
+
+        with pytest.raises(RuntimeError, match="schema version"):
+            SeenStore(path)

@@ -417,3 +417,95 @@ class TestEndToEndWithDnsServer:
 
         assert response.rcode() == dns.rcode.REFUSED
         assert record_store.query_txt_record("bob.example.com") is None
+
+
+class TestSchemaVersioning:
+    """Migration ladder for TSIGKeyStore (schema v4).
+
+    Versions:
+      v1 = original (name, algorithm, secret, allowed_suffixes, created_at,
+           expires_at, revoked)
+      v2 = + subject
+      v3 = + registered_spk
+      v4 = + registered_x25519_pub (current)
+
+    Pre-versioning binaries blindly ran every ALTER swallowing
+    ``duplicate column``; the new ladder preserves that idempotency
+    while stamping ``user_version`` on the way out.
+    """
+
+    def test_fresh_db_is_stamped_at_current_version(self, tmp_path):
+        from dmp.server.tsig_keystore import _SCHEMA_VERSION, TSIGKeyStore
+
+        store = TSIGKeyStore(str(tmp_path / "fresh.db"))
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == _SCHEMA_VERSION
+            cols = {
+                row[1]
+                for row in store._conn.execute(
+                    "PRAGMA table_info(tsig_keys)"
+                ).fetchall()
+            }
+            assert {"subject", "registered_spk", "registered_x25519_pub"} <= cols
+        finally:
+            store.close()
+
+    def test_legacy_v1_db_gets_all_three_columns_added(self, tmp_path):
+        """A pre-versioning v1 keystore (only the original 7 columns)
+        opens cleanly: all three v2/v3/v4 columns get ALTERed in,
+        ``user_version`` is stamped to 4."""
+        import sqlite3
+
+        from dmp.server.tsig_keystore import TSIGKeyStore
+
+        path = str(tmp_path / "legacy.db")
+        legacy = sqlite3.connect(path)
+        legacy.executescript("""
+            CREATE TABLE tsig_keys (
+                name TEXT PRIMARY KEY,
+                algorithm TEXT NOT NULL DEFAULT 'hmac-sha256',
+                secret BLOB NOT NULL,
+                allowed_suffixes TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL DEFAULT 0,
+                revoked INTEGER NOT NULL DEFAULT 0
+            );
+            """)
+        legacy.execute(
+            "INSERT INTO tsig_keys(name, secret, created_at) VALUES(?, ?, ?)",
+            ("k0.", b"\xaa" * 32, 100),
+        )
+        legacy.commit()
+        legacy.close()
+
+        store = TSIGKeyStore(path)
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == 4
+            cols = {
+                row[1]
+                for row in store._conn.execute(
+                    "PRAGMA table_info(tsig_keys)"
+                ).fetchall()
+            }
+            assert {"subject", "registered_spk", "registered_x25519_pub"} <= cols
+            row = store._conn.execute("SELECT name FROM tsig_keys").fetchone()
+            assert row[0] == "k0."
+        finally:
+            store.close()
+
+    def test_future_version_db_refuses_to_open(self, tmp_path):
+        import sqlite3
+
+        from dmp.server.tsig_keystore import TSIGKeyStore, _SCHEMA, _SCHEMA_VERSION
+
+        path = str(tmp_path / "future.db")
+        future = sqlite3.connect(path)
+        future.executescript(_SCHEMA)
+        future.execute(f"PRAGMA user_version = {_SCHEMA_VERSION + 5}")
+        future.commit()
+        future.close()
+
+        with pytest.raises(RuntimeError, match="schema version"):
+            TSIGKeyStore(path)

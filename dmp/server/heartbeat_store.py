@@ -55,7 +55,7 @@ DEFAULT_RETENTION_SECONDS = 72 * 3600  # 3 days
 DEFAULT_MAX_ROWS = 10_000
 
 
-_SCHEMA = """
+_SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS heartbeats_seen (
     operator_spk_hex  TEXT NOT NULL,
     endpoint          TEXT NOT NULL,
@@ -72,6 +72,10 @@ CREATE INDEX IF NOT EXISTS idx_hb_ts          ON heartbeats_seen(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_hb_exp         ON heartbeats_seen(exp);
 CREATE INDEX IF NOT EXISTS idx_hb_received_at ON heartbeats_seen(received_at);
 """
+
+# Latest schema version this code understands. Bump on every
+# schema-affecting change and add a v(N-1) → v(N) step in ``_migrate``.
+_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -109,8 +113,31 @@ class SeenStore:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Apply schema migrations idempotently and stamp ``user_version``.
+
+        v0 → v1: create the v1 schema (or no-op if tables already exist
+        from a pre-versioning binary).
+
+        Per-node singleton: no cross-process concurrent open expected,
+        so ``BEGIN IMMEDIATE`` isn't needed here (unlike PrekeyStore /
+        IntroQueue where multi-process opens are a real concern).
+        """
+        cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if cur_version > _SCHEMA_VERSION:
+            raise RuntimeError(
+                f"heartbeat seen-store at {self._path!r} has schema version "
+                f"{cur_version}, but this binary only understands up to "
+                f"{_SCHEMA_VERSION}. Refusing to open — using an older "
+                f"binary against a newer database would risk silently "
+                f"dropping fields."
+            )
+        if cur_version < 1:
+            self._conn.executescript(_SCHEMA_V1)
+            self._conn.execute("PRAGMA user_version = 1")
 
     # ------------------------------------------------------------------
     # writes

@@ -87,11 +87,17 @@ CREATE INDEX IF NOT EXISTS idx_tsig_active ON tsig_keys(revoked, expires_at);
 CREATE INDEX IF NOT EXISTS idx_tsig_subject ON tsig_keys(subject);
 """
 
-# Schema migration for keystores created before later columns landed.
+# Schema migrations. Each ADD COLUMN was added in successive code
+# revisions (subject → v2, registered_spk → v3, registered_x25519_pub
+# → v4); the current ``_SCHEMA`` declares all of them inline so a fresh
+# database lands directly at v4 via ``executescript``. For keystores
+# created by older binaries, the ALTERs run idempotently — sqlite
+# raises ``duplicate column`` on already-present columns, which we
+# swallow.
+#
 # ALTER TABLE IF NOT EXISTS is sqlite 3.35+, which we don't depend on,
-# so we add the columns idempotently via try/except. Each ADD COLUMN
-# raises OperationalError if the column already exists; swallow that
-# and continue.
+# so we add the columns via try/except. Future schema bumps add a
+# v(N) → v(N+1) ALTER and bump ``_SCHEMA_VERSION``.
 _MIGRATIONS = (
     "ALTER TABLE tsig_keys ADD COLUMN subject TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE tsig_keys ADD COLUMN registered_spk TEXT NOT NULL DEFAULT ''",
@@ -105,6 +111,10 @@ _MIGRATIONS = (
     # zone (no ``mb-{hash}.{zone}`` entry to extract).
     "ALTER TABLE tsig_keys ADD COLUMN registered_x25519_pub TEXT NOT NULL DEFAULT ''",
 )
+
+# Latest schema version this code understands. Bump on every
+# schema-affecting change and append the ALTER to ``_MIGRATIONS``.
+_SCHEMA_VERSION = 4
 
 
 def _normalize_name(name: str) -> str:
@@ -265,16 +275,48 @@ class TSIGKeyStore:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.executescript(_SCHEMA)
-        # Best-effort column adds for keystores created before the
-        # subject + registered_spk columns landed. SQLite raises on
-        # duplicate ADD COLUMN, which we swallow.
-        for stmt in _MIGRATIONS:
-            try:
-                self._conn.execute(stmt)
-            except sqlite3.OperationalError:
-                pass
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Apply schema migrations idempotently and stamp ``user_version``.
+
+        v0 → v4: a fresh database lands at v4 directly via
+        ``executescript(_SCHEMA)`` (the current schema has all four
+        columns inline). Legacy databases with subsets of the columns
+        get filled in by the idempotent ALTER pass — sqlite raises
+        ``duplicate column`` when a column is already present, which we
+        swallow.
+
+        Per-node singleton: no cross-process concurrent open expected,
+        so ``BEGIN IMMEDIATE`` isn't needed (PrekeyStore / IntroQueue
+        are different — multi-process opens are a real concern there).
+        """
+        cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if cur_version > _SCHEMA_VERSION:
+            raise RuntimeError(
+                f"tsig keystore at {self._path!r} has schema version "
+                f"{cur_version}, but this binary only understands up to "
+                f"{_SCHEMA_VERSION}. Refusing to open — using an older "
+                f"binary against a newer database would risk silently "
+                f"dropping fields."
+            )
+        if cur_version < _SCHEMA_VERSION:
+            # Order matters: ALTERs first to backfill columns on a
+            # legacy v1 keystore before executescript runs the CREATE
+            # INDEX on ``subject`` (which would otherwise raise
+            # ``no such column: subject`` on a v1 db). On a fresh db
+            # the ALTERs hit ``no such table`` (ignored), executescript
+            # creates everything from the v4 inline schema, and the
+            # second ALTER pass below hits ``duplicate column``
+            # (ignored). Idempotent in both directions.
+            for stmt in _MIGRATIONS:
+                try:
+                    self._conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass
+            self._conn.executescript(_SCHEMA)
+            self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     # ------------------------------------------------------------------
     # writes
