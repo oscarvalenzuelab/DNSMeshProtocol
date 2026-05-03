@@ -554,7 +554,7 @@ class TokenStore:
         self._rate_limiter = _PerTokenBucket()
 
     def _migrate(self) -> None:
-        """Apply schema migrations idempotently and stamp ``user_version``.
+        """Apply schema migrations atomically and stamp ``user_version``.
 
         Versions:
           0 → 2: a fresh database — ``executescript(_SCHEMA)`` creates
@@ -567,29 +567,52 @@ class TokenStore:
                  "v2 already, just stamp it".
           2 → 2: fully migrated, idempotent stamp.
 
-        Per-node singleton: no cross-process concurrent open expected,
-        so ``BEGIN IMMEDIATE`` isn't needed (PrekeyStore / IntroQueue
-        are different — multi-process opens are a real concern there).
+        Concurrency: NOT a per-node singleton — ``dnsmesh-node-admin``
+        opens the same token DB as the running node (see
+        ``dmp/server/admin.py``). Without ``BEGIN IMMEDIATE`` two
+        connections could both read ``user_version=0``, both attempt
+        the ALTER, and the second hits ``duplicate column``. The
+        current swallow handles that case, but a future migration
+        with non-idempotent operations (a UPDATE backfill, etc) would
+        race silently. Take the reserved write lock now.
         """
-        cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if cur_version > _SCHEMA_VERSION:
-            raise RuntimeError(
-                f"token store at {self._path!r} has schema version "
-                f"{cur_version}, but this binary only understands up to "
-                f"{_SCHEMA_VERSION}. Refusing to open — using an older "
-                f"binary against a newer database would risk silently "
-                f"dropping fields."
-            )
-        if cur_version < 2:
-            # CREATE TABLE IF NOT EXISTS — no-op if tables already exist
-            # (legacy v1 + pre-versioning v2 cases).
-            self._conn.executescript(_SCHEMA)
-            try:
-                self._conn.execute(_MIGRATION_V1_TO_V2)
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
-            self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        # Phase 1: ensure the schema tables/indexes exist. Idempotent
+        # at the SQL level via ``CREATE TABLE IF NOT EXISTS`` — sqlite
+        # serializes concurrent issuers via the file lock, so two
+        # connections both running this won't conflict. Run OUTSIDE
+        # ``BEGIN IMMEDIATE`` because ``executescript`` does an
+        # implicit COMMIT that would end our explicit transaction.
+        self._conn.commit()
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+
+        # Phase 2: atomic version-check + ALTER + stamp under
+        # ``BEGIN IMMEDIATE`` so two connections (e.g. node + admin)
+        # can't both read ``user_version=0`` and both attempt the
+        # ALTER. The second waits for the first to commit and then
+        # sees v2 already stamped.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if cur_version > _SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"token store at {self._path!r} has schema version "
+                    f"{cur_version}, but this binary only understands up to "
+                    f"{_SCHEMA_VERSION}. Refusing to open — using an older "
+                    f"binary against a newer database would risk silently "
+                    f"dropping fields."
+                )
+            if cur_version < 2:
+                try:
+                    self._conn.execute(_MIGRATION_V1_TO_V2)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+                self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     # ---- issuance ----------------------------------------------------------
 

@@ -310,11 +310,20 @@ class TSIGKeyStore:
             # creates everything from the v4 inline schema, and the
             # second ALTER pass below hits ``duplicate column``
             # (ignored). Idempotent in both directions.
+            #
+            # Filter the swallowed errors to ONLY the two we expect
+            # (PR #42 codex review caught the original blanket swallow:
+            # an unrelated OperationalError would silently leave the
+            # schema half-migrated and we would still stamp v4, which
+            # permanently masks the problem).
             for stmt in _MIGRATIONS:
                 try:
                     self._conn.execute(stmt)
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc).lower()
+                    if "duplicate column" in msg or "no such table" in msg:
+                        continue
+                    raise
             self._conn.executescript(_SCHEMA)
             self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 

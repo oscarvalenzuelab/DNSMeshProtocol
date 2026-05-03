@@ -509,3 +509,90 @@ class TestSchemaVersioning:
 
         with pytest.raises(RuntimeError, match="schema version"):
             TSIGKeyStore(path)
+
+    def test_legacy_v2_with_subject_already_present_but_unstamped(self, tmp_path):
+        """A pre-versioning binary that already ran the inline ``subject``
+        ALTER (and possibly more) but never stamped ``user_version`` opens
+        cleanly: the ALTER for ``subject`` hits ``duplicate column``
+        (caught), the ALTERs for the columns that don't exist yet succeed,
+        and the version is stamped to 4.
+        """
+        import sqlite3
+
+        from dmp.server.tsig_keystore import TSIGKeyStore
+
+        path = str(tmp_path / "legacy_v2.db")
+        legacy = sqlite3.connect(path)
+        # v2 shape: original v1 columns + subject (codex flagged the
+        # missing test for this half-migrated case).
+        legacy.executescript("""
+            CREATE TABLE tsig_keys (
+                name TEXT PRIMARY KEY,
+                algorithm TEXT NOT NULL DEFAULT 'hmac-sha256',
+                secret BLOB NOT NULL,
+                allowed_suffixes TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL DEFAULT 0,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                subject TEXT NOT NULL DEFAULT ''
+            );
+            """)
+        legacy.execute(
+            "INSERT INTO tsig_keys(name, secret, created_at, subject) "
+            "VALUES(?, ?, ?, ?)",
+            ("k0.", b"\xaa" * 32, 100, "alice@example.com"),
+        )
+        legacy.commit()
+        legacy.close()
+
+        store = TSIGKeyStore(path)
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == 4
+            cols = {
+                row[1]
+                for row in store._conn.execute(
+                    "PRAGMA table_info(tsig_keys)"
+                ).fetchall()
+            }
+            # All v4 columns present, including the v3/v4 ones added
+            # by the ladder on top of the v2 starting point.
+            assert {"subject", "registered_spk", "registered_x25519_pub"} <= cols
+            row = store._conn.execute("SELECT name, subject FROM tsig_keys").fetchone()
+            assert row == ("k0.", "alice@example.com")
+        finally:
+            store.close()
+
+    def test_unrelated_operational_error_propagates(self, tmp_path, monkeypatch):
+        """Codex P1 catch: the ALTER swallow must filter to only
+        ``duplicate column`` / ``no such table``. Any OTHER
+        OperationalError — a real SQL mistake in a future migration —
+        must propagate rather than silently leaving the schema
+        half-migrated AND stamping the new version."""
+        import sqlite3
+
+        from dmp.server import tsig_keystore as mod
+
+        # Pre-create the table so the bogus ALTER hits a real error
+        # rather than ``no such table`` (which is intentionally
+        # swallowed for the v0→v* fresh-db case).
+        path = str(tmp_path / "unrelated_err.db")
+        seed = sqlite3.connect(path)
+        seed.executescript(
+            "CREATE TABLE tsig_keys ("
+            "name TEXT PRIMARY KEY, secret BLOB NOT NULL, "
+            "created_at INTEGER NOT NULL"
+            ");"
+        )
+        seed.commit()
+        seed.close()
+        # Inject a bogus ALTER. ``ADD COLUMN ... PRIMARY KEY`` is
+        # rejected by sqlite ("Cannot add a PRIMARY KEY column") with
+        # an OperationalError whose message contains neither swallowed
+        # phrase — so the migration must propagate, not silently stamp
+        # v4 over a half-migrated schema.
+        bogus = "ALTER TABLE tsig_keys ADD COLUMN bogus INTEGER PRIMARY KEY"
+        monkeypatch.setattr(mod, "_MIGRATIONS", (bogus,))
+
+        with pytest.raises(sqlite3.OperationalError):
+            mod.TSIGKeyStore(path)

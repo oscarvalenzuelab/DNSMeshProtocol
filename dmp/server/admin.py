@@ -432,7 +432,15 @@ def main(argv: Optional[list] = None) -> int:
         )
         return 2
 
-    store = TokenStore(db_path)
+    try:
+        store = TokenStore(db_path)
+    except RuntimeError as exc:
+        # Schema-version refusal from TokenStore._migrate. Surface as
+        # a friendly CLI error rather than a Python traceback so the
+        # operator sees what to act on (downgrade the binary or
+        # migrate the data file).
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     try:
         return int(args.func(args, store))
     finally:
