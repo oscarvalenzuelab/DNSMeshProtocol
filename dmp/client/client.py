@@ -997,18 +997,29 @@ class DMPClient:
                         continue
                     if manifest.is_expired():
                         continue
-                    # Pinned signers gate. Three paths:
-                    #   1) known_spks non-empty + match  → accept (fall through)
-                    #   2) known_spks non-empty + miss   → drop (or rotation walk)
-                    #   3) known_spks EMPTY              → drop unless allow_tofu
-                    #
-                    # Path 3 is the default-deny TOFU gate. The legacy
-                    # behavior was to silently accept any signature-valid
-                    # manifest when the receiver had zero pins, which is
-                    # useful for onboarding but lets anyone spoofing DNS to
-                    # a pristine client get accepted as the contact.
+                    # Pinned signers gate + revocation check. Cases:
+                    #   1) known_spks non-empty + match → check revocation
+                    #      (a pinned key that was later revoked by its
+                    #      owner via rotate-then-revoke must drop).
+                    #   2) known_spks non-empty + miss → rotation-walk.
+                    #      No revocation check on the new head — that's
+                    #      a different key, and chain-walk acceptance
+                    #      already verified its current trust state.
+                    #   3) known_spks EMPTY + allow_tofu → check revocation
+                    #      (TOFU still respects revoked-by-issuer).
+                    #   4) known_spks EMPTY + not allow_tofu → drop.
+                    #      Default-deny first-contact gate (P0-3).
                     if known_spks:
-                        if manifest.sender_spk not in known_spks:
+                        if manifest.sender_spk in known_spks:
+                            # EXPERIMENTAL (M5.4): a sender who published
+                            # (rotation A→B) + (revocation of A) would
+                            # otherwise have manifests signed by A still
+                            # accepted by every contact that pinned A —
+                            # defeating revocation. Skipped without
+                            # rotation_chain_enabled (legacy behavior).
+                            if self._rotation_manifest_revoked(manifest.sender_spk):
+                                continue
+                        else:
                             # EXPERIMENTAL (M5.4): rotation-chain walking on
                             # verify failure. If a pinned contact rotated to
                             # a new key, the new key is accepted for this
@@ -1020,14 +1031,6 @@ class DMPClient:
                                 continue
                     elif not self.allow_tofu:
                         continue
-                    # EXPERIMENTAL (M5.4): cross-check that a PINNED
-                    # signing key hasn't itself been revoked. Without this,
-                    # a sender who published (rotation A→B) + (revocation of
-                    # A) would still have manifests signed by A accepted by
-                    # every contact that pinned A — defeating the whole
-                    # point of revocation. Only fires when rotation chain
-                    # walking is enabled; legacy clients keep their byte-
-                    # identical behavior.
                     elif self._rotation_manifest_revoked(manifest.sender_spk):
                         continue
                     # Atomic claim across the decrypt window: only one worker

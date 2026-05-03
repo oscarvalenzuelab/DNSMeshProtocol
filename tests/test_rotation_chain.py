@@ -636,6 +636,51 @@ class TestDMPClientRotationChainIntegration:
             alice.get_signing_public_key_hex()
         )
 
+    def test_opt_in_rejects_when_pinned_key_directly_revoked(self):
+        """Codex regression catch (P0-3 review): a sender who publishes
+        a self-revocation of a key the receiver has PINNED must have
+        their manifests signed by that revoked key dropped on the slot
+        walk. Earlier the P0-3 TOFU restructuring chained revocation
+        off the new ``elif`` and the pinned branch silently skipped it.
+        """
+        from dmp.client.client import DMPClient
+        from dmp.core.rotation import rotation_rrset_name_user_identity
+        from dmp.network.memory import InMemoryDNSStore
+
+        store = InMemoryDNSStore()
+        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            rotation_chain_enabled=True,
+        )
+        # Pin alice with her CURRENT signing key (no rotation yet).
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        # Alice self-revokes her pinned key (no rotation, no successor).
+        rrset = rotation_rrset_name_user_identity("alice", "mesh.test")
+        store.publish_txt_record(
+            rrset,
+            _sign_revocation(revoked=alice.crypto, subject="alice@mesh.test"),
+        )
+
+        # Sender still tries to deliver under the now-revoked key.
+        alice.send_message("bob", "compromised key still trying")
+        # Must drop — pinned + revoked is the precise hole the P0-3
+        # restructuring opened.
+        assert bob.receive_messages() == []
+
     def test_opt_in_rejects_when_revoked(self):
         """Rotation + revocation → manifest still dropped."""
         from dmp.client.client import DMPClient
