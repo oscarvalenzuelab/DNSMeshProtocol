@@ -11,6 +11,16 @@ on:
 permissions:
   contents: read
 
+# Cancel any still-running CI run for the same branch when a new
+# commit is pushed. Without this, every push to a PR kicks off a
+# fresh full matrix while the previous run keeps burning Actions
+# minutes — and the older run's eventual conclusion can land on the
+# PR after the newer one's, masking which commit's status counts.
+# `pages.yml` already has the equivalent block.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (py${{ matrix.python }})
