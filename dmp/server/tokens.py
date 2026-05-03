@@ -792,16 +792,23 @@ class TokenStore:
                 now=now,
             )
             self._conn.commit()
+            # Re-fetch under the lock — `_row_by_hash` reuses `self._conn`
+            # which is shared across threads (check_same_thread=False).
+            # Reading it outside `self._lock` lets a concurrent rotate on
+            # the same connection interleave a SELECT cursor with another
+            # thread's pending INSERT/UPDATE, which under py3.12's stricter
+            # sqlite3 transaction handling can return None or raise. The
+            # registration confirm path's caller maps the AssertionError
+            # at line below into an unlogged 500 — exactly the symptom
+            # observed on PR #36's py3.12 CI.
+            row = self._row_by_hash(token_hash)
+            assert row is not None, "inserted row disappeared — sqlite corruption?"
 
         # Drop in-memory rate buckets for the revoked tokens (outside
         # the DB lock — the limiter has its own).
         for h in freed_hashes:
             self._rate_limiter.forget(h)
 
-        # Re-fetch the canonical row so the caller gets an accurate
-        # is_live() / expires_at. Cheap, one row by PK.
-        row = self._row_by_hash(token_hash)
-        assert row is not None, "inserted row disappeared — sqlite corruption?"
         return token, row, True
 
     def revoke_by_subject(self, subject: str, *, remote_addr: str = "") -> int:

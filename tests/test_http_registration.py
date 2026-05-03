@@ -96,6 +96,23 @@ def reg_allowlist(tmp_path: Path):
         tokens.close()
 
 
+@pytest.fixture
+def reg_enabled_high_burst(tmp_path: Path):
+    """Stress-test fixture: registration enabled with a high endpoint burst
+    so concurrent-rotation stress tests don't trip the rate limiter
+    before they trip the race they exist to catch."""
+    api, store, tokens, config = _make_api(
+        tmp_path,
+        endpoint_rate_per_sec=1000.0,
+        endpoint_rate_burst=10000.0,
+    )
+    try:
+        yield api, store, tokens, config
+    finally:
+        api.stop()
+        tokens.close()
+
+
 # ---------------------------------------------------------------------------
 # Client helpers: do the real Ed25519 signing the node expects.
 # ---------------------------------------------------------------------------
@@ -512,6 +529,58 @@ class TestAtomicRotation:
             if r.is_live() and r.registered_spk is not None
         ]
         assert len(live) == 1, [r.token_hash[:8] for r in live]
+
+    def test_concurrent_rotations_no_intermittent_500(self, reg_enabled_high_burst):
+        """Stress regression for the sqlite-connection-shared-across-threads
+        race in TokenStore.rotate_self_service.
+
+        Before the fix: `_row_by_hash(token_hash)` ran AFTER the
+        `with self._lock:` block exited. Another thread entering the
+        lock could be mid-transaction on the same `self._conn`
+        (`check_same_thread=False`) when this SELECT ran. Under py3.12's
+        stricter sqlite3 transaction handling the SELECT could return
+        None for a row we just committed, the assertion at the call site
+        would raise AssertionError, http_api would translate it into an
+        unlogged 500 — exactly the failure mode we hit on PR #36's CI.
+
+        This test compounds the race window: 5 iterations × 20 concurrent
+        same-key confirms per iteration = 100 same-connection writes
+        racing with reads. Without the fix this consistently produces at
+        least one 500 across iterations on py3.12; with `_row_by_hash`
+        moved inside the lock all responses are 200.
+        """
+        api, _, tokens, _ = reg_enabled_high_burst
+        import threading
+
+        all_statuses: list = []
+        for iteration in range(5):
+            subject = f"alice-stress-{iteration}@example.com"
+            signer = Ed25519PrivateKey.generate()
+            r0 = _sign_and_confirm(api, subject, signer)
+            assert r0.status_code == 200
+
+            statuses: list = []
+            lock = threading.Lock()
+
+            def _worker(target_subject=subject, target_signer=signer):
+                r = _sign_and_confirm(api, target_subject, target_signer)
+                with lock:
+                    statuses.append(r.status_code)
+
+            threads = [threading.Thread(target=_worker) for _ in range(20)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            all_statuses.append((iteration, statuses))
+
+        offenders = [
+            (i, s) for (i, s) in all_statuses if not all(code == 200 for code in s)
+        ]
+        assert not offenders, (
+            f"non-200 responses under concurrent rotation (race in "
+            f"TokenStore.rotate_self_service?): {offenders}"
+        )
 
 
 class TestMalformedBodies:
