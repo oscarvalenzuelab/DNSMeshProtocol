@@ -622,7 +622,12 @@ class TestHttpEndpoint:
 
         record_store = InMemoryDNSStore()
         token_store = TokenStore(str(tmp_path / "tokens.db"))
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # TCP socket — DMPHttpApi binds TCP, and the kernel hands out
+        # free ports per-protocol. Using SOCK_DGRAM here returned a
+        # UDP-free port that wasn't necessarily TCP-free, causing
+        # ``OSError: [Errno 98] Address already in use`` on busy CI
+        # runners (py3.11/3.12 hit it on PR #41's matrix).
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
