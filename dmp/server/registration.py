@@ -34,8 +34,7 @@ import time
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from dmp.core.crypto import DMPCrypto
 
 from dmp.server.tokens import (
     DEFAULT_RATE_BURST,
@@ -45,13 +44,6 @@ from dmp.server.tokens import (
     _SubjectLocked,
     canonicalize_subject,
 )
-
-# Low-order Ed25519 block list — shared source of truth at
-# dmp.core.ed25519_points so registration, heartbeat, and any future
-# signed-record consumer all stay in sync.
-from dmp.core.ed25519_points import (
-    LOW_ORDER_ED25519_PUBKEYS as _LOW_ORDER_ED25519_PUBKEYS,
-)  # noqa: E402,F401
 
 # Version byte embedded in the signed message. Bump if we change the
 # signing-payload layout so old and new signatures can't collide.
@@ -406,23 +398,6 @@ def confirm_registration(
     # Challenge is a 32-byte nonce; verify shape before any DB ops.
     _parse_hex(challenge_hex, 32, "challenge")
 
-    # Reject Ed25519 low-order / small-subgroup public keys. With
-    # the identity point (01 00..00) as A and sig = identity || 00*32,
-    # Ed25519 verification succeeds on EVERY message — a complete
-    # signature-forgery bypass that lets an attacker reach the
-    # anti-takeover / allowlist policy layer without holding any
-    # private key. Other small-order points (orders 2 / 4 / 8) allow
-    # forgery on subsets of messages, which is still grindable.
-    # cryptography's Ed25519PublicKey.from_public_bytes does NOT
-    # reject these — the cryptography lib's default verify is the
-    # permissive (non-cofactored) algorithm per RFC 8032.
-    #
-    # The block set is the canonical + non-canonical low-order
-    # encodings. References: RFC 8032,
-    # https://pkg.go.dev/c2sp.org/CCTV/ed25519.
-    if spk_bytes in _LOW_ORDER_ED25519_PUBKEYS:
-        raise SignatureInvalid("low-order public key rejected")
-
     # Single-use challenge. Raises ChallengeExpired on miss/expired.
     pc = challenges.consume(challenge_hex, now=now)
 
@@ -434,11 +409,15 @@ def confirm_registration(
     # allowlisted". After reordering, an attacker without the
     # private key sees only 401 (or 400 on parse failures) and
     # cannot distinguish 403 / 409.
+    #
+    # DMPCrypto.verify_signature centralizes the Ed25519 low-order /
+    # small-subgroup block list (see dmp.core.ed25519_points). With
+    # the identity point as A and sig = identity || 00*32 the
+    # permissive RFC-8032 verify accepts on every message, which
+    # would let an unauthenticated attacker mint tokens.
     payload = _build_signing_payload(challenge_hex, subject, pc.node)
-    try:
-        Ed25519PublicKey.from_public_bytes(spk_bytes).verify(sig_bytes, payload)
-    except InvalidSignature as exc:
-        raise SignatureInvalid() from exc
+    if not DMPCrypto.verify_signature(payload, sig_bytes, spk_bytes):
+        raise SignatureInvalid()
 
     # The signer proved key control. Now apply policy.
     if not _domain_allowed(subject, config.allowlist):
@@ -738,16 +717,11 @@ def mint_tsig_via_registration(
     sig_bytes = _parse_hex(signature_hex, 64, "signature")
     _parse_hex(challenge_hex, 32, "challenge")
 
-    if spk_bytes in _LOW_ORDER_ED25519_PUBKEYS:
-        raise SignatureInvalid("low-order public key rejected")
-
     pc = challenges.consume(challenge_hex, now=now)
 
     payload = _build_signing_payload(challenge_hex, subject, pc.node)
-    try:
-        Ed25519PublicKey.from_public_bytes(spk_bytes).verify(sig_bytes, payload)
-    except InvalidSignature as exc:
-        raise SignatureInvalid() from exc
+    if not DMPCrypto.verify_signature(payload, sig_bytes, spk_bytes):
+        raise SignatureInvalid()
 
     if not _domain_allowed(subject, config.allowlist):
         raise SubjectNotAllowed()

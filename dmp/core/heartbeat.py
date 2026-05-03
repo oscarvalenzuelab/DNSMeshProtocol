@@ -66,7 +66,6 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from dmp.core.crypto import DMPCrypto
-from dmp.core.ed25519_points import is_low_order as _is_low_order
 
 # Wire prefix. v1 because the whole family of signed DMP records uses
 # v=dmp1; jumping to v=dmp2 is a flag day across everything post-audit.
@@ -515,13 +514,8 @@ class HeartbeatRecord:
         except ValueError:
             return None
 
-        # Low-order pubkey guard — identity point (01 00..00) with
-        # any sig verifies every message under permissive RFC 8032;
-        # other small-order points allow grinding forgeries on subsets.
-        # Shared block list with dmp.server.registration.
-        if _is_low_order(bytes(record.operator_spk)):
-            return None
-
+        # Low-order Ed25519 pubkey rejection is centralized inside
+        # DMPCrypto.verify_signature (see dmp.core.ed25519_points).
         if not DMPCrypto.verify_signature(body, sig, bytes(record.operator_spk)):
             return None
 
