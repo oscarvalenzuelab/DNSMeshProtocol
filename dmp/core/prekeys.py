@@ -304,9 +304,21 @@ class PrekeyStore:
         out: List[Tuple[Prekey, X25519PrivateKey]] = []
         with self._lock:
             for _ in range(count):
-                # Random prekey_id, retry on collision.
+                # Random prekey_id, retry on collision OR on the
+                # reserved value 0. ``NO_PREKEY = 0`` is the manifest
+                # sentinel for "no prekey, fall back to long-term key"
+                # (see dmp/core/manifest.py); a generator that returns 0
+                # would silently strip forward secrecy from senders that
+                # picked it, with the receiver indistinguishable from
+                # the legitimate long-term-key path. The collision
+                # probability against ``randbits(32)`` is 2^-32 per
+                # draw, but rare events fire under enough load — the
+                # one-line ``pid == 0`` check costs nothing and removes
+                # the failure mode entirely.
                 for _retry in range(10):
                     pid = secrets.randbits(32)
+                    if pid == 0:
+                        continue
                     exists = self._conn.execute(
                         "SELECT 1 FROM prekeys WHERE prekey_id = ?", (pid,)
                     ).fetchone()
