@@ -7,7 +7,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
@@ -591,26 +591,25 @@ class DMPClient:
                 published += 1
         return published
 
-    def _consume_prekey(self, prekey_id: int) -> None:
-        """Delete a prekey both locally and in DNS.
+    def _delete_published_prekey(self, wire: Optional[str]) -> None:
+        """Best-effort DELETE of a published prekey TXT record.
 
-        The local sqlite row carries the sk (FS secret) and the wire-record
-        string we published. We DELETE the wire record from the node so
-        later senders won't pick a prekey whose sk is already gone, then
-        drop the sqlite row. Best-effort on the DNS side — if the DELETE
-        fails we log nothing and still wipe the local sk; the published
-        prekey will just rot until its TTL elapses (old behavior).
+        Called after `PrekeyStore.claim_sk` has already wiped the local
+        sk row. The DNS delete is best-effort — a failure here means
+        the prekey_pub rots in DNS until its TTL elapses; a future
+        sender that picks it will hit "sk gone" on the receiver side
+        and the message will be silently dropped (caught by the
+        replay cache for any retry).
         """
-        wire = self.prekey_store.get_wire(prekey_id)
-        if wire:
-            try:
-                self.writer.delete_txt_record(
-                    prekey_rrset_name(self.username, self.domain),
-                    value=wire,
-                )
-            except Exception:
-                pass
-        self.prekey_store.consume(prekey_id)
+        if not wire:
+            return
+        try:
+            self.writer.delete_txt_record(
+                prekey_rrset_name(self.username, self.domain),
+                value=wire,
+            )
+        except Exception:
+            pass
 
     # ---- send --------------------------------------------------------------
 
@@ -1642,29 +1641,39 @@ class DMPClient:
             ttl=outer.header.ttl,
         )
         aad_bytes = aad_header.to_bytes() + manifest.prekey_id.to_bytes(4, "big")
-        # Prekey-based ECDH path for forward secrecy. When manifest.prekey_id
-        # is nonzero, look up the matching one-time X25519 private key in the
-        # local store and use it for decrypt instead of our long-term key.
-        # On successful decrypt we consume the prekey_sk so a later long-term
-        # key leak cannot recover this message's session.
-        prekey_private = None
+        # Prekey-based ECDH path for forward secrecy. When
+        # manifest.prekey_id is nonzero, atomically claim (read +
+        # delete) the matching one-time X25519 private key from the
+        # local store, then decrypt with it. The atomic claim closes
+        # the crash-window the previous get + decrypt + delete
+        # sequence had — if we crashed between successful decrypt and
+        # the delete, the sk would have stayed on disk until manual
+        # cleanup, weakening the FS guarantee under a later
+        # disk-compromise scenario.
+        prekey_private: Optional[Any] = None
+        prekey_wire: Optional[str] = None
         if manifest.prekey_id != NO_PREKEY:
-            prekey_private = self.prekey_store.get_private_key(manifest.prekey_id)
-            if prekey_private is None:
-                # Prekey was deleted or expired — we can't decrypt this
-                # message. That's a delivery failure, not a security failure.
+            claim = self.prekey_store.claim_sk(manifest.prekey_id)
+            if claim is None:
+                # Prekey was deleted, expired, or never existed. Either
+                # a transient race (replay cache will catch the retry)
+                # or a sender mismatch — drop silently.
                 return None
+            prekey_private, prekey_wire = claim
         try:
             plaintext = self.encryption.decrypt_with_header(
                 encrypted, aad_bytes, private_key=prekey_private
             )
         except Exception:
+            # The sk has already been wiped from disk by claim_sk,
+            # so a failed decrypt can't be retried with the same key.
+            # Still tear down the published prekey_pub record so a
+            # future sender doesn't pick a prekey whose sk is gone.
+            if prekey_wire is not None:
+                self._delete_published_prekey(prekey_wire)
             return None
-        if manifest.prekey_id != NO_PREKEY:
-            # One-time use: delete the sk locally AND the matching public
-            # record from DNS so future senders don't pick a prekey whose
-            # sk is gone. Best effort — a crash between decrypt and consume
-            # leaves the sk on disk; a DELETE failure leaves the prekey_pub
-            # rotting until its TTL.
-            self._consume_prekey(manifest.prekey_id)
+        if prekey_wire is not None:
+            # Decrypt succeeded — finalize the cross-side cleanup by
+            # deleting the published prekey_pub from DNS. Best-effort.
+            self._delete_published_prekey(prekey_wire)
         return plaintext, outer.header.timestamp, outer.header.message_id

@@ -355,6 +355,173 @@ class TestPrekeyStoreSchemaVersioning:
     # that actually matters. The dynamic test was theatre.
 
 
+class TestClaimSk:
+    """``PrekeyStore.claim_sk`` atomically returns the sk and deletes
+    the row. Replaces the previous get + decrypt + consume sequence on
+    the receive path so the sk is gone from disk before decrypt
+    starts. Closes the crash-window the old sequence had where a
+    crash between successful decrypt and `consume()` left the sk
+    on disk for a later disk-compromise attacker."""
+
+    def test_returns_sk_and_wire_then_deletes_row(self, tmp_path):
+        store = PrekeyStore(str(tmp_path / "p.db"))
+        try:
+            pool = store.generate_pool(count=1, ttl_seconds=3600)
+            prekey, sk = pool[0]
+            store.record_wire(prekey.prekey_id, "v=dmp1;t=prekey;d=...")
+
+            claim = store.claim_sk(prekey.prekey_id)
+            assert claim is not None
+            claimed_sk, wire = claim
+            # The returned sk derives the same pubkey as the original.
+            from cryptography.hazmat.primitives import serialization
+
+            claimed_pub = claimed_sk.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            assert claimed_pub == prekey.public_key
+            assert wire == "v=dmp1;t=prekey;d=..."
+            # And the row is gone — second claim returns None.
+            assert store.claim_sk(prekey.prekey_id) is None
+            # ``get_private_key`` also reflects the deletion.
+            assert store.get_private_key(prekey.prekey_id) is None
+        finally:
+            store.close()
+
+    def test_missing_prekey_id_returns_none(self, tmp_path):
+        store = PrekeyStore(str(tmp_path / "p.db"))
+        try:
+            assert store.claim_sk(99999) is None
+        finally:
+            store.close()
+
+    def test_expired_prekey_returns_none(self, tmp_path):
+        store = PrekeyStore(str(tmp_path / "p.db"))
+        try:
+            pool = store.generate_pool(count=1, ttl_seconds=0)
+            prekey, _ = pool[0]
+            # ttl=0 → exp == now; query uses strict ">" so already expired.
+            assert store.claim_sk(prekey.prekey_id) is None
+        finally:
+            store.close()
+
+    def test_zero_prekey_id_returns_none(self, tmp_path):
+        """The NO_PREKEY sentinel is never claimable, even via this
+        path — same reservation as get_private_key / consume."""
+        store = PrekeyStore(str(tmp_path / "p.db"))
+        try:
+            assert store.claim_sk(0) is None
+        finally:
+            store.close()
+
+    def test_concurrent_claims_only_one_wins_within_one_store(self, tmp_path):
+        """Single-instance race: 8 threads sharing one PrekeyStore.
+        The per-instance RLock alone is enough to serialize this
+        case; the harder cross-process case is tested below via
+        multiple PrekeyStore instances on the same db file.
+        """
+        import threading
+
+        store = PrekeyStore(str(tmp_path / "p.db"))
+        try:
+            pool = store.generate_pool(count=1, ttl_seconds=3600)
+            prekey, _ = pool[0]
+            results: list = []
+            lock = threading.Lock()
+            start = threading.Event()
+
+            def worker():
+                start.wait()
+                got = store.claim_sk(prekey.prekey_id)
+                with lock:
+                    results.append(got)
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            start.set()
+            for t in threads:
+                t.join(timeout=10)
+
+            wins = [r for r in results if r is not None]
+            assert len(wins) == 1, f"expected 1 winner, got {len(wins)}"
+        finally:
+            store.close()
+
+    def test_concurrent_claims_across_separate_store_instances(self, tmp_path):
+        """The harder case: each thread holds its OWN PrekeyStore on
+        the same db file. The per-instance RLock no longer helps
+        because each thread has a different instance. Atomicity has
+        to come from sqlite itself — `DELETE ... RETURNING` is one
+        statement, so exactly one issuer's RETURNING resolves to the
+        row.
+
+        This is the cross-process race shape: a node and an admin
+        tool could plausibly both open the same db simultaneously.
+        Two threads here is enough to expose the failure if the
+        fix regressed to SELECT-then-DELETE under autocommit.
+        """
+        import threading
+
+        seed = PrekeyStore(str(tmp_path / "p.db"))
+        try:
+            pool = seed.generate_pool(count=1, ttl_seconds=3600)
+            prekey, _ = pool[0]
+        finally:
+            seed.close()
+
+        results: list = []
+        lock = threading.Lock()
+        start = threading.Event()
+
+        def worker():
+            local = PrekeyStore(str(tmp_path / "p.db"))
+            try:
+                start.wait()
+                got = local.claim_sk(prekey.prekey_id)
+                with lock:
+                    results.append(got)
+            finally:
+                local.close()
+
+        # 16 threads × distinct PrekeyStore instances on the same db.
+        # If claim_sk regressed to SELECT-then-DELETE in autocommit
+        # mode, multiple of these could all read the row before any
+        # delete committed, and all return non-None.
+        threads = [threading.Thread(target=worker) for _ in range(16)]
+        for t in threads:
+            t.start()
+        start.set()
+        for t in threads:
+            t.join(timeout=15)
+
+        wins = [r for r in results if r is not None]
+        assert len(wins) == 1, (
+            f"DELETE ... RETURNING must be atomic across separate "
+            f"connections; got {len(wins)} winners (expected 1)"
+        )
+
+    def test_returns_none_when_wire_record_was_never_set(self, tmp_path):
+        """Pool generation creates the row with wire_record=''. If
+        the caller never recorded the published wire (e.g. publish
+        failed), claim_sk should still return the sk paired with
+        None for the wire — the caller decides whether to bother
+        with a DNS DELETE."""
+        store = PrekeyStore(str(tmp_path / "p.db"))
+        try:
+            pool = store.generate_pool(count=1, ttl_seconds=3600)
+            prekey, _ = pool[0]
+            # Note: NOT calling record_wire — wire_record stays ''.
+            claim = store.claim_sk(prekey.prekey_id)
+            assert claim is not None
+            sk, wire = claim
+            assert sk is not None
+            assert wire is None
+        finally:
+            store.close()
+
+
 class TestPrekeyIdReservation:
     """``prekey_id = 0`` is reserved as the ``NO_PREKEY`` sentinel
     (see dmp/core/manifest.py). The pool generator must never return
