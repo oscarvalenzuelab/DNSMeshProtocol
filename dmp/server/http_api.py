@@ -886,6 +886,17 @@ HTTPS exchange is the one-time TSIG-key registration step.</p>
             return exc.http_status
         except Exception:
             # Defensive — don't leak internal stack traces over the wire.
+            # Log with traceback so operators can grep their logs after
+            # users report a 500. Without this the swallow is silent and
+            # the same bug bites repeatedly: PR #37's py3.12 sqlite race
+            # spent a CI cycle pretending to be flake before we found the
+            # real cross-thread Connection bug. log.exception() captures
+            # the stack; the route + remote_addr fields make individual
+            # 500s correlatable.
+            log.exception(
+                "registration confirm 500: route=/v1/registration/confirm remote=%s",
+                remote_addr or "-",
+            )
             self._send_json(500, {"error": "internal error"})
             return 500
 
@@ -938,6 +949,10 @@ HTTPS exchange is the one-time TSIG-key registration step.</p>
             self._send_json(exc.http_status, {"error": exc.reason})
             return exc.http_status
         except Exception:
+            log.exception(
+                "tsig confirm 500: route=/v1/registration/tsig-confirm remote=%s",
+                remote_addr or "-",
+            )
             self._send_json(500, {"error": "internal error"})
             return 500
 

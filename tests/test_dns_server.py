@@ -19,9 +19,14 @@ from dmp.server.dns_server import DMPDnsServer, _split_for_txt_strings
 
 
 def _free_port() -> int:
-    # Bind UDP port 0, read back assigned port, release. A race is possible
-    # but the window is small for a per-test random port.
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Find a port free for TCP, since DMPDnsServer binds BOTH TCP and
+    # UDP. Asking the kernel for just a UDP-free port (the original
+    # implementation) returned ports that were sometimes already in
+    # use for TCP — an ``Address already in use`` race that surfaced
+    # on py3.12 CI under PR #41's load. TCP allocations are more
+    # contested in the test suite, so binding TCP→close gives a port
+    # that is in practice also UDP-free.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
