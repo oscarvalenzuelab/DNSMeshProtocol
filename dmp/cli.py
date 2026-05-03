@@ -150,6 +150,16 @@ class CLIConfig:
     # has pinned a contact.
     allow_tofu: bool = False
 
+    # P0-4 — DNSSEC AD-bit policy. When True every TXT/A/AAAA reply
+    # must carry the AD flag from the upstream recursor; replies
+    # without AD are dropped and the upstream is demoted. The trust
+    # boundary is the channel between this client and the chosen
+    # recursor — over plaintext UDP an on-path attacker can flip AD,
+    # so this gate is meaningful only when paired with a trusted local
+    # recursor or DoT/DoH. False (default) preserves the legacy
+    # behavior of trusting whatever the resolver returns.
+    dnssec_required: bool = False
+
     # M8.3 — claim-provider override. When non-empty, send/recv use
     # this single endpoint as the claim provider, skipping seen-feed
     # ranking. Use case: pin all first-contact reach through a known
@@ -265,6 +275,10 @@ class CLIConfig:
             # default to False (secure default). Operators flip it via
             # ``dnsmesh init --allow-tofu`` or hand-edit.
             allow_tofu=bool(data.get("allow_tofu", False)),
+            # P0-4 — back-compat: configs predating DNSSEC required
+            # default to False so existing deployments keep working.
+            # Operators opt in via ``dnsmesh init --require-dnssec``.
+            dnssec_required=bool(data.get("dnssec_required", False)),
             cluster_base_domain=data.get("cluster_base_domain", "") or "",
             cluster_operator_spk=data.get("cluster_operator_spk", "") or "",
             cluster_refresh_interval=int(data.get("cluster_refresh_interval", 3600)),
@@ -434,9 +448,23 @@ def _publish_failure_msg(writer: "_HttpWriter", name: str) -> str:
 
 
 class _DnsReader(DNSRecordReader):
-    """Reads records via a configured DNS resolver (or the system default)."""
+    """Reads records via a configured DNS resolver (or the system default).
 
-    def __init__(self, host: Optional[str], port: int = 5353):
+    ``dnssec_required`` (P0-4): when True the resolver requests DNSSEC
+    processing (EDNS0 + DO bit) and rejects answers without the AD
+    flag. The trust boundary is the channel between this client and
+    the recursor; meaningful only over DoT/DoH or a trusted local
+    recursor (an on-path attacker on plaintext UDP can flip AD).
+    """
+
+    def __init__(
+        self,
+        host: Optional[str],
+        port: int = 5353,
+        *,
+        dnssec_required: bool = False,
+    ):
+        import dns.flags
         import dns.resolver
 
         self._resolver = dns.resolver.Resolver()
@@ -445,8 +473,12 @@ class _DnsReader(DNSRecordReader):
             self._resolver.port = port
         self._resolver.timeout = 3.0
         self._resolver.lifetime = 6.0
+        self._dnssec_required = dnssec_required
+        if dnssec_required:
+            self._resolver.use_edns(0, dns.flags.DO, 4096)
 
     def query_txt_record(self, name: str):
+        import dns.flags
         import dns.resolver
 
         try:
@@ -455,6 +487,11 @@ class _DnsReader(DNSRecordReader):
             return None
         except Exception:
             return None
+        if self._dnssec_required:
+            response = getattr(answers, "response", None)
+            flags = getattr(response, "flags", 0) if response else 0
+            if not (flags & dns.flags.AD):
+                return None
         values = []
         for rdata in answers:
             values.append(b"".join(rdata.strings).decode("utf-8"))
@@ -636,8 +673,10 @@ def _make_reader(config: CLIConfig) -> DNSRecordReader:
         # when the entry was portless (ResolverPool inherits its own
         # default of 53 for those).
         pool_hosts = [(h, p) if p is not None else h for h, p in parsed]
-        return ResolverPool(pool_hosts)
-    return _DnsReader(config.dns_host, config.dns_port)
+        return ResolverPool(pool_hosts, dnssec_required=config.dnssec_required)
+    return _DnsReader(
+        config.dns_host, config.dns_port, dnssec_required=config.dnssec_required
+    )
 
 
 def _cluster_mode_enabled(config: CLIConfig) -> bool:
@@ -1589,6 +1628,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         kdf_salt=os.urandom(32).hex(),
         identity_domain=(args.identity_domain or "").strip(),
         allow_tofu=bool(getattr(args, "allow_tofu", False)),
+        dnssec_required=bool(getattr(args, "require_dnssec", False)),
     )
 
     # M10 — auto-probe the local node's DNS endpoint so same-zone
@@ -4734,6 +4774,16 @@ def build_parser() -> argparse.ArgumentParser:
         "pins a contact — useful for fresh onboarding, but a real attack "
         "surface for any client whose DNS path can be spoofed before any "
         "contact is pinned.",
+    )
+    p_init.add_argument(
+        "--require-dnssec",
+        action="store_true",
+        help="Drop DNS replies that the upstream recursor did not "
+        "DNSSEC-validate (no AD flag). Pair with a trusted local "
+        "recursor or DoT/DoH — over plaintext UDP to a public resolver "
+        "an on-path attacker can flip the AD bit and the gate becomes "
+        "theatre. Default False keeps the legacy behavior of trusting "
+        "whatever the resolver returns.",
     )
     p_init.set_defaults(func=cmd_init)
 

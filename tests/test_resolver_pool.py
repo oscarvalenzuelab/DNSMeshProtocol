@@ -6,6 +6,7 @@ import socket
 from unittest.mock import patch
 
 import dns.exception
+import dns.flags
 import dns.name
 import dns.resolver
 import pytest
@@ -24,13 +25,39 @@ class _FakeRdata:
         self.strings = strings
 
 
+class _FakeResponse:
+    """Mimic a dnspython Message; only the AD/DO flag word matters here."""
+
+    def __init__(self, flags: int):
+        self.flags = flags
+
+
 class _FakeAnswer(list):
-    """A dnspython Answer is iterable over rdata objects."""
+    """A dnspython Answer is iterable over rdata objects.
+
+    P0-4: ResolverPool reads ``answer.response.flags`` to gate on the
+    AD bit when ``dnssec_required=True``. Default constructor produces
+    an answer with AD set (the upstream-validated common case) so
+    existing tests that construct via ``_answer(...)`` keep passing.
+    """
+
+    def __init__(self, *args, ad: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        flags = dns.flags.AD if ad else 0
+        self.response = _FakeResponse(flags)
 
 
-def _answer(*txt_values: str) -> _FakeAnswer:
-    """Build a fake dnspython answer for the given TXT string(s)."""
-    return _FakeAnswer(_FakeRdata([v.encode("utf-8")]) for v in txt_values)
+def _answer(*txt_values: str, ad: bool = True) -> _FakeAnswer:
+    """Build a fake dnspython answer for the given TXT string(s).
+
+    ``ad`` controls whether the synthetic response carries the AD flag
+    (P0-4 DNSSEC gate); default True matches a validating-recursor
+    happy path so existing tests don't have to opt in.
+    """
+    return _FakeAnswer(
+        (_FakeRdata([v.encode("utf-8")]) for v in txt_values),
+        ad=ad,
+    )
 
 
 def _route_by_nameserver(routes):
@@ -466,6 +493,120 @@ class TestResolverPoolQuery:
             mock_resolve.side_effect = _route_by_nameserver(routes)
             pool = ResolverPool(["1.1.1.1"])
             assert pool.query_txt_record("x.example.com") == ["part-a;part-b"]
+
+
+# ---------------------------------------------------------------------
+# DNSSEC AD-bit policy (P0-4)
+# ---------------------------------------------------------------------
+
+
+class TestResolverPoolDnssecGate:
+    """``ResolverPool(..., dnssec_required=True)`` rejects answers without
+    the AD (Authenticated Data) flag — i.e. the upstream recursor did not
+    DNSSEC-validate. The trust boundary is the channel between the client
+    and the recursor; this gate is meaningful only over DoT/DoH or a
+    trusted local recursor (an on-path attacker on plaintext UDP can flip
+    AD). That caveat is documented on the constructor; tested here is the
+    in-process behavior given a recursor whose answers either do or do
+    not carry AD.
+    """
+
+    def test_default_off_does_not_require_ad(self):
+        """Back-compat: ``dnssec_required=False`` (default) accepts an
+        AD-less answer. Existing deployments must keep working."""
+        routes = {
+            "1.1.1.1": lambda n, t: _answer("v=dmp1;t=chunk;d=aGk=", ad=False),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1"])
+            assert pool.query_txt_record("mb-x.example.com") == [
+                "v=dmp1;t=chunk;d=aGk="
+            ]
+
+    def test_required_passes_when_ad_set(self):
+        """The validating-recursor happy path: AD set on the response,
+        the answer is delivered."""
+        routes = {
+            "1.1.1.1": lambda n, t: _answer("ad-validated", ad=True),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            assert pool.query_txt_record("mb-x.example.com") == ["ad-validated"]
+
+    def test_required_drops_when_ad_unset(self):
+        """A non-validating recursor (or a stripped/forged answer) does
+        not set AD. The answer must NOT reach the caller, and the
+        upstream is demoted on its health counter so subsequent queries
+        prefer a different resolver."""
+        routes = {
+            "1.1.1.1": lambda n, t: _answer("not-validated", ad=False),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            # No fallback resolver, so query_txt_record returns None —
+            # but the important assertion is "not the bypassed answer".
+            assert pool.query_txt_record("mb-x.example.com") is None
+
+    def test_required_falls_over_to_validating_resolver(self):
+        """Two-resolver pool: first returns an AD-less answer (rejected),
+        second returns AD-validated. Caller sees the validating answer.
+        """
+        routes = {
+            "1.1.1.1": lambda n, t: _answer("not-validated", ad=False),
+            "9.9.9.9": lambda n, t: _answer("validated", ad=True),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1", "9.9.9.9"], dnssec_required=True)
+            assert pool.query_txt_record("mb-x.example.com") == ["validated"]
+
+    def test_required_failover_demotes_ad_less_resolver(self):
+        """The AD-less resolver should land in cooldown after a failover —
+        it counts against its health, like any transport-class failure.
+        """
+        routes = {
+            "1.1.1.1": lambda n, t: _answer("not-validated", ad=False),
+            "9.9.9.9": lambda n, t: _answer("validated", ad=True),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(
+                ["1.1.1.1", "9.9.9.9"],
+                dnssec_required=True,
+                failure_threshold=1,
+            )
+            pool.query_txt_record("a.example.com")
+            healthy = pool.healthy_hosts()
+        # The AD-less resolver is demoted; the validator stays healthy.
+        assert "9.9.9.9" in healthy
+        assert "1.1.1.1" not in healthy
+
+    def test_required_uses_edns_do_bit(self):
+        """The pool must enable EDNS0 + DO so the recursor knows we want
+        DNSSEC processing — without DO many recursors strip RRSIGs and
+        never set AD, which would make every answer fail the gate even
+        from a validating resolver. We assert the dnspython-level flag
+        is set on each per-host resolver."""
+        pool = ResolverPool(["1.1.1.1", "9.9.9.9"], dnssec_required=True)
+        for state in pool._states:
+            options = state.resolver.edns
+            # dnspython exposes EDNS state through .edns (>=0 means enabled).
+            # Use ednsflags to inspect the requested DNSSEC OK bit.
+            assert options >= 0, "EDNS not enabled on dnssec_required resolver"
+            assert state.resolver.ednsflags & dns.flags.DO
 
 
 # ---------------------------------------------------------------------
