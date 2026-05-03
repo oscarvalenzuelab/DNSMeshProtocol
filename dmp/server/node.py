@@ -145,7 +145,17 @@ def _build_heartbeat_dns_reader():
          deployments, so the system resolver is the right default.
       3. Returns None when neither is available; the worker tolerates
          this and just doesn't harvest peers.
+
+    ``DMP_HEARTBEAT_DNSSEC_REQUIRED=1`` opts both paths into AD-bit
+    enforcement: the recursor must return validated answers or the
+    record is dropped. Same caveat as elsewhere — meaningful only
+    when paired with a trusted local recursor or DoT/DoH, since an
+    on-path attacker on plaintext UDP can flip AD.
     """
+    require_dnssec = os.environ.get(
+        "DMP_HEARTBEAT_DNSSEC_REQUIRED", ""
+    ).strip().lower() in ("1", "true", "yes")
+
     raw = os.environ.get("DMP_HEARTBEAT_DNS_RESOLVERS", "").strip()
     if raw:
         try:
@@ -162,7 +172,7 @@ def _build_heartbeat_dns_reader():
                 else:
                     hosts.append(entry)
             if hosts:
-                return ResolverPool(hosts=hosts)
+                return ResolverPool(hosts=hosts, dnssec_required=require_dnssec)
         except Exception:
             log.exception(
                 "DMP_HEARTBEAT_DNS_RESOLVERS unparseable; falling back to system resolver"
@@ -173,27 +183,39 @@ def _build_heartbeat_dns_reader():
     # their served zone (a common cluster pattern) get peer harvest
     # for free, and split-horizon deployments don't have to override.
     try:
+        import dns.flags
         import dns.resolver
 
         from dmp.network.base import DNSRecordReader
 
         class _SystemResolver(DNSRecordReader):
-            def __init__(self) -> None:
+            def __init__(self, dnssec_required: bool) -> None:
                 self._resolver = dns.resolver.Resolver()
                 self._resolver.timeout = 3.0
                 self._resolver.lifetime = 6.0
+                self._dnssec_required = dnssec_required
+                if dnssec_required:
+                    # EDNS0 + DO so the recursor knows we want DNSSEC
+                    # processing. Without DO many recursors strip
+                    # RRSIGs and never set AD.
+                    self._resolver.use_edns(0, dns.flags.DO, 4096)
 
             def query_txt_record(self, name: str):
                 try:
                     answers = self._resolver.resolve(name, "TXT")
                 except Exception:
                     return None
+                if self._dnssec_required:
+                    response = getattr(answers, "response", None)
+                    flags = getattr(response, "flags", 0) if response else 0
+                    if not (flags & dns.flags.AD):
+                        return None
                 values = []
                 for rdata in answers:
                     values.append(b"".join(rdata.strings).decode("utf-8"))
                 return values or None
 
-        return _SystemResolver()
+        return _SystemResolver(require_dnssec)
     except Exception:
         log.exception(
             "could not build heartbeat-worker resolver; peer harvest disabled"

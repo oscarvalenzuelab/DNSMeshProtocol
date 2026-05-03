@@ -101,3 +101,95 @@ class TestDMPNode:
     def test_node_stop_is_idempotent(self, node):
         node.stop()
         node.stop()  # must not raise
+
+
+class TestHeartbeatDnsReaderDnssecGate:
+    """``DMP_HEARTBEAT_DNSSEC_REQUIRED=1`` opts the heartbeat worker's
+    DNS reader into AD-bit enforcement on both code paths: the
+    ResolverPool built from ``DMP_HEARTBEAT_DNS_RESOLVERS`` and the
+    fallback system resolver."""
+
+    def test_pool_path_propagates_dnssec_required(self, monkeypatch):
+        from dmp.network.resolver_pool import ResolverPool
+        from dmp.server.node import _build_heartbeat_dns_reader
+
+        monkeypatch.setenv("DMP_HEARTBEAT_DNS_RESOLVERS", "1.1.1.1,9.9.9.9")
+        monkeypatch.setenv("DMP_HEARTBEAT_DNSSEC_REQUIRED", "1")
+
+        reader = _build_heartbeat_dns_reader()
+        assert isinstance(reader, ResolverPool)
+        assert reader._dnssec_required is True
+
+    def test_pool_path_default_off(self, monkeypatch):
+        from dmp.network.resolver_pool import ResolverPool
+        from dmp.server.node import _build_heartbeat_dns_reader
+
+        monkeypatch.setenv("DMP_HEARTBEAT_DNS_RESOLVERS", "1.1.1.1")
+        monkeypatch.delenv("DMP_HEARTBEAT_DNSSEC_REQUIRED", raising=False)
+
+        reader = _build_heartbeat_dns_reader()
+        assert isinstance(reader, ResolverPool)
+        assert reader._dnssec_required is False
+
+    def test_system_resolver_path_drops_ad_less_answer(self, monkeypatch):
+        """Fallback system-resolver path must also enforce AD when the
+        env var is set. AD-less answers return None — the worker
+        treats that as "nothing to harvest" (graceful degradation)
+        rather than passing unvalidated records through."""
+        import dns.flags
+        import dns.resolver
+
+        from dmp.server.node import _build_heartbeat_dns_reader
+
+        monkeypatch.delenv("DMP_HEARTBEAT_DNS_RESOLVERS", raising=False)
+        monkeypatch.setenv("DMP_HEARTBEAT_DNSSEC_REQUIRED", "1")
+
+        # Stub Resolver.resolve so we control the AD bit on the response.
+        class _FakeRdata:
+            def __init__(self, s):
+                self.strings = [s.encode("utf-8")]
+
+        class _FakeResponse:
+            def __init__(self, ad: bool):
+                self.flags = dns.flags.AD if ad else 0
+
+        class _FakeAnswer(list):
+            def __init__(self, vals, ad: bool):
+                super().__init__(_FakeRdata(v) for v in vals)
+                self.response = _FakeResponse(ad)
+
+        def fake_resolve(self, name, rdtype):
+            return _FakeAnswer(["unvalidated"], ad=False)
+
+        monkeypatch.setattr(dns.resolver.Resolver, "resolve", fake_resolve)
+        reader = _build_heartbeat_dns_reader()
+        assert reader.query_txt_record("x.example.com") is None
+
+    def test_system_resolver_path_passes_ad_set(self, monkeypatch):
+        import dns.flags
+        import dns.resolver
+
+        from dmp.server.node import _build_heartbeat_dns_reader
+
+        monkeypatch.delenv("DMP_HEARTBEAT_DNS_RESOLVERS", raising=False)
+        monkeypatch.setenv("DMP_HEARTBEAT_DNSSEC_REQUIRED", "1")
+
+        class _FakeRdata:
+            def __init__(self, s):
+                self.strings = [s.encode("utf-8")]
+
+        class _FakeResponse:
+            def __init__(self, ad: bool):
+                self.flags = dns.flags.AD if ad else 0
+
+        class _FakeAnswer(list):
+            def __init__(self, vals, ad: bool):
+                super().__init__(_FakeRdata(v) for v in vals)
+                self.response = _FakeResponse(ad)
+
+        def fake_resolve(self, name, rdtype):
+            return _FakeAnswer(["validated"], ad=True)
+
+        monkeypatch.setattr(dns.resolver.Resolver, "resolve", fake_resolve)
+        reader = _build_heartbeat_dns_reader()
+        assert reader.query_txt_record("x.example.com") == ["validated"]

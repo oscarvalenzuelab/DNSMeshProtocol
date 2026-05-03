@@ -2660,6 +2660,182 @@ class TestNodeDnsReaderTruncation:
             reader.query_txt_record("example.com.")
 
 
+class TestNodeDnsReaderDnssecGate:
+    """``_NodeDnsReader(dnssec_required=True)`` requires the AD flag on
+    the recursor's reply. Same policy as ResolverPool / DNSOperations;
+    closes the gap codex flagged on PR #39 where cluster-mode reads
+    bypassed the AD gate even when the operator opted in."""
+
+    def _build_response(self, request, name, values, *, ad_set: bool):
+        import dns.flags
+        import dns.message
+        import dns.rdataclass
+        import dns.rdatatype
+        import dns.rrset
+
+        response = dns.message.make_response(request)
+        if ad_set:
+            response.flags |= dns.flags.AD
+        rrset = dns.rrset.from_text_list(
+            name,
+            300,
+            dns.rdataclass.IN,
+            dns.rdatatype.TXT,
+            [f'"{v}"' for v in values],
+        )
+        response.answer.append(rrset)
+        return response
+
+    def test_default_off_does_not_require_ad(self, monkeypatch):
+        """Existing operators get the legacy behavior: AD-less replies
+        round-trip cleanly."""
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999")
+
+        def fake_udp(request, host, port, timeout):
+            return self._build_response(
+                request, "x.example.com.", ["v=dmp1;t=chunk;d=aGk="], ad_set=False
+            )
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        assert reader.query_txt_record("x.example.com.") == ["v=dmp1;t=chunk;d=aGk="]
+
+    def test_required_passes_when_ad_set(self, monkeypatch):
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", dnssec_required=True)
+
+        def fake_udp(request, host, port, timeout):
+            return self._build_response(
+                request, "x.example.com.", ["validated"], ad_set=True
+            )
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        assert reader.query_txt_record("x.example.com.") == ["validated"]
+
+    def test_required_raises_when_ad_unset(self, monkeypatch):
+        """A reply without AD is treated as a per-node transport
+        failure (raised), not as a healthy "no records" outcome.
+        UnionReader counts it against the node so a non-validating
+        upstream gets demoted instead of silently passing through."""
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", dnssec_required=True)
+
+        def fake_udp(request, host, port, timeout):
+            return self._build_response(
+                request, "x.example.com.", ["unvalidated"], ad_set=False
+            )
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        with pytest.raises(RuntimeError, match="AD flag missing"):
+            reader.query_txt_record("x.example.com.")
+
+    def test_required_sets_do_bit_on_outgoing_query(self, monkeypatch):
+        """Without the DO bit on the outgoing query, many recursors
+        strip RRSIGs and never set AD on the response. Verify the
+        wire query carries DO so a validating recursor will actually
+        do the validation we're going to check for."""
+        import dns.flags
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", dnssec_required=True)
+        captured = {}
+
+        def fake_udp(request, host, port, timeout):
+            captured["request"] = request
+            return self._build_response(request, "x.example.com.", ["v"], ad_set=True)
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        reader.query_txt_record("x.example.com.")
+        # dnspython's Message.ednsflags reflects the DO bit on the
+        # outgoing question.
+        assert captured["request"].ednsflags & dns.flags.DO
+
+    def test_required_raises_on_ad_less_nxdomain(self, monkeypatch):
+        """DNSSEC supports validated denial of existence — a real
+        validating recursor sets AD on NXDOMAIN for signed zones. An
+        AD-less NXDOMAIN is indistinguishable from a spoofed one and
+        must not be accepted as a healthy 'no record' answer when the
+        operator opted in to `dnssec_required`."""
+        import dns.message
+        import dns.query
+        import dns.rcode
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", dnssec_required=True)
+
+        def fake_udp(request, host, port, timeout):
+            response = dns.message.make_response(request)
+            response.set_rcode(dns.rcode.NXDOMAIN)
+            return response
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        with pytest.raises(RuntimeError, match="AD flag missing"):
+            reader.query_txt_record("missing.example.com.")
+
+    def test_required_accepts_validated_nxdomain(self, monkeypatch):
+        """AD-set NXDOMAIN is a validated denial — accept as a healthy
+        'no record' (return None). UnionReader treats None as
+        healthy-not-found, distinct from a transport error."""
+        import dns.flags
+        import dns.message
+        import dns.query
+        import dns.rcode
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", dnssec_required=True)
+
+        def fake_udp(request, host, port, timeout):
+            response = dns.message.make_response(request)
+            response.set_rcode(dns.rcode.NXDOMAIN)
+            response.flags |= dns.flags.AD
+            return response
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        assert reader.query_txt_record("missing.example.com.") is None
+
+    def test_required_checks_ad_after_tcp_retry(self, monkeypatch):
+        """When UDP returns truncated and the reader retries over TCP,
+        the AD check must apply to the TCP response — not the UDP one.
+        Without this, an attacker who can spoof TC=1 forces a TCP
+        retry whose unvalidated answer would slip through."""
+        import dns.flags
+        import dns.message
+        import dns.query
+
+        from dmp.cli import _NodeDnsReader
+
+        reader = _NodeDnsReader("127.0.0.1:9999", dnssec_required=True)
+
+        def fake_udp(request, host, port, timeout):
+            response = dns.message.make_response(request)
+            response.flags |= dns.flags.TC  # truncated → forces TCP retry
+            response.flags |= dns.flags.AD  # AD on UDP must not satisfy the gate
+            return response
+
+        def fake_tcp(request, host, port, timeout):
+            response = dns.message.make_response(request)
+            # TCP response WITHOUT AD — this is the one the gate must see.
+            return response
+
+        monkeypatch.setattr(dns.query, "udp", fake_udp)
+        monkeypatch.setattr(dns.query, "tcp", fake_tcp)
+        with pytest.raises(RuntimeError, match="AD flag missing"):
+            reader.query_txt_record("x.example.com.")
+
+
 class TestLocalOnlyClusterBootstrap:
     """Local-only CLI commands must not crash on cluster bootstrap failure.
 
