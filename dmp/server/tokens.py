@@ -517,12 +517,18 @@ CREATE TABLE IF NOT EXISTS token_audit (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON token_audit(ts);
 """
 
-# One-off migration for deployments that predate phase 3. Adding a
-# column at runtime is cheaper than bumping the schema_version and the
-# `tokens` table is single-owner (no migrations of in-flight data).
-_MIGRATION_ADD_REGISTERED_SPK = """
+# v1 → v2: add registered_spk so the anti-takeover gate has the
+# original signing key to compare future re-registrations against.
+# Pre-versioning binaries ran this inline and never stamped
+# ``user_version``; the migration ladder catches that case via the
+# ``duplicate column`` errno.
+_MIGRATION_V1_TO_V2 = """
 ALTER TABLE tokens ADD COLUMN registered_spk TEXT
 """
+
+# Latest schema version this code understands. Bump on every
+# schema-affecting change and add a v(N-1) → v(N) step in ``_migrate``.
+_SCHEMA_VERSION = 2
 
 
 class TokenStore:
@@ -539,21 +545,74 @@ class TokenStore:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.executescript(_SCHEMA)
-        # Best-effort additive migration for the phase-3 column.
-        # sqlite rejects "ADD COLUMN if already exists"; catch the
-        # duplicate-column error and move on.
-        try:
-            self._conn.execute(_MIGRATION_ADD_REGISTERED_SPK)
-        except sqlite3.OperationalError as exc:
-            if "duplicate column" not in str(exc).lower():
-                raise
+        self._migrate()
         self._conn.commit()
         # Per-token rate limiter. In-memory, ephemeral by design —
         # rate state doesn't survive a node restart, matching how the
         # per-IP limiter behaves. Reissuing a throttled token via a
         # restart is a documented failure mode in the operator guide.
         self._rate_limiter = _PerTokenBucket()
+
+    def _migrate(self) -> None:
+        """Apply schema migrations atomically and stamp ``user_version``.
+
+        Versions:
+          0 → 2: a fresh database — ``executescript(_SCHEMA)`` creates
+                 the v2 shape directly (registered_spk is in the CREATE
+                 TABLE). Stamp v2 and we're done.
+          1 → 2: a legacy database from before the inline registered_spk
+                 migration. Run the ALTER. Pre-versioning binaries that
+                 already ran the inline ALTER but never stamped will
+                 raise ``duplicate column`` here — caught and treated as
+                 "v2 already, just stamp it".
+          2 → 2: fully migrated, idempotent stamp.
+
+        Concurrency: NOT a per-node singleton — ``dnsmesh-node-admin``
+        opens the same token DB as the running node (see
+        ``dmp/server/admin.py``). Without ``BEGIN IMMEDIATE`` two
+        connections could both read ``user_version=0``, both attempt
+        the ALTER, and the second hits ``duplicate column``. The
+        current swallow handles that case, but a future migration
+        with non-idempotent operations (a UPDATE backfill, etc) would
+        race silently. Take the reserved write lock now.
+        """
+        # Phase 1: ensure the schema tables/indexes exist. Idempotent
+        # at the SQL level via ``CREATE TABLE IF NOT EXISTS`` — sqlite
+        # serializes concurrent issuers via the file lock, so two
+        # connections both running this won't conflict. Run OUTSIDE
+        # ``BEGIN IMMEDIATE`` because ``executescript`` does an
+        # implicit COMMIT that would end our explicit transaction.
+        self._conn.commit()
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+
+        # Phase 2: atomic version-check + ALTER + stamp under
+        # ``BEGIN IMMEDIATE`` so two connections (e.g. node + admin)
+        # can't both read ``user_version=0`` and both attempt the
+        # ALTER. The second waits for the first to commit and then
+        # sees v2 already stamped.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if cur_version > _SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"token store at {self._path!r} has schema version "
+                    f"{cur_version}, but this binary only understands up to "
+                    f"{_SCHEMA_VERSION}. Refusing to open — using an older "
+                    f"binary against a newer database would risk silently "
+                    f"dropping fields."
+                )
+            if cur_version < 2:
+                try:
+                    self._conn.execute(_MIGRATION_V1_TO_V2)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+                self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     # ---- issuance ----------------------------------------------------------
 

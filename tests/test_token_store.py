@@ -592,3 +592,152 @@ class TestAuditSplit:
         assert len(rejects) == 1
         _, _, _, _, addr, _ = rejects[0]
         assert addr == "10.0.0.7"
+
+
+class TestSchemaVersioning:
+    """Migration ladder for TokenStore.
+
+    Versions:
+      v1 = original schema (no registered_spk column)
+      v2 = current schema (registered_spk inline)
+
+    Pre-versioning binaries either already ran the inline ALTER (no
+    user_version stamp) or never did (legacy v1 schema). The ladder
+    handles both.
+    """
+
+    def test_fresh_db_is_stamped_at_current_version(self, tmp_path):
+        from dmp.server.tokens import _SCHEMA_VERSION, TokenStore
+
+        store = TokenStore(str(tmp_path / "fresh.db"))
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == _SCHEMA_VERSION
+            cols = {
+                row[1]
+                for row in store._conn.execute("PRAGMA table_info(tokens)").fetchall()
+            }
+            assert "registered_spk" in cols
+        finally:
+            store.close()
+
+    def test_legacy_v1_db_migrates_to_v2(self, tmp_path):
+        """A db created by the original tokens schema (no
+        registered_spk, user_version=0) gets the column added on
+        open and the version stamped. Existing rows are preserved.
+        """
+        import sqlite3
+
+        from dmp.server.tokens import TokenStore
+
+        path = str(tmp_path / "legacy.db")
+        legacy = sqlite3.connect(path)
+        legacy.executescript("""
+            CREATE TABLE tokens (
+                token_hash     TEXT PRIMARY KEY,
+                subject        TEXT NOT NULL,
+                subject_type   INTEGER NOT NULL,
+                subject_hash12 TEXT,
+                rate_per_sec   REAL NOT NULL DEFAULT 10.0,
+                rate_burst     INTEGER NOT NULL DEFAULT 50,
+                issued_at      INTEGER NOT NULL,
+                expires_at     INTEGER,
+                revoked_at     INTEGER,
+                issuer         TEXT NOT NULL DEFAULT '',
+                note           TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE token_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                token_hash TEXT,
+                subject TEXT,
+                remote_addr TEXT,
+                detail TEXT
+            );
+            """)
+        legacy.execute(
+            "INSERT INTO tokens(token_hash, subject, subject_type, "
+            "issued_at, issuer, note) VALUES(?, ?, ?, ?, ?, ?)",
+            ("h0", "alice@example", 1, 100, "test", ""),
+        )
+        legacy.commit()
+        legacy.close()
+
+        store = TokenStore(path)
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == 2
+            cols = {
+                row[1]
+                for row in store._conn.execute("PRAGMA table_info(tokens)").fetchall()
+            }
+            assert "registered_spk" in cols
+            row = store._conn.execute("SELECT token_hash FROM tokens").fetchone()
+            assert row[0] == "h0"
+        finally:
+            store.close()
+
+    def test_legacy_v1_5_with_registered_spk_but_unstamped(self, tmp_path):
+        """A pre-versioning binary that already ran the inline
+        registered_spk ALTER but never stamped ``user_version`` opens
+        cleanly: the ALTER hits ``duplicate column`` (caught), and the
+        version is stamped to v2.
+        """
+        import sqlite3
+
+        from dmp.server.tokens import TokenStore
+
+        path = str(tmp_path / "legacy_with_spk.db")
+        legacy = sqlite3.connect(path)
+        # Same as v1 schema but with registered_spk pre-added (matches
+        # what the pre-versioning binary's inline ALTER produced).
+        legacy.executescript("""
+            CREATE TABLE tokens (
+                token_hash TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                subject_type INTEGER NOT NULL,
+                subject_hash12 TEXT,
+                rate_per_sec REAL NOT NULL DEFAULT 10.0,
+                rate_burst INTEGER NOT NULL DEFAULT 50,
+                issued_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                revoked_at INTEGER,
+                issuer TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                registered_spk TEXT
+            );
+            CREATE TABLE token_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                token_hash TEXT,
+                subject TEXT,
+                remote_addr TEXT,
+                detail TEXT
+            );
+            """)
+        legacy.commit()
+        legacy.close()
+
+        store = TokenStore(path)
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == 2
+        finally:
+            store.close()
+
+    def test_future_version_db_refuses_to_open(self, tmp_path):
+        import sqlite3
+
+        from dmp.server.tokens import TokenStore, _SCHEMA, _SCHEMA_VERSION
+
+        path = str(tmp_path / "future.db")
+        future = sqlite3.connect(path)
+        future.executescript(_SCHEMA)
+        future.execute(f"PRAGMA user_version = {_SCHEMA_VERSION + 5}")
+        future.commit()
+        future.close()
+
+        with pytest.raises(RuntimeError, match="schema version"):
+            TokenStore(path)

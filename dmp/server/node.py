@@ -1633,7 +1633,19 @@ class DMPNode:
 
 
 def main() -> None:
-    node = DMPNode.from_env()
+    try:
+        node = DMPNode.from_env()
+    except RuntimeError as exc:
+        # Schema-version refusal from one of the per-node sqlite stores
+        # (SeenStore, TokenStore, TSIGKeyStore). Surface as a friendly
+        # exit-1 so the operator sees what to act on instead of a Python
+        # traceback. PR #40 added the same pattern to ``dnsmesh``'s
+        # ``_make_client``; PR #42 codex review caught it was missing on
+        # ``dnsmesh-node`` startup.
+        import sys
+
+        print(f"dnsmesh-node: {exc}", file=sys.stderr)
+        sys.exit(1)
     node.start()
     node.wait()
 
