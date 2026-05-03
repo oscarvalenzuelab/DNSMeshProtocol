@@ -86,7 +86,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 from dmp.core.crypto import DMPCrypto
-from dmp.core.ed25519_points import is_low_order as _is_low_order
 
 RECORD_PREFIX = "v=dmp1;t=claim;"
 
@@ -328,13 +327,8 @@ class ClaimRecord:
         except ValueError:
             return None
 
-        # Low-order Ed25519 pubkey guard — same defense as heartbeat
-        # / registration. The identity point (01 00..00) verifies
-        # every message under permissive RFC 8032 implementations;
-        # other small-order points permit grinding forgeries.
-        if _is_low_order(bytes(record.sender_spk)):
-            return None
-
+        # Low-order Ed25519 pubkey rejection is centralized inside
+        # DMPCrypto.verify_signature (see dmp.core.ed25519_points).
         if not DMPCrypto.verify_signature(body, sig, bytes(record.sender_spk)):
             return None
 

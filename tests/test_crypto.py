@@ -3,9 +3,11 @@
 import pytest
 import os
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidTag
 
 from dmp.core.crypto import DMPCrypto, EncryptedMessage, MessageEncryption
+from dmp.core.ed25519_points import LOW_ORDER_ED25519_PUBKEYS
 
 
 class TestDMPCrypto:
@@ -203,6 +205,106 @@ class TestDMPCrypto:
         # Wrong signer fails
         other = DMPCrypto()
         assert not DMPCrypto.verify_signature(data, signature, other.signing_public_key)
+
+    # Independent hard-coded low-order Ed25519 encoding fixtures. These
+    # MUST NOT be derived from dmp.core.ed25519_points.LOW_ORDER_ED25519_PUBKEYS
+    # — if an entry were accidentally deleted from the production set, a test
+    # that imports the same set would silently stop checking it. Source:
+    # https://pkg.go.dev/c2sp.org/CCTV/ed25519 + RFC 8032 small-subgroup
+    # canonical encodings.
+    _IDENTITY_POINT_HEX = (
+        "0100000000000000000000000000000000000000000000000000000000000000"
+    )
+    _LOW_ORDER_VECTORS = (
+        # order 1 — identity point. With sig = identity || 0^32, permissive
+        # RFC-8032 verify accepts on every message (full forgery).
+        _IDENTITY_POINT_HEX,
+        # order 2
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        # order 4 — both encodings
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000080",
+        # order 8 — canonical
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+        # non-canonical aliases the cryptography library still parses
+        "0100000000000000000000000000000000000000000000000000000000000080",
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    )
+
+    def test_verify_signature_rejects_identity_point_forgery(self):
+        """The canonical Ed25519 forgery against the identity public key:
+        sig = identity_pub || 0^32 verifies on every message under permissive
+        RFC-8032 verifiers. This is the worst-case attack — full signature
+        forgery without holding any private key. The central guard inside
+        DMPCrypto.verify_signature must reject it before .verify() runs.
+        """
+        identity_pub = bytes.fromhex(self._IDENTITY_POINT_HEX)
+        forgery_sig = identity_pub + b"\x00" * 32
+        # Must be rejected against any message — pick a few representative
+        # payloads to make the "every message" property visible in the test.
+        for msg in (b"", b"forgery target", b"\x00" * 1024, os.urandom(64)):
+            assert not DMPCrypto.verify_signature(
+                msg, forgery_sig, identity_pub
+            ), f"identity-point forgery accepted on message of len {len(msg)}"
+
+    def test_verify_signature_rejects_low_order_vectors_bytes(self):
+        """Each known low-order encoding must be rejected when passed as raw
+        bytes, regardless of signature shape. Uses independent hard-coded
+        vectors so an accidental deletion from the production block list
+        would not silently disable this check.
+        """
+        msg = b"forgery target"
+        forgery_sig = bytes.fromhex(self._IDENTITY_POINT_HEX) + b"\x00" * 32
+        zero_sig = b"\x00" * 64
+        for hex_pub in self._LOW_ORDER_VECTORS:
+            pub_bytes = bytes.fromhex(hex_pub)
+            assert not DMPCrypto.verify_signature(
+                msg, forgery_sig, pub_bytes
+            ), f"low-order pubkey {hex_pub} accepted with identity-forgery sig"
+            assert not DMPCrypto.verify_signature(
+                msg, zero_sig, pub_bytes
+            ), f"low-order pubkey {hex_pub} accepted with zero sig"
+
+    def test_verify_signature_rejects_low_order_vectors_instance(self):
+        """Same rejection when an Ed25519PublicKey instance is passed instead
+        of raw bytes. Callers that cache parsed keys must not bypass the guard.
+        """
+        msg = b"forgery target"
+        forgery_sig = bytes.fromhex(self._IDENTITY_POINT_HEX) + b"\x00" * 32
+        for hex_pub in self._LOW_ORDER_VECTORS:
+            pub_bytes = bytes.fromhex(hex_pub)
+            try:
+                pk_instance = Ed25519PublicKey.from_public_bytes(pub_bytes)
+            except Exception:
+                # Some non-canonical encodings are rejected at construction
+                # time by the underlying library; the bytes-form test above
+                # already exercises those.
+                continue
+            assert not DMPCrypto.verify_signature(
+                msg, forgery_sig, pk_instance
+            ), f"low-order pubkey instance {hex_pub} accepted"
+
+    def test_verify_signature_block_list_includes_all_known_vectors(self):
+        """The independent vector list MUST be a subset of the production
+        block list. If this test fails, the production list has lost an entry
+        that this test still expects to be rejected — investigate before
+        adding/removing vectors on either side.
+        """
+        for hex_pub in self._LOW_ORDER_VECTORS:
+            pub_bytes = bytes.fromhex(hex_pub)
+            assert (
+                pub_bytes in LOW_ORDER_ED25519_PUBKEYS
+            ), f"vector {hex_pub} missing from LOW_ORDER_ED25519_PUBKEYS"
+
+    def test_verify_signature_wrong_length_pubkey_rejected(self):
+        """Defense in depth: bytes pubkeys of the wrong length must fail
+        closed rather than raising or being silently coerced."""
+        data = b"x"
+        sig = b"\x00" * 64
+        assert not DMPCrypto.verify_signature(data, sig, b"\x00" * 31)
+        assert not DMPCrypto.verify_signature(data, sig, b"\x00" * 33)
+        assert not DMPCrypto.verify_signature(data, sig, b"")
 
     def test_signing_key_deterministic_from_passphrase(self):
         """Same passphrase produces the same Ed25519 signing key."""

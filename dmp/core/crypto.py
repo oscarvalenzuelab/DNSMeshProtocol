@@ -28,6 +28,8 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 
+from dmp.core.ed25519_points import is_low_order as _is_low_order_ed25519
+
 # Argon2id parameters for passphrase → 32-byte X25519 seed.
 # Tuned for ~20ms on a modern laptop. Still orders of magnitude more
 # resistant to offline brute force than the previous PBKDF2-SHA256 at
@@ -274,15 +276,30 @@ class DMPCrypto:
         """Verify an Ed25519 signature.
 
         Accepts either an Ed25519PublicKey instance or raw 32 pubkey bytes.
+        Public keys in the small-subgroup / low-order set are rejected here
+        before delegating to the underlying verify; see
+        ``dmp.core.ed25519_points`` for the rationale (identity-point forgery
+        and grindable small-order forgeries against permissive verifiers).
         """
         if isinstance(signing_public_key, (bytes, bytearray)):
-            if len(signing_public_key) != 32:
+            pub_bytes = bytes(signing_public_key)
+            if len(pub_bytes) != 32:
+                return False
+            if _is_low_order_ed25519(pub_bytes):
                 return False
             try:
-                signing_public_key = Ed25519PublicKey.from_public_bytes(
-                    bytes(signing_public_key)
+                signing_public_key = Ed25519PublicKey.from_public_bytes(pub_bytes)
+            except Exception:
+                return False
+        else:
+            try:
+                pub_bytes = signing_public_key.public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw,
                 )
             except Exception:
+                return False
+            if _is_low_order_ed25519(pub_bytes):
                 return False
         try:
             signing_public_key.verify(signature, data)
