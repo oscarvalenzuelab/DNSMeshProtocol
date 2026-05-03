@@ -134,24 +134,33 @@ class Prekey:
         return now > self.exp
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS prekeys (
-    prekey_id INTEGER PRIMARY KEY,
-    private_key BLOB NOT NULL,
-    public_key BLOB NOT NULL,
-    exp INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    wire_record TEXT DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_prekeys_exp ON prekeys(exp);
-"""
-
-# For upgrading existing databases that predate wire_record. Sqlite ignores
-# the ALTER if the column already exists? No — sqlite raises "duplicate
-# column name". Guard with a check on columns.
-_WIRE_RECORD_COLUMN_MIGRATION = (
-    "ALTER TABLE prekeys ADD COLUMN wire_record TEXT DEFAULT ''"
+# Schema v1 as individual statements (NOT a script). ``executescript``
+# does an implicit COMMIT before running, which would end the
+# ``BEGIN IMMEDIATE`` transaction in ``_migrate`` and let two concurrent
+# migrations race the ALTER. We issue each statement via ``execute`` to
+# stay inside the explicit transaction.
+_SCHEMA_V1_STATEMENTS: Tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS prekeys (
+        prekey_id INTEGER PRIMARY KEY,
+        private_key BLOB NOT NULL,
+        public_key BLOB NOT NULL,
+        exp INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_prekeys_exp ON prekeys(exp)",
 )
+
+# v1 → v2: add wire_record so the client can DELETE the published
+# prekey_pub from DNS when its sk is consumed. Without this, the
+# published RRset would rot in DNS — senders keep picking sks that
+# the recipient has already eaten.
+_MIGRATION_V1_TO_V2 = "ALTER TABLE prekeys ADD COLUMN wire_record TEXT DEFAULT ''"
+
+# Latest schema version this code understands. Bump on every schema-
+# affecting change and add a v(N-1) → v(N) step in ``_migrate``.
+_SCHEMA_VERSION = 2
 
 
 class PrekeyStore:
@@ -164,6 +173,12 @@ class PrekeyStore:
     The prekey_sk rows are the forward-secrecy secret. Protect the sqlite
     file with the same filesystem perms as the identity passphrase file
     (the CLI's `_make_client` wires them both out of `$DMP_CONFIG_HOME`).
+
+    Schema versioning (P1): tracked via ``PRAGMA user_version``. Each
+    bump adds a step to ``_migrate`` and increments ``_SCHEMA_VERSION``.
+    Refuses to open databases stamped at a HIGHER version than this code
+    knows — silently downgrading would risk dropping fields a newer
+    binary added.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -171,25 +186,92 @@ class PrekeyStore:
         parent = os.path.dirname(db_path) or "."
         os.makedirs(parent, exist_ok=True)
         self._lock = RLock()
+        # 30s busy-timeout: ``_migrate`` takes a reserved write lock via
+        # ``BEGIN IMMEDIATE`` so concurrent opens on the same file
+        # serialize. The default sqlite3 timeout (5s) is too tight under
+        # load — when many other sqlite stores in the same process are
+        # also active (test suite, busy CI), threads waiting on the
+        # migration lock can hit ``database is locked`` before the
+        # leader's transaction completes. 30s leaves headroom without
+        # masking real deadlocks.
         self._conn = sqlite3.connect(
-            db_path, isolation_level=None, check_same_thread=False
+            db_path, isolation_level=None, check_same_thread=False, timeout=30.0
         )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.executescript(_SCHEMA)
-        # Migrate older databases that lacked wire_record. Needed so a
-        # client upgraded in place can still delete its published prekeys
-        # on consume — without this, the published record rots in DNS.
-        cols = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(prekeys)").fetchall()
-        }
-        if "wire_record" not in cols:
-            self._conn.execute(_WIRE_RECORD_COLUMN_MIGRATION)
+        self._migrate()
         try:
             os.chmod(db_path, 0o600)
         except OSError:
             pass
+
+    def _migrate(self) -> None:
+        """Apply schema migrations atomically and idempotently.
+
+        Versions:
+          0 → 1: create the v1 schema (or no-op if tables already exist
+                 from a pre-versioning binary; the original schema bytes
+                 match the v1 definition).
+          1 → 2: ADD COLUMN wire_record so consume-on-decrypt can DELETE
+                 the published prekey_pub. Pre-existing v0 (unstamped)
+                 databases that already have wire_record (from the
+                 previous in-place migration) skip the ALTER and just
+                 stamp version 2.
+
+        Future schema bumps add v(N) → v(N+1) steps below.
+
+        Concurrency: the per-instance ``RLock`` serializes within ONE
+        ``PrekeyStore`` instance, but two instances on the same db file
+        share nothing in-process. Without ``BEGIN IMMEDIATE`` below,
+        both can read ``user_version=0``, both check ``wire_record``
+        not present, and both attempt the ALTER — sqlite raises
+        ``duplicate column name`` on the second. ``BEGIN IMMEDIATE``
+        takes a sqlite-level reserved write lock, so concurrent
+        migrations serialize via the file lock; the second connection
+        waits, then sees the post-migration version and no-ops.
+        """
+        # autocommit (isolation_level=None) means we drive transactions
+        # explicitly. BEGIN IMMEDIATE acquires the reserved lock now,
+        # which is what makes read-then-write atomic against other
+        # connections. A DEFERRED begin would let two transactions both
+        # read user_version=0 and race the ALTER.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if cur_version > _SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"prekey store at {self.db_path!r} has schema version "
+                    f"{cur_version}, but this binary only understands up to "
+                    f"{_SCHEMA_VERSION}. Refusing to open — using an older "
+                    f"client against a newer database would risk silently "
+                    f"dropping fields."
+                )
+            # v0 → v1: ensure the v1 tables exist. Idempotent against
+            # either a brand-new file OR an existing v0/v1/v2 file
+            # (CREATE TABLE IF NOT EXISTS is a no-op when the table is
+            # there).
+            if cur_version < 1:
+                for stmt in _SCHEMA_V1_STATEMENTS:
+                    self._conn.execute(stmt)
+                cur_version = 1
+            # v1 → v2: add wire_record. Some pre-versioning databases
+            # already have this column from the old in-place migration
+            # — in that case skip the ALTER but still stamp the version.
+            if cur_version < 2:
+                cols = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(prekeys)"
+                    ).fetchall()
+                }
+                if "wire_record" not in cols:
+                    self._conn.execute(_MIGRATION_V1_TO_V2)
+                cur_version = 2
+            self._conn.execute(f"PRAGMA user_version = {cur_version}")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         with self._lock:

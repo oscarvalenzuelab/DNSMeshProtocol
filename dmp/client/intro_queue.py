@@ -60,9 +60,21 @@ class IntroQueue:
 
     Pass ``":memory:"`` for tests; pass a real path in CLI use so
     pending intros survive across CLI invocations.
+
+    Schema versioning (P1): the schema is stamped via
+    ``PRAGMA user_version``. Each schema bump appends a step to
+    ``_migrate`` and increments ``_SCHEMA_VERSION``. Opening a
+    database whose stored version is HIGHER than this code knows
+    raises — refusing a silent downgrade prevents data loss when an
+    older binary points at a newer database.
     """
 
-    _SCHEMA = """
+    # Schema v1 as individual statements (NOT a script). ``executescript``
+    # does an implicit COMMIT before running, which would end the
+    # ``BEGIN IMMEDIATE`` transaction in ``_migrate``. Issue each
+    # statement via ``execute`` to stay inside the explicit transaction.
+    _SCHEMA_V1_STATEMENTS = (
+        """
         CREATE TABLE IF NOT EXISTS intros (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender_spk BLOB NOT NULL,
@@ -73,15 +85,24 @@ class IntroQueue:
             received_at INTEGER NOT NULL,
             msg_exp INTEGER NOT NULL,
             UNIQUE(sender_spk, msg_id)
-        );
+        )
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_intros_received_at
-            ON intros(received_at DESC);
+            ON intros(received_at DESC)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS denylist (
             sender_spk BLOB PRIMARY KEY,
             blocked_at INTEGER NOT NULL,
             note TEXT NOT NULL DEFAULT ''
-        );
-    """
+        )
+        """,
+    )
+
+    # Latest schema version this code understands. Bump on every
+    # schema-affecting change and append the migration to ``_MIGRATIONS``.
+    _SCHEMA_VERSION = 1
 
     def __init__(self, path: str = ":memory:") -> None:
         self._path = path
@@ -110,7 +131,7 @@ class IntroQueue:
             check_same_thread=False,
             isolation_level=None,  # autocommit
         )
-        self._conn.executescript(self._SCHEMA)
+        self._migrate()
         if path != ":memory:":
             try:
                 self._conn.execute("PRAGMA journal_mode=WAL")
@@ -125,6 +146,48 @@ class IntroQueue:
                         os.chmod(sibling, 0o600)
                 except OSError:
                     pass
+
+    def _migrate(self) -> None:
+        """Apply schema migrations atomically and stamp ``user_version``.
+
+        Reads the current ``PRAGMA user_version`` (0 for fresh databases
+        and for older databases that predate this versioning scheme).
+        The v0→v1 step is a CREATE TABLE IF NOT EXISTS pass — idempotent
+        for both cases — and stamps ``user_version=1``. Future schema
+        changes append a v1→v2 step (etc.) and bump ``_SCHEMA_VERSION``.
+
+        Refuses to open a database whose stored version is higher than
+        ``_SCHEMA_VERSION``: that means an older binary opened a
+        newer-schema file, and silently doing nothing would risk
+        downgrading the schema (or worse, writing old-shape rows into
+        a newer-shape table).
+
+        Concurrency: ``BEGIN IMMEDIATE`` makes the read-then-write
+        atomic against another connection on the same file. The current
+        v0→v1 step is idempotent so two racers wouldn't corrupt each
+        other today, but future migrations that ALTER columns would,
+        so the lock is in place from the start.
+        """
+        # autocommit isolation_level=None means we drive txs explicitly.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if cur_version > self._SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"intro_queue at {self._path!r} has schema version "
+                    f"{cur_version}, but this binary only understands up to "
+                    f"{self._SCHEMA_VERSION}. Refusing to open — using an "
+                    f"older client against a newer database would risk "
+                    f"silently dropping fields."
+                )
+            if cur_version < 1:
+                for stmt in self._SCHEMA_V1_STATEMENTS:
+                    self._conn.execute(stmt)
+                self._conn.execute("PRAGMA user_version = 1")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         try:
