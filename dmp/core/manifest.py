@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
@@ -180,27 +181,59 @@ class SlotManifest:
 class ReplayCache:
     """Reject re-publication of already-seen (sender_spk, msg_id) pairs.
 
-    Split API:
-      has_seen(spk, msg_id)  — read-only check; safe to call before fetch.
-      record(spk, msg_id, exp) — commit the pair to the seen set.
+    Atomic claim/finalize/release API for the receive path:
+      claim_for_decode(spk, msg_id, exp) — returns True if the caller now
+        owns the (spk, msg_id) slot; False if it is already in `seen` or
+        another worker holds an in-flight claim within the TTL. On True the
+        caller MUST follow up with either:
+          finalize(spk, msg_id, exp) — promote the slot to `seen` after a
+            successful decrypt+deliver.
+          release(spk, msg_id) — free the slot after a transient decrypt
+            failure (DNS miss, malformed ciphertext, etc.) so a later poll
+            can retry.
 
-    The caller is responsible for only calling `record()` once a message has
-    been successfully decoded, so a transient DNS miss during chunk fetch
-    doesn't permanently blacklist a valid manifest.
+    Why a separate in-flight set instead of just check-and-record on entry:
+    a transient chunk-fetch miss must not permanently blacklist a still-valid
+    manifest. The split lets the caller hold the slot only for the duration
+    of the actual decrypt attempt.
 
-    Optionally persists to disk at `persist_path`. Each `record()` rewrites
-    the file atomically (write to `<path>.tmp`, rename into place) so a
-    crash mid-write leaves either the old or the new state, never a torn
-    file. If `persist_path` is None the cache is purely in-memory and
-    resets on process restart.
+    Why this matters: the previous split-API
+      `if has_seen(): skip; decrypt(); record()` is non-atomic. Two
+    concurrent workers (threads, async loops, or repeated calls to
+    receive_messages) can both pass the has_seen gate, both decrypt the
+    same message, and both deliver the same plaintext to the inbox.
 
-    Format: JSON array of `[sender_spk_hex, msg_id_hex, expiry_unix]`.
-    Expired entries are dropped on load, on every query, and on every record.
+    Legacy single-step `check_and_record(...)` is kept for callers that
+    don't have a separate decrypt phase; they get the atomic seen-set
+    update without using the in-flight set.
+
+    Concurrency: a single `threading.RLock` covers seen, in_flight, and the
+    persistence file write. Within-process workers are serialized; cross-
+    process safety relies on the atomic `os.replace` (last writer wins).
+
+    Crashed-worker recovery: in-flight claims older than
+    `in_flight_ttl_seconds` are reclaimed on the next `claim_for_decode`,
+    so a worker that crashed between claim and finalize/release does not
+    permanently block the slot.
+
+    Persistence: optional, at `persist_path`. Only `seen` is persisted —
+    in-flight claims are intentionally in-memory only (process restart
+    clears them). Each finalize/record rewrites the file atomically
+    (`<path>.tmp` → rename). Format: JSON array of
+    `[sender_spk_hex, msg_id_hex, expiry_unix]`. Expired entries are
+    dropped on load, on every query, and on every write.
     """
 
     default_ttl: int = 3600
     persist_path: Optional[str] = None
+    in_flight_ttl_seconds: int = 300
     _seen: Dict[Tuple[bytes, bytes], int] = field(default_factory=dict)
+    _in_flight: Dict[Tuple[bytes, bytes], int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.persist_path:
@@ -232,6 +265,7 @@ class ReplayCache:
         self._seen = loaded
 
     def _save(self) -> None:
+        # Caller holds _lock. Only `seen` persists; in-flight is in-memory.
         if not self.persist_path:
             return
         data = [[spk.hex(), mid.hex(), exp] for (spk, mid), exp in self._seen.items()]
@@ -245,8 +279,9 @@ class ReplayCache:
     # ---- public API --------------------------------------------------------
 
     def has_seen(self, sender_spk: bytes, msg_id: bytes) -> bool:
-        self._purge()
-        return (bytes(sender_spk), bytes(msg_id)) in self._seen
+        with self._lock:
+            self._purge()
+            return (bytes(sender_spk), bytes(msg_id)) in self._seen
 
     def record(
         self,
@@ -254,12 +289,14 @@ class ReplayCache:
         msg_id: bytes,
         expiry: Optional[int] = None,
     ) -> None:
-        self._purge()
-        key = (bytes(sender_spk), bytes(msg_id))
-        self._seen[key] = (
-            expiry if expiry is not None else int(time.time()) + self.default_ttl
-        )
-        self._save()
+        with self._lock:
+            self._purge()
+            key = (bytes(sender_spk), bytes(msg_id))
+            self._seen[key] = (
+                expiry if expiry is not None else int(time.time()) + self.default_ttl
+            )
+            self._in_flight.pop(key, None)
+            self._save()
 
     def check_and_record(
         self,
@@ -267,19 +304,74 @@ class ReplayCache:
         msg_id: bytes,
         expiry: Optional[int] = None,
     ) -> bool:
-        """Atomically check-then-record.
+        """Atomically check-then-record without using the in-flight set.
 
         Returns True if the pair is fresh (and records it); False on replay.
-        Kept for callers that genuinely want the old single-step semantics.
-        New code should prefer `has_seen` + `record` around the work that
-        proves the message was actually delivered.
+        For receive paths that have a distinct decrypt phase, prefer
+        `claim_for_decode` + `finalize` / `release` so a transient decrypt
+        failure does not permanently consume the slot.
         """
-        if self.has_seen(sender_spk, msg_id):
-            return False
+        with self._lock:
+            if self.has_seen(sender_spk, msg_id):
+                return False
+            self.record(sender_spk, msg_id, expiry)
+            return True
+
+    def claim_for_decode(
+        self,
+        sender_spk: bytes,
+        msg_id: bytes,
+        expiry: Optional[int] = None,
+    ) -> bool:
+        """Atomically reserve a slot for a decrypt attempt.
+
+        Returns True iff this caller now owns the (sender_spk, msg_id)
+        slot — neither in the seen set nor held by another worker's still-
+        fresh in-flight claim. Caller MUST follow with `finalize(...)` on
+        successful decrypt or `release(...)` on failure.
+
+        Stale in-flight claims older than `in_flight_ttl_seconds` are
+        reclaimed here so a crashed worker does not permanently block the
+        slot.
+        """
+        with self._lock:
+            self._purge()
+            self._purge_stale_in_flight()
+            key = (bytes(sender_spk), bytes(msg_id))
+            if key in self._seen or key in self._in_flight:
+                return False
+            self._in_flight[key] = int(time.time())
+            return True
+
+    def finalize(
+        self,
+        sender_spk: bytes,
+        msg_id: bytes,
+        expiry: Optional[int] = None,
+    ) -> None:
+        """Promote an in-flight claim to seen. Pairs with claim_for_decode."""
         self.record(sender_spk, msg_id, expiry)
-        return True
+
+    def release(self, sender_spk: bytes, msg_id: bytes) -> None:
+        """Release an in-flight claim without recording it as seen.
+
+        Used when decrypt fails so a later poll can retry the same slot.
+        Idempotent: releasing an already-released or never-claimed slot
+        is a no-op.
+        """
+        with self._lock:
+            key = (bytes(sender_spk), bytes(msg_id))
+            self._in_flight.pop(key, None)
+
+    def _purge_stale_in_flight(self) -> None:
+        # Caller holds _lock.
+        cutoff = int(time.time()) - self.in_flight_ttl_seconds
+        stale = [k for k, claimed_at in self._in_flight.items() if claimed_at < cutoff]
+        for k in stale:
+            self._in_flight.pop(k, None)
 
     def _purge(self) -> None:
+        # Caller holds _lock.
         now = int(time.time())
         expired = [k for k, exp in self._seen.items() if now > exp]
         if not expired:
@@ -289,5 +381,6 @@ class ReplayCache:
         self._save()
 
     def size(self) -> int:
-        self._purge()
-        return len(self._seen)
+        with self._lock:
+            self._purge()
+            return len(self._seen)
