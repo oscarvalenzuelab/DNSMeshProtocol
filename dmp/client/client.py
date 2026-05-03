@@ -245,6 +245,7 @@ class DMPClient:
         prekey_store_path: Optional[str] = None,
         rotation_chain_enabled: bool = False,
         intro_queue_path: Optional[str] = None,
+        allow_tofu: bool = False,
     ):
         if store is not None:
             if writer is None:
@@ -277,6 +278,16 @@ class DMPClient:
         self.prekey_store = PrekeyStore(prekey_store_path or ":memory:")
 
         self.contacts: Dict[str, Contact] = {}
+
+        # First-contact / TOFU opt-in. The slot-walk receive path
+        # (receive_messages) silently delivers any signature-valid manifest
+        # when the receiver has zero pinned signing keys. That is useful
+        # for fresh onboarding but also lets anyone who can spoof DNS to
+        # a pristine client be accepted as the contact. Default False
+        # makes this an explicit opt-in; callers with a real onboarding
+        # flow set ``allow_tofu=True`` (or call ``enable_tofu(...)``) to
+        # accept first-contact deliveries until the user pins someone.
+        self.allow_tofu = allow_tofu
 
         # EXPERIMENTAL (M5.4): rotation-chain walking on verify failure.
         # Default False preserves byte-identical legacy behavior. Wire
@@ -363,9 +374,12 @@ class DMPClient:
         their zone), but ``send_message`` refuses (no ECDH target).
 
         `signing_key_hex` is optional for back-compat with configs that
-        predate Ed25519 pinning. When empty, incoming manifests from any
-        signer will be accepted on first delivery (TOFU); when present,
-        only manifests whose `sender_spk` matches are delivered.
+        predate Ed25519 pinning. When omitted on every contact, the
+        receiver's pinned-signer set is empty and ``receive_messages``
+        drops every manifest by default (TOFU is now opt-in via the
+        ``allow_tofu=True`` constructor flag or ``enable_tofu()``).
+        When present, only manifests whose ``sender_spk`` matches a
+        pinned key are delivered.
         """
         # Allow an empty `public_key_hex` only when the caller has at
         # least pinned a signing key — otherwise this is just a name
@@ -412,6 +426,22 @@ class DMPClient:
         return {
             c.signing_key_bytes for c in self.contacts.values() if c.signing_key_bytes
         }
+
+    def enable_tofu(self) -> None:
+        """Opt back into Trust-On-First-Use delivery on the slot-walk path.
+
+        With no pinned signing keys (``_known_signing_keys()`` empty),
+        ``receive_messages`` would otherwise drop every manifest. Calling
+        this lets an onboarding flow accept first-contact deliveries until
+        the user pins someone. This is symmetric with the constructor
+        ``allow_tofu=True`` flag — useful when the client is constructed
+        before the operator decides whether to allow TOFU.
+        """
+        self.allow_tofu = True
+
+    def disable_tofu(self) -> None:
+        """Disable TOFU delivery (the secure default). Pair with ``enable_tofu``."""
+        self.allow_tofu = False
 
     def _rotation_manifest_revoked(self, sender_spk: bytes) -> bool:
         """EXPERIMENTAL (M5.4): return True iff ``sender_spk`` matches a
@@ -896,10 +926,15 @@ class DMPClient:
 
         Returns the list of newly-delivered messages. Replay-cache rejections,
         signature failures, and manifests from un-pinned senders are silently
-        skipped. If the client has no pinned Ed25519 contacts at all, receive
-        falls back to TOFU and delivers any signature-valid manifest — useful
-        for fresh onboarding, but users should pin contacts before treating
-        delivered messages as authenticated.
+        skipped.
+
+        TOFU semantics: if the client has no pinned Ed25519 contacts at
+        all, the slot-walk path drops every signature-valid manifest by
+        default. Pass ``allow_tofu=True`` to ``DMPClient`` (or call
+        ``enable_tofu()``) to opt back into the legacy "deliver any
+        signature-valid manifest until you pin someone" behavior — useful
+        for fresh onboarding but a real attack surface for any client whose
+        DNS path can be spoofed before the user has pinned a contact.
 
         M10 — two-phase scheduling.
 
@@ -962,29 +997,40 @@ class DMPClient:
                         continue
                     if manifest.is_expired():
                         continue
-                    # If the user has pinned any signing keys, only accept
-                    # manifests from those senders. Unknown signers are dropped.
-                    if known_spks and manifest.sender_spk not in known_spks:
-                        # EXPERIMENTAL (M5.4): if rotation-chain walking is
-                        # enabled, try walking each pinned contact's chain
-                        # forward to see if the manifest's sender_spk is the
-                        # current head of a rotation. A valid walk means the
-                        # contact rotated their identity key; we extend the
-                        # accepted set for this receive pass. If the walk
-                        # fails or aborts (revocation, ambiguity, max_hops),
-                        # the manifest stays dropped. Never modifies
-                        # self.contacts — a rotation-chain walk is a
-                        # per-receive trust decision, not a permanent re-pin.
-                        if not self._rotation_manifest_accepted(manifest.sender_spk):
-                            continue
-                    # EXPERIMENTAL (M5.4): cross-check that a PINNED
-                    # signing key hasn't itself been revoked. Without this,
-                    # a sender who published (rotation A→B) + (revocation of
-                    # A) would still have manifests signed by A accepted by
-                    # every contact that pinned A — defeating the whole
-                    # point of revocation. Only fires when rotation chain
-                    # walking is enabled; legacy clients keep their byte-
-                    # identical behavior.
+                    # Pinned signers gate + revocation check. Cases:
+                    #   1) known_spks non-empty + match → check revocation
+                    #      (a pinned key that was later revoked by its
+                    #      owner via rotate-then-revoke must drop).
+                    #   2) known_spks non-empty + miss → rotation-walk.
+                    #      No revocation check on the new head — that's
+                    #      a different key, and chain-walk acceptance
+                    #      already verified its current trust state.
+                    #   3) known_spks EMPTY + allow_tofu → check revocation
+                    #      (TOFU still respects revoked-by-issuer).
+                    #   4) known_spks EMPTY + not allow_tofu → drop.
+                    #      Default-deny first-contact gate (P0-3).
+                    if known_spks:
+                        if manifest.sender_spk in known_spks:
+                            # EXPERIMENTAL (M5.4): a sender who published
+                            # (rotation A→B) + (revocation of A) would
+                            # otherwise have manifests signed by A still
+                            # accepted by every contact that pinned A —
+                            # defeating revocation. Skipped without
+                            # rotation_chain_enabled (legacy behavior).
+                            if self._rotation_manifest_revoked(manifest.sender_spk):
+                                continue
+                        else:
+                            # EXPERIMENTAL (M5.4): rotation-chain walking on
+                            # verify failure. If a pinned contact rotated to
+                            # a new key, the new key is accepted for this
+                            # receive pass without permanently re-pinning.
+                            # Never modifies self.contacts.
+                            if not self._rotation_manifest_accepted(
+                                manifest.sender_spk
+                            ):
+                                continue
+                    elif not self.allow_tofu:
+                        continue
                     elif self._rotation_manifest_revoked(manifest.sender_spk):
                         continue
                     # Atomic claim across the decrypt window: only one worker

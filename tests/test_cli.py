@@ -53,6 +53,7 @@ def shared_store(monkeypatch):
             domain=config.domain,
             store=store,
             replay_cache_path=replay_path,
+            allow_tofu=config.allow_tofu,
         )
         for name, entry in config.contacts.items():
             # Mirror the real _make_client: use the persisted
@@ -1265,7 +1266,11 @@ class TestSendRecv:
         assert rc == 0
         assert "sent" in capsys.readouterr().out
 
-        # Switch "identity" to bob and read.
+        # Switch "identity" to bob and read. Bob has no pinned signing
+        # keys yet (fresh init), so opt into TOFU explicitly to receive
+        # alice's first-contact manifest. Real onboarding flows would
+        # use ``dnsmesh contacts add alice <pub> --signing-key <spk>``
+        # instead.
         cli.main(
             [
                 "init",
@@ -1274,6 +1279,7 @@ class TestSendRecv:
                 "--endpoint",
                 "http://x",
                 "--force",
+                "--allow-tofu",
             ]
         )
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
@@ -1313,7 +1319,9 @@ class TestSendRecv:
         cli.main(["send", "bob", "only-once"])
         capsys.readouterr()
 
-        # bob's CLI reads once
+        # bob's CLI reads once. --allow-tofu is required because bob's
+        # fresh init has no pinned contacts; without it the slot walk
+        # drops alice's manifest as a default-deny first-contact.
         cli.main(
             [
                 "init",
@@ -1322,6 +1330,7 @@ class TestSendRecv:
                 "--endpoint",
                 "http://x",
                 "--force",
+                "--allow-tofu",
             ]
         )
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")
@@ -1627,6 +1636,7 @@ class TestDnsResolvers:
                 "--endpoint",
                 "http://x",
                 "--force",
+                "--allow-tofu",
             ]
         )
         monkeypatch.setenv("DMP_PASSPHRASE", "bob-pass")

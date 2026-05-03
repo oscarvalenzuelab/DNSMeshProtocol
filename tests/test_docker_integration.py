@@ -204,7 +204,18 @@ def test_container_roundtrip(node_container):
         writer=writer,
         reader=reader,
     )
-    alice.add_contact("bob", bob.get_public_key_hex())
+    alice.add_contact(
+        "bob",
+        bob.get_public_key_hex(),
+        signing_key_hex=bob.get_signing_public_key_hex(),
+    )
+    # bob must pin alice's signing key so receive_messages doesn't fall
+    # into TOFU (default-deny after P0-3).
+    bob.add_contact(
+        "alice",
+        alice.get_public_key_hex(),
+        signing_key_hex=alice.get_signing_public_key_hex(),
+    )
 
     assert alice.send_message("bob", "hello from a real container")
 
@@ -228,25 +239,33 @@ def test_container_survives_client_restart(node_container):
         writer=writer,
         reader=reader,
     )
-    # Grab bob's pubkey without retaining the client instance.
-    bob_pubkey = DMPClient(
+    # Grab bob's pub + spk without retaining the client instance.
+    _bob_for_keys = DMPClient(
         "bob",
         "bob-pass",
         domain="mesh.docker",
         writer=writer,
         reader=reader,
-    ).get_public_key_hex()
-    alice.add_contact("bob", bob_pubkey)
+    )
+    bob_pubkey = _bob_for_keys.get_public_key_hex()
+    bob_spk = _bob_for_keys.get_signing_public_key_hex()
+    alice_spk = alice.get_signing_public_key_hex()
+    alice.add_contact("bob", bob_pubkey, signing_key_hex=bob_spk)
 
     assert alice.send_message("bob", "delivered after restart")
 
     # A brand-new Bob process (fresh ReplayCache, no prior state) reads.
+    # Bob must pin alice for the slot walk to deliver — same default-deny
+    # gate as test_container_roundtrip.
     bob_fresh = DMPClient(
         "bob",
         "bob-pass",
         domain="mesh.docker",
         writer=writer,
         reader=reader,
+    )
+    bob_fresh.add_contact(
+        "alice", alice.get_public_key_hex(), signing_key_hex=alice_spk
     )
     inbox = bob_fresh.receive_messages()
     assert len(inbox) == 1
@@ -294,6 +313,13 @@ def test_container_forward_secrecy_end_to_end(node_container, tmp_path):
         "bob-fs",
         bob.get_public_key_hex(),
         signing_key_hex=bob.get_signing_public_key_hex(),
+    )
+    # Bob pins alice — required so receive_messages doesn't drop her
+    # manifest as TOFU under the new default-deny gate.
+    bob.add_contact(
+        "alice-fs",
+        alice.get_public_key_hex(),
+        signing_key_hex=alice.get_signing_public_key_hex(),
     )
 
     # Bob seeds a small prekey pool (5 keys, 1 hr TTL).
@@ -633,7 +659,18 @@ def test_container_concurrent_receive_delivers_exactly_once(node_container):
         writer=writer,
         reader=reader,
     )
-    alice.add_contact("bob-conc", bob.get_public_key_hex())
+    alice.add_contact(
+        "bob-conc",
+        bob.get_public_key_hex(),
+        signing_key_hex=bob.get_signing_public_key_hex(),
+    )
+    # Bob pins alice — receive_messages drops manifests from unpinned
+    # signers when not in TOFU mode.
+    bob.add_contact(
+        "alice-conc",
+        alice.get_public_key_hex(),
+        signing_key_hex=alice.get_signing_public_key_hex(),
+    )
 
     # Single message — exactly-once delivery is the property under test.
     payload = "concurrent-receive payload for the race test"
