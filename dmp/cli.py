@@ -1034,18 +1034,26 @@ def _make_client(
     # zone — fetching the cluster manifest from foo.com but then writing
     # mailbox records under mesh.local would break send/recv entirely.
     effective_domain = _effective_domain(config)
-    client = DMPClient(
-        config.username,
-        passphrase,
-        domain=effective_domain,
-        writer=writer,
-        reader=reader,
-        replay_cache_path=replay_path,
-        kdf_salt=kdf_salt,
-        prekey_store_path=prekey_path,
-        intro_queue_path=intro_queue_path,
-        allow_tofu=config.allow_tofu,
-    )
+    try:
+        client = DMPClient(
+            config.username,
+            passphrase,
+            domain=effective_domain,
+            writer=writer,
+            reader=reader,
+            replay_cache_path=replay_path,
+            kdf_salt=kdf_salt,
+            prekey_store_path=prekey_path,
+            intro_queue_path=intro_queue_path,
+            allow_tofu=config.allow_tofu,
+        )
+    except RuntimeError as exc:
+        # Schema-version refusal from prekey/intro stores: surface as a
+        # friendly CLI error rather than a Python traceback. The
+        # exception text already names the file and the version
+        # mismatch, which is what the operator needs to act on
+        # (downgrade the binary or migrate the data file).
+        _die(1, f"{exc}")
     # Attach the cluster handle (if any) so the CLI can close it at
     # exit. Setting an attribute on DMPClient after construction is
     # intentionally unintrusive — we do not modify DMPClient itself,

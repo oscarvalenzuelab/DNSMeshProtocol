@@ -176,7 +176,8 @@ class TestSchemaVersioning:
         # Simulate the pre-versioning shape: bare schema, user_version
         # never stamped (still 0, sqlite default).
         legacy = sqlite3.connect(path, isolation_level=None)
-        legacy.executescript(IntroQueue._SCHEMA_V1)
+        for stmt in IntroQueue._SCHEMA_V1_STATEMENTS:
+            legacy.execute(stmt)
         legacy.execute(
             "INSERT INTO intros(sender_spk, msg_id, plaintext, "
             "sender_mailbox_domain, received_at, msg_exp) "
@@ -205,7 +206,8 @@ class TestSchemaVersioning:
 
         path = str(tmp_path / "future.db")
         future = sqlite3.connect(path, isolation_level=None)
-        future.executescript(IntroQueue._SCHEMA_V1)
+        for stmt in IntroQueue._SCHEMA_V1_STATEMENTS:
+            future.execute(stmt)
         # Stamp a version higher than the code knows.
         future.execute(f"PRAGMA user_version = {IntroQueue._SCHEMA_VERSION + 5}")
         future.close()

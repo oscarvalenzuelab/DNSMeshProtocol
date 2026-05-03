@@ -279,6 +279,69 @@ class TestPrekeyStoreSchemaVersioning:
         with pytest.raises(RuntimeError, match="schema version"):
             PrekeyStore(db)
 
+    def test_concurrent_migrations_do_not_race(self, tmp_path):
+        """Two PrekeyStore instances opening the SAME legacy
+        (no-wire_record, unstamped) db file simultaneously must not
+        race each other's ALTER. Without BEGIN IMMEDIATE both can read
+        user_version=0, both observe wire_record absent, both attempt
+        the column add — sqlite raises ``duplicate column name`` on
+        the second. With the explicit reserved-lock transaction, the
+        second waits for the first to commit and then sees the
+        post-migration state.
+        """
+        import sqlite3
+        import threading
+
+        db = str(tmp_path / "race.db")
+        # Seed a legacy v1 schema (no wire_record, unstamped).
+        legacy = sqlite3.connect(db, isolation_level=None)
+        legacy.executescript("""
+            CREATE TABLE prekeys (
+                prekey_id INTEGER PRIMARY KEY,
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                exp INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            """)
+        legacy.close()
+
+        errors: list = []
+        stores: list = []
+        start = threading.Event()
+        lock = threading.Lock()
+
+        def _worker():
+            start.wait()
+            try:
+                s = PrekeyStore(db)
+                with lock:
+                    stores.append(s)
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=_worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        start.set()
+        for t in threads:
+            t.join(timeout=10)
+
+        try:
+            assert not errors, f"concurrent migrations raised: {errors}"
+            for s in stores:
+                cols = {
+                    row[1]
+                    for row in s._conn.execute("PRAGMA table_info(prekeys)").fetchall()
+                }
+                assert "wire_record" in cols
+                stamped = s._conn.execute("PRAGMA user_version").fetchone()[0]
+                assert stamped == 2
+        finally:
+            for s in stores:
+                s.close()
+
 
 class TestRrsetNaming:
     def test_hashed_label(self):

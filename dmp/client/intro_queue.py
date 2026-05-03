@@ -69,7 +69,12 @@ class IntroQueue:
     older binary points at a newer database.
     """
 
-    _SCHEMA_V1 = """
+    # Schema v1 as individual statements (NOT a script). ``executescript``
+    # does an implicit COMMIT before running, which would end the
+    # ``BEGIN IMMEDIATE`` transaction in ``_migrate``. Issue each
+    # statement via ``execute`` to stay inside the explicit transaction.
+    _SCHEMA_V1_STATEMENTS = (
+        """
         CREATE TABLE IF NOT EXISTS intros (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender_spk BLOB NOT NULL,
@@ -80,15 +85,20 @@ class IntroQueue:
             received_at INTEGER NOT NULL,
             msg_exp INTEGER NOT NULL,
             UNIQUE(sender_spk, msg_id)
-        );
+        )
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_intros_received_at
-            ON intros(received_at DESC);
+            ON intros(received_at DESC)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS denylist (
             sender_spk BLOB PRIMARY KEY,
             blocked_at INTEGER NOT NULL,
             note TEXT NOT NULL DEFAULT ''
-        );
-    """
+        )
+        """,
+    )
 
     # Latest schema version this code understands. Bump on every
     # schema-affecting change and append the migration to ``_MIGRATIONS``.
@@ -138,7 +148,7 @@ class IntroQueue:
                     pass
 
     def _migrate(self) -> None:
-        """Apply schema migrations idempotently and stamp ``user_version``.
+        """Apply schema migrations atomically and stamp ``user_version``.
 
         Reads the current ``PRAGMA user_version`` (0 for fresh databases
         and for older databases that predate this versioning scheme).
@@ -151,19 +161,33 @@ class IntroQueue:
         newer-schema file, and silently doing nothing would risk
         downgrading the schema (or worse, writing old-shape rows into
         a newer-shape table).
+
+        Concurrency: ``BEGIN IMMEDIATE`` makes the read-then-write
+        atomic against another connection on the same file. The current
+        v0→v1 step is idempotent so two racers wouldn't corrupt each
+        other today, but future migrations that ALTER columns would,
+        so the lock is in place from the start.
         """
-        cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if cur_version > self._SCHEMA_VERSION:
-            raise RuntimeError(
-                f"intro_queue at {self._path!r} has schema version "
-                f"{cur_version}, but this binary only understands up to "
-                f"{self._SCHEMA_VERSION}. Refusing to open — using an "
-                f"older client against a newer database would risk "
-                f"silently dropping fields."
-            )
-        if cur_version < 1:
-            self._conn.executescript(self._SCHEMA_V1)
-            self._conn.execute(f"PRAGMA user_version = 1")
+        # autocommit isolation_level=None means we drive txs explicitly.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if cur_version > self._SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"intro_queue at {self._path!r} has schema version "
+                    f"{cur_version}, but this binary only understands up to "
+                    f"{self._SCHEMA_VERSION}. Refusing to open — using an "
+                    f"older client against a newer database would risk "
+                    f"silently dropping fields."
+                )
+            if cur_version < 1:
+                for stmt in self._SCHEMA_V1_STATEMENTS:
+                    self._conn.execute(stmt)
+                self._conn.execute("PRAGMA user_version = 1")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         try:
