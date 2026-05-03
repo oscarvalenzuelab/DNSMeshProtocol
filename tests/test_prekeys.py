@@ -94,6 +94,37 @@ class TestPrekeyRecord:
         assert past.is_expired()
         assert not future.is_expired()
 
+    def test_far_future_exp_rejected(self):
+        """Reject prekeys whose expiry is years out. A real pool
+        refreshes daily; year-3000 expiries would let a sender pin
+        a prekey in every recipient's local store forever, blocking
+        identity rotation and consuming disk."""
+        identity = DMPCrypto()
+        now = int(time.time())
+        pk = Prekey(
+            prekey_id=42,
+            public_key=identity.get_public_key_bytes(),
+            exp=now + 365 * 86400,  # 1 year — past the 30-day cap
+        )
+        wire = pk.sign(identity)
+        assert (
+            Prekey.parse_and_verify(wire, identity.get_signing_public_key_bytes())
+            is None
+        )
+
+    def test_exp_within_30_days_accepted(self):
+        identity = DMPCrypto()
+        now = int(time.time())
+        pk = Prekey(
+            prekey_id=43,
+            public_key=identity.get_public_key_bytes(),
+            exp=now + 29 * 86400,
+        )
+        wire = pk.sign(identity)
+        result = Prekey.parse_and_verify(wire, identity.get_signing_public_key_bytes())
+        assert result is not None
+        assert result.prekey_id == 43
+
 
 class TestPrekeyStore:
     def test_generate_and_lookup(self, tmp_path):

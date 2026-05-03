@@ -302,6 +302,32 @@ class TestRotationRecordSecurity:
         wire = rec.sign(old, new)
         assert RotationRecord.parse_and_verify(wire) is None
 
+    def test_far_future_exp_rejected(self):
+        """Reject records whose `exp` is past the 5-year cap. The CLI
+        defaults rotation `exp` to 1 year; 5 years leaves slack for
+        slow rotation cadences without letting an attacker pin a
+        chain-walk path indefinitely."""
+        old = _crypto()
+        new = _crypto()
+        rec = _make_rotation(
+            old_crypto=old,
+            new_crypto=new,
+            exp_delta=6 * 365 * 86400,  # 6 years — past the cap
+        )
+        wire = rec.sign(old, new)
+        assert RotationRecord.parse_and_verify(wire) is None
+
+    def test_exp_within_5y_cap_accepted(self):
+        old = _crypto()
+        new = _crypto()
+        rec = _make_rotation(
+            old_crypto=old,
+            new_crypto=new,
+            exp_delta=4 * 365 * 86400,  # 4 years — under the cap
+        )
+        wire = rec.sign(old, new)
+        assert RotationRecord.parse_and_verify(wire) is not None
+
     def test_invalid_subject_type_enum_rejected_on_sign(self):
         old = _crypto()
         new = _crypto()

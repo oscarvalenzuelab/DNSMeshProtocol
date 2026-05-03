@@ -127,6 +127,46 @@ class TestSlotManifest:
         assert parsed.is_expired()
 
 
+class TestSlotManifestFutureSkew:
+    """A signed manifest whose `exp` is years in the future must
+    drop on parse — without this, a sender could publish entries
+    that every receiver remembers in their replay cache for the
+    lifetime of the universe."""
+
+    def test_far_future_exp_rejected(self):
+        sender = DMPCrypto()
+        now = int(time.time())
+        manifest = SlotManifest(
+            msg_id=uuid.uuid4().bytes,
+            sender_spk=sender.get_signing_public_key_bytes(),
+            recipient_id=b"\x01" * 32,
+            total_chunks=1,
+            data_chunks=1,
+            prekey_id=0,
+            ts=now,
+            exp=now + 365 * 86400,  # 1 year out — past the 30-day cap
+        )
+        wire = manifest.sign(sender)
+        assert SlotManifest.parse_and_verify(wire) is None
+
+    def test_exp_within_30_days_accepted(self):
+        sender = DMPCrypto()
+        now = int(time.time())
+        manifest = SlotManifest(
+            msg_id=uuid.uuid4().bytes,
+            sender_spk=sender.get_signing_public_key_bytes(),
+            recipient_id=b"\x01" * 32,
+            total_chunks=1,
+            data_chunks=1,
+            prekey_id=0,
+            ts=now,
+            exp=now + 29 * 86400,
+        )
+        wire = manifest.sign(sender)
+        result = SlotManifest.parse_and_verify(wire)
+        assert result is not None
+
+
 class TestReplayCache:
     def test_first_seen_accepted(self):
         cache = ReplayCache()

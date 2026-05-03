@@ -56,6 +56,13 @@ from dmp.core.crypto import DMPCrypto
 
 RECORD_PREFIX = "v=dmp1;t=cluster;"
 
+# Upper bound on how far in the future a cluster manifest's signed
+# `exp` can be. The supplied generator defaults to one year;
+# operators may go to two on slow-rotation deployments. A 5-year
+# ceiling leaves headroom while bounding the staleness window of
+# pinned cluster roots.
+MAX_EXP_FUTURE_SECONDS = 5 * 365 * 86400
+
 _MAGIC = b"DMPCL01"
 _SIG_LEN = 64
 _OPERATOR_SPK_LEN = 32
@@ -561,6 +568,13 @@ class ClusterManifest:
         # time.time()), the manifest is stale and must be rejected.
         now_ts = int(time.time()) if now is None else int(now)
         if manifest.exp < now_ts:
+            return None
+        # Reject manifests whose expiry is years out. Cluster
+        # operators rotate manifests on a 6-12 month cadence; the
+        # supplied generator defaults to one year. A 5-year ceiling
+        # leaves slack for slow rotation while bounding the
+        # worst-case staleness of trust roots clients pin.
+        if manifest.exp - now_ts > MAX_EXP_FUTURE_SECONDS:
             return None
 
         # 8. If the caller specified the expected cluster name, bind the

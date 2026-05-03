@@ -568,6 +568,46 @@ class TestClusterManifestExpiry:
             is None
         )
 
+    def test_far_future_exp_rejected(self):
+        """Drop manifests whose `exp` is past the 5-year cap. The
+        bundled generator defaults to one-year manifests; 5 years
+        is generous slack for slow operator cadences without letting
+        a stale trust root persist indefinitely in client state."""
+        operator = _make_operator()
+        now = int(time.time())
+        mf = ClusterManifest(
+            cluster_name="c.example.com",
+            operator_spk=operator.get_signing_public_key_bytes(),
+            nodes=[_make_node(1)],
+            seq=1,
+            exp=now + 6 * 365 * 86400,  # 6 years
+        )
+        wire = mf.sign(operator)
+        assert (
+            ClusterManifest.parse_and_verify(
+                wire, operator.get_signing_public_key_bytes(), now=now
+            )
+            is None
+        )
+
+    def test_exp_within_5y_cap_accepted(self):
+        operator = _make_operator()
+        now = int(time.time())
+        mf = ClusterManifest(
+            cluster_name="c.example.com",
+            operator_spk=operator.get_signing_public_key_bytes(),
+            nodes=[_make_node(1)],
+            seq=1,
+            exp=now + 4 * 365 * 86400,  # 4 years
+        )
+        wire = mf.sign(operator)
+        assert (
+            ClusterManifest.parse_and_verify(
+                wire, operator.get_signing_public_key_bytes(), now=now
+            )
+            is not None
+        )
+
     def test_now_kwarg_overrides_wall_clock(self):
         operator = _make_operator()
         now = int(time.time())

@@ -116,6 +116,14 @@ MAX_SLOT = 9
 # of captured claims, tolerates clock drift + queuing.
 _DEFAULT_TS_SKEW_SECONDS = 300
 
+# Upper bound on how far in the future a claim's signed `exp` can
+# be. Claims describe pending message deliveries and live as long
+# as the underlying manifest; 30 days of headroom covers slow-
+# delivery scenarios while bounding the intro-queue and replay-
+# cache bloat a sender could induce by publishing far-future
+# claims that every recipient must remember.
+_MAX_EXP_FUTURE_SECONDS = 30 * 86400
+
 
 @dataclass(frozen=True)
 class ClaimRecord:
@@ -341,6 +349,13 @@ class ClaimRecord:
         if record.ts - now > ts_skew_seconds:
             return None
         if record.exp <= now:
+            return None
+        # Refuse claims whose expiry is too far in the future. Real
+        # claims live as long as the underlying manifest (typically
+        # under a day); year-3000 expiries are a sender trying to
+        # pin a row in every recipient's intro queue / replay cache
+        # for the lifetime of the universe.
+        if record.exp - now > _MAX_EXP_FUTURE_SECONDS:
             return None
 
         return record
