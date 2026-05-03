@@ -142,3 +142,93 @@ class TestPersistence:
         # should be set (0o600).
         mode = stat.S_IMODE(os.stat(path).st_mode)
         assert mode & 0o077 == 0, f"intros.db is too permissive: 0o{mode:o}"
+
+
+class TestSchemaVersioning:
+    """``PRAGMA user_version`` migration ladder. Without versioning, a
+    schema bump that adds a column (or worse, drops one) silently
+    misalligns deployed databases against the running code. The
+    versioning makes upgrades + downgrades explicit failures."""
+
+    def test_fresh_db_is_stamped_at_current_version(self, tmp_path):
+        """A brand-new database lands at the latest schema version, so
+        future migrations know they only need to apply the v(N→N+1) step
+        rather than re-running the v0→v1 baseline."""
+        import sqlite3
+
+        path = str(tmp_path / "fresh.db")
+        q = IntroQueue(path)
+        try:
+            stored = q._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == IntroQueue._SCHEMA_VERSION
+        finally:
+            q.close()
+
+    def test_legacy_unversioned_db_migrates_to_current(self, tmp_path):
+        """An existing database created by a pre-versioning binary
+        (user_version=0, bare CREATE TABLE schema) opens cleanly: the
+        v0→v1 step re-runs CREATE TABLE IF NOT EXISTS (idempotent) and
+        stamps the version. Existing rows are preserved.
+        """
+        import sqlite3
+
+        path = str(tmp_path / "legacy.db")
+        # Simulate the pre-versioning shape: bare schema, user_version
+        # never stamped (still 0, sqlite default).
+        legacy = sqlite3.connect(path, isolation_level=None)
+        legacy.executescript(IntroQueue._SCHEMA_V1)
+        legacy.execute(
+            "INSERT INTO intros(sender_spk, msg_id, plaintext, "
+            "sender_mailbox_domain, received_at, msg_exp) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (b"\xaa" * 32, b"\xbb" * 16, b"legacy intro", "old.host", 100, 200),
+        )
+        legacy.close()
+
+        q = IntroQueue(path)
+        try:
+            stored = q._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == 1
+            rows = q.list_intros()
+            assert len(rows) == 1
+            assert rows[0].plaintext == b"legacy intro"
+        finally:
+            q.close()
+
+    def test_future_version_db_refuses_to_open(self, tmp_path):
+        """A database whose stored version is HIGHER than this code
+        understands must NOT open silently — running an older binary
+        against a newer schema would risk dropping fields the binary
+        doesn't know about. Hard error with the version mismatch.
+        """
+        import sqlite3
+
+        path = str(tmp_path / "future.db")
+        future = sqlite3.connect(path, isolation_level=None)
+        future.executescript(IntroQueue._SCHEMA_V1)
+        # Stamp a version higher than the code knows.
+        future.execute(f"PRAGMA user_version = {IntroQueue._SCHEMA_VERSION + 5}")
+        future.close()
+
+        with pytest.raises(RuntimeError, match="schema version"):
+            IntroQueue(path)
+
+    def test_reopen_existing_versioned_db_is_idempotent(self, tmp_path):
+        """A database already at the current version opens without
+        re-running migrations or bumping the stamp."""
+        path = str(tmp_path / "stable.db")
+        q1 = IntroQueue(path)
+        intro_id = _seed(q1)
+        v_after_first = q1._conn.execute("PRAGMA user_version").fetchone()[0]
+        q1.close()
+
+        q2 = IntroQueue(path)
+        try:
+            v_after_reopen = q2._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert v_after_reopen == v_after_first
+            # Data intact.
+            rows = q2.list_intros()
+            assert len(rows) == 1
+            assert rows[0].intro_id == intro_id
+        finally:
+            q2.close()

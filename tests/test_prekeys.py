@@ -165,6 +165,121 @@ class TestPrekeyStore:
             s2.close()
 
 
+class TestPrekeyStoreSchemaVersioning:
+    """``PRAGMA user_version`` migration ladder for the prekey store.
+
+    Pre-versioning binaries left ``user_version=0`` and ran an inline
+    column-presence check to add ``wire_record`` for v1→v2. The new
+    versioning makes that step explicit and stamps the version so future
+    bumps don't have to re-derive the schema state from PRAGMA
+    table_info every open.
+    """
+
+    def test_fresh_db_is_stamped_at_current_version(self, tmp_path):
+        from dmp.core.prekeys import _SCHEMA_VERSION
+
+        db = str(tmp_path / "fresh.db")
+        store = PrekeyStore(db)
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == _SCHEMA_VERSION
+        finally:
+            store.close()
+
+    def test_legacy_pre_wire_record_db_migrates_to_v2(self, tmp_path):
+        """A db created by the very first prekey-store binary (no
+        wire_record column, user_version unstamped) opens cleanly: the
+        v1→v2 step adds the column and stamps the version. Existing
+        rows are preserved."""
+        import sqlite3
+
+        db = str(tmp_path / "legacy.db")
+        # Mimic the original v1 schema: no wire_record column.
+        legacy = sqlite3.connect(db, isolation_level=None)
+        legacy.executescript("""
+            CREATE TABLE prekeys (
+                prekey_id INTEGER PRIMARY KEY,
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                exp INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            """)
+        legacy.execute(
+            "INSERT INTO prekeys(prekey_id, private_key, public_key, "
+            "exp, created_at) VALUES(?, ?, ?, ?, ?)",
+            (42, b"\x01" * 32, b"\x02" * 32, 9_999_999_999, 100),
+        )
+        legacy.close()
+
+        store = PrekeyStore(db)
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == 2
+            cols = {
+                row[1]
+                for row in store._conn.execute("PRAGMA table_info(prekeys)").fetchall()
+            }
+            assert "wire_record" in cols
+            # Old row still findable. get_private_key returns the
+            # constructed X25519PrivateKey, not raw bytes; existence is
+            # what the migration test cares about.
+            assert store.get_private_key(42) is not None
+        finally:
+            store.close()
+
+    def test_legacy_v1_5_with_wire_record_but_unstamped(self, tmp_path):
+        """Some pre-versioning binaries DID add wire_record via the old
+        inline migration but never stamped user_version. The v1→v2 step
+        must skip the duplicate ALTER (sqlite would raise) and just
+        stamp the version."""
+        import sqlite3
+
+        db = str(tmp_path / "legacy_with_wr.db")
+        legacy = sqlite3.connect(db, isolation_level=None)
+        legacy.executescript("""
+            CREATE TABLE prekeys (
+                prekey_id INTEGER PRIMARY KEY,
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                exp INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                wire_record TEXT DEFAULT ''
+            );
+            """)
+        legacy.close()
+
+        store = PrekeyStore(db)
+        try:
+            stored = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert stored == 2
+        finally:
+            store.close()
+
+    def test_future_version_db_refuses_to_open(self, tmp_path):
+        import sqlite3
+
+        from dmp.core.prekeys import _SCHEMA_VERSION
+
+        db = str(tmp_path / "future.db")
+        future = sqlite3.connect(db, isolation_level=None)
+        future.executescript("""
+            CREATE TABLE prekeys (
+                prekey_id INTEGER PRIMARY KEY,
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                exp INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                wire_record TEXT DEFAULT ''
+            );
+            """)
+        future.execute(f"PRAGMA user_version = {_SCHEMA_VERSION + 5}")
+        future.close()
+
+        with pytest.raises(RuntimeError, match="schema version"):
+            PrekeyStore(db)
+
+
 class TestRrsetNaming:
     def test_hashed_label(self):
         name = prekey_rrset_name("alice", "mesh.example.com")

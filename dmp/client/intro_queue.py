@@ -60,9 +60,16 @@ class IntroQueue:
 
     Pass ``":memory:"`` for tests; pass a real path in CLI use so
     pending intros survive across CLI invocations.
+
+    Schema versioning (P1): the schema is stamped via
+    ``PRAGMA user_version``. Each schema bump appends a step to
+    ``_migrate`` and increments ``_SCHEMA_VERSION``. Opening a
+    database whose stored version is HIGHER than this code knows
+    raises — refusing a silent downgrade prevents data loss when an
+    older binary points at a newer database.
     """
 
-    _SCHEMA = """
+    _SCHEMA_V1 = """
         CREATE TABLE IF NOT EXISTS intros (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender_spk BLOB NOT NULL,
@@ -82,6 +89,10 @@ class IntroQueue:
             note TEXT NOT NULL DEFAULT ''
         );
     """
+
+    # Latest schema version this code understands. Bump on every
+    # schema-affecting change and append the migration to ``_MIGRATIONS``.
+    _SCHEMA_VERSION = 1
 
     def __init__(self, path: str = ":memory:") -> None:
         self._path = path
@@ -110,7 +121,7 @@ class IntroQueue:
             check_same_thread=False,
             isolation_level=None,  # autocommit
         )
-        self._conn.executescript(self._SCHEMA)
+        self._migrate()
         if path != ":memory:":
             try:
                 self._conn.execute("PRAGMA journal_mode=WAL")
@@ -125,6 +136,34 @@ class IntroQueue:
                         os.chmod(sibling, 0o600)
                 except OSError:
                     pass
+
+    def _migrate(self) -> None:
+        """Apply schema migrations idempotently and stamp ``user_version``.
+
+        Reads the current ``PRAGMA user_version`` (0 for fresh databases
+        and for older databases that predate this versioning scheme).
+        The v0→v1 step is a CREATE TABLE IF NOT EXISTS pass — idempotent
+        for both cases — and stamps ``user_version=1``. Future schema
+        changes append a v1→v2 step (etc.) and bump ``_SCHEMA_VERSION``.
+
+        Refuses to open a database whose stored version is higher than
+        ``_SCHEMA_VERSION``: that means an older binary opened a
+        newer-schema file, and silently doing nothing would risk
+        downgrading the schema (or worse, writing old-shape rows into
+        a newer-shape table).
+        """
+        cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if cur_version > self._SCHEMA_VERSION:
+            raise RuntimeError(
+                f"intro_queue at {self._path!r} has schema version "
+                f"{cur_version}, but this binary only understands up to "
+                f"{self._SCHEMA_VERSION}. Refusing to open — using an "
+                f"older client against a newer database would risk "
+                f"silently dropping fields."
+            )
+        if cur_version < 1:
+            self._conn.executescript(self._SCHEMA_V1)
+            self._conn.execute(f"PRAGMA user_version = 1")
 
     def close(self) -> None:
         try:
