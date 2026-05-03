@@ -225,8 +225,8 @@ class ResolverPool(DNSRecordReader):
         failure_threshold: int = 1,
         dnssec_required: bool = False,
     ) -> None:
-        """``dnssec_required`` (P0-4): when True, every TXT lookup
-        requires the upstream resolver's reply to carry the AD
+        """``dnssec_required`` (P0-4): when True, every TXT/A/AAAA/NS
+        lookup requires the upstream resolver's reply to carry the AD
         (Authenticated Data) flag — i.e. a validating recursor signed off
         on the answer. Replies missing AD are treated as transport
         failures and the upstream is demoted, so a non-validating or
@@ -241,6 +241,18 @@ class ResolverPool(DNSRecordReader):
           - The pool also queries the recursor with the EDNS DO bit set
             so the recursor knows we want DNSSEC processing; without DO,
             many recursors strip RRSIGs and never set AD.
+          - **Negative responses are NOT validated.** dnspython raises
+            ``NXDOMAIN`` / ``NoAnswer`` before our gate sees the message,
+            and the exception drops the AD-bit context. So an attacker
+            who can return ``NXDOMAIN`` (e.g. via spoofed UDP) still
+            gets a "no records" outcome through the pool — the response
+            is unauthenticated denial. Mitigations: pair with a trusted
+            local recursor that validates negative responses (NSEC/NSEC3
+            chains) and refuses unsigned denials, OR fall back to
+            full local validation. Tracked as follow-up: switch the
+            ``dnssec_required=True`` path to lower-level
+            ``dns.message`` + ``dns.query`` so the AD bit on negative
+            responses is reachable.
           - Local validation against a trust anchor is a separate, larger
             project; that requires shipping/refreshing the root anchor
             and full chain validation in-process.
@@ -502,6 +514,14 @@ class ResolverPool(DNSRecordReader):
             except self._NAME_NOT_FOUND_ERRORS:
                 continue
             except self._TRANSPORT_ERRORS:
+                self._mark_failure(state)
+                continue
+            # P0-4: same AD-bit gate as TXT/A/AAAA. NS records feed the
+            # DNS UPDATE writer's split-host target chase
+            # (dns_update_writer:_resolve_to_ip), so an unvalidated NS
+            # answer routes writes to an attacker-chosen host. Demote
+            # the upstream and try the next.
+            if self._dnssec_required and not _ad_bit_set(answers):
                 self._mark_failure(state)
                 continue
             self._mark_success(state)

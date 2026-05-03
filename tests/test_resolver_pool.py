@@ -608,6 +608,45 @@ class TestResolverPoolDnssecGate:
             assert options >= 0, "EDNS not enabled on dnssec_required resolver"
             assert state.resolver.ednsflags & dns.flags.DO
 
+    def test_required_drops_ad_less_ns_answer(self):
+        """resolve_ns_hosts feeds the DNS UPDATE writer's split-host
+        target chase. An unvalidated NS reply would route writes to an
+        attacker-chosen host, so the AD gate must apply there too —
+        codex review of PR #39 caught the original gap.
+        """
+
+        class _FakeNsRdata:
+            def __init__(self, target):
+                # dnspython's NS rdata exposes .target as a dns.name.Name
+                self.target = dns.name.from_text(target)
+
+        def _ns_answer(*targets, ad: bool):
+            ans = _FakeAnswer()
+            for t in targets:
+                ans.append(_FakeNsRdata(t))
+            ans.response = _FakeResponse(dns.flags.AD if ad else 0)
+            return ans
+
+        # AD set: NS hosts returned.
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(
+                {"1.1.1.1": lambda n, t: _ns_answer("ns1.example.com.", ad=True)}
+            )
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            assert pool.resolve_ns_hosts("example.com") == ["ns1.example.com"]
+
+        # AD unset: must drop, return empty list.
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(
+                {"1.1.1.1": lambda n, t: _ns_answer("ns1.example.com.", ad=False)}
+            )
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            assert pool.resolve_ns_hosts("example.com") == []
+
 
 # ---------------------------------------------------------------------
 # Health tracking & cooldown
