@@ -76,8 +76,16 @@ class Prekey:
     exp: int  # unix seconds after which recipient may drop
 
     def to_body_bytes(self) -> bytes:
-        if not (0 <= self.prekey_id < (1 << 32)):
-            raise ValueError("prekey_id out of range")
+        # ``prekey_id == 0`` is reserved as the manifest sentinel
+        # ``NO_PREKEY`` (see dmp.core.manifest); a signed record
+        # carrying it would be ambiguous with the "no prekey
+        # selected, fall back to long-term X25519" path on the
+        # receiver. Refuse to construct such a record at all.
+        if not (1 <= self.prekey_id < (1 << 32)):
+            raise ValueError(
+                "prekey_id out of range (must be 1..2^32-1; "
+                "0 is reserved as NO_PREKEY)"
+            )
         if len(self.public_key) != 32:
             raise ValueError("public_key must be 32 bytes")
         return (
@@ -90,8 +98,18 @@ class Prekey:
     def from_body_bytes(cls, body: bytes) -> "Prekey":
         if len(body) != _BODY_LEN:
             raise ValueError(f"prekey body must be {_BODY_LEN} bytes, got {len(body)}")
+        prekey_id = int.from_bytes(body[0:4], "big")
+        # Reject the reserved NO_PREKEY value at parse time so a
+        # malicious or buggy peer can't publish a signed prekey
+        # record that the sender then picks, silently bypassing
+        # forward secrecy on the manifest wire.
+        if prekey_id == 0:
+            raise ValueError(
+                "prekey_id 0 is reserved as NO_PREKEY and not valid "
+                "in a signed prekey record"
+            )
         return cls(
-            prekey_id=int.from_bytes(body[0:4], "big"),
+            prekey_id=prekey_id,
             public_key=body[4:36],
             exp=int.from_bytes(body[36:44], "big"),
         )
@@ -375,6 +393,14 @@ class PrekeyStore:
 
     def get_private_key(self, prekey_id: int) -> Optional[X25519PrivateKey]:
         """Return the sk for a given prekey_id, or None if absent / expired."""
+        # Refuse the reserved sentinel even if a legacy/imported db
+        # has a row at prekey_id=0. The manifest wire encodes "no
+        # prekey, fall back to long-term key" as 0; a successful
+        # lookup here would silently strip forward secrecy from a
+        # session that the receiver was meant to recognize as the
+        # legacy fallback path.
+        if prekey_id == 0:
+            return None
         with self._lock:
             row = self._conn.execute(
                 "SELECT private_key FROM prekeys WHERE prekey_id = ? AND exp > ?",
@@ -391,6 +417,13 @@ class PrekeyStore:
         row is gone, a later leak of the long-term X25519 key cannot
         recover the same session key.
         """
+        # Same refusal as ``get_private_key``: the reserved sentinel
+        # is not a consumable prekey. Don't delete a legacy id=0
+        # row here either — leave it alone so an operator can audit
+        # how it got there. (A separate one-off cleanup migration
+        # could remove zero rows; out of scope for this fix.)
+        if prekey_id == 0:
+            return False
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM prekeys WHERE prekey_id = ?", (prekey_id,)
