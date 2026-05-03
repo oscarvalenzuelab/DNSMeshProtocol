@@ -583,6 +583,58 @@ class TestAtomicRotation:
         )
 
 
+class TestUnhandled500IsLogged:
+    """Operators must see SOMETHING in the log when an internal
+    ``except Exception`` swallows a 500 — without it, the bug that
+    almost killed PR #36's CI (a sqlite cross-thread Connection race
+    surfacing as 500) was diagnosable only by reproducing it manually.
+    """
+
+    def test_500_path_emits_exception_log(self, reg_enabled, monkeypatch, caplog):
+        """Force a non-RegistrationError exception out of confirm and
+        assert the swallow path emits a log record carrying the route
+        + traceback."""
+        import logging
+
+        api, _, _, _ = reg_enabled
+
+        # Stub confirm_registration to raise a generic Exception that
+        # http_api treats as "unknown internal error" (NOT a
+        # RegistrationError, which has its own 4xx mapping).
+        from dmp.server import registration as reg_mod
+
+        def _boom(**_kwargs):
+            raise RuntimeError("synthetic internal failure for log test")
+
+        monkeypatch.setattr(reg_mod, "confirm_registration", _boom)
+
+        # The HTTP handler imports via ``from dmp.server.registration
+        # import ... confirm_registration`` inside the function body, so
+        # patching the module attribute is enough — there's no top-of-
+        # file rebind to also patch.
+
+        signer = Ed25519PrivateKey.generate()
+        with caplog.at_level(logging.ERROR, logger="dmp.server.http_api"):
+            r = _sign_and_confirm(api, "alice@example.com", signer)
+
+        assert r.status_code == 500
+        # Must have emitted at least one record naming the route, with
+        # the traceback attached.
+        matches = [
+            rec
+            for rec in caplog.records
+            if rec.name == "dmp.server.http_api"
+            and "route=/v1/registration/confirm" in rec.getMessage()
+        ]
+        assert matches, (
+            "expected a log record from dmp.server.http_api naming the "
+            f"500 route; got: {[(r.name, r.getMessage()) for r in caplog.records]}"
+        )
+        # log.exception() carries exc_info — verify the original
+        # exception is reachable for stack-trace dumping.
+        assert any(rec.exc_info is not None for rec in matches)
+
+
 class TestMalformedBodies:
     def test_missing_fields(self, reg_enabled):
         api, _, _, _ = reg_enabled
