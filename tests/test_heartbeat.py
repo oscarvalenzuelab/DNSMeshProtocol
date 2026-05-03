@@ -215,6 +215,32 @@ class TestFreshness:
         with pytest.raises(ValueError, match="exp must be strictly greater"):
             bad.to_body_bytes()
 
+    def test_far_future_exp_rejected(self, signer: DMPCrypto, now: int) -> None:
+        """Heartbeats are short-lived liveness pings (default TTL is
+        minutes). A heartbeat with `exp` more than 30 days out would
+        let an operator pin a stale endpoint in every peer's
+        seen-store essentially forever."""
+        hb = HeartbeatRecord(
+            endpoint="https://dmp.example.com",
+            operator_spk=signer.get_signing_public_key_bytes(),
+            version="0.1.0",
+            ts=now,
+            exp=now + 365 * 86400,  # 1 year — past the 30-day cap
+        )
+        wire = hb.sign(signer)
+        assert HeartbeatRecord.parse_and_verify(wire, now=now) is None
+
+    def test_exp_within_30_days_accepted(self, signer: DMPCrypto, now: int) -> None:
+        hb = HeartbeatRecord(
+            endpoint="https://dmp.example.com",
+            operator_spk=signer.get_signing_public_key_bytes(),
+            version="0.1.0",
+            ts=now,
+            exp=now + 29 * 86400,
+        )
+        wire = hb.sign(signer)
+        assert HeartbeatRecord.parse_and_verify(wire, now=now) is not None
+
 
 # ---------------------------------------------------------------------------
 # Endpoint shape enforcement

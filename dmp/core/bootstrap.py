@@ -59,6 +59,12 @@ from dmp.core.cluster import _validate_dns_name
 
 RECORD_PREFIX = "v=dmp1;t=bootstrap;"
 
+# Upper bound on how far in the future a bootstrap record's signed
+# `exp` can be. Same 5-year ceiling as rotation/cluster — anchors
+# rotate on a multi-year cadence, so 5y leaves headroom while
+# bounding the staleness of pinned trust roots.
+MAX_EXP_FUTURE_SECONDS = 5 * 365 * 86400
+
 _MAGIC = b"DMPBS01"
 _SIG_LEN = 64
 _SIGNER_SPK_LEN = 32
@@ -471,6 +477,12 @@ class BootstrapRecord:
         # 7. Expiry.
         now_ts = int(time.time()) if now is None else int(now)
         if record.exp < now_ts:
+            return None
+        # Reject records with absurdly far-future expiry. Bootstrap
+        # anchors typically rotate every 1-2 years; a 5-year ceiling
+        # leaves headroom for slow rotation cadences while bounding
+        # the staleness window of pinned trust roots.
+        if record.exp - now_ts > MAX_EXP_FUTURE_SECONDS:
             return None
 
         # 8. If the caller specified the expected user domain, bind the

@@ -56,6 +56,12 @@ _BODY_LEN = 4 + 32 + 8  # prekey_id + pub + exp = 44
 _SIG_LEN = 64
 _WIRE_LEN = _BODY_LEN + _SIG_LEN  # 108 bytes
 
+# Upper bound on how far in the future a prekey's signed `exp` can
+# be. Operators typically refresh prekey pools daily; 30 days is
+# generous headroom while bounding the local-store bloat a sender
+# could induce by publishing pools with year-3000 expiries.
+MAX_EXP_FUTURE_SECONDS = 30 * 86400
+
 
 def prekey_rrset_name(username: str, base_domain: str) -> str:
     """DNS name at which a user's prekey pool is published.
@@ -144,6 +150,13 @@ class Prekey:
         except ValueError:
             return None
         if not DMPCrypto.verify_signature(body, sig, expected_signer_spk):
+            return None
+        # Refuse prekeys whose expiry is far in the future. A real
+        # pool refreshes every day or so; a year-3000 `exp` would
+        # let a sender pin a prekey in every recipient's local store
+        # for the lifetime of the universe, blocking ID rotation
+        # and consuming disk.
+        if pk.exp - int(time.time()) > MAX_EXP_FUTURE_SECONDS:
             return None
         return pk
 

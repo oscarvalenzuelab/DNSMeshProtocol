@@ -529,6 +529,47 @@ class TestBootstrapRecordExpiry:
         assert not future.is_expired()
         assert past.is_expired()
 
+    def test_far_future_exp_rejected(self):
+        """Records with `exp` more than 5 years out are dropped on
+        parse. Bootstrap anchors rotate every 1-2 years; a year-3000
+        signed record would let an operator pin a stale trust root
+        in every recipient's bootstrap state for the lifetime of the
+        universe."""
+        signer = _make_signer()
+        now = int(time.time())
+        record = BootstrapRecord(
+            user_domain="example.com",
+            signer_spk=signer.get_signing_public_key_bytes(),
+            entries=[_make_entry()],
+            seq=1,
+            exp=now + 6 * 365 * 86400,  # 6 years — past 5-year cap
+        )
+        wire = record.sign(signer)
+        assert (
+            BootstrapRecord.parse_and_verify(
+                wire, signer.get_signing_public_key_bytes(), now=now
+            )
+            is None
+        )
+
+    def test_exp_within_5y_cap_accepted(self):
+        signer = _make_signer()
+        now = int(time.time())
+        record = BootstrapRecord(
+            user_domain="example.com",
+            signer_spk=signer.get_signing_public_key_bytes(),
+            entries=[_make_entry()],
+            seq=1,
+            exp=now + 4 * 365 * 86400,  # 4 years — within cap
+        )
+        wire = record.sign(signer)
+        assert (
+            BootstrapRecord.parse_and_verify(
+                wire, signer.get_signing_public_key_bytes(), now=now
+            )
+            is not None
+        )
+
 
 # ---- size -----------------------------------------------------------------
 

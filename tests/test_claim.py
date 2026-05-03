@@ -211,6 +211,35 @@ class TestFreshness:
         wire = record.sign(c)
         assert ClaimRecord.parse_and_verify(wire) is not None
 
+    def test_far_future_exp_rejected(self):
+        """A signed claim with an `exp` years in the future must drop.
+        Real claims live as long as the underlying manifest (under a
+        day in practice); a year-3000 expiry is a sender trying to
+        pin an entry in every recipient's intro queue / replay cache
+        forever."""
+        c = _crypto()
+        now = int(time.time())
+        record = _claim(
+            sender_spk=c.get_signing_public_key_bytes(),
+            ts=now,
+            exp=now + 365 * 86400,  # 1 year out — well past the 30-day cap
+        )
+        wire = record.sign(c)
+        assert ClaimRecord.parse_and_verify(wire) is None
+
+    def test_exp_within_30_days_accepted(self):
+        """An expiry just under the 30-day cap is still accepted —
+        the bound is generous enough for slow-delivery scenarios."""
+        c = _crypto()
+        now = int(time.time())
+        record = _claim(
+            sender_spk=c.get_signing_public_key_bytes(),
+            ts=now,
+            exp=now + 29 * 86400,  # 29 days — under the 30-day cap
+        )
+        wire = record.sign(c)
+        assert ClaimRecord.parse_and_verify(wire) is not None
+
 
 class TestFieldValidation:
     def test_msg_id_wrong_length_rejected(self):

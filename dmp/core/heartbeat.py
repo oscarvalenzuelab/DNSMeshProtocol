@@ -113,6 +113,13 @@ MAX_WIRE_LEN = 1200  # matches ClusterManifest / RotationRecord
 # network queuing but not an attacker sitting on an old heartbeat.
 _DEFAULT_TS_SKEW_SECONDS = 300
 
+# Upper bound on how far in the future a heartbeat's signed `exp`
+# can be. Heartbeats are short-lived liveness pings; the default
+# TTL is minutes. A 30-day ceiling is far above any legitimate
+# value while bounding the seen-store bloat an operator could
+# induce by publishing an endpoint pin with year-3000 expiry.
+MAX_EXP_FUTURE_SECONDS = 30 * 86400
+
 # Low-order Ed25519 pubkey rejection delegates to
 # dmp.core.ed25519_points so registration + heartbeat + any future
 # signed-record consumer share a single authoritative list.
@@ -523,6 +530,12 @@ class HeartbeatRecord:
         if abs(record.ts - now) > ts_skew_seconds:
             return None
         if record.exp <= now:
+            return None
+        # Heartbeats are short-lived liveness pings (default TTL is
+        # minutes). Reject any with `exp` more than 30 days out — a
+        # year-3000 heartbeat would let an operator pin a stale
+        # endpoint in every peer's seen-store essentially forever.
+        if record.exp - now > MAX_EXP_FUTURE_SECONDS:
             return None
 
         return record

@@ -57,6 +57,14 @@ from dmp.core.crypto import DMPCrypto
 RECORD_PREFIX_ROTATION = "v=dmp1;t=rotation;"
 RECORD_PREFIX_REVOCATION = "v=dmp1;t=revocation;"
 
+# Upper bound on how far in the future a rotation record's signed
+# `exp` can be. Real operators rotate every 6-12 months; the CLI
+# default is one year. A 5-year ceiling is generous enough that no
+# legitimate flow hits it, tight enough that an attacker can't
+# pin entries in every chain-walker's state for the lifetime of
+# the universe.
+MAX_EXP_FUTURE_SECONDS = 5 * 365 * 86400
+
 _MAGIC_ROTATION = b"DMPROT1"
 _MAGIC_REVOCATION = b"DMPRV01"
 _SIG_LEN = 64
@@ -438,6 +446,14 @@ class RotationRecord:
         # 8. Expiry.
         now_ts = int(time.time()) if now is None else int(now)
         if record.exp < now_ts:
+            return None
+        # Refuse rotation records whose expiry is absurdly far in the
+        # future. Operators typically rotate every 6 months to a year;
+        # the CLI's `dnsmesh identity rotate` defaults to a one-year
+        # exp. A 5-year ceiling leaves headroom for slow-rotation
+        # deployments while bounding the worst-case state a
+        # rotation-chain walker has to keep around for.
+        if record.exp - now_ts > MAX_EXP_FUTURE_SECONDS:
             return None
 
         return record

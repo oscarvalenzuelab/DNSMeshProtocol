@@ -52,6 +52,14 @@ _SIG_LEN = 64
 _WIRE_LEN = _BODY_LEN + _SIG_LEN  # 172 bytes
 DEFAULT_MANIFEST_TTL = 300
 
+# Upper bound on how far in the future a manifest's signed `exp`
+# can be. Real messages live for minutes to hours; a 30-day ceiling
+# leaves headroom for slow-delivery scenarios while bounding the
+# replay-cache and intro-queue bloat a sender could otherwise
+# induce by publishing year-3000-expiry records that every recipient
+# must remember.
+MAX_EXP_FUTURE_SECONDS = 30 * 86400
+
 # Sentinel for "sender did not use a prekey; ECDH used recipient's
 # long-term X25519 key — no forward secrecy for this message."
 NO_PREKEY = 0
@@ -169,6 +177,13 @@ class SlotManifest:
         except ValueError:
             return None
         if not DMPCrypto.verify_signature(body, signature, manifest.sender_spk):
+            return None
+        # Refuse manifests whose expiry is too far in the future. A
+        # legitimate sender publishes messages with TTLs of minutes to
+        # hours; an `exp` that lands in year 3000 is either a clock
+        # bug or a deliberate attempt to make every receiver remember
+        # this message in their replay cache forever.
+        if manifest.exp - int(time.time()) > MAX_EXP_FUTURE_SECONDS:
             return None
         return manifest, signature
 
