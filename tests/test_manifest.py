@@ -161,6 +161,117 @@ class TestReplayCache:
         assert cache.size() == 2
 
 
+class TestReplayCacheClaim:
+    """Atomic claim/finalize/release prevents two concurrent receive workers
+    from both decrypting and delivering the same (sender_spk, msg_id) pair.
+    The previous split-API (`has_seen` -> decrypt -> `record`) had a TOCTOU
+    window during the decrypt phase. claim_for_decode closes that window.
+    """
+
+    def test_claim_first_caller_wins(self):
+        cache = ReplayCache()
+        spk, mid = b"A" * 32, b"M" * 16
+        assert cache.claim_for_decode(spk, mid) is True
+        assert cache.claim_for_decode(spk, mid) is False
+
+    def test_claim_then_finalize_blocks_future_claims(self):
+        cache = ReplayCache()
+        spk, mid = b"A" * 32, b"M" * 16
+        assert cache.claim_for_decode(spk, mid) is True
+        cache.finalize(spk, mid, expiry=int(time.time()) + 300)
+        # Now in `seen`; no further claim possible regardless of in-flight.
+        assert cache.has_seen(spk, mid)
+        assert cache.claim_for_decode(spk, mid) is False
+
+    def test_release_frees_slot_for_retry(self):
+        """Decrypt failure releases the slot so a later poll can retry the
+        same manifest — the whole point of the in-flight split is to avoid
+        permanent blacklisting on transient errors."""
+        cache = ReplayCache()
+        spk, mid = b"A" * 32, b"M" * 16
+        assert cache.claim_for_decode(spk, mid) is True
+        cache.release(spk, mid)
+        # Slot is free again; a retry can claim it.
+        assert cache.claim_for_decode(spk, mid) is True
+        assert not cache.has_seen(spk, mid)
+
+    def test_release_is_idempotent(self):
+        cache = ReplayCache()
+        spk, mid = b"A" * 32, b"M" * 16
+        # No prior claim — release is a no-op, no exception.
+        cache.release(spk, mid)
+        cache.claim_for_decode(spk, mid)
+        cache.release(spk, mid)
+        cache.release(spk, mid)  # double-release is fine.
+
+    def test_stale_in_flight_claim_reclaimed_after_ttl(self):
+        """Worker that crashes between claim and finalize/release would
+        otherwise block the slot forever. claim_for_decode purges in-flight
+        entries older than in_flight_ttl_seconds so the slot is reusable."""
+        cache = ReplayCache(in_flight_ttl_seconds=1)
+        spk, mid = b"A" * 32, b"M" * 16
+        assert cache.claim_for_decode(spk, mid) is True
+        # Backdate the claim past the TTL.
+        cache._in_flight[(spk, mid)] = int(time.time()) - 10
+        # Next claim purges stale entries and succeeds.
+        assert cache.claim_for_decode(spk, mid) is True
+
+    def test_concurrent_claims_only_one_wins(self):
+        """Real-thread concurrency test: 16 threads race to claim the same
+        (spk, msg_id) pair. Exactly one must win; the rest must observe
+        False. Without the lock + in-flight check, multiple workers would
+        all see has_seen=False and proceed to decrypt+deliver in parallel.
+        """
+        import threading
+
+        cache = ReplayCache()
+        spk, mid = b"A" * 32, b"M" * 16
+        winners = []
+        winners_lock = threading.Lock()
+        start = threading.Event()
+
+        def worker():
+            start.wait()
+            if cache.claim_for_decode(spk, mid):
+                with winners_lock:
+                    winners.append(threading.get_ident())
+
+        threads = [threading.Thread(target=worker) for _ in range(16)]
+        for t in threads:
+            t.start()
+        start.set()
+        for t in threads:
+            t.join()
+
+        assert (
+            len(winners) == 1
+        ), f"expected exactly one winner of the claim race, got {len(winners)}"
+
+    def test_in_flight_does_not_persist_across_instances(self, tmp_path):
+        """Persistence covers `seen` only. In-flight claims are intentionally
+        in-memory: a process restart should not leave a slot blocked
+        forever just because the previous process held an in-flight claim
+        when it died."""
+        path = str(tmp_path / "replay.json")
+        c1 = ReplayCache(persist_path=path)
+        spk, mid = b"A" * 32, b"M" * 16
+        assert c1.claim_for_decode(spk, mid) is True
+        # Simulate process restart — same path, fresh instance.
+        c2 = ReplayCache(persist_path=path)
+        assert c2.claim_for_decode(spk, mid) is True
+        assert not c2.has_seen(spk, mid)
+
+    def test_finalize_persists_to_seen(self, tmp_path):
+        path = str(tmp_path / "replay.json")
+        c1 = ReplayCache(persist_path=path)
+        spk, mid = b"A" * 32, b"M" * 16
+        assert c1.claim_for_decode(spk, mid) is True
+        c1.finalize(spk, mid, expiry=int(time.time()) + 300)
+        # New instance reads `seen` from disk; the slot stays blocked.
+        c2 = ReplayCache(persist_path=path)
+        assert c2.has_seen(spk, mid)
+
+
 class TestReplayCachePersistence:
     def test_record_persists_across_instances(self, tmp_path):
         path = str(tmp_path / "replay.json")

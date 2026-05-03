@@ -987,17 +987,26 @@ class DMPClient:
                     # identical behavior.
                     elif self._rotation_manifest_revoked(manifest.sender_spk):
                         continue
-                    # Check-only here; we record in the replay cache *after*
-                    # we actually decode the message. Otherwise a transient
-                    # DNS miss during chunk fetch would permanently suppress
-                    # a still-valid manifest on later polls.
-                    if self.replay_cache.has_seen(manifest.sender_spk, manifest.msg_id):
+                    # Atomic claim across the decrypt window: only one worker
+                    # can decrypt+deliver a given (sender_spk, msg_id) pair.
+                    # claim_for_decode returns False if the slot is already
+                    # in `seen` or held by another worker's still-fresh
+                    # in-flight claim. release() frees the slot on transient
+                    # decrypt failure so a later poll can retry; finalize()
+                    # promotes it to `seen` on success. The previous
+                    # has_seen → decrypt → record sequence let two
+                    # concurrent receive workers double-deliver the same
+                    # message.
+                    if not self.replay_cache.claim_for_decode(
+                        manifest.sender_spk, manifest.msg_id, manifest.exp
+                    ):
                         continue
                     decoded = self._fetch_and_decrypt(manifest, source_zone=zone)
                     if decoded is None:
+                        self.replay_cache.release(manifest.sender_spk, manifest.msg_id)
                         continue
                     plaintext, ts, msg_id = decoded
-                    self.replay_cache.record(
+                    self.replay_cache.finalize(
                         manifest.sender_spk, manifest.msg_id, manifest.exp
                     )
                     results.append(
@@ -1304,17 +1313,25 @@ class DMPClient:
                     if self._rotation_manifest_revoked(manifest.sender_spk):
                         _drop("revoked")
                         continue
+                    # Atomic claim across decrypt — same race-prevention as
+                    # receive_messages. The has_seen check above is a fast-
+                    # path skip to avoid the manifest+chunk fetch cost; this
+                    # is the actual concurrency gate. A loser of the race
+                    # gets False and skips without re-delivering.
+                    if not self.replay_cache.claim_for_decode(
+                        manifest.sender_spk, manifest.msg_id, manifest.exp
+                    ):
+                        _drop("replay")
+                        continue
                     decoded = self._fetch_and_decrypt(
                         manifest, source_zone=claim.sender_mailbox_domain
                     )
                     if decoded is None:
+                        self.replay_cache.release(manifest.sender_spk, manifest.msg_id)
                         _drop("decrypt-failed")
                         continue
                     plaintext, ts, msg_id = decoded
-                    # Record in replay cache only after successful
-                    # decrypt — a transient chunk fetch miss must not
-                    # permanently suppress this claim.
-                    self.replay_cache.record(
+                    self.replay_cache.finalize(
                         manifest.sender_spk, manifest.msg_id, manifest.exp
                     )
 

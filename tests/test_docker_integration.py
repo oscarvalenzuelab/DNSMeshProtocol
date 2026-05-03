@@ -588,3 +588,99 @@ def test_container_rotation_compromise_revokes_old_key(node_container):
         SUBJECT_TYPE_USER_IDENTITY,
     )
     assert resolved is None
+
+
+def test_container_concurrent_receive_delivers_exactly_once(node_container):
+    """Atomic claim_for_decode prevents duplicate delivery under concurrent
+    receive workers (P0-2).
+
+    Setup: alice sends ONE message via a real dnsmesh-node container. Bob
+    has a single DMPClient (one shared in-memory ReplayCache) and spawns
+    16 threads that all call receive_messages() simultaneously against the
+    same DNS+HTTP backend.
+
+    Without the atomic claim/finalize/release on ReplayCache, all 16
+    threads pass `has_seen` (still False), all 16 fetch+decrypt, all 16
+    append the same plaintext to their result list, and the user observes
+    duplicate delivery. With the fix, exactly one thread wins the
+    claim_for_decode race and the rest see False and skip without
+    decrypting.
+
+    This is the end-to-end equivalent of the unit test
+    test_concurrent_claims_only_one_wins, but exercises the real
+    receive_messages pipeline (DNS query, manifest verify, chunk fetch,
+    AEAD decrypt) against a real container — proves the wiring at the
+    call site in client.py is correct, not just the ReplayCache primitive.
+    """
+    import threading
+
+    from dmp.client.client import DMPClient
+
+    writer = _HttpWriter(node_container["http_base"])
+    reader = _DnsReader("127.0.0.1", node_container["dns_port"])
+
+    alice = DMPClient(
+        "alice-conc",
+        "alice-conc-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
+    )
+    bob = DMPClient(
+        "bob-conc",
+        "bob-conc-pass",
+        domain="mesh.docker",
+        writer=writer,
+        reader=reader,
+    )
+    alice.add_contact("bob-conc", bob.get_public_key_hex())
+
+    # Single message — exactly-once delivery is the property under test.
+    payload = "concurrent-receive payload for the race test"
+    payload_bytes = payload.encode("utf-8")
+    assert alice.send_message("bob-conc", payload)
+
+    # Confirm a single-threaded receive sees the message before we race —
+    # otherwise a "0 winners" outcome could be misread as the property
+    # holding when in fact the message just isn't there.
+    sanity = bob.receive_messages()
+    assert len(sanity) == 1, "sanity precheck: single-threaded recv saw nothing"
+    assert sanity[0].plaintext == payload_bytes
+    # That receive consumed the slot; re-publish to give the race something
+    # to fight over.
+    assert alice.send_message("bob-conc", payload)
+
+    results: list = []
+    results_lock = threading.Lock()
+    start = threading.Event()
+    errors: list = []
+
+    def worker():
+        start.wait()
+        try:
+            inbox = bob.receive_messages()
+        except Exception as exc:  # bubble unexpected exceptions to the test
+            with results_lock:
+                errors.append(exc)
+            return
+        with results_lock:
+            results.extend(inbox)
+
+    threads = [threading.Thread(target=worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    start.set()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, f"workers raised: {errors}"
+    # Total delivered messages across ALL threads must be exactly 1, even
+    # though 16 threads raced to the same (sender_spk, msg_id).
+    delivered_payloads = [m.plaintext for m in results]
+    assert len(delivered_payloads) == 1, (
+        f"duplicate delivery: 16 concurrent receivers produced "
+        f"{len(delivered_payloads)} messages (expected 1)"
+    )
+    assert delivered_payloads[0] == payload_bytes
+    # The seen set should now contain exactly the one (spk, msg_id).
+    assert bob.replay_cache.size() == 2  # the precheck-delivered + the raced one
