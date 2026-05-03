@@ -211,8 +211,16 @@ class TestResolverFailoverAcceptance:
             writer=shared_store,
             reader=pool,
         )
-        alice.add_contact("bob", bob.get_public_key_hex())
-        bob.add_contact("alice", alice.get_public_key_hex())
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
 
         assert alice.send_message("bob", "hello over failover")
 

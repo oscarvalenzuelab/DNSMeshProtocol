@@ -140,6 +140,16 @@ class CLIConfig:
     # `_make_client` call. Updated by `dnsmesh identity rotate`.
     verify_pubkey: str = ""
 
+    # P0-3 — first-contact / TOFU opt-in. When False (default), the
+    # slot-walk receive path drops every signature-valid manifest if
+    # the operator has zero pinned signing keys. Set True via
+    # ``dnsmesh init --allow-tofu`` (or by editing the config) to opt
+    # back into the legacy "deliver any signature-valid manifest until
+    # you pin someone" behavior. Useful for fresh onboarding; risky
+    # for any client whose DNS path can be spoofed before the user
+    # has pinned a contact.
+    allow_tofu: bool = False
+
     # M8.3 — claim-provider override. When non-empty, send/recv use
     # this single endpoint as the claim provider, skipping seen-feed
     # ranking. Use case: pin all first-contact reach through a known
@@ -251,6 +261,10 @@ class CLIConfig:
             kdf_salt=data.get("kdf_salt", ""),
             verify_pubkey=data.get("verify_pubkey", "") or "",
             identity_domain=data.get("identity_domain", ""),
+            # P0-3 — back-compat: configs predating the TOFU opt-in
+            # default to False (secure default). Operators flip it via
+            # ``dnsmesh init --allow-tofu`` or hand-edit.
+            allow_tofu=bool(data.get("allow_tofu", False)),
             cluster_base_domain=data.get("cluster_base_domain", "") or "",
             cluster_operator_spk=data.get("cluster_operator_spk", "") or "",
             cluster_refresh_interval=int(data.get("cluster_refresh_interval", 3600)),
@@ -991,6 +1005,7 @@ def _make_client(
         kdf_salt=kdf_salt,
         prekey_store_path=prekey_path,
         intro_queue_path=intro_queue_path,
+        allow_tofu=config.allow_tofu,
     )
     # Attach the cluster handle (if any) so the CLI can close it at
     # exit. Setting an attribute on DMPClient after construction is
@@ -1573,6 +1588,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         # minimum (8) and matches our key length.
         kdf_salt=os.urandom(32).hex(),
         identity_domain=(args.identity_domain or "").strip(),
+        allow_tofu=bool(getattr(args, "allow_tofu", False)),
     )
 
     # M10 — auto-probe the local node's DNS endpoint so same-zone
@@ -4707,6 +4723,17 @@ def build_parser() -> argparse.ArgumentParser:
         "is split-host or when init is offline; you can set "
         "local_node_dns_server / local_node_dns_port manually or run "
         "`dnsmesh doctor` later.",
+    )
+    p_init.add_argument(
+        "--allow-tofu",
+        action="store_true",
+        help="Opt into Trust-On-First-Use receive on the slot-walk path. "
+        "Without this, the receiver drops every signature-valid manifest "
+        "when it has zero pinned signing keys (the secure default). With "
+        "it, any signature-valid manifest is delivered until the user "
+        "pins a contact — useful for fresh onboarding, but a real attack "
+        "surface for any client whose DNS path can be spoofed before any "
+        "contact is pinned.",
     )
     p_init.set_defaults(func=cmd_init)
 

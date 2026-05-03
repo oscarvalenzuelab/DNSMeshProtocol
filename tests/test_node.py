@@ -80,7 +80,18 @@ class TestDMPNode:
         # real persistent store behind the same API the DNS + HTTP layers use.
         alice = DMPClient("alice", "apass", domain="mesh.test", store=node.store)
         bob = DMPClient("bob", "bpass", domain="mesh.test", store=node.store)
-        alice.add_contact("bob", bob.get_public_key_hex())
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        # bob must pin alice so receive_messages doesn't fall into TOFU
+        # (default-deny after P0-3).
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
 
         assert alice.send_message("bob", "via node store")
         inbox = bob.receive_messages()

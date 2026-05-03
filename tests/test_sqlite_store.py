@@ -143,8 +143,16 @@ class TestClientOverSqlite:
         try:
             alice = DMPClient("alice", "apass", domain="mesh.test", store=store)
             bob = DMPClient("bob", "bpass", domain="mesh.test", store=store)
-            alice.add_contact("bob", bob.get_public_key_hex())
-            bob.add_contact("alice", alice.get_public_key_hex())
+            alice.add_contact(
+                "bob",
+                bob.get_public_key_hex(),
+                signing_key_hex=bob.get_signing_public_key_hex(),
+            )
+            bob.add_contact(
+                "alice",
+                alice.get_public_key_hex(),
+                signing_key_hex=alice.get_signing_public_key_hex(),
+            )
 
             assert alice.send_message("bob", "hello from sqlite")
             inbox = bob.receive_messages()
@@ -162,14 +170,25 @@ class TestClientOverSqlite:
         store1 = SqliteMailboxStore(db)
         alice = DMPClient("alice", "apass", domain="mesh.test", store=store1)
         bob_for_keys = DMPClient("bob", "bpass", domain="mesh.test", store=store1)
-        alice.add_contact("bob", bob_for_keys.get_public_key_hex())
+        alice.add_contact(
+            "bob",
+            bob_for_keys.get_public_key_hex(),
+            signing_key_hex=bob_for_keys.get_signing_public_key_hex(),
+        )
         assert alice.send_message("bob", "picked up after restart")
         store1.close()
 
         # Phase 2: new process, new store handle, new bob client reads.
+        # bob must pin alice — without a pin, the slot walk drops every
+        # manifest unless ``allow_tofu=True`` (P0-3 default-deny).
         store2 = SqliteMailboxStore(db)
         try:
             bob = DMPClient("bob", "bpass", domain="mesh.test", store=store2)
+            bob.add_contact(
+                "alice",
+                alice.get_public_key_hex(),
+                signing_key_hex=alice.get_signing_public_key_hex(),
+            )
             inbox = bob.receive_messages()
             assert len(inbox) == 1
             assert inbox[0].plaintext == b"picked up after restart"

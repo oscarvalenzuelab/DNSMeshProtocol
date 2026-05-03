@@ -11,8 +11,19 @@ from dmp.network.memory import InMemoryDNSStore
 def _pair(store: InMemoryDNSStore, domain: str = "mesh.test"):
     alice = DMPClient("alice", "alice-pass", domain=domain, store=store)
     bob = DMPClient("bob", "bob-pass", domain=domain, store=store)
-    alice.add_contact("bob", bob.get_public_key_hex())
-    bob.add_contact("alice", alice.get_public_key_hex())
+    # Pin signing keys mutually — the secure default. Without
+    # signing_key_hex the receiver's known_spks is empty and
+    # receive_messages drops every manifest unless ``allow_tofu=True``.
+    alice.add_contact(
+        "bob",
+        bob.get_public_key_hex(),
+        signing_key_hex=bob.get_signing_public_key_hex(),
+    )
+    bob.add_contact(
+        "alice",
+        alice.get_public_key_hex(),
+        signing_key_hex=alice.get_signing_public_key_hex(),
+    )
     return alice, bob
 
 
@@ -132,7 +143,18 @@ class TestSendReceive:
         store = InMemoryDNSStore()
         alice, bob = _pair(store)
         eve = DMPClient("eve", "eve-pass", domain="mesh.test", store=store)
-        eve.add_contact("bob", bob.get_public_key_hex())
+        eve.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        # Bob must pin Eve too — the test exercises bob delivering
+        # messages from BOTH alice and eve, not just one of them.
+        bob.add_contact(
+            "eve",
+            eve.get_public_key_hex(),
+            signing_key_hex=eve.get_signing_public_key_hex(),
+        )
 
         # Two different senders, two back-to-back messages to bob. With 10
         # empty slots available, the first-empty scan should deposit them in
@@ -182,18 +204,55 @@ class TestSendReceive:
         assert inbox[0].plaintext == b"bob is pinned"
         assert inbox[0].sender_signing_pk == bob.crypto.get_signing_public_key_bytes()
 
-    def test_tofu_delivery_when_no_contacts_pinned(self):
-        """Without any pinned signing keys, receive falls back to TOFU —
-        any signature-valid manifest for us is delivered. This keeps the
-        initial 'publish your identity, exchange keys, pin' workflow
-        working at all."""
+    def test_tofu_delivery_requires_explicit_opt_in(self):
+        """The slot-walk receive path is default-deny when the receiver
+        has no pinned signing keys. ``allow_tofu=True`` re-enables the
+        legacy "deliver any signature-valid manifest until you pin
+        someone" behavior, which is useful for the initial onboarding
+        flow but a real attack surface for a pristine client whose DNS
+        path can be spoofed.
+        """
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice", "alice-pass", domain="mesh.test", store=store, allow_tofu=True
+        )
+        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        # alice has no pinned signing keys at all — pure TOFU receive.
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        assert bob.send_message("alice", "first contact")
+
+        inbox = alice.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"first contact"
+
+    def test_tofu_dropped_by_default_when_no_contacts_pinned(self):
+        """The opposite of the test above: with the secure default
+        (``allow_tofu=False``), an empty pinned-signer set causes every
+        signature-valid manifest to be silently dropped on the slot
+        walk. Operators that want first-contact delivery must opt in
+        explicitly via ``allow_tofu=True`` or ``enable_tofu()``.
+        """
         store = InMemoryDNSStore()
         alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
         bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
-        # alice has no contacts at all — no pins yet.
-        bob.add_contact("alice", alice.get_public_key_hex())
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
         assert bob.send_message("alice", "first contact")
 
+        # alice has no pins → default-deny drops the manifest.
+        assert alice.receive_messages() == []
+
+        # Flipping the gate at runtime delivers the still-published
+        # manifest on the next poll. Symmetric with passing
+        # ``allow_tofu=True`` to the constructor.
+        alice.enable_tofu()
         inbox = alice.receive_messages()
         assert len(inbox) == 1
         assert inbox[0].plaintext == b"first contact"
@@ -261,7 +320,11 @@ class TestSendReceive:
         long-term X25519 key (no FS) rather than failing to send."""
         store = InMemoryDNSStore()
         alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        # bob receives via TOFU because no contact pins HIM — explicit
+        # opt-in is required after P0-3.
+        bob = DMPClient(
+            "bob", "bob-pass", domain="mesh.test", store=store, allow_tofu=True
+        )
         # NOTE: no signing_key_hex — alice can't verify any prekey signature.
         alice.add_contact("bob", bob.get_public_key_hex())
 
@@ -302,7 +365,11 @@ class TestSendReceive:
         """
         store = InMemoryDNSStore()
         alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        # bob has no pinned contacts in this test — receive falls back to
+        # TOFU which is opt-in after P0-3.
+        bob = DMPClient(
+            "bob", "bob-pass", domain="mesh.test", store=store, allow_tofu=True
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -450,7 +517,9 @@ class TestSendReceive:
 
         store = InMemoryDNSStore()
         alice, bob = _pair(store)
-        bob.add_contact("alice", alice.get_public_key_hex())
+        # `_pair` already pinned alice's signing key on bob — the legacy
+        # extra add_contact below was a no-op that wiped the pin (older
+        # signature without signing_key_hex). Removed.
 
         # alice sends normally so the chunks land with the *real* msg_id
         # embedded in the inner header.
@@ -794,10 +863,16 @@ class TestCrossZoneReceive:
         without an explicit `domain=` (the legacy `dnsmesh contacts add`
         path), `Contact.domain` falls back to `self.domain` — both
         zones collapse and `_zones_to_poll()` returns a single entry.
+
+        These legacy adds also omit ``signing_key_hex``, so bob has no
+        pinned signers and receives via TOFU. After P0-3 that requires
+        explicit ``allow_tofu=True``.
         """
         store = InMemoryDNSStore()
         alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        bob = DMPClient(
+            "bob", "bob-pass", domain="mesh.test", store=store, allow_tofu=True
+        )
         # Legacy add — no domain= passed, no signing key (TOFU mode).
         alice.add_contact("bob", bob.get_public_key_hex())
         bob.add_contact("alice", alice.get_public_key_hex())
