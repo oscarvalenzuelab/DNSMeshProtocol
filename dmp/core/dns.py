@@ -5,6 +5,7 @@ import json
 import hashlib
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
+import dns.flags
 import dns.resolver
 import dns.message
 import dns.rdatatype
@@ -141,9 +142,26 @@ class DNSEncoder:
 
 
 class DNSOperations:
-    """DNS query and response operations for DMP"""
+    """DNS query and response operations for DMP.
 
-    def __init__(self, resolvers: Optional[List[str]] = None):
+    ``dnssec_required`` (P0-4): when True the resolver requests DNSSEC
+    processing (EDNS0 + DO bit) and every reply must carry the AD
+    (Authenticated Data) flag — i.e. the upstream recursor DNSSEC-
+    validated the answer. Replies missing AD are rejected. The trust
+    boundary is the channel between this client and the recursor, so
+    AD-bit policy is meaningful only over a transport an on-path
+    attacker cannot rewrite (DoT/DoH or a pinned local recursor); over
+    plaintext UDP to a public resolver an on-path attacker can flip AD
+    and the check becomes theatre. Local trust-anchor validation is a
+    larger separate project.
+    """
+
+    def __init__(
+        self,
+        resolvers: Optional[List[str]] = None,
+        *,
+        dnssec_required: bool = False,
+    ):
         """Initialize with optional custom resolvers"""
         self.resolver = dns.resolver.Resolver()
         if resolvers:
@@ -155,11 +173,26 @@ class DNSOperations:
         # Set reasonable timeouts
         self.resolver.timeout = 5.0
         self.resolver.lifetime = 10.0
+        self._dnssec_required = dnssec_required
+        if dnssec_required:
+            # Ask the recursor to do DNSSEC processing. Without DO bit
+            # many recursors strip RRSIGs and never set AD, which would
+            # make every answer fail the gate even from a validating
+            # resolver.
+            self.resolver.use_edns(0, dns.flags.DO, 4096)
 
     def query_txt_record(self, domain: str) -> Optional[List[str]]:
         """Query TXT records for a domain"""
         try:
             answers = self.resolver.resolve(domain, "TXT")
+            if self._dnssec_required:
+                response = getattr(answers, "response", None)
+                flags = getattr(response, "flags", 0) if response else 0
+                if not (flags & dns.flags.AD):
+                    # Upstream didn't validate (or the chain failed).
+                    # Drop the answer — DMP must not consume DNS data
+                    # without validation when the operator opted in.
+                    return None
             records = []
             for rdata in answers:
                 # TXT records can have multiple strings

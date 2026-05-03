@@ -59,11 +59,32 @@ from typing import Iterable, List, Optional, Sequence, Tuple, Union
 HostSpec = Union[str, Tuple[str, int]]
 
 import dns.exception
+import dns.flags
 import dns.resolver
 
 from dmp.network.base import DNSRecordReader
 
 log = logging.getLogger(__name__)
+
+
+def _ad_bit_set(answer) -> bool:
+    """Return True iff the dnspython Answer carries an AD-validated response.
+
+    Used by the DNSSEC-required code path. dnspython's :class:`Answer`
+    exposes the underlying message via ``.response``; the AD (Authenticated
+    Data) flag in the message header indicates the upstream recursor
+    successfully validated the DNSSEC chain for this RRset. Tolerates
+    older dnspython shapes where ``.response`` may be missing — fail
+    closed (return False) so a parsing oddity does not silently turn off
+    the validation gate.
+    """
+    response = getattr(answer, "response", None)
+    if response is None:
+        return False
+    flags = getattr(response, "flags", None)
+    if flags is None:
+        return False
+    return bool(flags & dns.flags.AD)
 
 
 # Four operator-diverse public resolvers, IPv4 only. Discovery probes each
@@ -202,7 +223,40 @@ class ResolverPool(DNSRecordReader):
         lifetime: float = 10.0,
         cooldown_seconds: float = 60.0,
         failure_threshold: int = 1,
+        dnssec_required: bool = False,
     ) -> None:
+        """``dnssec_required`` (P0-4): when True, every TXT/A/AAAA/NS
+        lookup requires the upstream resolver's reply to carry the AD
+        (Authenticated Data) flag — i.e. a validating recursor signed off
+        on the answer. Replies missing AD are treated as transport
+        failures and the upstream is demoted, so a non-validating or
+        actively-stripping resolver no longer poisons DMP record reads.
+
+        Caveats baked into AD-bit policy:
+          - The trust boundary is the channel between this client and the
+            chosen recursor. AD is meaningful only over a transport an
+            on-path attacker cannot rewrite (DoT/DoH, or a trusted local
+            recursor). Plaintext UDP to a public resolver lets any
+            on-path party flip AD, making the check theatre.
+          - The pool also queries the recursor with the EDNS DO bit set
+            so the recursor knows we want DNSSEC processing; without DO,
+            many recursors strip RRSIGs and never set AD.
+          - **Negative responses are NOT validated.** dnspython raises
+            ``NXDOMAIN`` / ``NoAnswer`` before our gate sees the message,
+            and the exception drops the AD-bit context. So an attacker
+            who can return ``NXDOMAIN`` (e.g. via spoofed UDP) still
+            gets a "no records" outcome through the pool — the response
+            is unauthenticated denial. Mitigations: pair with a trusted
+            local recursor that validates negative responses (NSEC/NSEC3
+            chains) and refuses unsigned denials, OR fall back to
+            full local validation. Tracked as follow-up: switch the
+            ``dnssec_required=True`` path to lower-level
+            ``dns.message`` + ``dns.query`` so the AD bit on negative
+            responses is reachable.
+          - Local validation against a trust anchor is a separate, larger
+            project; that requires shipping/refreshing the root anchor
+            and full chain validation in-process.
+        """
         if not hosts:
             raise ValueError("ResolverPool requires at least one host")
         if failure_threshold < 1:
@@ -224,6 +278,7 @@ class ResolverPool(DNSRecordReader):
         self._port = port
         self._cooldown_seconds = cooldown_seconds
         self._failure_threshold = failure_threshold
+        self._dnssec_required = dnssec_required
         self._lock = threading.Lock()
 
         self._states: List[_HostState] = []
@@ -233,6 +288,13 @@ class ResolverPool(DNSRecordReader):
             resolver.port = host_port
             resolver.timeout = timeout
             resolver.lifetime = lifetime
+            if dnssec_required:
+                # EDNS0 + DO (DNSSEC OK) bit asks the recursor to do
+                # DNSSEC processing and include RRSIGs. Without DO many
+                # recursors strip signatures and never set AD on the
+                # response. Payload 4096 is the standard EDNS0 buffer
+                # size that fits typical signed RRsets.
+                resolver.use_edns(0, dns.flags.DO, 4096)
             self._states.append(
                 _HostState(host=host, port=host_port, resolver=resolver)
             )
@@ -341,6 +403,19 @@ class ResolverPool(DNSRecordReader):
             # propagates up. Blanket-catching here would let one bad
             # lookup demote every upstream into cooldown.
 
+            # P0-4: when DNSSEC is required, the upstream resolver MUST
+            # have validated the answer (AD flag set on the response).
+            # An answer without AD means either (a) the recursor isn't
+            # validating, (b) the zone is unsigned, or (c) the validator
+            # rejected the chain. From DMP's perspective every one of
+            # those is "this answer is not trustworthy" — drop it and
+            # demote the upstream. The on-path-AD-flip caveat is real
+            # and is documented on the constructor; mitigate via
+            # DoT/DoH or a pinned local recursor.
+            if self._dnssec_required and not _ad_bit_set(answers):
+                self._mark_failure(state)
+                continue
+
             records: List[str] = []
             for rdata in answers:
                 # dnspython exposes each TXT rdata as a tuple of byte
@@ -406,6 +481,11 @@ class ResolverPool(DNSRecordReader):
                 except self._TRANSPORT_ERRORS:
                     self._mark_failure(state)
                     continue
+                # P0-4: same AD-bit gate as TXT — refuse address answers
+                # that the upstream did not DNSSEC-validate.
+                if self._dnssec_required and not _ad_bit_set(answers):
+                    self._mark_failure(state)
+                    continue
                 for rdata in answers:
                     self._mark_success(state)
                     addr = getattr(rdata, "address", None)
@@ -434,6 +514,14 @@ class ResolverPool(DNSRecordReader):
             except self._NAME_NOT_FOUND_ERRORS:
                 continue
             except self._TRANSPORT_ERRORS:
+                self._mark_failure(state)
+                continue
+            # P0-4: same AD-bit gate as TXT/A/AAAA. NS records feed the
+            # DNS UPDATE writer's split-host target chase
+            # (dns_update_writer:_resolve_to_ip), so an unvalidated NS
+            # answer routes writes to an attacker-chosen host. Demote
+            # the upstream and try the next.
+            if self._dnssec_required and not _ad_bit_set(answers):
                 self._mark_failure(state)
                 continue
             self._mark_success(state)

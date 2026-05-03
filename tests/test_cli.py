@@ -74,7 +74,12 @@ def shared_store(monkeypatch):
         def query_txt_record(self, name):
             return store.query_txt_record(name)
 
-    def fake_dns_reader(host, port=5353):
+    def fake_dns_reader(host, port=5353, *, dnssec_required=False):
+        # Accept the P0-4 kwarg even though the in-memory shim doesn't
+        # exercise DNSSEC — keeps the test fixture in lockstep with
+        # _make_reader's call shape so signature changes surface here
+        # rather than as a TypeError swallowed mid-flow.
+        del dnssec_required
         return _SharedStoreReader()
 
     monkeypatch.setattr(cli, "_make_client", fake_make_client)
