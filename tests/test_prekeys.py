@@ -324,6 +324,215 @@ class TestPrekeyStoreSchemaVersioning:
     # that actually matters. The dynamic test was theatre.
 
 
+class TestPrekeyIdReservation:
+    """``prekey_id = 0`` is reserved as the ``NO_PREKEY`` sentinel
+    (see dmp/core/manifest.py). The pool generator must never return
+    it — otherwise a sender that picked the prekey would silently
+    fall back to the recipient's long-term X25519 key (no forward
+    secrecy) without the manifest's ``prekey_id`` carrying any
+    distinguishing signal.
+    """
+
+    def test_zero_prekey_id_is_skipped(self, tmp_path, monkeypatch):
+        """Force ``secrets.randbits`` to return 0 on the first draw,
+        then a usable value on the second. The generator must skip 0
+        and produce a non-zero prekey_id on the second attempt.
+        """
+        from dmp.core import prekeys as mod
+
+        store = mod.PrekeyStore(str(tmp_path / "p.db"))
+        try:
+            # Stateful patch: first call returns 0, every subsequent
+            # call returns 12345.
+            calls = {"n": 0}
+
+            def fake_randbits(n_bits):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return 0
+                return 12345
+
+            monkeypatch.setattr(mod.secrets, "randbits", fake_randbits)
+            pool = store.generate_pool(count=1, ttl_seconds=3600)
+            assert len(pool) == 1
+            prekey, _ = pool[0]
+            # Reserved 0 was rejected; the second draw landed.
+            assert prekey.prekey_id == 12345
+            # And we made at least 2 draws.
+            assert calls["n"] >= 2
+        finally:
+            store.close()
+
+    def test_no_zero_id_in_a_large_pool(self, tmp_path):
+        """Statistical sanity: generate many prekeys and verify none
+        end up with ``prekey_id == 0``. Without the reservation, the
+        2^-32 chance per draw means this rarely catches the bug —
+        but combined with the targeted test above it confirms the
+        guard fires in production usage too.
+        """
+        from dmp.core.manifest import NO_PREKEY
+        from dmp.core.prekeys import PrekeyStore
+
+        store = PrekeyStore(str(tmp_path / "pool.db"))
+        try:
+            pool = store.generate_pool(count=200, ttl_seconds=3600)
+            ids = [pk.prekey_id for pk, _ in pool]
+            assert NO_PREKEY == 0  # if the sentinel ever changes
+            assert NO_PREKEY not in ids
+        finally:
+            store.close()
+
+    def test_collision_retry_budget_still_works_with_zero_skip(
+        self, tmp_path, monkeypatch
+    ):
+        """If every draw returns 0 (an extreme stuck-RNG scenario),
+        the retry budget runs out and the generator raises rather
+        than looping forever. Belt-and-suspenders: the generator's
+        outer 10-retry bound covers both the collision case AND a
+        pathological all-zero RNG.
+        """
+        from dmp.core import prekeys as mod
+
+        store = mod.PrekeyStore(str(tmp_path / "stuck.db"))
+        try:
+            monkeypatch.setattr(mod.secrets, "randbits", lambda n: 0)
+            with pytest.raises(RuntimeError, match="could not allocate"):
+                store.generate_pool(count=1, ttl_seconds=3600)
+        finally:
+            store.close()
+
+    def test_to_body_bytes_rejects_zero(self):
+        """Codex P1: defense-in-depth at the wire layer. Even if a
+        legacy / buggy / malicious caller constructs a Prekey with
+        ``prekey_id=0``, ``to_body_bytes`` (and therefore ``sign``)
+        must refuse — preventing publication of an ambiguous record.
+        """
+        pk = Prekey(prekey_id=0, public_key=b"\x01" * 32, exp=9_999_999_999)
+        with pytest.raises(ValueError, match="reserved as NO_PREKEY"):
+            pk.to_body_bytes()
+
+    def test_from_body_bytes_rejects_zero(self):
+        """Same wire-layer defense on the parse side: a signed prekey
+        record carrying ``prekey_id=0`` must be rejected at parse
+        time so a sender cannot pick it from DNS."""
+        body = (
+            (0).to_bytes(4, "big")  # prekey_id = 0
+            + b"\x01" * 32  # public_key
+            + (9_999_999_999).to_bytes(8, "big")  # exp
+        )
+        with pytest.raises(ValueError, match="reserved as NO_PREKEY"):
+            Prekey.from_body_bytes(body)
+
+    def test_parse_and_verify_returns_none_for_zero_id_record(self):
+        """End-to-end: even a correctly-signed prekey record with
+        ``prekey_id=0`` must NOT round-trip through
+        ``parse_and_verify``. ``from_body_bytes`` raises ValueError
+        on the zero id, which parse_and_verify converts to None.
+        """
+        from dmp.core.crypto import DMPCrypto
+
+        identity = DMPCrypto()
+        # Construct a body manually (since to_body_bytes refuses zero)
+        # and sign it. This simulates a non-conforming peer publishing
+        # the ambiguous record.
+        body = (
+            (0).to_bytes(4, "big")
+            + b"\x01" * 32
+            + (int(time.time()) + 86400).to_bytes(8, "big")
+        )
+        sig = identity.sign_data(body)
+        wire = RECORD_PREFIX + base64.b64encode(body + sig).decode("ascii")
+        # Even though the signature is valid, parse_and_verify must
+        # reject the zero prekey_id — the wire-layer guard fires
+        # before signature check matters for delivery.
+        result = Prekey.parse_and_verify(wire, identity.get_signing_public_key_bytes())
+        assert result is None
+
+    def test_get_private_key_refuses_zero_even_if_row_exists(self, tmp_path):
+        """Codex P2: a legacy/imported db could already have a row at
+        ``prekey_id=0``. ``get_private_key`` must refuse the lookup
+        regardless of what the table contains, so the receiver's
+        decrypt path can't accidentally use it."""
+        import sqlite3
+
+        from dmp.core.prekeys import PrekeyStore
+
+        path = str(tmp_path / "legacy_zero.db")
+        # Create a v2 schema directly and inject a row at prekey_id=0,
+        # mimicking a legacy/imported db that managed to slip 0 in.
+        legacy = sqlite3.connect(path, isolation_level=None)
+        legacy.executescript("""
+            CREATE TABLE prekeys (
+                prekey_id INTEGER PRIMARY KEY,
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                exp INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                wire_record TEXT DEFAULT ''
+            );
+            """)
+        legacy.execute(
+            "INSERT INTO prekeys(prekey_id, private_key, public_key, "
+            "exp, created_at) VALUES(?, ?, ?, ?, ?)",
+            (0, b"\x05" * 32, b"\x06" * 32, 9_999_999_999, 100),
+        )
+        legacy.execute("PRAGMA user_version = 2")
+        legacy.close()
+
+        store = PrekeyStore(path)
+        try:
+            # The row exists — but the lookup must refuse the
+            # reserved id.
+            assert store.get_private_key(0) is None
+            # Direct sql confirms the row IS still there (we don't
+            # auto-delete legacy rows).
+            row = store._conn.execute(
+                "SELECT prekey_id FROM prekeys WHERE prekey_id = 0"
+            ).fetchone()
+            assert row is not None and row[0] == 0
+        finally:
+            store.close()
+
+    def test_consume_refuses_zero(self, tmp_path):
+        """``consume(0)`` must return False even if a legacy id=0
+        row is present in the table. Same NO_PREKEY guarantee as
+        ``get_private_key``."""
+        import sqlite3
+
+        from dmp.core.prekeys import PrekeyStore
+
+        path = str(tmp_path / "legacy_zero_consume.db")
+        legacy = sqlite3.connect(path, isolation_level=None)
+        legacy.executescript("""
+            CREATE TABLE prekeys (
+                prekey_id INTEGER PRIMARY KEY,
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                exp INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                wire_record TEXT DEFAULT ''
+            );
+            """)
+        legacy.execute(
+            "INSERT INTO prekeys(prekey_id, private_key, public_key, "
+            "exp, created_at) VALUES(?, ?, ?, ?, ?)",
+            (0, b"\x05" * 32, b"\x06" * 32, 9_999_999_999, 100),
+        )
+        legacy.execute("PRAGMA user_version = 2")
+        legacy.close()
+
+        store = PrekeyStore(path)
+        try:
+            # Refusal returns False without touching the row.
+            assert store.consume(0) is False
+            row = store._conn.execute(
+                "SELECT prekey_id FROM prekeys WHERE prekey_id = 0"
+            ).fetchone()
+            assert row is not None
+        finally:
+            store.close()
+
+
 class TestRrsetNaming:
     def test_hashed_label(self):
         name = prekey_rrset_name("alice", "mesh.example.com")
