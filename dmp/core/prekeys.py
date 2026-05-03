@@ -404,6 +404,49 @@ class PrekeyStore:
 
     # ---- lookup + consumption ---------------------------------------------
 
+    def claim_sk(
+        self, prekey_id: int
+    ) -> Optional[Tuple[X25519PrivateKey, Optional[str]]]:
+        """Atomically delete the row and return its `(sk, wire_record)`.
+
+        The receive path uses this instead of separate
+        `get_private_key` + `consume` calls. A single ``DELETE ...
+        RETURNING`` runs as one sqlite statement, so cross-process
+        racers can't both observe the row and both consume it: the
+        earlier SELECT-then-DELETE shape was two separate transactions
+        in autocommit mode, and two `PrekeyStore` instances on the
+        same db file could both read the row before either delete
+        committed. ``RETURNING`` collapses that to one atomic step
+        (sqlite >= 3.35, shipped with Python's bundled sqlite for
+        every version we support).
+
+        The sk is gone from disk before the caller starts decrypting,
+        so a crash between successful decrypt and any cleanup can no
+        longer leave the secret behind for a future
+        disk-compromise attacker. If decrypt fails the sk is gone
+        too, but a failed decrypt with a one-time-use key is
+        unrecoverable anyway: the manifest's `prekey_id` plus the
+        chunks' AAD bind the ciphertext, so retrying with the same
+        sk wouldn't have helped.
+
+        Returns None if the prekey_id is the reserved sentinel
+        (0 == NO_PREKEY), expired, or absent.
+        """
+        if prekey_id == 0:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "DELETE FROM prekeys "
+                "WHERE prekey_id = ? AND exp > ? "
+                "RETURNING private_key, wire_record",
+                (prekey_id, int(time.time())),
+            ).fetchone()
+        if row is None:
+            return None
+        sk_bytes, wire = row[0], row[1]
+        wire_str = str(wire) if wire else None
+        return X25519PrivateKey.from_private_bytes(sk_bytes), wire_str
+
     def get_private_key(self, prekey_id: int) -> Optional[X25519PrivateKey]:
         """Return the sk for a given prekey_id, or None if absent / expired."""
         # Refuse the reserved sentinel even if a legacy/imported db
