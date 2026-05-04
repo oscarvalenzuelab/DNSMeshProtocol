@@ -1175,6 +1175,85 @@ class TestCrossZoneReceive:
         assert len(inbox) == 1
         assert inbox[0].plaintext == b"from alice"
 
+    def test_pinned_spk_from_other_zone_does_not_replay_into_pinned_zone(self):
+        # Codex P2 from the post-#52 fresh audit: the slot-walk pin
+        # check used the GLOBAL pinned-spk set, so an attacker who
+        # could write into a pinned contact's zone could replay a
+        # different pinned sender's manifest there and have it
+        # accepted. Now the pin is bound to the zone being polled —
+        # only contacts whose ``Contact.domain`` matches the zone
+        # qualify as valid signers for manifests found in it.
+        #
+        # To exercise the gate (not the replay cache that fronts it),
+        # the test stages alice's manifest+chunks ONLY in carol.mesh
+        # — no legitimate copy in alice.mesh. Without the per-zone
+        # binding, bob accepts the carol.mesh copy because alice's
+        # spk is globally pinned. With it, the gate refuses and the
+        # inbox stays empty.
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        carol = DMPClient(
+            "carol",
+            "carol-pass",
+            domain="carol.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Bob pins both alice (in alice.mesh) and carol (in carol.mesh).
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.mesh",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        bob.add_contact(
+            "carol",
+            carol.get_public_key_hex(),
+            domain="carol.mesh",
+            signing_key_hex=carol.get_signing_public_key_hex(),
+        )
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+
+        # Alice publishes a real manifest + chunks for bob in alice.mesh.
+        assert alice.send_message("bob", "real message")
+
+        # Attacker copies the records into carol.mesh AND removes the
+        # alice.mesh originals — so the only copy bob can find lives
+        # under the wrong zone.
+        for name in list(store.list_names()):
+            if not name.endswith(".alice.mesh"):
+                continue
+            cloned = name[: -len(".alice.mesh")] + ".carol.mesh"
+            for v in store.query_txt_record(name) or []:
+                store.publish_txt_record(cloned, v)
+            store.delete_txt_record(name)
+
+        # The carol.mesh copy carries alice's pinned spk — globally
+        # known, but NOT bound to carol.mesh. The fixed gate drops
+        # it. Result: nothing delivered.
+        assert bob.receive_messages() == []
+
 
 class TestPersistencePathsRequired:
     # Both ``intro_queue_path`` and ``prekey_store_path`` were
