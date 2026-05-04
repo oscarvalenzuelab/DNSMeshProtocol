@@ -744,13 +744,29 @@ class _NodeDnsReader(DNSRecordReader):
     has a single deterministic destination — we do NOT fall back to
     the system resolver on failure (that would hide an unreachable
     cluster node from the union).
+
+    `dnssec_required` mirrors the policy on `ResolverPool` /
+    `_DnsReader`: when set, every reply must carry the AD flag from
+    a validating recursor or it is treated as transport failure
+    (raised so the union counts it as a node failure). The DO bit
+    is set on outgoing queries so the recursor knows to validate
+    and include RRSIGs. Same trust caveat: meaningful only over a
+    pinned local recursor or DoT/DoH; an on-path attacker on
+    plaintext UDP can flip AD.
     """
 
-    def __init__(self, dns_endpoint: str, *, timeout: float = 3.0) -> None:
+    def __init__(
+        self,
+        dns_endpoint: str,
+        *,
+        timeout: float = 3.0,
+        dnssec_required: bool = False,
+    ) -> None:
         host, port = _parse_host_port(dns_endpoint, default_port=53)
         self._host = host
         self._port = port
         self._timeout = float(timeout)
+        self._dnssec_required = dnssec_required
 
     def query_txt_record(self, name: str):
         import dns.exception
@@ -766,7 +782,16 @@ class _NodeDnsReader(DNSRecordReader):
         # failure and increments consecutive_failures). Coalescing both
         # to None would make dead DNS endpoints look perpetually
         # healthy in `cluster status` and defeat the pool's demotion.
-        request = dns.message.make_query(name, dns.rdatatype.TXT)
+        if self._dnssec_required:
+            # EDNS0 + DO so the recursor knows to do DNSSEC processing
+            # and include RRSIGs. Without DO many recursors strip
+            # RRSIGs and never set AD, which would make the gate fail
+            # every answer even from a validating resolver.
+            request = dns.message.make_query(
+                name, dns.rdatatype.TXT, use_edns=0, want_dnssec=True
+            )
+        else:
+            request = dns.message.make_query(name, dns.rdatatype.TXT)
         response = dns.query.udp(
             request,
             self._host,
@@ -784,6 +809,19 @@ class _NodeDnsReader(DNSRecordReader):
                 self._host,
                 port=self._port,
                 timeout=self._timeout,
+            )
+        # AD-bit gate: applied BEFORE the NXDOMAIN/rcode handling
+        # below. DNSSEC supports validated denial of existence via
+        # NSEC/NSEC3 — a real validating recursor sets AD on
+        # NXDOMAIN responses for signed zones. If the operator
+        # opted into `dnssec_required`, an AD-less NXDOMAIN is
+        # indistinguishable from a spoofed one and must NOT pass
+        # as a healthy "no record" answer. Raising treats it as a
+        # per-node transport failure so UnionReader demotes the
+        # upstream rather than blackholing reads.
+        if self._dnssec_required and not (response.flags & dns.flags.AD):
+            raise RuntimeError(
+                f"DNSSEC AD flag missing from {self._host} reply for {name}"
             )
         rcode = response.rcode()
         if rcode == dns.rcode.NXDOMAIN:
@@ -846,7 +884,9 @@ def _make_cluster_reader_factory(
 
     def factory(node: ClusterNode) -> DNSRecordReader:
         if node.dns_endpoint:
-            return _NodeDnsReader(node.dns_endpoint)
+            return _NodeDnsReader(
+                node.dns_endpoint, dnssec_required=config.dnssec_required
+            )
         return bootstrap_reader
 
     return factory
