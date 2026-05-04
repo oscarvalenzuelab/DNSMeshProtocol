@@ -2859,6 +2859,50 @@ class TestNodeDnsReaderDnssecGate:
             reader.query_txt_record("x.example.com.")
 
 
+class TestDnsReaderDnssecLogs:
+    # `_DnsReader` (the single-host reader the CLI builds when the
+    # operator passes only --dns-host) returns None when the AD bit
+    # is missing on a `dnssec_required=True` reply. Without a log
+    # the operator sees empty results with no signal that DNSSEC
+    # enforcement is the cause — same blind spot the heartbeat
+    # reader had before #49.
+
+    def test_logs_when_dropping_ad_less_answer(self, monkeypatch, caplog):
+        import logging
+
+        import dns.flags
+        import dns.resolver
+
+        class _FakeRdata:
+            def __init__(self, s):
+                self.strings = [s.encode("utf-8")]
+
+        class _FakeResponse:
+            def __init__(self, ad):
+                self.flags = dns.flags.AD if ad else 0
+
+        class _FakeAnswer(list):
+            def __init__(self, vals, ad):
+                super().__init__(_FakeRdata(v) for v in vals)
+                self.response = _FakeResponse(ad)
+
+        def fake_resolve(self, name, rdtype):
+            return _FakeAnswer(["nope"], ad=False)
+
+        monkeypatch.setattr(dns.resolver.Resolver, "resolve", fake_resolve)
+        reader = cli._DnsReader("127.0.0.1", 53, dnssec_required=True)
+        with caplog.at_level(logging.WARNING, logger="dmp.cli"):
+            assert reader.query_txt_record("missing-token") is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less TXT" in m
+            and "missing-token" in m
+            and "127.0.0.1:53" in m
+            and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
+
+
 class TestLocalOnlyClusterBootstrap:
     """Local-only CLI commands must not crash on cluster bootstrap failure.
 

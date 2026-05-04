@@ -3,6 +3,7 @@
 import base64
 import json
 import hashlib
+import logging
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
 import dns.flags
@@ -10,6 +11,8 @@ import dns.resolver
 import dns.message
 import dns.rdatatype
 import dns.name
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -192,6 +195,13 @@ class DNSOperations:
                     # Upstream didn't validate (or the chain failed).
                     # Drop the answer — DMP must not consume DNS data
                     # without validation when the operator opted in.
+                    # Warn so operators can correlate vanished records
+                    # with their DNSSEC opt-in rather than guessing.
+                    log.warning(
+                        "DNSOperations: dropping AD-less TXT answer for "
+                        "%s (dnssec_required=True)",
+                        domain,
+                    )
                     return None
             records = []
             for rdata in answers:

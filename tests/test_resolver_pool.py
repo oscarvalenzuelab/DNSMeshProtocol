@@ -647,6 +647,96 @@ class TestResolverPoolDnssecGate:
             pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
             assert pool.resolve_ns_hosts("example.com") == []
 
+    # The three log-emission tests below pin operator visibility for
+    # the three call sites that drop AD-less answers. Without these,
+    # a misconfigured recursor silently halts TXT/address/NS lookups
+    # and the only symptom is empty results — same blind-spot the
+    # heartbeat reader had before #49.
+
+    def test_required_logs_when_dropping_ad_less_txt(self, caplog):
+        routes = {
+            "1.1.1.1": lambda n, t: _answer("not-validated", ad=False),
+        }
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            with caplog.at_level(logging.WARNING, logger="dmp.network.resolver_pool"):
+                assert pool.query_txt_record("dropped-name") is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        # Pin every load-bearing field — name, upstream IP+port, the
+        # rdtype tag (TXT), and the env-style flag — so a future
+        # refactor that drops any of them fails the test.
+        assert any(
+            "AD-less TXT" in m
+            and "dropped-name" in m
+            and "1.1.1.1:53" in m
+            and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
+
+    def test_required_logs_when_dropping_ad_less_address(self, caplog):
+        class _AddrRdata:
+            def __init__(self, addr):
+                self.address = addr
+
+        def _addr_answer(addr, ad):
+            ans = _FakeAnswer()
+            ans.append(_AddrRdata(addr))
+            ans.response = _FakeResponse(dns.flags.AD if ad else 0)
+            return ans
+
+        routes = {"1.1.1.1": lambda n, t: _addr_answer("203.0.113.7", ad=False)}
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            with caplog.at_level(logging.WARNING, logger="dmp.network.resolver_pool"):
+                assert pool.resolve_address("addr-target") is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        # `resolve_address` runs the AD gate inside an rdtype loop
+        # (A then AAAA). Pin "AD-less A" specifically — a mutation
+        # that strips the rdtype from the message would otherwise
+        # pass with a bare "AD-less" substring check.
+        assert any(
+            "AD-less A " in m
+            and "addr-target" in m
+            and "1.1.1.1:53" in m
+            and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
+
+    def test_required_logs_when_dropping_ad_less_ns(self, caplog):
+        class _FakeNsRdata:
+            def __init__(self, target):
+                self.target = dns.name.from_text(target)
+
+        def _ns_answer(*targets, ad: bool):
+            ans = _FakeAnswer()
+            for t in targets:
+                ans.append(_FakeNsRdata(t))
+            ans.response = _FakeResponse(dns.flags.AD if ad else 0)
+            return ans
+
+        routes = {"1.1.1.1": lambda n, t: _ns_answer("ns1.test.", ad=False)}
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = _route_by_nameserver(routes)
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            with caplog.at_level(logging.WARNING, logger="dmp.network.resolver_pool"):
+                assert pool.resolve_ns_hosts("ns-zone-target") == []
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less NS" in m
+            and "ns-zone-target" in m
+            and "1.1.1.1:53" in m
+            and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
+
 
 # ---------------------------------------------------------------------
 # Health tracking & cooldown

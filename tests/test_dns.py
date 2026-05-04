@@ -1,8 +1,15 @@
 """Tests for DNS operations and encoding"""
 
+import logging
+from unittest.mock import patch
+
 import pytest
 import base64
 import json
+
+import dns.flags
+import dns.resolver
+
 from dmp.core.dns import DMPDNSRecord, DNSEncoder, DNSOperations, DNSChunkManager
 
 
@@ -231,6 +238,41 @@ class TestDNSOperations:
         assert len(messages) == 1
         assert messages[0][0] == 3  # Slot number
         assert messages[0][1].data == b"message for slot 3"
+
+
+class TestDNSOperationsDnssecLogs:
+    # Without these warnings a non-validating recursor silently
+    # turns every TXT lookup into None — same operator-blindspot
+    # as the heartbeat reader before #49.
+
+    def test_logs_when_dropping_ad_less_answer(self, caplog):
+        class _FakeRdata:
+            def __init__(self, s):
+                self.strings = [s.encode("utf-8")]
+
+        class _FakeResponse:
+            def __init__(self, ad):
+                self.flags = dns.flags.AD if ad else 0
+
+        class _FakeAnswer(list):
+            def __init__(self, vals, ad):
+                super().__init__(_FakeRdata(v) for v in vals)
+                self.response = _FakeResponse(ad)
+
+        ops = DNSOperations(dnssec_required=True)
+        with patch.object(
+            dns.resolver.Resolver,
+            "resolve",
+            autospec=True,
+            return_value=_FakeAnswer(["nope"], ad=False),
+        ):
+            with caplog.at_level(logging.WARNING, logger="dmp.core.dns"):
+                assert ops.query_txt_record("dropped-domain") is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less TXT" in m and "dropped-domain" in m and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
 
 
 class TestDNSChunkManager:
