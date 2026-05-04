@@ -15,6 +15,40 @@ import dns.name
 log = logging.getLogger(__name__)
 
 
+class DnssecValidationError(RuntimeError):
+    """Raised when a DNS reader rejects an answer because the upstream
+    recursor failed to DNSSEC-validate it (AD bit missing on a
+    positive answer or on a NXDOMAIN/NoAnswer denial).
+
+    Subclasses ``RuntimeError`` so existing ``except RuntimeError:``
+    handlers keep catching this — it is a transport-class failure
+    from a caller's perspective. New code that wants to distinguish
+    DNSSEC rejection from other failures (UnionReader per-node
+    demotion, metrics, dashboards) should catch this type by name.
+
+    Reader behavior is asymmetric on purpose:
+
+    - ``DNSOperations`` (``dmp.core.dns``), ``_DnsReader`` (``dmp.cli``),
+      ``_SystemResolver`` (``dmp.server.node`` heartbeat fallback), and
+      ``ResolverPool`` (``dmp.network.resolver_pool``) all log a
+      WARNING and return ``None`` when they drop an AD-less answer.
+      Their callers treat ``query_txt_record`` as Optional[List[str]];
+      raising would cascade as a behavior change through every
+      consumer that handles a missing record gracefully.
+      ``ResolverPool`` additionally demotes the offending upstream via
+      its internal ``_mark_failure`` so the next query prefers a
+      different resolver — the per-pool demotion is not lost.
+
+    - ``_NodeDnsReader`` (``dmp.cli``) raises this exception instead.
+      It is wired into a ``UnionReader`` pool whose health bookkeeping
+      depends on raised exceptions to demote misbehaving nodes
+      (``UnionReader._safe_query``). Returning ``None`` here would let
+      a single AD-stripped node be treated as a healthy empty answer
+      and never demoted — letting an attacker who can flip AD on one
+      cluster node permanently halt cluster reads from that node.
+    """
+
+
 def _negative_response_ad_set(exc, qname: str) -> bool:
     """True iff every response on a negative reply carries the AD flag.
 
@@ -247,6 +281,9 @@ class DNSOperations:
                 # without validation when the operator opted in.
                 # Warn so operators can correlate vanished records
                 # with their DNSSEC opt-in rather than guessing.
+                # Returns None rather than raising
+                # ``DnssecValidationError`` — see that class's
+                # docstring for the reader-by-reader contract.
                 log.warning(
                     "DNSOperations: dropping AD-less TXT answer for "
                     "%s (dnssec_required=True)",
