@@ -781,6 +781,27 @@ HTTPS exchange is the one-time TSIG-key registration step.</p>
                 )
                 return 413
 
+        # Universal input shape check so a bad name / value surfaces
+        # as 400 (client error) rather than 502 (backend broke). Reuses
+        # the same validators ``LocalDNSPublisher`` enforces because
+        # the constraints they impose — DNS-compliant name, no control
+        # chars / quote in the value — are universal: every legitimate
+        # DMP record value is printable ASCII (base64 + ``;``-separated
+        # ``key=val``). Without this layer, a multi-tenant user
+        # sending newline-laced input gets a 502 indistinguishable
+        # from a transient writer outage.
+        from dmp.network.dns_publisher import (
+            _is_safe_txt_value,
+            _is_valid_dns_name,
+        )
+
+        if not _is_valid_dns_name(name):
+            self._send_json(400, {"error": "invalid record name"})
+            return 400
+        if not _is_safe_txt_value(value):
+            self._send_json(400, {"error": "invalid record value"})
+            return 400
+
         ok = writer.publish_txt_record(name, value, ttl=ttl)
         status = 201 if ok else 502
         self._send_json(status, {"ok": ok})
@@ -805,8 +826,23 @@ HTTPS exchange is the one-time TSIG-key registration step.</p>
         if writer is None:
             self._send_json(501, {"error": "writer not configured"})
             return 501
+        # Same input-shape gate as POST: a bad name surfaces as 400,
+        # not 502 / 404. Value is optional on DELETE (None = whole-
+        # RRset wipe per DNSRecordWriter contract); validate it only
+        # if present.
+        from dmp.network.dns_publisher import (
+            _is_safe_txt_value,
+            _is_valid_dns_name,
+        )
+
+        if not _is_valid_dns_name(name):
+            self._send_json(400, {"error": "invalid record name"})
+            return 400
         body = self._read_json_body() or {}
         value = body.get("value") if isinstance(body, dict) else None
+        if value is not None and not _is_safe_txt_value(value):
+            self._send_json(400, {"error": "invalid record value"})
+            return 400
         ok = writer.delete_txt_record(name, value=value)
         status = 204 if ok else 404
         self._send_empty(status)

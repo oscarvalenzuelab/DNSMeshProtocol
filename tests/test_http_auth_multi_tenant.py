@@ -236,6 +236,45 @@ class TestMultiTenantDelete:
         # silently swallowed.
         assert store.query_txt_record("chunk-0001-abcdef012345.example.com")
 
+    def test_bad_name_returns_400_not_502(self, mt_setup):
+        # An authenticated user posting a name that contains a
+        # newline / control char must get 400 (client error) instead
+        # of 502 (backend broke). Without HTTP-level validation,
+        # ``LocalDNSPublisher`` would refuse to write and the
+        # generic publish-failed branch would surface a confusing
+        # 502 indistinguishable from a transient writer outage.
+        api, _, _ = mt_setup
+        from urllib.parse import quote
+
+        # ``\n`` in the URL path needs URL-encoding to survive the
+        # HTTP request line. After unquote() in _match_name, the
+        # name is back to ``...\nsrv-record=...``.
+        bad_name = (
+            "ok-" + quote("\n", safe="") + "srv-record=evil.example,attacker,1234"
+        )
+        url = f"http://127.0.0.1:{api.port}/v1/records/{bad_name}"
+        headers = {"Authorization": "Bearer op-token"}
+        r = requests.post(
+            url,
+            json={"value": "v=dmp1"},
+            headers=headers,
+            timeout=2,
+        )
+        assert r.status_code == 400
+        assert "invalid record name" in r.text
+
+    def test_bad_value_returns_400_not_502(self, mt_setup):
+        api, _, _ = mt_setup
+        headers = {"Authorization": "Bearer op-token"}
+        r = requests.post(
+            _url(api, "ok.example.com"),
+            json={"value": "v=dmp1\ntxt-record=injected.example.com,evil"},
+            headers=headers,
+            timeout=2,
+        )
+        assert r.status_code == 400
+        assert "invalid record value" in r.text
+
     def test_operator_can_delete_chunk(self, mt_setup):
         # Sanity: operator-token short-circuit still grants delete.
         api, _, _ = mt_setup

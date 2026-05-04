@@ -107,6 +107,120 @@ class TestDNSPublisherInheritance:
         assert mem_b.query_txt_record("x.example.com") == ["shared"]
 
 
+class TestLocalDNSPublisherInjectionRejection:
+    # The publisher writes ``txt-record=NAME,"VALUE"`` lines verbatim
+    # into a dnsmasq config and reloads the service. Without input
+    # validation, an authenticated multi-tenant user could craft a
+    # name or value that escapes the directive and injects arbitrary
+    # rules. Codex P2 from the post-#52 fresh audit.
+
+    def _publisher(self, tmp_path):
+        from dmp.network.dns_publisher import LocalDNSPublisher
+
+        return LocalDNSPublisher(config_file=str(tmp_path / "dmp.conf"))
+
+    def test_name_with_newline_rejected(self, tmp_path):
+        pub = self._publisher(tmp_path)
+        evil = "ok.example.com\nsrv-record=evil.example.com,attacker.host,1234"
+        assert pub.publish_txt_record(evil, "v=dmp1") is False
+        assert evil not in pub.records
+
+    def test_name_with_comma_rejected(self, tmp_path):
+        pub = self._publisher(tmp_path)
+        assert (
+            pub.publish_txt_record("foo.example.com,injected.example.com", "v") is False
+        )
+
+    def test_name_with_space_rejected(self, tmp_path):
+        pub = self._publisher(tmp_path)
+        assert pub.publish_txt_record("foo bar.example.com", "v") is False
+
+    def test_value_with_quote_rejected(self, tmp_path):
+        pub = self._publisher(tmp_path)
+        # ``"`` would terminate the dnsmasq quote and let the rest
+        # of the line be reparsed as new directive fields.
+        assert (
+            pub.publish_txt_record(
+                "ok.example.com",
+                'v",strxxx="injected',
+            )
+            is False
+        )
+
+    def test_value_with_newline_rejected(self, tmp_path):
+        pub = self._publisher(tmp_path)
+        assert (
+            pub.publish_txt_record(
+                "ok.example.com",
+                "v=dmp1\ntxt-record=injected.example.com,evil",
+            )
+            is False
+        )
+
+    def test_value_with_control_char_rejected(self, tmp_path):
+        pub = self._publisher(tmp_path)
+        assert pub.publish_txt_record("ok.example.com", "v=dmp1\x07") is False
+
+    def test_legitimate_dmp_value_accepted(self, tmp_path):
+        # Sanity: a real DMP record value (printable ASCII, base64
+        # body) passes validation and reaches the dict.
+        pub = self._publisher(tmp_path)
+        assert pub.publish_txt_record(
+            "id-1234567890ab.example.com",
+            "v=dmp1;t=identity;d=YWJjZA==",
+        )
+        assert pub.records["id-1234567890ab.example.com"].startswith("v=dmp1")
+
+    def test_underscore_prefix_label_accepted(self, tmp_path):
+        # M10 / RFC-2782-style names (``_dnsmesh-claim-XXX.zone``) must
+        # still publish — the validator allows the leading-underscore
+        # service-label form.
+        pub = self._publisher(tmp_path)
+        assert pub.publish_txt_record(
+            "_dnsmesh-claim-abc.example.com",
+            "v=dmp1",
+        )
+
+    def test_delete_with_invalid_name_does_not_rewrite_config(self, tmp_path):
+        # Defense in depth: even if a malformed name somehow lands in
+        # ``pub.records`` (e.g. via a programmatic caller that
+        # bypassed publish_txt_record), delete() must reject it
+        # BEFORE triggering ``_write_and_reload`` — otherwise the
+        # rewrite would emit the bad name back into the config file.
+        # Without the validator, delete would fall through, find the
+        # name in records, remove it, and trigger a rewrite.
+        pub = self._publisher(tmp_path)
+        bad = "evil.example\nsrv-record=attacker,host,1234"
+        # Seed the dict directly so delete sees the name.
+        pub.records[bad] = "v=dmp1"
+        # Track whether _write_and_reload was called.
+        calls = []
+        original = pub._write_and_reload
+        pub._write_and_reload = lambda: (calls.append(True), original())[-1]
+        assert pub.delete_txt_record(bad) is False
+        # The validator stopped delete BEFORE the rewrite, so no
+        # config-file write happened — and the bad name stays out
+        # of the config file.
+        assert calls == []
+
+    def test_config_file_contains_no_injected_directives(self, tmp_path):
+        # End-to-end: an injection attempt fails at validation, the
+        # config file never sees the malicious string, and a
+        # subsequent legitimate publish writes a clean file.
+        pub = self._publisher(tmp_path)
+        assert (
+            pub.publish_txt_record(
+                "ok.example.com\nsrv-record=evil.example,attacker,1234",
+                "v",
+            )
+            is False
+        )
+        pub.publish_txt_record("ok.example.com", "v=dmp1;t=identity")
+        contents = (tmp_path / "dmp.conf").read_text()
+        assert "srv-record" not in contents
+        assert contents.count("\n") == 1
+
+
 class TestSplitTxtValue:
     """The RFC 1035 TXT character-string cap is 255 bytes. M2.1 cluster
     manifests run up to 1200 bytes post-base64, so every writer has to
