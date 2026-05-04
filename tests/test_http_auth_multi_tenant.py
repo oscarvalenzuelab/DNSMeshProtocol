@@ -214,6 +214,42 @@ class TestMultiTenantDelete:
         )
         assert r.status_code == 401
 
+    def test_shared_pool_token_cannot_delete_chunk(self, mt_setup):
+        # A pool token may publish into the chunk namespace (any user
+        # can deliver chunks for anyone) but must NOT delete chunks
+        # there. Without this gate, a stolen pool token would wipe
+        # other users' co-resident chunk RRsets.
+        api, store, tokens = mt_setup
+        # Operator seeds the chunk so DELETE has a target.
+        assert (
+            _post(api, "chunk-0001-abcdef012345.example.com", "op-token", "v1") == 201
+        )
+        alice_token, _ = tokens.issue("alice@example.com")
+        headers = {"Authorization": f"Bearer {alice_token}"}
+        r = requests.delete(
+            _url(api, "chunk-0001-abcdef012345.example.com"),
+            headers=headers,
+            timeout=2,
+        )
+        assert r.status_code == 401
+        # The chunk RRset still exists — DELETE was refused, not
+        # silently swallowed.
+        assert store.query_txt_record("chunk-0001-abcdef012345.example.com")
+
+    def test_operator_can_delete_chunk(self, mt_setup):
+        # Sanity: operator-token short-circuit still grants delete.
+        api, _, _ = mt_setup
+        assert (
+            _post(api, "chunk-0002-abcdef012345.example.com", "op-token", "v1") == 201
+        )
+        headers = {"Authorization": "Bearer op-token"}
+        r = requests.delete(
+            _url(api, "chunk-0002-abcdef012345.example.com"),
+            headers=headers,
+            timeout=2,
+        )
+        assert r.status_code == 204
+
 
 # ---------------------------------------------------------------------------
 # Back-compat: legacy + open modes must still behave like pre-M5.5.
