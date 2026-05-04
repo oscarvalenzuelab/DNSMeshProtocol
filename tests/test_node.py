@@ -78,8 +78,22 @@ class TestDMPNode:
         # Drive the client directly against the node's sqlite store. Exercises
         # the full send -> chunk -> publish -> poll -> decrypt path through a
         # real persistent store behind the same API the DNS + HTTP layers use.
-        alice = DMPClient("alice", "apass", domain="mesh.test", store=node.store)
-        bob = DMPClient("bob", "bpass", domain="mesh.test", store=node.store)
+        alice = DMPClient(
+            "alice",
+            "apass",
+            domain="mesh.test",
+            store=node.store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bpass",
+            domain="mesh.test",
+            store=node.store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),

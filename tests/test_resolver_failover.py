@@ -203,6 +203,8 @@ class TestResolverFailoverAcceptance:
             domain="mesh.test",
             writer=shared_store,
             reader=pool,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         bob = DMPClient(
             "bob",
@@ -210,6 +212,8 @@ class TestResolverFailoverAcceptance:
             domain="mesh.test",
             writer=shared_store,
             reader=pool,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         alice.add_contact(
             "bob",

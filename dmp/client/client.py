@@ -242,9 +242,9 @@ class DMPClient:
         reader: Optional[DNSRecordReader] = None,
         replay_cache_path: Optional[str] = None,
         kdf_salt: Optional[bytes] = None,
-        prekey_store_path: Optional[str] = None,
+        prekey_store_path: str,
         rotation_chain_enabled: bool = False,
-        intro_queue_path: Optional[str] = None,
+        intro_queue_path: str,
         allow_tofu: bool = False,
     ):
         if store is not None:
@@ -272,10 +272,11 @@ class DMPClient:
 
         # Prekey store: holds one-time X25519 prekey *private* halves so the
         # receive path can look them up by prekey_id and consume after decrypt.
-        # If no path is provided we get an ephemeral in-memory store via
-        # sqlite's :memory: — useful for tests but it drops on process exit,
-        # so a CLI deployment should always pass a path.
-        self.prekey_store = PrekeyStore(prekey_store_path or ":memory:")
+        # The path is required at the call site — silently falling back to
+        # ``:memory:`` had every CLI restart wipe the prekey pool, breaking
+        # forward secrecy negotiation for in-flight messages. Tests that
+        # genuinely want an ephemeral store pass ``":memory:"`` explicitly.
+        self.prekey_store = PrekeyStore(prekey_store_path)
 
         self.contacts: Dict[str, Contact] = {}
 
@@ -315,7 +316,7 @@ class DMPClient:
         # never invoke claim send/recv don't pay the import cost.
         from dmp.client.intro_queue import IntroQueue
 
-        self.intro_queue = IntroQueue(intro_queue_path or ":memory:")
+        self.intro_queue = IntroQueue(intro_queue_path)
 
         # M10 — local DNS endpoint for SAME-ZONE recipient-zone claim
         # publishes. The CLI sets these (from ``cfg.tsig_dns_server``

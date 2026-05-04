@@ -556,7 +556,7 @@ def test_chain_walk_unions_zone_anchored_and_hash_form():
 
 
 class TestDMPClientRotationChainIntegration:
-    """Verify DMPClient(rotation_chain_enabled=...) plumbing.
+    """Verify DMPClient(rotation_chain_enabled=..., intro_queue_path=":memory:", prekey_store_path=":memory:") plumbing.
 
     Default (False) MUST preserve byte-identical legacy behavior: a
     manifest from a non-pinned signer is dropped, period.
@@ -572,8 +572,22 @@ class TestDMPClientRotationChainIntegration:
         from dmp.network.memory import InMemoryDNSStore
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # Bob pins alice, then alice rotates to a new passphrase/key.
         # The rotated-alice sends from the new key; without the flag,
         # bob's receive drops it (pinned key doesn't match).
@@ -582,7 +596,14 @@ class TestDMPClientRotationChainIntegration:
             alice.get_public_key_hex(),
             signing_key_hex=alice.get_signing_public_key_hex(),
         )
-        alice2 = DMPClient("alice", "alice-new-pass", domain="mesh.test", store=store)
+        alice2 = DMPClient(
+            "alice",
+            "alice-new-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice2.add_contact("bob", bob.get_public_key_hex())
         alice2.send_message("bob", "hello from rotated alice")
         assert bob.receive_messages() == []
@@ -597,8 +618,22 @@ class TestDMPClientRotationChainIntegration:
         from dmp.network.memory import InMemoryDNSStore
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        alice2 = DMPClient("alice", "alice-new-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        alice2 = DMPClient(
+            "alice",
+            "alice-new-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         bob = DMPClient(
             "bob",
@@ -606,6 +641,8 @@ class TestDMPClientRotationChainIntegration:
             domain="mesh.test",
             store=store,
             rotation_chain_enabled=True,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         bob.add_contact(
             "alice",
@@ -648,13 +685,22 @@ class TestDMPClientRotationChainIntegration:
         from dmp.network.memory import InMemoryDNSStore
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         bob = DMPClient(
             "bob",
             "bob-pass",
             domain="mesh.test",
             store=store,
             rotation_chain_enabled=True,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         # Pin alice with her CURRENT signing key (no rotation yet).
         bob.add_contact(
@@ -688,14 +734,30 @@ class TestDMPClientRotationChainIntegration:
         from dmp.network.memory import InMemoryDNSStore
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        alice2 = DMPClient("alice", "alice-new-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        alice2 = DMPClient(
+            "alice",
+            "alice-new-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         bob = DMPClient(
             "bob",
             "bob-pass",
             domain="mesh.test",
             store=store,
             rotation_chain_enabled=True,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         bob.add_contact(
             "alice",
@@ -747,10 +809,20 @@ class TestDMPClientRotationChainIntegration:
         # locally on "mesh.local". This is the cross-zone case:
         # alice was pinned via `dmp identity fetch alice@other-zone.example --add`.
         alice = DMPClient(
-            "alice", "alice-pass", domain="other-zone.example", store=store
+            "alice",
+            "alice-pass",
+            domain="other-zone.example",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         alice2 = DMPClient(
-            "alice", "alice-new-pass", domain="other-zone.example", store=store
+            "alice",
+            "alice-new-pass",
+            domain="other-zone.example",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
 
         bob = DMPClient(
@@ -759,6 +831,8 @@ class TestDMPClientRotationChainIntegration:
             domain="mesh.local",
             store=store,
             rotation_chain_enabled=True,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         # Bob pins alice WITH the remote domain — exactly what the CLI
         # does after the M5.4-followup fix (persist contact.domain from
@@ -798,7 +872,12 @@ class TestDMPClientRotationChainIntegration:
         # RRsets. Because bob's mailbox addressing is tied to bob's
         # domain, alice2 must publish there.
         alice2_in_bob_zone = DMPClient(
-            "alice", "alice-new-pass", domain="mesh.local", store=store
+            "alice",
+            "alice-new-pass",
+            domain="mesh.local",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         alice2_in_bob_zone.add_contact("bob", bob.get_public_key_hex())
         alice2_in_bob_zone.send_message("bob", "cross-zone rotated hello")

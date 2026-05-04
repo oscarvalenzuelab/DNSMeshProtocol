@@ -54,6 +54,8 @@ def shared_store(monkeypatch):
             store=store,
             replay_cache_path=replay_path,
             allow_tofu=config.allow_tofu,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         for name, entry in config.contacts.items():
             # Mirror the real _make_client: use the persisted
@@ -1264,7 +1266,14 @@ class TestSendRecv:
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
 
         # Discover bob's pubkey by spinning up a client in the same store.
-        bob = DMPClient("bob", "bob-pass", domain="mesh.local", store=shared_store)
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.local",
+            store=shared_store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         cli.main(["contacts", "add", "bob", bob.get_public_key_hex()])
 
         rc = cli.main(["send", "bob", "hello from cli"])
@@ -1316,7 +1325,14 @@ class TestSendRecv:
         capsys.readouterr()
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
 
-        bob = DMPClient("bob", "bob-pass", domain="mesh.local", store=shared_store)
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.local",
+            store=shared_store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         cli.main(["contacts", "add", "bob", bob.get_public_key_hex()])
         capsys.readouterr()
 
@@ -1628,7 +1644,14 @@ class TestDnsResolvers:
         monkeypatch.setenv("DMP_PASSPHRASE", "alice-pass")
         capsys.readouterr()
 
-        bob = DMPClient("bob", "bob-pass", domain="mesh.local", store=shared_store)
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.local",
+            store=shared_store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         cli.main(["contacts", "add", "bob", bob.get_public_key_hex()])
         cli.main(["send", "bob", "legacy hi"])
         assert "sent" in capsys.readouterr().out

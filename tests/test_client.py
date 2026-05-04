@@ -1,5 +1,6 @@
 """End-to-end client tests over an InMemoryDNSStore."""
 
+import inspect
 import time
 
 import pytest
@@ -9,8 +10,22 @@ from dmp.network.memory import InMemoryDNSStore
 
 
 def _pair(store: InMemoryDNSStore, domain: str = "mesh.test"):
-    alice = DMPClient("alice", "alice-pass", domain=domain, store=store)
-    bob = DMPClient("bob", "bob-pass", domain=domain, store=store)
+    alice = DMPClient(
+        "alice",
+        "alice-pass",
+        domain=domain,
+        store=store,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
+    )
+    bob = DMPClient(
+        "bob",
+        "bob-pass",
+        domain=domain,
+        store=store,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
+    )
     # Pin signing keys mutually — the secure default. Without
     # signing_key_hex the receiver's known_spks is empty and
     # receive_messages drops every manifest unless ``allow_tofu=True``.
@@ -66,7 +81,14 @@ class TestSendReceive:
     def test_other_user_cannot_decrypt(self):
         store = InMemoryDNSStore()
         alice, bob = _pair(store)
-        eve = DMPClient("eve", "eve-pass", domain="mesh.test", store=store)
+        eve = DMPClient(
+            "eve",
+            "eve-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         alice.send_message("bob", "secret")
 
@@ -78,12 +100,26 @@ class TestSendReceive:
 
     def test_unknown_recipient_returns_false(self):
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "p", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "p",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         assert alice.send_message("nobody", "hi") is False
 
     def test_invalid_contact_key_rejected(self):
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "p", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "p",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         assert alice.add_contact("badhex", "zz") is False
         assert alice.add_contact("shortkey", "aabb") is False
 
@@ -142,7 +178,14 @@ class TestSendReceive:
         """Back-to-back sends prefer empty slots so neither message is lost."""
         store = InMemoryDNSStore()
         alice, bob = _pair(store)
-        eve = DMPClient("eve", "eve-pass", domain="mesh.test", store=store)
+        eve = DMPClient(
+            "eve",
+            "eve-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         eve.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -178,9 +221,30 @@ class TestSendReceive:
         import hashlib
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
-        eve = DMPClient("eve", "eve-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        eve = DMPClient(
+            "eve",
+            "eve-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # alice pins bob (both keys). No pin for eve.
         alice.add_contact(
@@ -214,9 +278,22 @@ class TestSendReceive:
         """
         store = InMemoryDNSStore()
         alice = DMPClient(
-            "alice", "alice-pass", domain="mesh.test", store=store, allow_tofu=True
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            allow_tofu=True,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
-        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # alice has no pinned signing keys at all — pure TOFU receive.
         bob.add_contact(
             "alice",
@@ -237,8 +314,22 @@ class TestSendReceive:
         explicitly via ``allow_tofu=True`` or ``enable_tofu()``.
         """
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         bob.add_contact(
             "alice",
             alice.get_public_key_hex(),
@@ -264,8 +355,22 @@ class TestSendReceive:
         cannot recover that session's plaintext.
         """
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # Pin both directions with signing keys so prekey verification works.
         alice.add_contact(
@@ -319,11 +424,24 @@ class TestSendReceive:
         """Without a pinned signing key for bob, alice falls back to his
         long-term X25519 key (no FS) rather than failing to send."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # bob receives via TOFU because no contact pins HIM — explicit
         # opt-in is required after P0-3.
         bob = DMPClient(
-            "bob", "bob-pass", domain="mesh.test", store=store, allow_tofu=True
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            allow_tofu=True,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         # NOTE: no signing_key_hex — alice can't verify any prekey signature.
         alice.add_contact("bob", bob.get_public_key_hex())
@@ -364,11 +482,24 @@ class TestSendReceive:
         has one fewer entry.
         """
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # bob has no pinned contacts in this test — receive falls back to
         # TOFU which is opt-in after P0-3.
         bob = DMPClient(
-            "bob", "bob-pass", domain="mesh.test", store=store, allow_tofu=True
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            allow_tofu=True,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         alice.add_contact(
             "bob",
@@ -396,8 +527,22 @@ class TestSendReceive:
         he polls, the ciphertext is undeliverable — the FS property working
         in the other direction."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -621,7 +766,14 @@ class TestSendReceive:
 
         store = InMemoryDNSStore()
         alice, bob = _pair(store)
-        eve = DMPClient("eve", "eve-pass", domain="mesh.test", store=store)
+        eve = DMPClient(
+            "eve",
+            "eve-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # Alice legitimately sends, chunks and manifest land in the store.
         assert alice.send_message("bob", "survive the squat")
@@ -661,7 +813,14 @@ class TestSendReceive:
 
         store = InMemoryDNSStore()
         alice, bob = _pair(store)
-        eve = DMPClient("eve", "eve-pass", domain="mesh.test", store=store)
+        eve = DMPClient(
+            "eve",
+            "eve-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # Eve overwrites every one of Bob's slots with a manifest that claims
         # to be from Alice. Since Eve can't sign with Alice's Ed25519 key, the
@@ -699,7 +858,14 @@ class TestSpkOnlyContact:
 
     def test_add_contact_accepts_spk_only(self):
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         ok = alice.add_contact(
             "spk-only-friend",
             public_key_hex="",
@@ -714,15 +880,36 @@ class TestSpkOnlyContact:
 
     def test_add_contact_rejects_no_keys_at_all(self):
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # Empty pub AND empty spk — nothing useful to pin.
         assert alice.add_contact("ghost", public_key_hex="", domain="g.mesh") is False
 
     def test_recv_walks_spk_only_contact_zone(self):
         """An spk-only pinned contact still gets their zone polled."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # Bob pins alice with full keys.
         bob.add_contact(
@@ -775,8 +962,22 @@ class TestCrossZoneReceive:
         nothing.
         """
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # Bob pins alice and explicitly records her zone — this is what
         # `dnsmesh identity fetch alice@alice.mesh --add` writes today.
@@ -817,8 +1018,22 @@ class TestCrossZoneReceive:
         alice.mesh and decodes successfully.
         """
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         bob.add_contact(
             "alice",
             alice.get_public_key_hex(),
@@ -869,9 +1084,22 @@ class TestCrossZoneReceive:
         explicit ``allow_tofu=True``.
         """
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="mesh.test", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         bob = DMPClient(
-            "bob", "bob-pass", domain="mesh.test", store=store, allow_tofu=True
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            allow_tofu=True,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
         # Legacy add — no domain= passed, no signing key (TOFU mode).
         alice.add_contact("bob", bob.get_public_key_hex())
@@ -890,10 +1118,29 @@ class TestCrossZoneReceive:
         manifest must not be discovered.
         """
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         mallory = DMPClient(
-            "mallory", "mallory-pass", domain="mallory.mesh", store=store
+            "mallory",
+            "mallory-pass",
+            domain="mallory.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
 
         bob.add_contact(
@@ -927,3 +1174,39 @@ class TestCrossZoneReceive:
         # pinned) — but the M8.1 promise is that we don't even look.
         assert len(inbox) == 1
         assert inbox[0].plaintext == b"from alice"
+
+
+class TestPersistencePathsRequired:
+    # Both ``intro_queue_path`` and ``prekey_store_path`` were
+    # ``Optional[str] = None`` and silently fell back to a
+    # ``:memory:`` sqlite when omitted. That made every CLI restart
+    # wipe the prekey pool (breaking forward-secrecy negotiation
+    # for in-flight messages) and dropped every pending first-
+    # contact intro on the floor. They are now required keyword
+    # arguments. Tests pin the contract at the signature level so a
+    # future refactor that re-introduces a default catches here.
+
+    def test_intro_queue_path_has_no_default(self):
+        sig = inspect.signature(DMPClient)
+        param = sig.parameters["intro_queue_path"]
+        assert param.default is inspect.Parameter.empty
+        # Pin keyword-only so a future refactor that re-orders the
+        # signature into positionals cannot satisfy the no-default
+        # check by accident — passing a path positionally is also
+        # forbidden.
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_prekey_store_path_has_no_default(self):
+        sig = inspect.signature(DMPClient)
+        param = sig.parameters["prekey_store_path"]
+        assert param.default is inspect.Parameter.empty
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_construct_without_persistence_paths_raises(self):
+        with pytest.raises(TypeError):
+            DMPClient(  # type: ignore[call-arg]
+                "alice",
+                "alice-pass",
+                domain="mesh.test",
+                store=InMemoryDNSStore(),
+            )

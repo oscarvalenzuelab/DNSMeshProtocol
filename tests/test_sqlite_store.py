@@ -141,8 +141,22 @@ class TestClientOverSqlite:
 
         store = SqliteMailboxStore(str(tmp_path / "mesh.db"))
         try:
-            alice = DMPClient("alice", "apass", domain="mesh.test", store=store)
-            bob = DMPClient("bob", "bpass", domain="mesh.test", store=store)
+            alice = DMPClient(
+                "alice",
+                "apass",
+                domain="mesh.test",
+                store=store,
+                intro_queue_path=":memory:",
+                prekey_store_path=":memory:",
+            )
+            bob = DMPClient(
+                "bob",
+                "bpass",
+                domain="mesh.test",
+                store=store,
+                intro_queue_path=":memory:",
+                prekey_store_path=":memory:",
+            )
             alice.add_contact(
                 "bob",
                 bob.get_public_key_hex(),
@@ -168,8 +182,22 @@ class TestClientOverSqlite:
 
         # Phase 1: alice sends while bob is "offline". Close the store.
         store1 = SqliteMailboxStore(db)
-        alice = DMPClient("alice", "apass", domain="mesh.test", store=store1)
-        bob_for_keys = DMPClient("bob", "bpass", domain="mesh.test", store=store1)
+        alice = DMPClient(
+            "alice",
+            "apass",
+            domain="mesh.test",
+            store=store1,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob_for_keys = DMPClient(
+            "bob",
+            "bpass",
+            domain="mesh.test",
+            store=store1,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob_for_keys.get_public_key_hex(),
@@ -183,7 +211,14 @@ class TestClientOverSqlite:
         # manifest unless ``allow_tofu=True`` (P0-3 default-deny).
         store2 = SqliteMailboxStore(db)
         try:
-            bob = DMPClient("bob", "bpass", domain="mesh.test", store=store2)
+            bob = DMPClient(
+                "bob",
+                "bpass",
+                domain="mesh.test",
+                store=store2,
+                intro_queue_path=":memory:",
+                prekey_store_path=":memory:",
+            )
             bob.add_contact(
                 "alice",
                 alice.get_public_key_hex(),

@@ -196,6 +196,8 @@ def test_container_roundtrip(node_container):
         domain="mesh.docker",
         writer=writer,
         reader=reader,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     bob = DMPClient(
         "bob",
@@ -203,6 +205,8 @@ def test_container_roundtrip(node_container):
         domain="mesh.docker",
         writer=writer,
         reader=reader,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     alice.add_contact(
         "bob",
@@ -238,6 +242,8 @@ def test_container_survives_client_restart(node_container):
         domain="mesh.docker",
         writer=writer,
         reader=reader,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     # Grab bob's pub + spk without retaining the client instance.
     _bob_for_keys = DMPClient(
@@ -246,6 +252,8 @@ def test_container_survives_client_restart(node_container):
         domain="mesh.docker",
         writer=writer,
         reader=reader,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     bob_pubkey = _bob_for_keys.get_public_key_hex()
     bob_spk = _bob_for_keys.get_signing_public_key_hex()
@@ -263,6 +271,8 @@ def test_container_survives_client_restart(node_container):
         domain="mesh.docker",
         writer=writer,
         reader=reader,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     bob_fresh.add_contact(
         "alice", alice.get_public_key_hex(), signing_key_hex=alice_spk
@@ -299,6 +309,7 @@ def test_container_forward_secrecy_end_to_end(node_container, tmp_path):
         writer=writer,
         reader=reader,
         prekey_store_path=alice_prekeys,
+        intro_queue_path=":memory:",
     )
     bob = DMPClient(
         "bob-fs",
@@ -307,6 +318,7 @@ def test_container_forward_secrecy_end_to_end(node_container, tmp_path):
         writer=writer,
         reader=reader,
         prekey_store_path=bob_prekeys,
+        intro_queue_path=":memory:",
     )
     # Alice pins both of bob's keys — required to verify prekey signatures.
     alice.add_contact(
@@ -391,6 +403,8 @@ def test_container_zone_anchored_identity(node_container):
         domain="mesh.docker",
         writer=writer,
         reader=reader,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     record = make_record(alice.crypto, "alice-z")
     wire = record.sign(alice.crypto)
@@ -500,6 +514,8 @@ def _rotate_identity(
         reader=old_client.reader,
         kdf_salt=kdf_salt,
         rotation_chain_enabled=old_client.rotation_chain_enabled,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
 
 
@@ -522,6 +538,8 @@ def test_container_rotation_routine_chain_walk(node_container):
         writer=writer,
         reader=reader,
         kdf_salt=alice_salt,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     bob = DMPClient(
         "bob",
@@ -531,6 +549,8 @@ def test_container_rotation_routine_chain_walk(node_container):
         reader=reader,
         kdf_salt=bob_salt,
         rotation_chain_enabled=True,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     alice.add_contact(
         "bob",
@@ -588,6 +608,8 @@ def test_container_rotation_compromise_revokes_old_key(node_container):
         writer=writer,
         reader=reader,
         kdf_salt=alice_salt,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     bob = DMPClient(
         "bob",
@@ -597,6 +619,8 @@ def test_container_rotation_compromise_revokes_old_key(node_container):
         reader=reader,
         kdf_salt=bob_salt,
         rotation_chain_enabled=True,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
 
     _rotate_identity(
@@ -651,6 +675,8 @@ def test_container_concurrent_receive_delivers_exactly_once(node_container):
         domain="mesh.docker",
         writer=writer,
         reader=reader,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     bob = DMPClient(
         "bob-conc",
@@ -658,6 +684,8 @@ def test_container_concurrent_receive_delivers_exactly_once(node_container):
         domain="mesh.docker",
         writer=writer,
         reader=reader,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
     )
     alice.add_contact(
         "bob-conc",
