@@ -493,6 +493,34 @@ class TestAuthorizeSharedPool:
         r = store.authorize_write(token, "chunk-0001-abcdef012345.example.com")
         assert not r.ok
 
+    def test_shared_pool_token_cannot_delete_chunk(self, store: TokenStore) -> None:
+        # The pool grants any live token publish access to chunks
+        # because chunks are content-addressed and the namespace has
+        # no per-record ownership. Delete must NOT inherit the same
+        # permissive policy: a stolen pool token would otherwise
+        # wipe co-resident RRsets it never authored.
+        token, _ = store.issue("alice@example.com")
+        r = store.authorize_write(
+            token, "chunk-0001-abcdef012345.example.com", op="delete"
+        )
+        assert not r.ok
+        assert "shared-pool" in r.reason.lower()
+        # Publish on the same name still succeeds — only delete is
+        # refused.
+        r2 = store.authorize_write(token, "chunk-0001-abcdef012345.example.com")
+        assert r2.ok
+
+    def test_shared_pool_token_cannot_delete_mailbox(self, store: TokenStore) -> None:
+        # Mailbox-slot delivery flows through the shared pool because
+        # any user can deliver to any mailbox. Delete therefore lands
+        # in the same branch and must be rejected.
+        token, _ = store.issue("alice@example.com")
+        r = store.authorize_write(
+            token, "slot-3.mb-abcdef012345.example.com", op="delete"
+        )
+        assert not r.ok
+        assert "shared-pool" in r.reason.lower()
+
 
 class TestAuthorizeOperatorOnly:
     def test_end_user_token_cannot_publish_cluster(self, store: TokenStore) -> None:

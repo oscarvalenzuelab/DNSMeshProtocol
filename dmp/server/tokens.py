@@ -947,8 +947,16 @@ class TokenStore:
         *,
         remote_addr: str = "",
         log_use: bool = True,
+        op: str = "publish",
     ) -> AuthResult:
         """Classify ``record_name`` and check ``token`` against the scope.
+
+        ``op`` is ``"publish"`` or ``"delete"``. Shared-pool tokens
+        may publish into the chunk namespace (their whole purpose)
+        but MUST NOT delete: a stolen pool token would otherwise be
+        able to wipe other users' chunk RRsets it never authored.
+        Owner-exclusive tokens can delete their own scope (the user
+        deleting their identity / mailbox is a documented flow).
 
         Returns an :class:`AuthResult`. When ``log_use`` is True (the
         default), a successful authorization writes a row to the
@@ -1121,13 +1129,35 @@ class TokenStore:
                     self._conn.commit()
                 return AuthResult(True, row=row, scope=scope)
 
-            # Shared pool: any live token is fine. Deliberately do
-            # NOT populate token_hash / subject on the audit row —
-            # that's the split-audit policy. Per-token rate limit is
-            # enforced the same way as for owner-exclusive, but the
-            # throttled audit row ALSO drops token_hash/subject to
-            # keep the split-audit invariant: an operator with the DB
-            # cannot tell which user was throttled on a chunk write.
+            # Shared pool: any live token is fine to PUBLISH. Delete
+            # is operator-only at this layer — the chunk namespace
+            # has no per-record ownership record, so we cannot tell
+            # whether a given pool token authored the RRset it's
+            # asking to remove. Allowing pool deletes meant any live
+            # pool token could wipe co-resident chunks (codex P1
+            # round on the post-#51 audit). Operator tokens still
+            # delete via the operator-token short-circuit higher up.
+            if op == "delete":
+                if log_use:
+                    self._audit(
+                        "rejected",
+                        remote_addr=remote_addr,
+                        detail="shared-pool delete refused",
+                    )
+                    self._conn.commit()
+                return AuthResult(
+                    False,
+                    row=row,
+                    scope=scope,
+                    reason="shared-pool tokens may publish but not delete",
+                )
+            # Deliberately do NOT populate token_hash / subject on
+            # the audit row — that's the split-audit policy. Per-
+            # token rate limit is enforced the same way as for
+            # owner-exclusive, but the throttled audit row ALSO
+            # drops token_hash/subject to keep the split-audit
+            # invariant: an operator with the DB cannot tell which
+            # user was throttled on a chunk write.
             if not self._rate_limiter.allow(
                 token_hash, row.rate_per_sec, row.rate_burst
             ):

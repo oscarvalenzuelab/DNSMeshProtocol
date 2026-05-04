@@ -126,8 +126,13 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             return ""
         return header[len("Bearer ") :]
 
-    def _authorize_record_write(self, record_name: str) -> bool:
+    def _authorize_record_write(self, record_name: str, op: str = "publish") -> bool:
         """Mode-aware authorization for ``/v1/records/{name}`` writes.
+
+        ``op`` is ``"publish"`` or ``"delete"``. The operator-token
+        short-circuit accepts both, since operators can always do
+        either. The TokenStore branch passes ``op`` through so the
+        scope-class rules can refuse e.g. shared-pool deletes.
 
         ``auth_mode == "open"``: accept everything. Dev / trusted LAN only.
         ``auth_mode == "legacy"``: only the operator token is accepted
@@ -169,6 +174,7 @@ class _DMPHttpHandler(BaseHTTPRequestHandler):
             presented,
             record_name,
             remote_addr=self.client_address[0] if self.client_address else "",
+            op=op,
         )
         # Stash the AuthResult on the handler so the POST/DELETE
         # caller can translate ``throttled`` to HTTP 429 rather than
@@ -791,7 +797,7 @@ HTTPS exchange is the one-time TSIG-key registration step.</p>
             return 404
         if not self._check_rate_limit():
             return 429
-        if not self._authorize_record_write(name):
+        if not self._authorize_record_write(name, op="delete"):
             status, payload = self._auth_failure_response()
             self._send_json(status, payload)
             return status
