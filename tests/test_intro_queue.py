@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import tempfile
 
@@ -24,7 +25,7 @@ def _seed(q: IntroQueue, *, sender_spk: bytes = b"\x33" * 32, msg_id: bytes = No
 
 class TestIntroBasics:
     def test_add_and_list(self):
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         intro_id = _seed(q)
         assert intro_id is not None
         rows = q.list_intros()
@@ -33,7 +34,7 @@ class TestIntroBasics:
         assert rows[0].plaintext == b"hello stranger"
 
     def test_get_intro_round_trip(self):
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         intro_id = _seed(q)
         got = q.get_intro(intro_id)
         assert got is not None
@@ -41,11 +42,11 @@ class TestIntroBasics:
         assert got.plaintext == b"hello stranger"
 
     def test_get_missing_returns_none(self):
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         assert q.get_intro(999) is None
 
     def test_remove_intro(self):
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         intro_id = _seed(q)
         assert q.remove_intro(intro_id) is True
         assert q.list_intros() == []
@@ -54,7 +55,7 @@ class TestIntroBasics:
 
     def test_dedupe_same_sender_and_msg(self):
         """A re-poll that re-discovers the same claim must not duplicate."""
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         spk = b"\x44" * 32
         msg_id = b"\x55" * 16
         first = _seed(q, sender_spk=spk, msg_id=msg_id)
@@ -64,7 +65,7 @@ class TestIntroBasics:
         assert len(q.list_intros()) == 1
 
     def test_has_intro(self):
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         spk = b"\x77" * 32
         msg_id = b"\x88" * 16
         assert q.has_intro(spk, msg_id) is False
@@ -74,7 +75,7 @@ class TestIntroBasics:
 
 class TestDenylist:
     def test_block_then_add_drops(self):
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         spk = b"\xaa" * 32
         q.block_sender(spk, note="spam")
         assert q.is_blocked(spk) is True
@@ -84,7 +85,7 @@ class TestDenylist:
         assert q.list_intros() == []
 
     def test_unblock_allows_again(self):
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         spk = b"\xbb" * 32
         q.block_sender(spk)
         assert q.unblock_sender(spk) is True
@@ -92,7 +93,7 @@ class TestDenylist:
         assert _seed(q, sender_spk=spk) is not None
 
     def test_block_idempotent(self):
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         spk = b"\xcc" * 32
         q.block_sender(spk, note="first")
         q.block_sender(spk, note="second")  # no-op
@@ -105,7 +106,7 @@ class TestDenylist:
         for the specific message; the queue layer doesn't make that
         decision implicitly.
         """
-        q = IntroQueue()
+        q = IntroQueue(":memory:")
         intro_id = _seed(q)
         spk = q.list_intros()[0].sender_spk
         q.block_sender(spk)
@@ -234,3 +235,20 @@ class TestSchemaVersioning:
             assert rows[0].intro_id == intro_id
         finally:
             q2.close()
+
+
+class TestPathRequired:
+    def test_construct_without_path_raises(self):
+        # Pending intros silently disappeared on every restart when
+        # the constructor accepted a default ``:memory:`` path. The
+        # argument is now mandatory: callers that genuinely want an
+        # ephemeral queue pass ``":memory:"`` explicitly.
+        with pytest.raises(TypeError):
+            IntroQueue()  # type: ignore[call-arg]
+
+    def test_path_parameter_has_no_default(self):
+        # Pin the contract at the signature level so a future change
+        # that adds a new required positional in front of ``path``
+        # cannot silently re-introduce a default for ``path`` itself.
+        sig = inspect.signature(IntroQueue)
+        assert sig.parameters["path"].default is inspect.Parameter.empty
