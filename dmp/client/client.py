@@ -428,6 +428,30 @@ class DMPClient:
             c.signing_key_bytes for c in self.contacts.values() if c.signing_key_bytes
         }
 
+    def _known_signing_keys_for_zone(self, zone: str) -> set[bytes]:
+        """Signing keys of pinned contacts whose zone matches ``zone``.
+
+        The slot-walk receive path uses this to bind ``sender_spk``
+        acceptance to the zone the manifest was found in. Without
+        this binding, a manifest signed by Bob's pinned key would be
+        accepted under Carol's zone too — letting any pinned contact
+        replay another pinned sender's manifest into their own zone
+        and win the race against the legitimate copy. Codex P2 on
+        the post-#52 fresh audit.
+
+        Empty ``Contact.domain`` (legacy back-compat: contacts added
+        before per-contact zones existed) folds into ``self.domain``
+        so single-zone deployments keep delivering.
+        """
+        out: set[bytes] = set()
+        for c in self.contacts.values():
+            if not c.signing_key_bytes:
+                continue
+            contact_zone = c.domain or self.domain
+            if contact_zone == zone:
+                out.add(c.signing_key_bytes)
+        return out
+
     def enable_tofu(self) -> None:
         """Opt back into Trust-On-First-Use delivery on the slot-walk path.
 
@@ -983,6 +1007,13 @@ class DMPClient:
         else:
             slot_walk_zones = self._zones_to_poll()
         for zone in slot_walk_zones:
+            # Per-zone pin set: only contacts whose zone matches the
+            # one we're polling are valid signers for manifests found
+            # there. Closes the cross-zone replay surface — any pinned
+            # contact's zone could otherwise carry a copy of another
+            # pinned sender's manifest and win the race against the
+            # legitimate copy in the original zone.
+            zone_known_spks = self._known_signing_keys_for_zone(zone)
             for slot in range(SLOT_COUNT):
                 slot_domain = self._slot_domain(self.user_id, slot, zone=zone)
                 records = self.reader.query_txt_record(slot_domain)
@@ -998,10 +1029,10 @@ class DMPClient:
                     if manifest.is_expired():
                         continue
                     # Pinned signers gate + revocation check. Cases:
-                    #   1) known_spks non-empty + match → check revocation
+                    #   1) known_spks non-empty + zone match → check revocation
                     #      (a pinned key that was later revoked by its
                     #      owner via rotate-then-revoke must drop).
-                    #   2) known_spks non-empty + miss → rotation-walk.
+                    #   2) known_spks non-empty + zone miss → rotation-walk.
                     #      No revocation check on the new head — that's
                     #      a different key, and chain-walk acceptance
                     #      already verified its current trust state.
@@ -1009,8 +1040,14 @@ class DMPClient:
                     #      (TOFU still respects revoked-by-issuer).
                     #   4) known_spks EMPTY + not allow_tofu → drop.
                     #      Default-deny first-contact gate (P0-3).
+                    #
+                    # The "match" check is bound to ``zone_known_spks``
+                    # (this zone's pinned contacts only), not the global
+                    # ``known_spks``. The outer ``if known_spks:`` gate
+                    # stays global so TOFU semantics don't break — any
+                    # pin anywhere disables TOFU site-wide.
                     if known_spks:
-                        if manifest.sender_spk in known_spks:
+                        if manifest.sender_spk in zone_known_spks:
                             # EXPERIMENTAL (M5.4): a sender who published
                             # (rotation A→B) + (revocation of A) would
                             # otherwise have manifests signed by A still
