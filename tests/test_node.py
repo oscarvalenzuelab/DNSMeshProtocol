@@ -258,3 +258,42 @@ class TestHeartbeatDnsReaderDnssecGate:
         monkeypatch.setattr(dns.resolver.Resolver, "resolve", fake_resolve)
         reader = _build_heartbeat_dns_reader()
         assert reader.query_txt_record("x.example.com") == ["validated"]
+
+    def test_system_resolver_path_logs_when_dropping_ad_less_nxdomain(
+        self, monkeypatch, caplog
+    ):
+        # Negative-response AD gate. A spoofed NXDOMAIN halts peer
+        # harvest with the same outward symptom as a real "no record"
+        # answer, so we log + drop without trusting the denial.
+        import logging
+
+        import dns.flags
+        import dns.message
+        import dns.name
+        import dns.resolver
+
+        from dmp.server.node import _build_heartbeat_dns_reader
+
+        monkeypatch.delenv("DMP_HEARTBEAT_DNS_RESOLVERS", raising=False)
+        monkeypatch.setenv("DMP_HEARTBEAT_DNSSEC_REQUIRED", "1")
+
+        def side_effect(self, name, rdtype):
+            qname = dns.name.from_text(name) if isinstance(name, str) else name
+            response = dns.message.Message()
+            response.flags = dns.flags.QR | dns.flags.RA
+            raise dns.resolver.NXDOMAIN(qnames=[qname], responses={qname: response})
+
+        monkeypatch.setattr(dns.resolver.Resolver, "resolve", side_effect)
+        reader = _build_heartbeat_dns_reader()
+
+        queried = "harvested-peer-token"
+        with caplog.at_level(logging.WARNING, logger="dmp.server.node"):
+            assert reader.query_txt_record(queried) is None
+
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less negative" in m
+            and queried in m
+            and "DMP_HEARTBEAT_DNSSEC_REQUIRED" in m
+            for m in msgs
+        ), msgs

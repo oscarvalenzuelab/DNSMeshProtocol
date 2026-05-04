@@ -15,6 +15,40 @@ import dns.name
 log = logging.getLogger(__name__)
 
 
+def _negative_response_ad_set(exc, qname: str) -> bool:
+    """True iff every response on a negative reply carries the AD flag.
+
+    dnspython's ``Answer`` object isn't built for negative responses,
+    but ``NXDOMAIN`` and ``NoAnswer`` both keep the raw response
+    message accessible. ``NoAnswer.response()`` takes no args;
+    ``NXDOMAIN`` keeps a ``responses`` dict keyed by ``dns.name.Name``
+    (a single ``resolve()`` can retry across multiple qnames with the
+    search-list).
+
+    Policy: ALL contained responses must carry AD. An "any one is
+    AD-set" policy would let a malicious recursor bless an AD-less
+    denial for the target by piggybacking on an AD-set response for
+    a benign search-list retry. Empty ``responses()`` (no recorded
+    responses at all) is treated as not-validated. Falls back to
+    False on any API weirdness so the gate fails closed under
+    ``dnssec_required``.
+    """
+    del qname  # str → dns.name conversion is brittle; check all instead
+    try:
+        if hasattr(exc, "responses"):
+            responses = list(exc.responses().values())
+            if not responses:
+                return False
+            return all(bool(getattr(r, "flags", 0) & dns.flags.AD) for r in responses)
+        if hasattr(exc, "response"):
+            response = exc.response()  # NoAnswer
+            flags = getattr(response, "flags", 0) if response else 0
+            return bool(flags & dns.flags.AD)
+        return False
+    except Exception:
+        return False
+
+
 @dataclass
 class DMPDNSRecord:
     """Container for DMP data in DNS records"""
@@ -188,29 +222,43 @@ class DNSOperations:
         """Query TXT records for a domain"""
         try:
             answers = self.resolver.resolve(domain, "TXT")
-            if self._dnssec_required:
-                response = getattr(answers, "response", None)
-                flags = getattr(response, "flags", 0) if response else 0
-                if not (flags & dns.flags.AD):
-                    # Upstream didn't validate (or the chain failed).
-                    # Drop the answer — DMP must not consume DNS data
-                    # without validation when the operator opted in.
-                    # Warn so operators can correlate vanished records
-                    # with their DNSSEC opt-in rather than guessing.
-                    log.warning(
-                        "DNSOperations: dropping AD-less TXT answer for "
-                        "%s (dnssec_required=True)",
-                        domain,
-                    )
-                    return None
-            records = []
-            for rdata in answers:
-                # TXT records can have multiple strings
-                txt_data = "".join(s.decode("utf-8") for s in rdata.strings)
-                records.append(txt_data)
-            return records
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, Exception):
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer) as exc:
+            # Negative responses (NSEC/NSEC3-backed denial of existence)
+            # also need AD-bit checking when ``dnssec_required`` is set.
+            # Without this, an unvalidated NXDOMAIN/NoAnswer is
+            # indistinguishable from a forged one and silently passes
+            # as "no record" — defeating the gate. dnspython exposes
+            # the raw response on the exception so we can read flags.
+            if self._dnssec_required and not _negative_response_ad_set(exc, domain):
+                log.warning(
+                    "DNSOperations: dropping AD-less negative answer for "
+                    "%s (dnssec_required=True)",
+                    domain,
+                )
             return None
+        except Exception:
+            return None
+        if self._dnssec_required:
+            response = getattr(answers, "response", None)
+            flags = getattr(response, "flags", 0) if response else 0
+            if not (flags & dns.flags.AD):
+                # Upstream didn't validate (or the chain failed).
+                # Drop the answer — DMP must not consume DNS data
+                # without validation when the operator opted in.
+                # Warn so operators can correlate vanished records
+                # with their DNSSEC opt-in rather than guessing.
+                log.warning(
+                    "DNSOperations: dropping AD-less TXT answer for "
+                    "%s (dnssec_required=True)",
+                    domain,
+                )
+                return None
+        records = []
+        for rdata in answers:
+            # TXT records can have multiple strings
+            txt_data = "".join(s.decode("utf-8") for s in rdata.strings)
+            records.append(txt_data)
+        return records
 
     def query_dmp_record(self, domain: str) -> Optional[DMPDNSRecord]:
         """Query and parse DMP record from DNS"""

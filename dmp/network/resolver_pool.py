@@ -62,6 +62,7 @@ import dns.exception
 import dns.flags
 import dns.resolver
 
+from dmp.core.dns import _negative_response_ad_set
 from dmp.network.base import DNSRecordReader
 
 log = logging.getLogger(__name__)
@@ -241,18 +242,15 @@ class ResolverPool(DNSRecordReader):
           - The pool also queries the recursor with the EDNS DO bit set
             so the recursor knows we want DNSSEC processing; without DO,
             many recursors strip RRSIGs and never set AD.
-          - **Negative responses are NOT validated.** dnspython raises
-            ``NXDOMAIN`` / ``NoAnswer`` before our gate sees the message,
-            and the exception drops the AD-bit context. So an attacker
-            who can return ``NXDOMAIN`` (e.g. via spoofed UDP) still
-            gets a "no records" outcome through the pool — the response
-            is unauthenticated denial. Mitigations: pair with a trusted
-            local recursor that validates negative responses (NSEC/NSEC3
-            chains) and refuses unsigned denials, OR fall back to
-            full local validation. Tracked as follow-up: switch the
-            ``dnssec_required=True`` path to lower-level
-            ``dns.message`` + ``dns.query`` so the AD bit on negative
-            responses is reachable.
+          - **Negative responses ARE validated.** dnspython raises
+            ``NXDOMAIN`` / ``NoAnswer`` to surface a denial, but the
+            raw response is still reachable on the exception via
+            ``responses()`` / ``response()``. The pool reads the AD
+            flag off the negative reply: AD-set means the recursor
+            DNSSEC-validated the denial (NSEC/NSEC3) and the absence
+            counts as a healthy "no record" vote; AD-unset means the
+            denial is unauthenticated and the upstream is demoted.
+            See ``dmp.core.dns._negative_response_ad_set``.
           - Local validation against a trust anchor is a separate, larger
             project; that requires shipping/refreshing the root anchor
             and full chain validation in-process.
@@ -387,7 +385,25 @@ class ResolverPool(DNSRecordReader):
         for state in self._iter_ordered():
             try:
                 answers = state.resolver.resolve(name, "TXT")
-            except self._NAME_NOT_FOUND_ERRORS:
+            except self._NAME_NOT_FOUND_ERRORS as exc:
+                # Negative-response AD gate. A NXDOMAIN/NoAnswer with
+                # the AD flag set is a real validated denial of
+                # existence (NSEC/NSEC3) — vote for "not found".
+                # Without AD when ``dnssec_required`` is on, the
+                # negative is indistinguishable from a forged one
+                # (an attacker who can spoof a denial can erase a
+                # mailbox slot or identity record); demote the
+                # upstream like any unvalidated answer.
+                if self._dnssec_required and not _negative_response_ad_set(exc, name):
+                    log.warning(
+                        "ResolverPool: dropping AD-less negative TXT answer "
+                        "for %s from upstream %s:%d (dnssec_required=True)",
+                        name,
+                        state.host,
+                        state.port,
+                    )
+                    self._mark_failure(state)
+                    continue
                 # Defer the health decision: if a later resolver
                 # returns a real record, this one was wrong and we'll
                 # demote it retroactively. If everyone agrees the name
@@ -486,7 +502,24 @@ class ResolverPool(DNSRecordReader):
             for state in self._iter_ordered():
                 try:
                     answers = state.resolver.resolve(host, rdtype)
-                except self._NAME_NOT_FOUND_ERRORS:
+                except self._NAME_NOT_FOUND_ERRORS as exc:
+                    # Same negative-response AD gate as TXT. A forged
+                    # NXDOMAIN here would steer DNS UPDATE writes to
+                    # a fallback hostname an attacker controls — see
+                    # _resolve_to_ip in dns_update_writer.
+                    if self._dnssec_required and not _negative_response_ad_set(
+                        exc, host
+                    ):
+                        log.warning(
+                            "ResolverPool: dropping AD-less negative %s "
+                            "answer for %s from upstream %s:%d "
+                            "(dnssec_required=True)",
+                            rdtype,
+                            host,
+                            state.host,
+                            state.port,
+                        )
+                        self._mark_failure(state)
                     continue
                 except self._TRANSPORT_ERRORS:
                     self._mark_failure(state)
@@ -529,7 +562,19 @@ class ResolverPool(DNSRecordReader):
         for state in self._iter_ordered():
             try:
                 answers = state.resolver.resolve(zone, "NS")
-            except self._NAME_NOT_FOUND_ERRORS:
+            except self._NAME_NOT_FOUND_ERRORS as exc:
+                # NS lookups feed dns_update_writer's split-host target
+                # chase, so an unvalidated negative would route writes
+                # to whatever the attacker maps the fallback host to.
+                if self._dnssec_required and not _negative_response_ad_set(exc, zone):
+                    log.warning(
+                        "ResolverPool: dropping AD-less negative NS answer "
+                        "for %s from upstream %s:%d (dnssec_required=True)",
+                        zone,
+                        state.host,
+                        state.port,
+                    )
+                    self._mark_failure(state)
                 continue
             except self._TRANSPORT_ERRORS:
                 self._mark_failure(state)

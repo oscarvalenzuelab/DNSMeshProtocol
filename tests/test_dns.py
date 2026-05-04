@@ -274,6 +274,112 @@ class TestDNSOperationsDnssecLogs:
             for m in msgs
         ), msgs
 
+    # The two tests below close the negative-response AD gap: a
+    # forged NXDOMAIN looks identical to a real "no record" reply
+    # to upstream callers, so an attacker who can spoof denial of
+    # existence can erase mailbox slots or identity records.
+
+    def _nx(self, *, ad: bool):
+        import dns.message
+        import dns.name
+
+        def side_effect(self, name, rdtype="A", *args, **kwargs):
+            qname = dns.name.from_text(name) if isinstance(name, str) else name
+            response = dns.message.Message()
+            response.flags = (dns.flags.QR | dns.flags.RA) | (dns.flags.AD if ad else 0)
+            raise dns.resolver.NXDOMAIN(qnames=[qname], responses={qname: response})
+
+        return side_effect
+
+    def test_logs_when_dropping_ad_less_nxdomain(self, caplog):
+        ops = DNSOperations(dnssec_required=True)
+        with patch.object(dns.resolver.Resolver, "resolve", autospec=True) as m:
+            m.side_effect = self._nx(ad=False)
+            with caplog.at_level(logging.WARNING, logger="dmp.core.dns"):
+                assert ops.query_txt_record("forged-domain") is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less negative" in m
+            and "forged-domain" in m
+            and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
+
+    def test_silent_for_validated_nxdomain(self, caplog):
+        # Validated denial of existence is healthy — same return
+        # value (None) but no warning, since this is the recursor
+        # doing its job.
+        ops = DNSOperations(dnssec_required=True)
+        with patch.object(dns.resolver.Resolver, "resolve", autospec=True) as m:
+            m.side_effect = self._nx(ad=True)
+            with caplog.at_level(logging.WARNING, logger="dmp.core.dns"):
+                assert ops.query_txt_record("validated-absent") is None
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "AD-less" in r.getMessage()
+        ]
+        assert warnings == [], warnings
+
+
+class TestNegativeResponseAdSet:
+    """Direct coverage for ``_negative_response_ad_set``.
+
+    Codex round on PR #51 caught that an "any AD" policy lets a
+    malicious recursor bless an AD-less denial for the target by
+    piggybacking on an AD-set response for a benign search-list
+    retry. Policy is now "ALL contained responses must have AD" —
+    these tests pin that contract.
+    """
+
+    @staticmethod
+    def _nxdomain(ads):
+        import dns.message
+        import dns.name
+
+        responses = {}
+        for i, ad in enumerate(ads):
+            qname = dns.name.from_text(f"q{i}.example.")
+            r = dns.message.Message()
+            r.flags = (dns.flags.QR | dns.flags.RA) | (dns.flags.AD if ad else 0)
+            responses[qname] = r
+        return dns.resolver.NXDOMAIN(qnames=list(responses), responses=responses)
+
+    def test_all_ad_set_returns_true(self):
+        from dmp.core.dns import _negative_response_ad_set
+
+        exc = self._nxdomain([True, True])
+        assert _negative_response_ad_set(exc, "any") is True
+
+    def test_mixed_returns_false(self):
+        # The piggyback attack: one AD-set search-list retry should
+        # NOT bless an AD-less denial for the actual target.
+        from dmp.core.dns import _negative_response_ad_set
+
+        exc = self._nxdomain([True, False])
+        assert _negative_response_ad_set(exc, "any") is False
+
+    def test_all_ad_unset_returns_false(self):
+        from dmp.core.dns import _negative_response_ad_set
+
+        exc = self._nxdomain([False])
+        assert _negative_response_ad_set(exc, "any") is False
+
+    def test_noanswer_uses_single_response(self):
+        import dns.message
+
+        from dmp.core.dns import _negative_response_ad_set
+
+        r = dns.message.Message()
+        r.flags = dns.flags.QR | dns.flags.AD
+        exc = dns.resolver.NoAnswer(response=r)
+        assert _negative_response_ad_set(exc, "any") is True
+
+        r2 = dns.message.Message()
+        r2.flags = dns.flags.QR
+        exc2 = dns.resolver.NoAnswer(response=r2)
+        assert _negative_response_ad_set(exc2, "any") is False
+
 
 class TestDNSChunkManager:
     """Test chunk management"""

@@ -316,9 +316,12 @@ class TestResolveToIp:
         assert pool.calls == ["anything.example"]
 
     def test_resolver_pool_failure_falls_back_to_system(self):
-        """Pool returning None doesn't permanently fail — system
+        """Pool returning None doesn't permanently fail — when the
+        operator opts into ``allow_system_fallback``, the system
         resolver is the last-resort fallback so a misconfigured pool
-        doesn't lock us out entirely."""
+        doesn't lock them out entirely. Strict mode (default) is
+        covered by ``test_pool_returns_none_does_not_leak_to_system_resolver``.
+        """
 
         class _DeadPool:
             def resolve_address(self, host):
@@ -326,19 +329,63 @@ class TestResolveToIp:
 
         # ``localhost`` resolves via the system resolver in any test
         # environment, so this exercises the fallback cleanly.
-        out = _resolve_to_ip("localhost", resolver_pool=_DeadPool())
+        out = _resolve_to_ip(
+            "localhost",
+            resolver_pool=_DeadPool(),
+            allow_system_fallback=True,
+        )
         assert out in {"127.0.0.1", "::1"}
 
     def test_resolver_pool_exception_does_not_propagate(self):
         """A resolver pool that raises (e.g. all upstreams down)
-        falls back to the system resolver instead of crashing the
+        falls back to the system resolver under
+        ``allow_system_fallback=True`` instead of crashing the
         publish path."""
 
         class _BadPool:
             def resolve_address(self, host):
                 raise RuntimeError("simulated transport storm")
 
-        out = _resolve_to_ip("localhost", resolver_pool=_BadPool())
+        out = _resolve_to_ip(
+            "localhost",
+            resolver_pool=_BadPool(),
+            allow_system_fallback=True,
+        )
+        assert out in {"127.0.0.1", "::1"}
+
+    def test_pool_returns_none_does_not_leak_to_system_resolver(self):
+        """Codex PR #51 P1: when a configured pool returns None for
+        the host (e.g. demoted by the AD-less negative-response
+        gate), the writer must NOT silently fall through to
+        ``socket.getaddrinfo`` for the same host. Otherwise the
+        DNSSEC trust boundary is bypassed — an attacker who can
+        forge AD-less NXDOMAIN to the pinned pool would still steer
+        the writer at whatever the system resolver returns. Strict
+        mode (default) returns None; opt-in via
+        ``allow_system_fallback=True`` keeps the leak available
+        for hybrid split-host operators who explicitly accept it.
+        """
+
+        class _NoAddrPool:
+            # resolve_address always returns None — what ResolverPool
+            # does for an AD-less NXDOMAIN under dnssec_required=True.
+            def resolve_address(self, host):
+                return None
+
+            def resolve_ns_hosts(self, zone):
+                return []
+
+        # Default: no fallback, must return None even though
+        # localhost would resolve via getaddrinfo otherwise.
+        out = _resolve_to_ip("localhost", resolver_pool=_NoAddrPool())
+        assert out is None
+
+        # Opt-in: explicitly accepted leak for hybrid deployments.
+        out = _resolve_to_ip(
+            "localhost",
+            resolver_pool=_NoAddrPool(),
+            allow_system_fallback=True,
+        )
         assert out in {"127.0.0.1", "::1"}
 
     def test_writer_construction_resolves_hostname(self):

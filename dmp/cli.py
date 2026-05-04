@@ -484,9 +484,27 @@ class _DnsReader(DNSRecordReader):
         import dns.flags
         import dns.resolver
 
+        from dmp.core.dns import _negative_response_ad_set
+
         try:
             answers = self._resolver.resolve(name, "TXT")
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer) as exc:
+            # Negative responses also need AD-checking: a forged
+            # NXDOMAIN looks identical to a real one to the upstream
+            # caller, so an attacker who can spoof denial-of-existence
+            # erases mailbox slots or identity records.
+            if self._dnssec_required and not _negative_response_ad_set(exc, name):
+                upstream = (
+                    f"{self._resolver.nameservers[0]}:{self._resolver.port}"
+                    if self._resolver.nameservers
+                    else "system-resolver"
+                )
+                log.warning(
+                    "_DnsReader: dropping AD-less negative TXT answer for "
+                    "%s from upstream %s (dnssec_required=True)",
+                    name,
+                    upstream,
+                )
             return None
         except Exception:
             return None

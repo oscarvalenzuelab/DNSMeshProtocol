@@ -737,6 +737,101 @@ class TestResolverPoolDnssecGate:
             for m in msgs
         ), msgs
 
+    # The four tests below close the negative-response AD gap codex
+    # flagged on PR #46. Without them, a forged NXDOMAIN looks
+    # identical to a real "no such name" reply and silently passes
+    # the gate. dnspython exposes the raw response on the exception
+    # so the AD bit is checkable without dropping the resolver layer.
+
+    def _nxdomain(self, ad: bool):
+        """Return a side_effect that raises NXDOMAIN with AD-controlled response."""
+
+        def _build_response(ad_flag: bool):
+            response = dns.message.Message()
+            response.flags = (dns.flags.QR | dns.flags.RA) | (
+                dns.flags.AD if ad_flag else 0
+            )
+            return response
+
+        import dns.message
+        import dns.name as dns_name
+
+        def side_effect(self, name, rdtype="A", *args, **kwargs):
+            qname = dns_name.from_text(name) if isinstance(name, str) else name
+            response = _build_response(ad)
+            raise dns.resolver.NXDOMAIN(qnames=[qname], responses={qname: response})
+
+        return side_effect
+
+    def test_required_drops_ad_less_nxdomain(self, caplog):
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = self._nxdomain(ad=False)
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            with caplog.at_level(logging.WARNING, logger="dmp.network.resolver_pool"):
+                # Single upstream returning AD-less NXDOMAIN: no
+                # validated denial vote, no positive answer, result is
+                # None — but the upstream gets demoted, not voted as
+                # "tried_not_found".
+                assert pool.query_txt_record("forged-name") is None
+            assert pool.snapshot()[0]["consecutive_failures"] >= 1
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less negative TXT" in m
+            and "forged-name" in m
+            and "1.1.1.1:53" in m
+            and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
+
+    def test_required_accepts_validated_nxdomain(self):
+        # AD-set NXDOMAIN is a real DNSSEC-validated denial of
+        # existence (NSEC/NSEC3). The pool should treat it as a
+        # healthy "no such name" vote — same as today's behavior
+        # for the non-DNSSEC case — and NOT demote the upstream.
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = self._nxdomain(ad=True)
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            assert pool.query_txt_record("validated-absent") is None
+            assert pool.snapshot()[0]["consecutive_failures"] == 0
+
+    def test_required_drops_ad_less_negative_address(self, caplog):
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = self._nxdomain(ad=False)
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            with caplog.at_level(logging.WARNING, logger="dmp.network.resolver_pool"):
+                assert pool.resolve_address("forged-host") is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less negative A " in m
+            and "forged-host" in m
+            and "1.1.1.1:53" in m
+            and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
+
+    def test_required_drops_ad_less_negative_ns(self, caplog):
+        with patch.object(
+            dns.resolver.Resolver, "resolve", autospec=True
+        ) as mock_resolve:
+            mock_resolve.side_effect = self._nxdomain(ad=False)
+            pool = ResolverPool(["1.1.1.1"], dnssec_required=True)
+            with caplog.at_level(logging.WARNING, logger="dmp.network.resolver_pool"):
+                assert pool.resolve_ns_hosts("forged-zone") == []
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less negative NS" in m
+            and "forged-zone" in m
+            and "1.1.1.1:53" in m
+            and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
+
 
 # ---------------------------------------------------------------------
 # Health tracking & cooldown

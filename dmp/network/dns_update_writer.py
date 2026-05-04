@@ -117,6 +117,7 @@ def _resolve_to_ip(host, resolver_pool=None, allow_system_fallback=False):
     except (ValueError, dns.exception.SyntaxError):
         pass
 
+    skip_system_direct = False
     if resolver_pool is not None and hasattr(resolver_pool, "resolve_address"):
         try:
             ip = resolver_pool.resolve_address(host)
@@ -124,16 +125,24 @@ def _resolve_to_ip(host, resolver_pool=None, allow_system_fallback=False):
             ip = None
         if ip:
             return ip
-        # Pool exhausted without an answer — fall through to the system
-        # resolver as a last resort. An operator with strict policies
-        # (``--no-default-resolvers``) is fine here: getaddrinfo would
-        # use whatever resolv.conf points at, which is what they
-        # already accepted by setting that flag.
+        # Pool exhausted without an answer for the host directly.
+        # When ``allow_system_fallback`` is False, do NOT leak to
+        # ``socket.getaddrinfo`` for this same host — an attacker who
+        # forges AD-less NXDOMAIN to the pinned pool (now demoted by
+        # the negative-response AD gate) would otherwise still get
+        # the writer to ask the system resolver, bypassing the trust
+        # boundary. The NS-chain branch below stays reachable because
+        # it gates its own system-resolver use on the same flag.
+        if not allow_system_fallback:
+            skip_system_direct = True
 
-    try:
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
-    except (socket.gaierror, UnicodeError):
+    if skip_system_direct:
         infos = []
+    else:
+        try:
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
+        except (socket.gaierror, UnicodeError):
+            infos = []
     for af, _, _, _, sockaddr in infos:
         if af == socket.AF_INET:
             return sockaddr[0]
