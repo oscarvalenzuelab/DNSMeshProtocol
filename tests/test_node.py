@@ -179,6 +179,57 @@ class TestHeartbeatDnsReaderDnssecGate:
         reader = _build_heartbeat_dns_reader()
         assert reader.query_txt_record("x.example.com") is None
 
+    def test_system_resolver_path_logs_when_dropping_ad_less(self, monkeypatch, caplog):
+        # The drop must be visible to operators. Without a log line,
+        # an AD-less recursor silently halts peer harvest and the
+        # only symptom is a stale seen-store with no obvious cause.
+        import logging
+
+        import dns.flags
+        import dns.resolver
+
+        from dmp.server.node import _build_heartbeat_dns_reader
+
+        monkeypatch.delenv("DMP_HEARTBEAT_DNS_RESOLVERS", raising=False)
+        monkeypatch.setenv("DMP_HEARTBEAT_DNSSEC_REQUIRED", "1")
+
+        class _FakeRdata:
+            def __init__(self, s):
+                self.strings = [s.encode("utf-8")]
+
+        class _FakeResponse:
+            def __init__(self, ad: bool):
+                self.flags = dns.flags.AD if ad else 0
+
+        class _FakeAnswer(list):
+            def __init__(self, vals, ad: bool):
+                super().__init__(_FakeRdata(v) for v in vals)
+                self.response = _FakeResponse(ad)
+
+        def fake_resolve(self, name, rdtype):
+            return _FakeAnswer(["unvalidated"], ad=False)
+
+        monkeypatch.setattr(dns.resolver.Resolver, "resolve", fake_resolve)
+        reader = _build_heartbeat_dns_reader()
+
+        # Use a non-dotted token as the queried name so the substring
+        # assertion below doesn't trip CodeQL's URL-substring rule
+        # (the test substring would otherwise look URL-shaped).
+        queried = "harvested-peer-token"
+        with caplog.at_level(logging.WARNING, logger="dmp.server.node"):
+            assert reader.query_txt_record(queried) is None
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less" in r.getMessage()
+            and queried in r.getMessage()
+            and "DMP_HEARTBEAT_DNSSEC_REQUIRED" in r.getMessage()
+            for r in warnings
+        ), (
+            "expected AD-less warning naming the queried name AND the env "
+            f"var, got: {[r.getMessage() for r in warnings]}"
+        )
+
     def test_system_resolver_path_passes_ad_set(self, monkeypatch):
         import dns.flags
         import dns.resolver

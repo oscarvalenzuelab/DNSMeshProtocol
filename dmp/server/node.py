@@ -209,6 +209,19 @@ def _build_heartbeat_dns_reader():
                     response = getattr(answers, "response", None)
                     flags = getattr(response, "flags", 0) if response else 0
                     if not (flags & dns.flags.AD):
+                        # Drop the answer, but say so loudly. Returning
+                        # None here makes the heartbeat worker quietly
+                        # skip the peer; without this log line the
+                        # operator has no signal that DNSSEC enforcement
+                        # is what stopped harvesting. Warning level
+                        # (not error) because a single AD-less reply
+                        # may be transient — if the recursor is
+                        # broken it'll fire on every poll.
+                        log.warning(
+                            "heartbeat: dropping AD-less TXT answer for %s "
+                            "(DMP_HEARTBEAT_DNSSEC_REQUIRED=1)",
+                            name,
+                        )
                         return None
                 values = []
                 for rdata in answers:
