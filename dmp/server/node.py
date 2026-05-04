@@ -201,8 +201,24 @@ def _build_heartbeat_dns_reader():
                     self._resolver.use_edns(0, dns.flags.DO, 4096)
 
             def query_txt_record(self, name: str):
+                from dmp.core.dns import _negative_response_ad_set
+
                 try:
                     answers = self._resolver.resolve(name, "TXT")
+                except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer) as exc:
+                    # Negative-response AD gate. Without this, a
+                    # spoofed NXDOMAIN halts peer harvest with the
+                    # same outcome as a real "no record" answer.
+                    if self._dnssec_required and not _negative_response_ad_set(
+                        exc, name
+                    ):
+                        log.warning(
+                            "heartbeat: dropping AD-less negative TXT "
+                            "answer for %s "
+                            "(DMP_HEARTBEAT_DNSSEC_REQUIRED=1)",
+                            name,
+                        )
+                    return None
                 except Exception:
                     return None
                 if self._dnssec_required:

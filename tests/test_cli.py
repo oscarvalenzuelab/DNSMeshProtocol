@@ -2902,6 +2902,35 @@ class TestDnsReaderDnssecLogs:
             for m in msgs
         ), msgs
 
+    def test_logs_when_dropping_ad_less_nxdomain(self, monkeypatch, caplog):
+        # Negative-response AD gate: the same threat model that
+        # forced the positive-answer gate applies to NXDOMAIN.
+        import logging
+
+        import dns.flags
+        import dns.message
+        import dns.name
+        import dns.resolver
+
+        def side_effect(self, name, rdtype):
+            qname = dns.name.from_text(name) if isinstance(name, str) else name
+            response = dns.message.Message()
+            response.flags = dns.flags.QR | dns.flags.RA  # AD intentionally unset
+            raise dns.resolver.NXDOMAIN(qnames=[qname], responses={qname: response})
+
+        monkeypatch.setattr(dns.resolver.Resolver, "resolve", side_effect)
+        reader = cli._DnsReader("127.0.0.1", 53, dnssec_required=True)
+        with caplog.at_level(logging.WARNING, logger="dmp.cli"):
+            assert reader.query_txt_record("forged-host") is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "AD-less negative TXT" in m
+            and "forged-host" in m
+            and "127.0.0.1:53" in m
+            and "dnssec_required=True" in m
+            for m in msgs
+        ), msgs
+
 
 class TestLocalOnlyClusterBootstrap:
     """Local-only CLI commands must not crash on cluster bootstrap failure.
