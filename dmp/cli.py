@@ -24,6 +24,7 @@ import argparse
 import getpass
 import ipaddress
 import json
+import logging
 import os
 import sys
 import time
@@ -42,6 +43,8 @@ from dmp.core.cluster import ClusterNode
 from dmp.network.base import DNSRecordReader, DNSRecordWriter
 from dmp.network.composite_reader import CompositeReader
 from dmp.network.resolver_pool import ResolverPool, WELL_KNOWN_RESOLVERS
+
+log = logging.getLogger(__name__)
 
 # ----------------------------- config ----------------------------------------
 
@@ -491,6 +494,22 @@ class _DnsReader(DNSRecordReader):
             response = getattr(answers, "response", None)
             flags = getattr(response, "flags", 0) if response else 0
             if not (flags & dns.flags.AD):
+                # Same operator-visibility concern as the heartbeat
+                # reader and the resolver pool: a silent return here
+                # looks identical to "no record" to upstream callers.
+                # Include the configured upstream so a misbehaving
+                # recursor is identifiable from the log.
+                upstream = (
+                    f"{self._resolver.nameservers[0]}:{self._resolver.port}"
+                    if self._resolver.nameservers
+                    else "system-resolver"
+                )
+                log.warning(
+                    "_DnsReader: dropping AD-less TXT answer for %s "
+                    "from upstream %s (dnssec_required=True)",
+                    name,
+                    upstream,
+                )
                 return None
         values = []
         for rdata in answers:

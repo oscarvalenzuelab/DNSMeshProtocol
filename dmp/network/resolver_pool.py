@@ -413,6 +413,16 @@ class ResolverPool(DNSRecordReader):
             # and is documented on the constructor; mitigate via
             # DoT/DoH or a pinned local recursor.
             if self._dnssec_required and not _ad_bit_set(answers):
+                # Demote and continue. Without a log line the operator
+                # sees pool exhaustion (No answer / cooldown) but no
+                # signal that DNSSEC enforcement is the cause.
+                log.warning(
+                    "ResolverPool: dropping AD-less TXT answer for %s "
+                    "from upstream %s:%d (dnssec_required=True)",
+                    name,
+                    state.host,
+                    state.port,
+                )
                 self._mark_failure(state)
                 continue
 
@@ -484,6 +494,14 @@ class ResolverPool(DNSRecordReader):
                 # P0-4: same AD-bit gate as TXT — refuse address answers
                 # that the upstream did not DNSSEC-validate.
                 if self._dnssec_required and not _ad_bit_set(answers):
+                    log.warning(
+                        "ResolverPool: dropping AD-less %s answer for %s "
+                        "from upstream %s:%d (dnssec_required=True)",
+                        rdtype,
+                        host,
+                        state.host,
+                        state.port,
+                    )
                     self._mark_failure(state)
                     continue
                 for rdata in answers:
@@ -522,6 +540,13 @@ class ResolverPool(DNSRecordReader):
             # answer routes writes to an attacker-chosen host. Demote
             # the upstream and try the next.
             if self._dnssec_required and not _ad_bit_set(answers):
+                log.warning(
+                    "ResolverPool: dropping AD-less NS answer for %s "
+                    "from upstream %s:%d (dnssec_required=True)",
+                    zone,
+                    state.host,
+                    state.port,
+                )
                 self._mark_failure(state)
                 continue
             self._mark_success(state)
