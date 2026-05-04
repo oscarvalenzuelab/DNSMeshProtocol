@@ -52,8 +52,22 @@ def _alice_bob_pinned(store: InMemoryDNSStore):
     land on the recipient's zone and bob's phase-1 poll finds them on
     his own zone.
     """
-    alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-    bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+    alice = DMPClient(
+        "alice",
+        "alice-pass",
+        domain="alice.mesh",
+        store=store,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
+    )
+    bob = DMPClient(
+        "bob",
+        "bob-pass",
+        domain="bob.mesh",
+        store=store,
+        intro_queue_path=":memory:",
+        prekey_store_path=":memory:",
+    )
     alice.add_contact(
         "bob",
         bob.get_public_key_hex(),
@@ -145,9 +159,21 @@ class TestM10Client:
         # share AND short-circuiting publish_claim with a writer that
         # rejects the recipient-zone path.
         alice = DMPClient(
-            "alice", "alice-pass", domain="alice.mesh", store=sender_store
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=sender_store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
-        bob = DMPClient("bob", "bob-pass", domain="alice.mesh", store=sender_store)
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="alice.mesh",
+            store=sender_store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # Both clients see the same shared store at "alice.mesh"; bob's
         # contact for alice carries a *different* domain (bob.mesh), so
         # alice's M10 publish targets a zone that doesn't exist in the
@@ -221,9 +247,21 @@ class TestM10Client:
         slot-walk recovers."""
         sender_store = InMemoryDNSStore()
         alice = DMPClient(
-            "alice", "alice-pass", domain="alice.mesh", store=sender_store
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=sender_store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
         )
-        bob = DMPClient("bob", "bob-pass", domain="alice.mesh", store=sender_store)
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="alice.mesh",
+            store=sender_store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -266,7 +304,14 @@ class TestM10Client:
         recipient_store = InMemoryDNSStore()
         # bob's own zone has the claim but no manifest is reachable at
         # alice's claimed sender_mailbox_domain.
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=recipient_store)
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=recipient_store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice_signer = DMPCrypto.from_passphrase("alice", salt=b"S" * 32)
         bob.add_contact(
             "alice",
@@ -304,9 +349,30 @@ class TestM10Client:
         OWN hash12."""
         store = InMemoryDNSStore()
         m10_un_tsig_d_to_store(store)
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
-        carol = DMPClient("carol", "carol-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        carol = DMPClient(
+            "carol",
+            "carol-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         alice.add_contact(
             "bob",
@@ -361,9 +427,30 @@ class TestM10Client:
         TOFU rule."""
         store = InMemoryDNSStore()
         m10_un_tsig_d_to_store(store)
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
-        eve = DMPClient("eve", "eve-pass", domain="eve.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        eve = DMPClient(
+            "eve",
+            "eve-pass",
+            domain="eve.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         alice.add_contact(
             "bob",
@@ -477,9 +564,30 @@ class TestCodexRound1Regressions:
         the diagnostic flag turns off — the M8.3 first-contact
         provider channel is orthogonal."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
-        eve = DMPClient("eve", "eve-pass", domain="eve.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        eve = DMPClient(
+            "eve",
+            "eve-pass",
+            domain="eve.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # Bob pins alice (so phase 1's TOFU skip rule doesn't fire),
         # but NOT eve. Eve is the unpinned stranger whose claim has
@@ -526,9 +634,30 @@ class TestCodexRound1Regressions:
         """Same regression flagged in the same finding: ``skip_primary``
         MUST also leave the claim_providers channel intact."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
-        eve = DMPClient("eve", "eve-pass", domain="eve.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        eve = DMPClient(
+            "eve",
+            "eve-pass",
+            domain="eve.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         bob.add_contact(
             "alice",
@@ -571,8 +700,22 @@ class TestCodexRound1Regressions:
         store = InMemoryDNSStore()
         m10_un_tsig_d_to_store(store)
         # No pinned contacts → pure TOFU.
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -717,7 +860,14 @@ class TestCodexRound5DomainExplicitPersistence:
         from dmp.client.client import Contact
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # Add a contact with an explicit domain — what
         # ``identity fetch user@host --add`` does.
         alice.add_contact(
@@ -765,8 +915,22 @@ class TestCodexRound1ServerSameZone:
         from dmp.client import client as _client
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="dmp.example.com", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="dmp.example.com", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="dmp.example.com",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="dmp.example.com",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # Legacy add: no domain passed → backfill to self.domain,
         # domain_explicit=False.
         alice.add_contact(
@@ -806,8 +970,22 @@ class TestCodexRound1ServerSameZone:
         from dmp.client import client as _client
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="dmp.example.com", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="dmp.example.com", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="dmp.example.com",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="dmp.example.com",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # Explicit same-zone: caller passed the zone name even though
         # it matches alice's own.
         alice.add_contact(
@@ -851,8 +1029,22 @@ class TestCodexRound1ServerSameZone:
         from dmp.client import client as _client
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -903,8 +1095,22 @@ class TestCodexRound1ServerSameZone:
         from dmp.client import client as _client
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="dmp.example.com", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="dmp.example.com", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="dmp.example.com",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="dmp.example.com",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -960,8 +1166,22 @@ class TestCodexRound1ServerSameZone:
         from dmp.client import client as _client
 
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),

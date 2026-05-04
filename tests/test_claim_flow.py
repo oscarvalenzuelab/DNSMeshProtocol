@@ -102,8 +102,22 @@ class TestClaimFlow:
     def test_pinned_sender_claim_delivered_to_inbox(self):
         """Alice (pinned) publishes a claim; Bob receives it as a normal inbox message."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # Alice has bob pinned (so she can address him).
         alice.add_contact(
@@ -149,8 +163,22 @@ class TestClaimFlow:
     def test_unpinned_sender_lands_in_intro_queue(self):
         """Alice is NOT pinned; her claim leads to a quarantined intro."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # Alice can address bob (knows his pubkey from a directory
         # lookup, say). Bob does NOT pin alice.
@@ -195,8 +223,22 @@ class TestClaimFlow:
     def test_block_then_re_poll_drops_silently(self):
         """A blocked sender's claim is dropped; intro queue stays empty."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -231,8 +273,22 @@ class TestClaimFlow:
 
     def test_replay_skips_repolled_claim(self):
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -278,9 +334,30 @@ class TestClaimFlow:
         points at a manifest signed by someone else.
         """
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        eve = DMPClient("eve", "eve-pass", domain="eve.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        eve = DMPClient(
+            "eve",
+            "eve-pass",
+            domain="eve.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
 
         # Alice publishes a real message + manifest.
         alice.add_contact(
@@ -350,8 +427,22 @@ class TestClaimFlow:
 class TestIntroQueueCli:
     def _setup_pending_intro(self):
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -410,8 +501,22 @@ class TestIntroQueueCli:
         """Codex P1 fix: send_message with claim_providers populates the
         provider's claim namespace."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -438,8 +543,22 @@ class TestIntroQueueCli:
         """Codex P1 fix: receive_messages with claim_providers also polls
         claims and lands un-pinned senders in the intro queue."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
-        bob = DMPClient("bob", "bob-pass", domain="bob.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         alice.add_contact(
             "bob",
             bob.get_public_key_hex(),
@@ -466,7 +585,14 @@ class TestIntroQueueCli:
         """Codex P1 fix: a contact pinned via `intro trust` (spk only)
         cannot be sent to until X25519 is filled in."""
         store = InMemoryDNSStore()
-        alice = DMPClient("alice", "alice-pass", domain="alice.mesh", store=store)
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
         # Manually pin a spk-only contact (mimics what trust_intro
         # leaves behind before identity-fetch fills in pub).
         ok = alice.add_contact(
