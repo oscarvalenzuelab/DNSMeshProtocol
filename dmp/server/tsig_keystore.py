@@ -40,6 +40,7 @@ counts and removes a class of stale-keyring bugs).
 
 from __future__ import annotations
 
+import os
 import secrets
 import sqlite3
 import threading
@@ -271,12 +272,35 @@ class TSIGKeyStore:
 
     def __init__(self, db_path: str) -> None:
         self._path = db_path
+        # Tighten the parent directory BEFORE creating the file so a
+        # permissive umask doesn't leave the new sqlite file (or its
+        # WAL/SHM siblings) world-readable. The DB holds TSIG shared
+        # secrets — local disclosure lets any reader forge DNS UPDATE
+        # writes for every scope a key covers. Mirror IntroQueue's
+        # pattern: 0o700 on the dir, 0o600 on the DB and every
+        # -wal/-shm sibling sqlite materializes alongside it.
+        on_disk = db_path != ":memory:"
+        if on_disk:
+            parent = os.path.dirname(db_path) or "."
+            os.makedirs(parent, exist_ok=True)
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._migrate()
         self._conn.commit()
+        if on_disk:
+            for suffix in ("", "-wal", "-shm"):
+                sibling = db_path + suffix
+                try:
+                    if os.path.exists(sibling):
+                        os.chmod(sibling, 0o600)
+                except OSError:
+                    pass
 
     def _migrate(self) -> None:
         """Apply schema migrations idempotently and stamp ``user_version``.

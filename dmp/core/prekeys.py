@@ -214,8 +214,21 @@ class PrekeyStore:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        parent = os.path.dirname(db_path) or "."
-        os.makedirs(parent, exist_ok=True)
+        # Tighten the parent directory BEFORE creating the file so a
+        # permissive umask doesn't leave the new sqlite file (or its
+        # WAL/SHM siblings) world-readable. The DB holds the X25519
+        # prekey private halves — local disclosure equals forward-
+        # secrecy compromise. Mirror IntroQueue's pattern:
+        # 0o700 on the dir, 0o600 on the DB and every -wal/-shm
+        # sibling sqlite materializes alongside it.
+        on_disk = db_path != ":memory:"
+        if on_disk:
+            parent = os.path.dirname(db_path) or "."
+            os.makedirs(parent, exist_ok=True)
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass
         self._lock = RLock()
         # 30s busy-timeout: ``_migrate`` takes a reserved write lock via
         # ``BEGIN IMMEDIATE`` so concurrent opens on the same file
@@ -231,10 +244,14 @@ class PrekeyStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._migrate()
-        try:
-            os.chmod(db_path, 0o600)
-        except OSError:
-            pass
+        if on_disk:
+            for suffix in ("", "-wal", "-shm"):
+                sibling = db_path + suffix
+                try:
+                    if os.path.exists(sibling):
+                        os.chmod(sibling, 0o600)
+                except OSError:
+                    pass
 
     def _migrate(self) -> None:
         """Apply schema migrations atomically and idempotently.

@@ -196,6 +196,68 @@ class TestPrekeyStore:
             s2.close()
 
 
+class TestPrekeyStoreFilePerms:
+    # The DB holds X25519 prekey private halves — local disclosure
+    # equals forward-secrecy compromise for in-flight messages
+    # against this client. A permissive umask on the parent dir
+    # used to leave the DB and its WAL/SHM siblings world-readable
+    # because chmod was applied only to the main DB file (codex P2
+    # on the post-#52 fresh audit).
+
+    def test_db_and_wal_shm_are_0600_after_init(self, tmp_path):
+        import os
+        import stat
+
+        path = str(tmp_path / "secrets" / "prekeys.db")
+        from dmp.core.prekeys import PrekeyStore
+
+        store = PrekeyStore(path)
+        try:
+            # Force the WAL/SHM siblings to actually exist by
+            # writing a row.
+            store.generate_pool(count=1, ttl_seconds=3600)
+            for suffix in ("", "-wal", "-shm"):
+                p = path + suffix
+                if not os.path.exists(p):
+                    continue
+                mode = stat.S_IMODE(os.stat(p).st_mode)
+                assert mode & 0o077 == 0, f"{p!r} too permissive: 0o{mode:o}"
+        finally:
+            store.close()
+
+    def test_parent_dir_is_0700_after_init(self, tmp_path):
+        import os
+        import stat
+
+        parent = tmp_path / "secrets"
+        path = str(parent / "prekeys.db")
+        from dmp.core.prekeys import PrekeyStore
+
+        PrekeyStore(path).close()
+        mode = stat.S_IMODE(os.stat(parent).st_mode)
+        assert mode & 0o077 == 0, f"parent dir too permissive: 0o{mode:o}"
+
+    def test_existing_loose_parent_is_healed_on_reopen(self, tmp_path):
+        # An operator upgrading from a pre-#53 build has an existing
+        # parent dir created with the old, looser perms. The chmod
+        # MUST run on every ``__init__``, not just first-time
+        # creation, so the bad perms heal on the next start.
+        import os
+        import stat
+
+        parent = tmp_path / "existing"
+        parent.mkdir(mode=0o755)
+        # Confirm the loose mode before init.
+        before = stat.S_IMODE(os.stat(parent).st_mode)
+        assert before & 0o077 != 0
+        path = str(parent / "prekeys.db")
+        from dmp.core.prekeys import PrekeyStore
+
+        PrekeyStore(path).close()
+        after = stat.S_IMODE(os.stat(parent).st_mode)
+        assert after & 0o077 == 0, f"loose parent dir not healed: 0o{after:o}"
+
+
 class TestPrekeyStoreSchemaVersioning:
     """``PRAGMA user_version`` migration ladder for the prekey store.
 
