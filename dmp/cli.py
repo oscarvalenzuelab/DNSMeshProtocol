@@ -853,11 +853,16 @@ class _NodeDnsReader(DNSRecordReader):
         # NXDOMAIN responses for signed zones. If the operator
         # opted into `dnssec_required`, an AD-less NXDOMAIN is
         # indistinguishable from a spoofed one and must NOT pass
-        # as a healthy "no record" answer. Raising treats it as a
-        # per-node transport failure so UnionReader demotes the
-        # upstream rather than blackholing reads.
+        # as a healthy "no record" answer. Raising
+        # ``DnssecValidationError`` treats this as a per-node
+        # transport failure so UnionReader demotes the upstream
+        # rather than blackholing reads. The asymmetry vs the
+        # resolver-based readers (which return None) is intentional
+        # — see the ``DnssecValidationError`` docstring.
         if self._dnssec_required and not (response.flags & dns.flags.AD):
-            raise RuntimeError(
+            from dmp.core.dns import DnssecValidationError
+
+            raise DnssecValidationError(
                 f"DNSSEC AD flag missing from {self._host} reply for {name}"
             )
         rcode = response.rcode()

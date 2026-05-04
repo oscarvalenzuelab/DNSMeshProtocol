@@ -2745,10 +2745,15 @@ class TestNodeDnsReaderDnssecGate:
         """A reply without AD is treated as a per-node transport
         failure (raised), not as a healthy "no records" outcome.
         UnionReader counts it against the node so a non-validating
-        upstream gets demoted instead of silently passing through."""
+        upstream gets demoted instead of silently passing through.
+        The raised type is ``DnssecValidationError`` so callers (and
+        future metrics/dashboards) can distinguish DNSSEC rejection
+        from generic transport failures; it subclasses ``RuntimeError``
+        so legacy ``except RuntimeError:`` keeps working."""
         import dns.query
 
         from dmp.cli import _NodeDnsReader
+        from dmp.core.dns import DnssecValidationError
 
         reader = _NodeDnsReader("127.0.0.1:9999", dnssec_required=True)
 
@@ -2758,8 +2763,11 @@ class TestNodeDnsReaderDnssecGate:
             )
 
         monkeypatch.setattr(dns.query, "udp", fake_udp)
-        with pytest.raises(RuntimeError, match="AD flag missing"):
+        with pytest.raises(DnssecValidationError, match="AD flag missing"):
             reader.query_txt_record("x.example.com.")
+        # Subclass relationship: legacy ``except RuntimeError:``
+        # handlers must still catch this.
+        assert issubclass(DnssecValidationError, RuntimeError)
 
     def test_required_sets_do_bit_on_outgoing_query(self, monkeypatch):
         """Without the DO bit on the outgoing query, many recursors
