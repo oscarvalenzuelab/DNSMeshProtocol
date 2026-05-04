@@ -596,3 +596,57 @@ class TestSchemaVersioning:
 
         with pytest.raises(sqlite3.OperationalError):
             mod.TSIGKeyStore(path)
+
+
+class TestTSIGKeystoreFilePerms:
+    # The DB holds TSIG shared secrets — local disclosure lets any
+    # reader forge DNS UPDATE writes for every scope a key covers.
+    # Pre-#53 the store had no chmod at all (codex P2 on the
+    # post-#52 fresh audit).
+
+    def test_db_and_wal_shm_are_0600_after_init(self, tmp_path):
+        import os
+        import stat
+
+        path = str(tmp_path / "secrets" / "tsig.db")
+        s = TSIGKeyStore(path)
+        try:
+            # Force WAL/SHM siblings to materialize via a write.
+            s.mint(
+                name="alice-7d2f.example.com.",
+                allowed_suffixes=("alice.example.com",),
+                subject="alice@example.com",
+            )
+            for suffix in ("", "-wal", "-shm"):
+                p = path + suffix
+                if not os.path.exists(p):
+                    continue
+                mode = stat.S_IMODE(os.stat(p).st_mode)
+                assert mode & 0o077 == 0, f"{p!r} too permissive: 0o{mode:o}"
+        finally:
+            s.close()
+
+    def test_parent_dir_is_0700_after_init(self, tmp_path):
+        import os
+        import stat
+
+        parent = tmp_path / "secrets"
+        path = str(parent / "tsig.db")
+        TSIGKeyStore(path).close()
+        mode = stat.S_IMODE(os.stat(parent).st_mode)
+        assert mode & 0o077 == 0, f"parent dir too permissive: 0o{mode:o}"
+
+    def test_existing_loose_parent_is_healed_on_reopen(self, tmp_path):
+        # Pre-#53 deployments have parent dirs with looser perms;
+        # __init__ must heal them on reopen.
+        import os
+        import stat
+
+        parent = tmp_path / "existing"
+        parent.mkdir(mode=0o755)
+        before = stat.S_IMODE(os.stat(parent).st_mode)
+        assert before & 0o077 != 0
+        path = str(parent / "tsig.db")
+        TSIGKeyStore(path).close()
+        after = stat.S_IMODE(os.stat(parent).st_mode)
+        assert after & 0o077 == 0, f"loose parent dir not healed: 0o{after:o}"
