@@ -58,8 +58,11 @@ class IntroQueue:
     process may have a CLI thread and a background poller writing
     concurrently. Uses WAL journaling for non-blocking reads.
 
-    Pass ``":memory:"`` for tests; pass a real path in CLI use so
-    pending intros survive across CLI invocations.
+    Path is required — there is no implicit in-memory default.
+    A forgotten path silently lost pending first-contact messages
+    on every CLI restart; making the argument mandatory forces the
+    decision at the call site. Tests that genuinely want an
+    ephemeral queue pass ``":memory:"`` explicitly.
 
     Schema versioning (P1): the schema is stamped via
     ``PRAGMA user_version``. Each schema bump appends a step to
@@ -104,7 +107,7 @@ class IntroQueue:
     # schema-affecting change and append the migration to ``_MIGRATIONS``.
     _SCHEMA_VERSION = 1
 
-    def __init__(self, path: str = ":memory:") -> None:
+    def __init__(self, path: str) -> None:
         self._path = path
         # On-disk paths: ensure the parent directory exists with
         # tight permissions BEFORE creating the file, then chmod
