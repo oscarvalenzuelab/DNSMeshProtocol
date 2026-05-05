@@ -302,3 +302,61 @@ class TestSelfRowSynthesisOverridesGossipped:
                 api.stop()
         finally:
             seen_store.close()
+
+
+class TestOpenBindGuard:
+    # ``auth_mode='open'`` on a non-loopback bind exposes
+    # ``/v1/records/*`` to anyone reachable on that interface
+    # without authentication. The constructor refuses unless an
+    # operator opts in via ``DMP_ALLOW_OPEN_PUBLIC_BIND=1``. Loopback
+    # binds (127.x, ::1, ``localhost``, "") are always fine for dev.
+
+    def test_refuses_open_on_zero_zero_zero_zero(self):
+        store = InMemoryDNSStore()
+        with pytest.raises(ValueError, match="auth_mode='open'"):
+            DMPHttpApi(store, host="0.0.0.0", port=0)
+
+    def test_refuses_open_on_empty_host_wildcard(self):
+        # Python's socket layer treats ``""`` as a wildcard bind
+        # (every interface). The guard must catch this, not pass it
+        # through as "local-only".
+        store = InMemoryDNSStore()
+        with pytest.raises(ValueError, match="auth_mode='open'"):
+            DMPHttpApi(store, host="", port=0)
+
+    def test_refuses_open_on_zero_short_form(self):
+        # ``"0"`` resolves to 0.0.0.0 in socket binds — same wildcard
+        # surface as ``0.0.0.0`` itself.
+        store = InMemoryDNSStore()
+        with pytest.raises(ValueError, match="auth_mode='open'"):
+            DMPHttpApi(store, host="0", port=0)
+
+    def test_refuses_open_on_ipv6_wildcard(self):
+        store = InMemoryDNSStore()
+        with pytest.raises(ValueError, match="auth_mode='open'"):
+            DMPHttpApi(store, host="::", port=0)
+
+    def test_refuses_open_on_public_ip(self):
+        store = InMemoryDNSStore()
+        with pytest.raises(ValueError, match="auth_mode='open'"):
+            DMPHttpApi(store, host="203.0.113.7", port=0)
+
+    def test_loopback_bind_allowed(self):
+        store = InMemoryDNSStore()
+        # No raise — 127.0.0.1 is local-only.
+        api = DMPHttpApi(store, host="127.0.0.1", port=0)
+        assert api.auth_mode == "open"
+
+    def test_explicit_opt_in_env_var(self, monkeypatch):
+        monkeypatch.setenv("DMP_ALLOW_OPEN_PUBLIC_BIND", "1")
+        store = InMemoryDNSStore()
+        # The opt-in lets the constructor proceed even on 0.0.0.0.
+        api = DMPHttpApi(store, host="0.0.0.0", port=0)
+        assert api.auth_mode == "open"
+
+    def test_legacy_mode_with_token_unaffected(self):
+        store = InMemoryDNSStore()
+        # Bearer token + 0.0.0.0 = "legacy" auth mode, not "open" —
+        # the guard doesn't fire.
+        api = DMPHttpApi(store, host="0.0.0.0", port=0, bearer_token="op-token")
+        assert api.auth_mode == "legacy"

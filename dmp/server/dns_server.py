@@ -508,20 +508,32 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
             # class (typically IN) and surfaces the wire class (NONE for
             # "delete RR from RRset", ANY for "delete RRset") on the
             # ``rrset.deleting`` attribute. ``None`` means "add".
+            # Decode the wire bytes as STRICT UTF-8 — DMP record
+            # values are printable ASCII (base64 + ``;``-separated
+            # ``key=val``), so any non-UTF-8 bytes indicate either a
+            # malformed UPDATE or an authenticated user smuggling
+            # non-canonical bytes that the receive path would later
+            # compare against a different Unicode form than what was
+            # signed. Reject the whole UPDATE rather than apply
+            # ``errors="replace"`` and persist the mangled form.
             deleting = getattr(rrset, "deleting", None)
-            if deleting is None:
-                for rdata in rrset:
-                    value = b"".join(rdata.strings).decode("utf-8", errors="replace")
-                    ops.append(("add", owner, value, int(rrset.ttl) or DEFAULT_TTL))
-            elif deleting == dns.rdataclass.NONE:
-                # Delete a specific RR from the RRset (rdata must match).
-                for rdata in rrset:
-                    value = b"".join(rdata.strings).decode("utf-8", errors="replace")
-                    ops.append(("delete", owner, value, 0))
-            elif deleting == dns.rdataclass.ANY:
-                # Delete the entire RRset at this owner.
-                ops.append(("delete", owner, None, 0))
-            else:
+            try:
+                if deleting is None:
+                    for rdata in rrset:
+                        value = b"".join(rdata.strings).decode("utf-8")
+                        ops.append(("add", owner, value, int(rrset.ttl) or DEFAULT_TTL))
+                elif deleting == dns.rdataclass.NONE:
+                    # Delete a specific RR from the RRset (rdata must match).
+                    for rdata in rrset:
+                        value = b"".join(rdata.strings).decode("utf-8")
+                        ops.append(("delete", owner, value, 0))
+                elif deleting == dns.rdataclass.ANY:
+                    # Delete the entire RRset at this owner.
+                    ops.append(("delete", owner, None, 0))
+                else:
+                    response.set_rcode(dns.rcode.FORMERR)
+                    return response
+            except UnicodeDecodeError:
                 response.set_rcode(dns.rcode.FORMERR)
                 return response
 

@@ -89,6 +89,13 @@ def node_container():
             f"127.0.0.1:{http_port}:8053/tcp",
             "-e",
             "DMP_LOG_LEVEL=WARNING",
+            # The container binds HTTP on 0.0.0.0 (default) with no
+            # bearer_token — that's "open auth on public bind",
+            # refused without an opt-in. The host-side forward
+            # (127.0.0.1:HOST_PORT:8053/tcp) keeps this isolated to
+            # the test runner's loopback regardless.
+            "-e",
+            "DMP_ALLOW_OPEN_PUBLIC_BIND=1",
             "dnsmesh-node:latest",
         ],
         check=True,

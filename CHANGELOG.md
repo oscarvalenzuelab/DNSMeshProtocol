@@ -9,6 +9,33 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- Receive path no longer burns the recipient's one-time prekey on
+  AEAD failure. The previous "atomic claim" deleted the prekey
+  private half BEFORE decrypt, so a malformed-but-signature-valid
+  manifest from any contact would permanently consume the prekey;
+  every other legitimate sender that picked the same `prekey_id`
+  would lose decrypt too. Now the receive path reads the sk
+  without consuming it, attempts AEAD, and consumes only on
+  success. Failure paths leave the row intact for the next
+  legitimate sender.
+- HTTP API refuses to start with `auth_mode='open'` on a
+  non-loopback bind. Previously a node with no `bearer_token` and
+  the default `0.0.0.0` host bind would expose `/v1/records/*`
+  publish + delete to every interface without authentication.
+  Loopback (127.x, ::1, `localhost`, "") is still fine for dev.
+  Operators who genuinely want unauthenticated public access (e.g.
+  isolated cluster networks, local docker networks) opt in via
+  `DMP_ALLOW_OPEN_PUBLIC_BIND=1`.
+- Receive path refuses manifests without `chunk_hashes`. The brief
+  legacy-compat window during the rollout of per-chunk content
+  binding is closed; legacy senders MUST upgrade. This shuts the
+  remaining `wrap_block(garbage)` chunk-poison vector for any
+  still-supported pre-upgrade sender.
+- DNS UPDATE handler decodes TXT rdata as STRICT UTF-8. Previously
+  used `errors='replace'`, which silently mapped non-canonical
+  bytes to U+FFFD and persisted a Unicode form different from
+  what was signed. Reject the whole UPDATE on decode failure
+  (FORMERR) instead.
 - `SlotManifest` commits to per-chunk content via SHA-256 hashes
   signed alongside the rest of the manifest body. Receivers verify
   each fetched chunk record against its expected hash before adding
