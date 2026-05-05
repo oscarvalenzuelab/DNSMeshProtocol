@@ -504,13 +504,33 @@ class DMPClient:
                 continue
         return False
 
-    def _rotation_manifest_accepted(self, sender_spk: bytes) -> bool:
+    def _rotation_manifest_accepted(self, sender_spk: bytes, zone: str) -> bool:
         """EXPERIMENTAL (M5.4): check a rotation chain for sender_spk.
 
-        Walks each pinned contact's rotation chain; if any chain's
-        current head is ``sender_spk``, accept the manifest. A rotation
-        chain is ONLY consulted when ``rotation_chain_enabled=True``;
-        otherwise this returns False and legacy behavior is preserved.
+        Walks rotation chains of contacts whose pinning makes them
+        plausibly the author of a manifest found under ``zone``. If
+        any candidate chain's current head is ``sender_spk``, accept
+        the manifest. The rotation chain is ONLY consulted when
+        ``rotation_chain_enabled=True``; otherwise this returns False
+        and legacy behavior is preserved.
+
+        Zone-binding rule:
+
+          - Polling ``self.domain``: walk EVERY pinned contact's
+            chain. The legacy same-mesh + cross-zone publishing
+            pattern lands manifests under the recipient's own zone
+            regardless of where the sender is pinned, so restricting
+            to ``contact.domain == self.domain`` here would drop
+            legitimate rotated-key deliveries from contacts pinned
+            in other zones.
+
+          - Polling a non-self zone Z: only walk chains for contacts
+            whose pinned ``Contact.domain`` is Z. Without this, an
+            attacker with write access to one pinned contact's zone
+            could replay a manifest signed by ANOTHER contact's
+            rotated key — the global walker resolves that key and
+            accepts. Same threat shape as the slot-walk direct-pin
+            bug PR #54 fixed.
 
         Wire format subject to post-audit revision in v0.3.0 — see
         ``docs/protocol/rotation.md``.
@@ -520,9 +540,14 @@ class DMPClient:
         # Import lazily to avoid the cold-path import on every receive.
         from dmp.core.rotation import SUBJECT_TYPE_USER_IDENTITY
 
+        walk_all = zone == self.domain
         for contact in self.contacts.values():
             if not contact.signing_key_bytes:
                 continue
+            if not walk_all:
+                contact_zone = contact.domain or self.domain
+                if contact_zone != zone:
+                    continue
             subject = f"{contact.username}@{contact.domain}"
             try:
                 current = self._rotation_chain.resolve_current_spk(
@@ -1007,13 +1032,20 @@ class DMPClient:
         else:
             slot_walk_zones = self._zones_to_poll()
         for zone in slot_walk_zones:
-            # Per-zone pin set: only contacts whose zone matches the
-            # one we're polling are valid signers for manifests found
-            # there. Closes the cross-zone replay surface — any pinned
-            # contact's zone could otherwise carry a copy of another
-            # pinned sender's manifest and win the race against the
-            # legitimate copy in the original zone.
-            zone_known_spks = self._known_signing_keys_for_zone(zone)
+            # Per-zone pin set, with the same asymmetric carve-out
+            # the rotation walker and claim-path direct-pin gate
+            # use: ``zone == self.domain`` accepts any pinned spk
+            # (legitimate cross-zone publishing lands manifests in
+            # the recipient's own zone), non-self zones accept only
+            # contacts pinned to that exact zone (closes the
+            # cross-pin replay surface — any pinned contact's zone
+            # could otherwise carry a copy of another pinned
+            # sender's manifest and win the race against the
+            # legitimate copy in the original zone).
+            if zone == self.domain:
+                zone_known_spks = known_spks
+            else:
+                zone_known_spks = self._known_signing_keys_for_zone(zone)
             for slot in range(SLOT_COUNT):
                 slot_domain = self._slot_domain(self.user_id, slot, zone=zone)
                 records = self.reader.query_txt_record(slot_domain)
@@ -1061,9 +1093,13 @@ class DMPClient:
                             # verify failure. If a pinned contact rotated to
                             # a new key, the new key is accepted for this
                             # receive pass without permanently re-pinning.
-                            # Never modifies self.contacts.
+                            # Never modifies self.contacts. Bound to
+                            # the polled zone so a rotated-key match
+                            # against a contact in a DIFFERENT zone
+                            # cannot be replayed here — same threat
+                            # model as the direct-pin gate above.
                             if not self._rotation_manifest_accepted(
-                                manifest.sender_spk
+                                manifest.sender_spk, zone
                             ):
                                 continue
                     elif not self.allow_tofu:
@@ -1429,9 +1465,39 @@ class DMPClient:
                     # straight to the inbox. Mirror the receive_messages
                     # logic: pinned ∪ rotated → inbox; everyone else →
                     # intro queue.
+                    # Both the direct-pin AND rotation-walk checks
+                    # are bound to the claim's advertised mailbox
+                    # zone, with the same asymmetric carve-out:
+                    # ``claim.sender_mailbox_domain == self.domain``
+                    # walks the global pin set, otherwise the pin
+                    # set is restricted to contacts whose
+                    # ``Contact.domain`` matches the claim's zone.
+                    #
+                    # Why the carve-out: legitimate cross-zone
+                    # publishing puts a manifest under the recipient's
+                    # OWN zone (it's the only zone both parties can
+                    # reliably write to). A claim into self.domain
+                    # from a contact pinned in another zone is the
+                    # documented pattern, not an attack.
+                    #
+                    # Why the strict gate elsewhere: a malicious
+                    # claim provider could point ``sender_mailbox_domain``
+                    # at carol's zone with alice's pinned spk + a
+                    # copy of alice's manifest+chunks, pass the
+                    # cross-bind, decrypt, and deliver via global
+                    # ``in known_spks``. The per-zone gate refuses.
+                    if claim.sender_mailbox_domain == self.domain:
+                        direct_pin_match = manifest.sender_spk in known_spks
+                    else:
+                        zone_known_spks = self._known_signing_keys_for_zone(
+                            claim.sender_mailbox_domain
+                        )
+                        direct_pin_match = manifest.sender_spk in zone_known_spks
                     is_pinned_or_rotated = bool(known_spks) and (
-                        manifest.sender_spk in known_spks
-                        or self._rotation_manifest_accepted(manifest.sender_spk)
+                        direct_pin_match
+                        or self._rotation_manifest_accepted(
+                            manifest.sender_spk, claim.sender_mailbox_domain
+                        )
                     )
                     if is_pinned_or_rotated:
                         # Pinned (possibly via rotation chain) sender →
