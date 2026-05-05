@@ -1175,6 +1175,54 @@ class TestCrossZoneReceive:
         assert len(inbox) == 1
         assert inbox[0].plaintext == b"from alice"
 
+    def test_pinned_spk_from_other_zone_publishing_into_self_domain_delivers(self):
+        # Codex round-3 on PR #57: the slot-walk direct-pin gate
+        # was strict on ``self.domain`` too, breaking the legitimate
+        # cross-zone publish pattern (sender pinned in one zone but
+        # publishing into the recipient's OWN zone). The rotation
+        # walker had a ``self.domain`` carve-out for the same
+        # pattern; the direct-pin gate now matches it.
+        store = InMemoryDNSStore()
+        # Alice publishes from a client whose domain is bob.mesh
+        # (the recipient-zone publish pattern), even though bob has
+        # her pinned at her real home zone alice.mesh.
+        alice_in_bob_zone = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob.add_contact(
+            "alice",
+            alice_in_bob_zone.get_public_key_hex(),
+            domain="alice.mesh",  # pin at alice's home zone
+            signing_key_hex=alice_in_bob_zone.get_signing_public_key_hex(),
+        )
+        alice_in_bob_zone.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        assert alice_in_bob_zone.send_message("bob", "cross-zone slot-walk")
+        # Bob walks zones [alice.mesh, bob.mesh]. Manifest is in
+        # bob.mesh (= self.domain). The asymmetric carve-out lets
+        # alice's pinned spk match even though her contact's domain
+        # is alice.mesh, not bob.mesh.
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"cross-zone slot-walk"
+
     def test_pinned_spk_from_other_zone_does_not_replay_into_pinned_zone(self):
         # Codex P2 from the post-#52 fresh audit: the slot-walk pin
         # check used the GLOBAL pinned-spk set, so an attacker who

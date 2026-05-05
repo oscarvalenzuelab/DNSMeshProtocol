@@ -423,6 +423,217 @@ class TestClaimFlow:
         assert result.quarantined_intro_ids == []
         assert "manifest-spk-mismatch" in result.dropped_reasons
 
+    def test_claim_with_pinned_spk_in_wrong_zone_quarantined(self):
+        # Codex follow-up on PR #57. The claim path's direct-pin
+        # check used to consult the GLOBAL pinned-spk set: a
+        # malicious claim provider could point
+        # ``sender_mailbox_domain`` at carol's zone with alice's
+        # pinned spk, copy alice's manifest+chunks there, and
+        # ``manifest.sender_spk == claim.sender_spk`` (alice on both)
+        # passed the cross-bind. Decrypt then succeeds because the
+        # chunks are alice's real ones — the global ``in known_spks``
+        # would deliver alice's message under carol's authority.
+        # The fix binds the direct-pin check to the claim's
+        # advertised mailbox zone, so an alice-spk match in carol's
+        # zone falls through to the intro queue instead.
+        import hashlib
+
+        from dmp.core.claim import ClaimRecord, claim_rrset_name
+        from dmp.core.manifest import SlotManifest
+
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        carol = DMPClient(
+            "carol",
+            "carol-pass",
+            domain="carol.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Bob pins both alice and carol, each in their own zone.
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.mesh",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        bob.add_contact(
+            "carol",
+            carol.get_public_key_hex(),
+            domain="carol.mesh",
+            signing_key_hex=carol.get_signing_public_key_hex(),
+        )
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        # Alice publishes a real manifest+chunks in her own zone.
+        assert alice.send_message("bob", "alice → bob")
+
+        # Find the slot manifest's msg_id.
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        bob_hash = hashlib.sha256(bob_recipient_id).hexdigest()[:12]
+        msg_id = None
+        for slot in range(10):
+            for r in (
+                store.query_txt_record(f"slot-{slot}.mb-{bob_hash}.alice.mesh") or []
+            ):
+                parsed = SlotManifest.parse_and_verify(r)
+                if parsed:
+                    msg_id = parsed[0].msg_id
+                    break
+            if msg_id:
+                break
+        assert msg_id
+
+        # Attacker copies alice's slot manifest + chunks into
+        # carol.mesh. The cross-bind ``manifest.sender_spk == claim.sender_spk``
+        # will still pass because both are alice's real spk — the
+        # only thing distinguishing legitimate from replay is the
+        # zone the claim points at.
+        for name in list(store.list_names()):
+            if not name.endswith(".alice.mesh"):
+                continue
+            head = name[: -len(".alice.mesh")]
+            if not (head.startswith("slot-") or head.startswith("chunk-")):
+                continue
+            cloned = head + ".carol.mesh"
+            for v in store.query_txt_record(name) or []:
+                store.publish_txt_record(cloned, v)
+
+        # Malicious claim: alice's spk + carol's zone + bob's slot.
+        now = int(time.time())
+        evil_claim = ClaimRecord(
+            msg_id=msg_id,
+            sender_spk=alice.crypto.get_signing_public_key_bytes(),
+            sender_mailbox_domain="carol.mesh",
+            slot=0,
+            ts=now,
+            exp=now + 300,
+        )
+        wire = evil_claim.sign(alice.crypto)  # signed by alice's spk
+        store.publish_txt_record(
+            claim_rrset_name(bob_recipient_id, 0, PROVIDER_ZONE), wire, ttl=300
+        )
+
+        result = bob.receive_claims(provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)])
+        # The direct-pin check now binds to ``claim.sender_mailbox_domain``
+        # (carol.mesh). Alice's spk is NOT in carol.mesh's pinned
+        # set, so the inbox-fast-path fails and the message lands
+        # in the intro queue (still discoverable, but not silently
+        # delivered as if alice's authority was acknowledged in
+        # carol's zone).
+        assert result.delivered == []
+        assert len(result.quarantined_intro_ids) == 1
+
+    def test_claim_into_self_domain_from_other_zone_pin_still_delivers(self):
+        # Codex round-2 on PR #57: the direct-pin gate must mirror
+        # the rotation walker's ``self.domain`` carve-out. The
+        # legitimate cross-zone publish pattern lands a sender's
+        # manifest under the recipient's OWN zone — it's the only
+        # zone both parties reliably control writes for. A pinned
+        # contact whose ``Contact.domain`` is alice.mesh, sending
+        # via a claim that points at bob.mesh (recipient's zone),
+        # MUST deliver to the inbox, not the intro queue.
+        import hashlib
+
+        from dmp.core.claim import ClaimRecord, claim_rrset_name
+        from dmp.core.manifest import SlotManifest
+
+        store = InMemoryDNSStore()
+        # Alice publishes from a client whose ``domain`` is bob.mesh
+        # (the recipient-zone publish pattern), but bob has alice
+        # pinned at her real home zone alice.mesh.
+        alice_in_bob_zone = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.mesh",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob.add_contact(
+            "alice",
+            alice_in_bob_zone.get_public_key_hex(),
+            domain="alice.mesh",  # pin at alice's home zone
+            signing_key_hex=alice_in_bob_zone.get_signing_public_key_hex(),
+        )
+        alice_in_bob_zone.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            domain="bob.mesh",
+            signing_key_hex=bob.get_signing_public_key_hex(),
+        )
+        assert alice_in_bob_zone.send_message("bob", "cross-zone direct pin")
+
+        # Find msg_id from the manifest in bob.mesh.
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        bob_hash = hashlib.sha256(bob_recipient_id).hexdigest()[:12]
+        msg_id = None
+        for slot in range(10):
+            for r in (
+                store.query_txt_record(f"slot-{slot}.mb-{bob_hash}.bob.mesh") or []
+            ):
+                parsed = SlotManifest.parse_and_verify(r)
+                if parsed:
+                    msg_id = parsed[0].msg_id
+                    break
+            if msg_id:
+                break
+        assert msg_id
+
+        # Publish a claim pointing at bob.mesh (recipient's own zone).
+        now = int(time.time())
+        legitimate_claim = ClaimRecord(
+            msg_id=msg_id,
+            sender_spk=alice_in_bob_zone.crypto.get_signing_public_key_bytes(),
+            sender_mailbox_domain="bob.mesh",
+            slot=0,
+            ts=now,
+            exp=now + 300,
+        )
+        wire = legitimate_claim.sign(alice_in_bob_zone.crypto)
+        store.publish_txt_record(
+            claim_rrset_name(bob_recipient_id, 0, PROVIDER_ZONE), wire, ttl=300
+        )
+
+        result = bob.receive_claims(provider_zones=[(PROVIDER_ZONE, PROVIDER_ENDPOINT)])
+        # ``claim.sender_mailbox_domain == bob.domain == self.domain``
+        # → direct-pin walk-all → alice's spk in known_spks → deliver.
+        assert len(result.delivered) == 1
+        assert result.delivered[0].plaintext == b"cross-zone direct pin"
+        assert result.quarantined_intro_ids == []
+
 
 class TestIntroQueueCli:
     def _setup_pending_intro(self):

@@ -884,3 +884,104 @@ class TestDMPClientRotationChainIntegration:
         inbox = bob.receive_messages()
         assert len(inbox) == 1
         assert inbox[0].plaintext == b"cross-zone rotated hello"
+
+    def test_rotation_walker_does_not_accept_cross_pin_replay(self):
+        # Codex follow-up from PR #54: with the rotation chain
+        # walker globally scoped, an attacker with write access to
+        # one pinned contact's zone could publish a manifest signed
+        # by ANOTHER pinned contact's rotated key — the walker would
+        # resolve it globally and accept. The post-#56 fix binds
+        # the walk to the polled zone for non-self zones, breaking
+        # the cross-pin replay while preserving the legitimate
+        # cross-zone case (sender publishing to recipient's own
+        # zone) covered above.
+        from dmp.client.client import DMPClient
+        from dmp.network.memory import InMemoryDNSStore
+
+        store = InMemoryDNSStore()
+        # Alice — pinned in alice.example, rotates her key.
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.example",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        alice2 = DMPClient(
+            "alice",
+            "alice-new-pass",
+            domain="alice.example",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Carol — a totally separate pinned contact with her own zone.
+        carol = DMPClient(
+            "carol",
+            "carol-pass",
+            domain="carol.example",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.example",
+            store=store,
+            rotation_chain_enabled=True,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.example",
+            signing_key_hex=alice.get_signing_public_key_hex(),
+        )
+        bob.add_contact(
+            "carol",
+            carol.get_public_key_hex(),
+            domain="carol.example",
+            signing_key_hex=carol.get_signing_public_key_hex(),
+        )
+        # Publish alice's rotation chain under alice.example (where
+        # the walker would normally find it).
+        store.publish_txt_record(
+            rotation_rrset_name_user_identity("alice", "alice.example"),
+            _sign_rotation(
+                old=alice.crypto,
+                new=alice2.crypto,
+                seq=1,
+                subject="alice@alice.example",
+            ),
+        )
+        # Alice2 publishes a real manifest+chunks to bob in alice.example.
+        alice2.add_contact("bob", bob.get_public_key_hex(), domain="bob.example")
+        assert alice2.send_message("bob", "rotated alice → bob")
+
+        # Attacker copies just the slot manifest + chunks (NOT the
+        # rotation record) into carol.example and removes the
+        # legitimate slot+chunk copies. The rotation chain stays in
+        # alice.example so the walker, if globally scoped, would
+        # still resolve alice's rotated key — that's exactly the
+        # bypass the per-zone binding closes.
+        for name in list(store.list_names()):
+            if not name.endswith(".alice.example"):
+                continue
+            head = name[: -len(".alice.example")]
+            if not (head.startswith("slot-") or head.startswith("chunk-")):
+                continue
+            cloned = head + ".carol.example"
+            for v in store.query_txt_record(name) or []:
+                store.publish_txt_record(cloned, v)
+            store.delete_txt_record(name)
+
+        # Bob walks zones [alice.example, carol.example, bob.example].
+        # In carol.example, the manifest carries alice2's rotated spk.
+        # With the per-zone walker, carol's chain is the only one
+        # consulted there (alice's not walked) — the rotated-key
+        # match is rejected. Inbox stays empty.
+        inbox = bob.receive_messages()
+        assert inbox == []
