@@ -258,6 +258,38 @@ class TSIGKey:
                 return True
         return False
 
+    def covers_for_op(self, owner: str, op: str) -> bool:
+        """True iff `owner` is in scope for this key AND `op` is allowed.
+
+        Adds operation-aware authorization on top of plain ``covers``.
+        Self-service registration grants wildcard suffixes for the
+        shared namespaces (``slot-*.mb-*``, ``chunk-*-*``,
+        ``claim-*.mb-*``, ``_dnsmesh-claim-*``) so any user can deliver
+        to any recipient — chunks are content-addressed and mailbox
+        slots are owned by the recipient, not the sender. That's
+        fine for ADDs but unsafe for DELETEs: a wildcard-scoped key
+        could otherwise wipe co-resident records it never authored.
+
+        Policy: a DELETE is allowed only when the matching suffix is
+        a literal owner-exclusive shape (no ``*`` wildcards in the
+        labels). The user's own ``mb-{hash}.{zone}`` and
+        ``_dnsmesh-claim-{spk16}.{zone}`` qualify; the four
+        shared-namespace wildcards do not. ADDs continue to use the
+        plain coverage check so legitimate publish flows are
+        unaffected.
+
+        DELETE under tight-scope deployments (``DMP_TSIG_TIGHT_SCOPE=1``)
+        is unaffected because tight-scope drops the wildcards at mint
+        time — every covering suffix in that mode is already literal.
+        """
+        for suffix in self.allowed_suffixes:
+            if not _suffix_match(owner, suffix):
+                continue
+            if op == "delete" and "*" in suffix:
+                continue
+            return True
+        return False
+
 
 class TSIGKeyStore:
     """Sqlite-backed TSIG key store.
@@ -713,7 +745,7 @@ class TSIGKeyStore:
             row = store.get(name_text)
             if row is None or not row.is_active(now=now):
                 return False
-            return row.covers(owner)
+            return row.covers_for_op(owner, op)
 
         return authorize
 

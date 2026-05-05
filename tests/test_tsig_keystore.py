@@ -241,6 +241,175 @@ class TestAuthorizer:
         authorize = store.build_authorizer()
         assert not authorize(dns.name.from_text("ghost."), "add", "anything.example")
 
+    def test_wildcard_scoped_key_can_add_chunks(self, store):
+        # Self-service registration grants wildcard suffixes (the
+        # chunk namespace is shared across users), so ADD on any
+        # chunk name in scope must succeed.
+        store.put(
+            name="alice",
+            secret=b"\x01" * 32,
+            allowed_suffixes=("chunk-*-*.shared.example",),
+        )
+        authorize = store.build_authorizer()
+        assert authorize(
+            dns.name.from_text("alice."),
+            "add",
+            "chunk-0001-abc123def456.shared.example",
+        )
+
+    def test_wildcard_scoped_key_cannot_delete_chunks(self, store):
+        # The shared chunk namespace has no per-record ownership,
+        # so a wildcard-scoped key letting any holder DELETE other
+        # users' chunks is the same threat as the HTTP shared-pool
+        # delete bug fixed in #52, just on the DNS UPDATE side.
+        store.put(
+            name="alice",
+            secret=b"\x01" * 32,
+            allowed_suffixes=("chunk-*-*.shared.example",),
+        )
+        authorize = store.build_authorizer()
+        assert not authorize(
+            dns.name.from_text("alice."),
+            "delete",
+            "chunk-0001-abc123def456.shared.example",
+        )
+
+    def test_wildcard_slot_mailbox_cannot_delete(self, store):
+        # ``slot-*.mb-*`` is granted to every registrant so anyone
+        # can deliver to any mailbox. DELETE through it would let
+        # one user wipe another user's mailbox slot — refused.
+        store.put(
+            name="alice",
+            secret=b"\x01" * 32,
+            allowed_suffixes=("slot-*.mb-*.shared.example",),
+        )
+        authorize = store.build_authorizer()
+        assert authorize(
+            dns.name.from_text("alice."),
+            "add",
+            "slot-3.mb-abcdef012345.shared.example",
+        )
+        assert not authorize(
+            dns.name.from_text("alice."),
+            "delete",
+            "slot-3.mb-abcdef012345.shared.example",
+        )
+
+    def test_owner_exclusive_suffix_can_still_delete(self, store):
+        # The user's OWN mailbox suffix (literal, no wildcards) is
+        # owner-exclusive — they can ADD AND DELETE their own slot
+        # records. This is the legitimate rotate-old-publish-new
+        # path; if delete were globally refused it would block
+        # operators from cleaning up after themselves.
+        store.put(
+            name="alice",
+            secret=b"\x01" * 32,
+            allowed_suffixes=("mb-abcdef012345.shared.example",),
+        )
+        authorize = store.build_authorizer()
+        assert authorize(
+            dns.name.from_text("alice."),
+            "delete",
+            "slot-3.mb-abcdef012345.shared.example",
+        )
+
+    def test_underscore_claim_wildcard_cannot_delete(self, store):
+        # ``_dnsmesh-claim-*`` is the M10 first-contact claim
+        # namespace, also wildcard-granted. Same rule.
+        store.put(
+            name="alice",
+            secret=b"\x01" * 32,
+            allowed_suffixes=("_dnsmesh-claim-*.shared.example",),
+        )
+        authorize = store.build_authorizer()
+        assert authorize(
+            dns.name.from_text("alice."),
+            "add",
+            "_dnsmesh-claim-abc123.shared.example",
+        )
+        assert not authorize(
+            dns.name.from_text("alice."),
+            "delete",
+            "_dnsmesh-claim-abc123.shared.example",
+        )
+
+    def test_claim_mailbox_wildcard_cannot_delete(self, store):
+        # ``claim-*.mb-*`` is the same-zone claim namespace
+        # (granted to every registrant for self-service claim
+        # publishing). Same rule.
+        store.put(
+            name="alice",
+            secret=b"\x01" * 32,
+            allowed_suffixes=("claim-*.mb-*.shared.example",),
+        )
+        authorize = store.build_authorizer()
+        assert authorize(
+            dns.name.from_text("alice."),
+            "add",
+            "claim-3.mb-abcdef012345.shared.example",
+        )
+        assert not authorize(
+            dns.name.from_text("alice."),
+            "delete",
+            "claim-3.mb-abcdef012345.shared.example",
+        )
+
+    def test_literal_claim_owner_can_delete(self, store):
+        # ``_dnsmesh-claim-{spk16}.{zone}`` is the user's own
+        # claim record (literal, no wildcards). Owner-exclusive,
+        # delete authority is the legitimate "rotate-and-republish"
+        # path.
+        store.put(
+            name="alice",
+            secret=b"\x01" * 32,
+            allowed_suffixes=("_dnsmesh-claim-1234567890abcdef.shared.example",),
+        )
+        authorize = store.build_authorizer()
+        assert authorize(
+            dns.name.from_text("alice."),
+            "delete",
+            "_dnsmesh-claim-1234567890abcdef.shared.example",
+        )
+
+    def test_bare_zone_loose_scope_can_delete(self, store):
+        # ``DMP_TSIG_LOOSE_SCOPE=1`` admin-issued keys carry the
+        # bare zone as the only scope. The bare zone is literal —
+        # no wildcards — so DELETE remains authorized: the
+        # operator escape hatch is preserved.
+        store.put(
+            name="admin",
+            secret=b"\x01" * 32,
+            allowed_suffixes=("shared.example",),
+        )
+        authorize = store.build_authorizer()
+        assert authorize(
+            dns.name.from_text("admin."),
+            "delete",
+            "anything.shared.example",
+        )
+
+    def test_mixed_literal_and_wildcard_for_same_owner_allows_delete(self, store):
+        # If a key has BOTH a wildcard AND a literal suffix that
+        # match the same owner name, the literal must still
+        # authorize DELETE — the wildcard is skipped only on a
+        # delete and the loop continues to find the literal.
+        store.put(
+            name="alice",
+            secret=b"\x01" * 32,
+            allowed_suffixes=(
+                "slot-*.mb-*.shared.example",
+                "mb-abcdef012345.shared.example",
+            ),
+        )
+        authorize = store.build_authorizer()
+        # Slot under alice's own mailbox: matches BOTH the wildcard
+        # and the literal mailbox suffix. DELETE must be allowed.
+        assert authorize(
+            dns.name.from_text("alice."),
+            "delete",
+            "slot-3.mb-abcdef012345.shared.example",
+        )
+
 
 class TestEndToEndWithDnsServer:
     """Sanity-check that dns_server picks up the keystore-built
