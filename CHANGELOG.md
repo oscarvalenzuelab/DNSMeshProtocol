@@ -7,6 +7,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-05 — security audit roundup
+
+Multi-pass security audit cycle with fifteen merged PRs (#52–#66)
+plus three follow-up issues (#63 KDF transcript binding, #64
+canonical AAD, #65 Cloudflare/Route53 publisher overwrite) tracked
+for future cycles.
+
+The wire format gained per-chunk content-binding hashes inside
+`SlotManifest` and the TSIG-mint flow now requires X25519
+proof-of-possession via a challenge-response. Receivers refuse
+pre-#62 manifests outright, so v0.7.0 senders MUST be paired with
+v0.7.0 receivers — there is no in-flight legacy-compat window.
+
 ### Security
 
 - Receive path no longer burns the recipient's one-time prekey on
