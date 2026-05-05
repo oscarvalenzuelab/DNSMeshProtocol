@@ -101,6 +101,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from dmp.core.bootstrap import RECORD_PREFIX as _BOOTSTRAP_PREFIX
+from dmp.core.chunking import MessageChunker
 from dmp.core.claim import RECORD_PREFIX as _CLAIM_PREFIX
 from dmp.core.claim import ClaimRecord
 from dmp.core.cluster import ClusterManifest
@@ -110,8 +111,62 @@ from dmp.core.identity import RECORD_PREFIX as _IDENTITY_PREFIX
 from dmp.core.manifest import RECORD_PREFIX as _MANIFEST_PREFIX
 from dmp.core.manifest import SlotManifest
 from dmp.core.prekeys import RECORD_PREFIX as _PREKEY_PREFIX
+from dmp.core.rotation import (
+    RECORD_PREFIX_REVOCATION,
+    RECORD_PREFIX_ROTATION,
+    RevocationRecord,
+    RotationRecord,
+)
 
 log = logging.getLogger(__name__)
+
+# Generic DMP-record prefix. Every DMP record type starts with
+# ``v=dmp1;t=<typename>;``; non-DMP TXT records (SPF, DKIM, ad-hoc
+# operator records hosted in the same zone) do not. ``verify_record``
+# uses this to distinguish "future-protocol record this binary
+# doesn't recognize" (refuse) from "legitimate non-DMP zone hygiene"
+# (accept).
+_DMP_GENERIC_PREFIX = "v=dmp"
+
+# Owner-name patterns DMP records publish under. Anti-entropy
+# refuses non-DMP TXT values at these names so a peer can't sync
+# ``v=spf1 ...`` (or any opaque blob) into ``slot-0.mb-{victim}.zone``
+# and pollute the victim's mailbox slot. Operator-hosted records
+# (DKIM at ``_domainkey.``, SPF at the apex, etc.) are fine because
+# their owners don't match these patterns.
+_DMP_RESERVED_NAME_RES = (
+    re.compile(r"^slot-\d+\.mb-[a-f0-9]+\."),
+    re.compile(r"^chunk-\d+-[a-f0-9]+\."),
+    re.compile(r"^mb-[a-f0-9]+\."),
+    re.compile(r"^id-[a-f0-9]+\."),
+    re.compile(r"^prekeys\.id-[a-f0-9]+\."),
+    re.compile(r"^_dnsmesh-"),
+    re.compile(r"^claim-\d+\.mb-[a-f0-9]+\."),
+    # Cluster manifest at ``cluster.<zone>``.
+    re.compile(r"^cluster\."),
+    # Bootstrap at ``_dmp.<user_domain>``.
+    re.compile(r"^_dmp\."),
+    # Zone-anchored identity at ``dmp.<zone>`` and hashed identity at
+    # ``dmp.<hash>.<domain>``.
+    re.compile(r"^dmp\."),
+    # Rotation + revocation RRsets ``rotate.<...>``.
+    re.compile(r"^rotate\."),
+)
+
+
+def _is_dmp_reserved_name(name: str) -> bool:
+    """True iff the owner name matches a DMP record-name pattern.
+
+    Used by ``verify_record`` to refuse non-DMP TXT values at owners
+    a DMP record would normally publish under, closing the alias
+    surface where a peer could push e.g. SPF text into a mailbox
+    slot via anti-entropy and have the local DNS server return it.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    lower = name.lower()
+    return any(pat.match(lower) for pat in _DMP_RESERVED_NAME_RES)
+
 
 # Transport limits exposed as module constants so tests can poke them.
 DEFAULT_HTTP_TIMEOUT = 5.0
@@ -361,7 +416,8 @@ def _peers_from_wire(
 
 def _classify_record(value: str) -> str:
     """Return a short tag for the record type: manifest/identity/prekey/
-    cluster/bootstrap/chunk/claim/unknown. Used only for logging + dispatch."""
+    cluster/bootstrap/chunk/claim/rotation/revocation/non-dmp/unknown-dmp.
+    Used only for logging + dispatch."""
     if value.startswith(_MANIFEST_PREFIX):
         return "manifest"
     if value.startswith(_IDENTITY_PREFIX):
@@ -376,7 +432,18 @@ def _classify_record(value: str) -> str:
         return "chunk"
     if value.startswith(_CLAIM_PREFIX):
         return "claim"
-    return "unknown"
+    if value.startswith(RECORD_PREFIX_ROTATION):
+        return "rotation"
+    if value.startswith(RECORD_PREFIX_REVOCATION):
+        return "revocation"
+    # ``v=dmp...`` payloads we don't recognize are future-protocol
+    # records this binary can't validate. They MUST NOT replicate
+    # — see ``verify_record``. Truly non-DMP TXT (SPF, DKIM, etc.)
+    # gets a separate tag so the operator's zone hygiene records
+    # keep syncing.
+    if value.startswith(_DMP_GENERIC_PREFIX):
+        return "unknown-dmp"
+    return "non-dmp"
 
 
 def _structural_parse_signed(value: str, prefix: str) -> bool:
@@ -402,6 +469,7 @@ def verify_record(
     value: str,
     *,
     cluster_operator_spk: Optional[bytes] = None,
+    name: str = "",
 ) -> bool:
     """Re-verify a record as if it had been published to us directly.
 
@@ -409,14 +477,23 @@ def verify_record(
     False otherwise. The anti-entropy worker is the only caller; the
     public publish path goes through HTTP and does its own validation.
 
-    Records with self-identifying signers (manifest, identity) undergo
-    full signature verification. Cluster manifests verify against
-    ``cluster_operator_spk`` if the node has one pinned; otherwise a
-    structural parse is used. Prekey / bootstrap records don't expose
-    the signer key at this layer; we use a structural parse and the
-    *client* reading the record later will re-verify with the real key.
-    Chunks and unknown blobs are accepted as opaque (the signed manifest
-    that references a chunk is the thing that binds it).
+    Records with self-identifying signers (manifest, identity, claim,
+    rotation, revocation) undergo full signature verification.
+    Cluster manifests verify against ``cluster_operator_spk`` if the
+    node has one pinned; otherwise a structural parse is used.
+    Prekey / bootstrap records don't expose the signer key at this
+    layer; we use a structural parse and the *client* reading the
+    record later will re-verify with the real key. Chunks structurally
+    validate via ``unwrap_block`` — a content-binding manifest
+    addition is tracked for v0.7. Future-protocol DMP records the
+    classifier doesn't recognize are refused.
+
+    Non-DMP TXT (SPF, DKIM, etc.) is accepted ONLY when the owner
+    ``name`` doesn't match a DMP-reserved pattern; otherwise refused
+    so a peer can't alias e.g. SPF text into ``slot-0.mb-{victim}.zone``.
+    Callers that pass an empty ``name`` skip the alias check, which is
+    safe for the existing test fixtures that target ``verify_record``
+    directly with no name context.
     """
     if not isinstance(value, str) or not value:
         return False
@@ -443,9 +520,50 @@ def verify_record(
         # tampered claim would let a malicious peer poison every
         # downstream provider's namespace.
         return ClaimRecord.parse_and_verify(value) is not None
-    # chunks and unknown — accept. Chunks are bound by their manifest;
-    # unknown types are future-proofing.
-    return True
+    if kind == "rotation":
+        # Self-verifying: the body carries both old + new spk and
+        # both signatures. parse_and_verify rejects forgeries.
+        return RotationRecord.parse_and_verify(value) is not None
+    if kind == "revocation":
+        # Self-verifying: the body carries the revoked spk and its
+        # own signature.
+        return RevocationRecord.parse_and_verify(value) is not None
+    if kind == "chunk":
+        # Chunks are bound by their signed manifest at receive time,
+        # but the manifest doesn't currently commit to per-chunk
+        # content (tracked for v0.7). Accepting them fully opaque
+        # turns anti-entropy into a chunk-poisoning surface. As
+        # defense in depth, structurally validate via ``unwrap_block``
+        # — refuses raw-garbage payloads. Doesn't close the bug for
+        # an attacker who calls ``wrap_block(garbage)``, but raises
+        # the bar from "any TXT works" to "valid wrapped block".
+        try:
+            payload = value[len(_CHUNK_PREFIX) :]
+            raw = base64.b64decode(payload, validate=True)
+        except Exception:
+            return False
+        chunker = MessageChunker(enable_error_correction=True)
+        return chunker.unwrap_block(raw) is not None
+    if kind == "non-dmp":
+        # Operator-hosted zone records (SPF, DKIM, A/MX co-resident
+        # with DMP records). Anti-entropy must replicate these to
+        # keep cluster nodes serving consistent zones. They are not
+        # DMP-shaped so they can't pose as future-protocol DMP
+        # records — but they CAN alias DMP owner names if the peer
+        # is malicious (e.g. publish ``v=spf1 ...`` at
+        # ``slot-0.mb-{victim}.zone``). Refuse non-DMP at any owner
+        # matching a DMP-reserved pattern; everywhere else trust as
+        # opaque.
+        if name and _is_dmp_reserved_name(name):
+            return False
+        return True
+    # ``unknown-dmp``: a ``v=dmp...`` record this binary doesn't
+    # recognize. Refuse — anti-entropy used to accept these as
+    # "future-proofing", but that turns sync into a write proxy
+    # for any DMP-shaped record type the binary lacks a validator
+    # for. New types must be wired into ``_classify_record`` and
+    # ``verify_record`` before they can replicate.
+    return False
 
 
 # Transport — isolated behind a small callable so tests can inject a fake
@@ -1254,7 +1372,9 @@ class AntiEntropyWorker:
             self.stats.records_pulled += 1
             # Re-verify signed record types. If verification fails, drop.
             if not verify_record(
-                value, cluster_operator_spk=self._cluster_operator_spk
+                value,
+                cluster_operator_spk=self._cluster_operator_spk,
+                name=name,
             ):
                 log.warning(
                     "anti-entropy: peer %s returned unverifiable record for %s",

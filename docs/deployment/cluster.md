@@ -124,9 +124,19 @@ Each node runs a background thread (`AntiEntropyWorker`) that every
    locally — OR present but with a stale TTL — goes on the pull list.
 3. POSTs `http://<peer>/v1/sync/pull` with the pull list. The peer
    returns the full TXT values.
-4. **Re-verifies signatures** on signed record types
-   (`ClusterManifest`, `IdentityRecord`, `Prekey`, `SlotManifest`,
-   `BootstrapRecord`) before writing. Peers are untrusted.
+4. **Re-verifies records** before writing. Peers are untrusted.
+   Full signature verification on `ClusterManifest`, `IdentityRecord`,
+   `SlotManifest`, `ClaimRecord`, `RotationRecord`, `RevocationRecord`.
+   Structural-only on `Prekey` and `BootstrapRecord` (the signer key
+   isn't in this layer's context; the client that reads the record
+   later does its own real verification). Chunks are structurally
+   validated via the RS+checksum unwrap. `v=dmp...` records the
+   binary doesn't recognize are refused — future-protocol record
+   types must be added to the verifier before they can replicate.
+   Non-DMP TXT (SPF, DKIM, etc.) keeps replicating for zone hygiene
+   but is refused at any owner name matching a DMP record-name
+   pattern (so a peer can't alias arbitrary text into a victim's
+   mailbox slot).
 5. Writes validated records to the local store and advances the
    per-peer watermark (compound cursor `(ts, name, value_hash)`).
 
