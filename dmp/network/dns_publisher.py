@@ -16,6 +16,7 @@ Optional third-party deps (requests, boto3) are imported lazily inside the
 backends that need them so the core library stays usable without them.
 """
 
+import re
 from typing import Optional, List
 
 import dns.update
@@ -24,6 +25,50 @@ import dns.tsigkeyring
 import dns.rcode
 
 from dmp.network.base import DNSRecordWriter
+
+# Strict DNS-name validator for ``LocalDNSPublisher``: the publisher
+# writes the name verbatim into a dnsmasq ``txt-record=NAME,...``
+# directive, so anything that breaks the parser is a config-injection
+# vector. Labels follow RFC 1035 alphanumeric + hyphen, plus the
+# leading-underscore form (RFC 2782 / RFC 8552) DMP uses for
+# ``_dnsmesh-claim-...`` records. Each label is 1-63 bytes; the
+# total name is ≤253 bytes; trailing dot is tolerated.
+_DNS_LABEL_RE = re.compile(r"^_?[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
+
+
+def _is_valid_dns_name(name: str) -> bool:
+    if not isinstance(name, str) or not name or len(name) > 253:
+        return False
+    candidate = name[:-1] if name.endswith(".") else name
+    if not candidate:
+        return False
+    for label in candidate.split("."):
+        if not _DNS_LABEL_RE.match(label):
+            return False
+    return True
+
+
+def _is_safe_txt_value(value: str) -> bool:
+    """True iff ``value`` is safe to write inside a quoted dnsmasq
+    txt-record string.
+
+    dnsmasq's txt-record syntax has no escape mechanism inside the
+    quoted strings, so a literal ``"`` terminates the quote and lets
+    arbitrary content escape into a fresh directive on the same line.
+    A literal newline / carriage return ends the directive entirely
+    and lets the attacker append a whole new rule. Other control
+    characters are rejected for safety — a real DMP record value is
+    printable ASCII (base64 + ``;``-separated key=val tokens).
+    """
+    if not isinstance(value, str):
+        return False
+    for ch in value:
+        if ch == '"':
+            return False
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            return False
+    return True
+
 
 # Per RFC 1035 a DNS TXT record's RDATA is a sequence of
 # <character-string>s, each prefixed by a single length byte, capping
@@ -326,10 +371,22 @@ class LocalDNSPublisher(DNSRecordWriter):
             return False
 
     def publish_txt_record(self, name: str, value: str, ttl: int = 300) -> bool:
+        # Validate BEFORE storing. The dnsmasq config file is
+        # rewritten from ``self.records`` on every publish/delete,
+        # so a single bad name or value would persist across calls
+        # and re-inject every reload. Multi-tenant deployments that
+        # let an authenticated user POST arbitrary values otherwise
+        # turn this writer into a config-injection sink.
+        if not _is_valid_dns_name(name):
+            return False
+        if not _is_safe_txt_value(value):
+            return False
         self.records[name] = value
         return self._write_and_reload()
 
     def delete_txt_record(self, name: str, value: Optional[str] = None) -> bool:
+        if not _is_valid_dns_name(name):
+            return False
         if name not in self.records:
             return False
         del self.records[name]
