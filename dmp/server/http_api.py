@@ -896,6 +896,14 @@ HTTPS exchange is the one-time TSIG-key registration step.</p>
                 "challenge": pc.challenge_hex,
                 "node": pc.node,
                 "expires_at": pc.expires_at,
+                # Ephemeral X25519 public half for the TSIG-mint
+                # X25519 proof-of-possession flow. The client uses
+                # this to compute their DH side and HMACs the
+                # shared secret over (challenge, subject, claimed
+                # x25519_pub). Server retains the matching ephemeral
+                # private half in the ChallengeStore for
+                # verification on tsig-confirm.
+                "server_x25519_pub": pc.server_x25519_eph_pub.hex(),
                 "version": 1,
             },
         )

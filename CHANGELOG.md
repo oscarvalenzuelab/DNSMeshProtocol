@@ -9,6 +9,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- Self-service TSIG registration requires X25519 proof-of-possession.
+  The challenge response now carries a server-issued ephemeral X25519
+  pubkey; the registrant computes a DH against it with their X25519
+  private half, HMACs the shared secret over (challenge, subject,
+  claimed pub), and posts the result as `x25519_pop` on
+  `/v1/registration/tsig-confirm`. Without this, an attacker could
+  read a victim's published `x25519_pub` from their identity record,
+  register their own subject + Ed25519 key but claim the victim's
+  pubkey, and have the server mint a TSIG key scoped to
+  `mb-{hash12(victim_x25519_pub)}.{zone}` — a direct write into the
+  victim's mailbox under `DMP_TSIG_TIGHT_SCOPE=1`. Legacy clients
+  that POST `x25519_pub` without `x25519_pop` keep working but lose
+  the literal `mb-{hash}.{zone}` suffix; identity / prekey / own-claim
+  literal suffixes are unaffected, and the loose-mode wildcards still
+  apply.
 - TSIG authorizer refuses DNS UPDATE `DELETE` through wildcard
   suffixes. Self-service registration grants every user wildcard
   scopes for the shared namespaces (`slot-*.mb-*`, `chunk-*-*`,

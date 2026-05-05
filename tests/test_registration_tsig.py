@@ -165,13 +165,30 @@ class TestMintTsigViaRegistration:
         assert f"id-{full_hash16}.ops.example" not in minted.allowed_suffixes
 
     def test_x25519_pub_extends_scope_to_mailbox(self, keystore, config, challenges):
-        """When the registration body includes ``x25519_pub`` the
-        minted key gains ``mb-<hash12>.<zone>`` — the user's own
-        mailbox alias. Works in default (tight) mode."""
+        """When the registration body includes ``x25519_pub`` AND a
+        valid ``x25519_pop``, the minted key gains
+        ``mb-<hash12>.<zone>`` — the user's own mailbox alias."""
         import hashlib
-        import os
 
-        x_pub = os.urandom(32)
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import (
+            X25519PrivateKey,
+        )
+
+        from dmp.server.registration import build_x25519_pop
+
+        # Real X25519 keypair so we can compute a valid PoP.
+        x_priv_obj = X25519PrivateKey.generate()
+        x_priv = x_priv_obj.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        x_pub = x_priv_obj.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+
         pc = challenges.issue(config.node_hostname)
         body, _ = _signed_body(
             subject="alice@ops.example",
@@ -179,6 +196,13 @@ class TestMintTsigViaRegistration:
             node=pc.node,
         )
         body["x25519_pub"] = x_pub.hex()
+        body["x25519_pop"] = build_x25519_pop(
+            server_eph_pub=pc.server_x25519_eph_pub,
+            x25519_priv=x_priv,
+            challenge_hex=pc.challenge_hex,
+            subject="alice@ops.example",
+            claimed_x25519_pub=x_pub,
+        ).hex()
         minted = mint_tsig_via_registration(
             keystore=keystore,
             challenges=challenges,
@@ -465,6 +489,216 @@ class TestMintTsigViaRegistration:
             body=body2,
         )
         assert second.name != first.name
+
+
+class TestX25519ProofOfPossession:
+    # The forgery surface is: an attacker reads a victim's published
+    # ``x25519_pub`` from their identity record, registers under their
+    # OWN subject + Ed25519 key but claims the victim's ``x25519_pub``,
+    # and the server mints a TSIG key scoped to
+    # ``mb-{hash12(victim_x25519_pub)}.{zone}``. Under
+    # DMP_TSIG_TIGHT_SCOPE that's a direct write into the victim's
+    # mailbox; under loose scope the wildcards already grant the same
+    # but the literal mailbox suffix is privilege the attacker shouldn't
+    # have. The PoP check requires the registrant to prove possession
+    # of the X25519 private half before that scope is granted.
+
+    def _real_x25519_keypair(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import (
+            X25519PrivateKey,
+        )
+
+        priv_obj = X25519PrivateKey.generate()
+        priv = priv_obj.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        pub = priv_obj.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        return priv, pub
+
+    def _build_pop(self, pc, *, x_priv, x_pub, subject):
+        from dmp.server.registration import build_x25519_pop
+
+        return build_x25519_pop(
+            server_eph_pub=pc.server_x25519_eph_pub,
+            x25519_priv=x_priv,
+            challenge_hex=pc.challenge_hex,
+            subject=subject,
+            claimed_x25519_pub=x_pub,
+        ).hex()
+
+    def test_valid_pop_grants_mailbox_scope(self, keystore, config, challenges):
+        x_priv, x_pub = self._real_x25519_keypair()
+        pc = challenges.issue(config.node_hostname)
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        body["x25519_pub"] = x_pub.hex()
+        body["x25519_pop"] = self._build_pop(
+            pc, x_priv=x_priv, x_pub=x_pub, subject="alice@ops.example"
+        )
+        minted = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=config,
+            body=body,
+        )
+        # Confirms the literal ``mb-{hash12}.{zone}`` suffix lands.
+        import hashlib
+
+        recipient_id = hashlib.sha256(x_pub).digest()
+        mailbox_hash = hashlib.sha256(recipient_id).hexdigest()[:12]
+        assert f"mb-{mailbox_hash}.ops.example" in minted.allowed_suffixes
+
+    def test_pop_mismatched_pub_refused(self, keystore, config, challenges):
+        # Attacker holds x_priv_attacker but claims x_pub_victim. The
+        # PoP they can compute is over their own keypair; the server
+        # tries to verify against the CLAIMED victim pub and the DH
+        # shared-secret won't match.
+        attacker_priv, attacker_pub = self._real_x25519_keypair()
+        _, victim_pub = self._real_x25519_keypair()
+
+        pc = challenges.issue(config.node_hostname)
+        body, _ = _signed_body(
+            subject="attacker@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        body["x25519_pub"] = victim_pub.hex()
+        # Attacker computes a "PoP" with their own private key but
+        # claims the victim's pubkey. Server's DH against the claimed
+        # pub yields a different shared secret, HMAC fails.
+        body["x25519_pop"] = self._build_pop(
+            pc,
+            x_priv=attacker_priv,
+            x_pub=attacker_pub,
+            subject="attacker@ops.example",
+        )
+        with pytest.raises(SignatureInvalid):
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=config,
+                body=body,
+            )
+
+    def test_pop_garbage_bytes_refused(self, keystore, config, challenges):
+        _, x_pub = self._real_x25519_keypair()
+        pc = challenges.issue(config.node_hostname)
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        body["x25519_pub"] = x_pub.hex()
+        body["x25519_pop"] = "00" * 32  # 32 bytes of zeros, not a valid HMAC
+        with pytest.raises(SignatureInvalid):
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=config,
+                body=body,
+            )
+
+    def test_pop_bound_to_subject(self, keystore, config, challenges):
+        # Attacker captured a victim's valid (challenge, pop, subject)
+        # tuple from a real registration, then tries to replay it
+        # under their own subject. The server's HMAC check binds the
+        # subject into the message so the attacker's substitution
+        # invalidates the proof.
+        x_priv, x_pub = self._real_x25519_keypair()
+        pc = challenges.issue(config.node_hostname)
+        # Victim built a pop for THEIR subject.
+        victim_pop = self._build_pop(
+            pc, x_priv=x_priv, x_pub=x_pub, subject="alice@ops.example"
+        )
+        # Attacker tries to use it under a different subject.
+        body, _ = _signed_body(
+            subject="mallory@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        body["x25519_pub"] = x_pub.hex()
+        body["x25519_pop"] = victim_pop
+        with pytest.raises(SignatureInvalid):
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=config,
+                body=body,
+            )
+
+    def test_pop_replay_across_challenges_refused(self, keystore, config, challenges):
+        # An attacker captures a valid (challenge_A, x25519_pub, pop_A)
+        # tuple. They can't replay pop_A against a fresh challenge_B
+        # because the server's ephemeral X25519 private differs per
+        # challenge — the DH shared secret won't match.
+        x_priv, x_pub = self._real_x25519_keypair()
+
+        # Issue and immediately consume challenge A so we have a valid
+        # pop bound to A's ephemeral key, then issue challenge B.
+        pc_a = challenges.issue(config.node_hostname)
+        pop_a = self._build_pop(
+            pc_a, x_priv=x_priv, x_pub=x_pub, subject="alice@ops.example"
+        )
+        # Consume A so the next confirm uses challenge B (a confirm
+        # only consumes its OWN challenge — fresh issue gives the
+        # attacker a different nonce).
+        pc_b = challenges.issue(config.node_hostname)
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc_b.challenge_hex,
+            node=pc_b.node,
+        )
+        body["x25519_pub"] = x_pub.hex()
+        body["x25519_pop"] = pop_a  # pop bound to challenge A, not B
+        with pytest.raises(SignatureInvalid):
+            mint_tsig_via_registration(
+                keystore=keystore,
+                challenges=challenges,
+                config=config,
+                body=body,
+            )
+
+    def test_legacy_client_no_pop_drops_pubkey_silently(
+        self, keystore, config, challenges
+    ):
+        # Legacy clients that POST ``x25519_pub`` without
+        # ``x25519_pop`` keep working but lose the literal
+        # ``mb-{hash}.{zone}`` suffix. Identity / prekey / own-claim
+        # literal suffixes are unaffected, and the wildcard scopes
+        # in loose mode still apply.
+        _, x_pub = self._real_x25519_keypair()
+        pc = challenges.issue(config.node_hostname)
+        body, _ = _signed_body(
+            subject="alice@ops.example",
+            challenge_hex=pc.challenge_hex,
+            node=pc.node,
+        )
+        body["x25519_pub"] = x_pub.hex()
+        # Deliberately omit x25519_pop.
+        minted = mint_tsig_via_registration(
+            keystore=keystore,
+            challenges=challenges,
+            config=config,
+            body=body,
+        )
+        # Wildcard scope still present.
+        assert any("slot-*.mb-*" in s for s in minted.allowed_suffixes)
+        # Literal mailbox suffix NOT present (since the pubkey was
+        # dropped from scope derivation without proof).
+        import hashlib
+
+        recipient_id = hashlib.sha256(x_pub).digest()
+        mailbox_hash = hashlib.sha256(recipient_id).hexdigest()[:12]
+        assert f"mb-{mailbox_hash}.ops.example" not in minted.allowed_suffixes
 
 
 class TestHttpEndpoint:

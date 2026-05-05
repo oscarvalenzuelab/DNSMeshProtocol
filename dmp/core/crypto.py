@@ -386,3 +386,38 @@ class MessageEncryption:
             associated_data=header_aad,
             private_key=private_key,
         )
+
+
+def build_x25519_registration_pop(
+    server_eph_pub: bytes,
+    x25519_priv: bytes,
+    challenge_hex: str,
+    subject: str,
+    claimed_x25519_pub: bytes,
+) -> bytes:
+    """Compute the X25519 proof-of-possession for TSIG self-service registration.
+
+    The TSIG-mint flow uses this to prove the registrant holds the
+    X25519 private half corresponding to a claimed ``x25519_pub`` —
+    without it, an attacker could read a victim's published pubkey
+    and have the server scope the minted TSIG key to the victim's
+    mailbox owner. The server side recomputes the same HMAC against
+    the matching ephemeral private half it stored when it issued the
+    challenge.
+
+    Lives in ``dmp.core.crypto`` (not ``dmp.server.registration``) so
+    the CLI can import it without depending on server-side modules.
+    """
+    import hashlib
+    import hmac
+
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey,
+        X25519PublicKey,
+    )
+
+    priv = X25519PrivateKey.from_private_bytes(x25519_priv)
+    server_pub_obj = X25519PublicKey.from_public_bytes(server_eph_pub)
+    shared = priv.exchange(server_pub_obj)
+    msg = bytes.fromhex(challenge_hex) + subject.encode("utf-8") + claimed_x25519_pub
+    return hmac.new(shared, msg, hashlib.sha256).digest()
