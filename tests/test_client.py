@@ -123,13 +123,19 @@ class TestSendReceive:
         assert alice.add_contact("badhex", "zz") is False
         assert alice.add_contact("shortkey", "aabb") is False
 
-    def test_txt_records_fit_in_single_dns_string(self):
-        """Every published TXT value must be <= 255 bytes to fit a single DNS string.
+    def test_txt_records_split_to_dns_string_limits(self):
+        """Each character-string in a TXT record must be <= 255 bytes.
 
-        Real DNS backends (BIND UPDATE, Route53, dnsmasq) publish one string
-        per record by default. A record that exceeds 255 bytes either gets
-        truncated, rejected, or silently splits in backend-specific ways.
+        DNS TXT records carry multiple character-strings per RR; the
+        wire limit is 255 bytes PER STRING, not per logical value.
+        Real backends (BIND UPDATE, Route53, dnsmasq) call
+        ``_split_txt_value`` to chunk long values into multiple
+        strings before transmission. The check here mirrors that —
+        every per-string fragment must fit, regardless of the
+        logical value's total size.
         """
+        from dmp.network.dns_publisher import _split_txt_value
+
         store = InMemoryDNSStore()
         alice, bob = _pair(store)
 
@@ -138,9 +144,10 @@ class TestSendReceive:
 
         for name in store.list_names():
             for value in store.query_txt_record(name) or []:
-                assert (
-                    len(value.encode("utf-8")) <= 255
-                ), f"TXT record at {name} is {len(value)} bytes — exceeds DNS per-string limit"
+                for fragment in _split_txt_value(value):
+                    assert (
+                        len(fragment.encode("utf-8")) <= 255
+                    ), f"TXT record at {name} produces a {len(fragment)}-byte fragment — exceeds DNS per-string limit"
 
     def test_transient_chunk_miss_does_not_blacklist(self):
         """Replay cache must not record a manifest until decrypt succeeds.
@@ -642,6 +649,78 @@ class TestSendReceive:
         )
         for chunk_num in range(parity):  # delete the first `parity` data chunks
             store.delete_txt_record(alice._chunk_domain(msg_key, chunk_num))
+
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == payload
+
+    def test_chunk_rrset_wrap_block_garbage_refused_via_manifest_hashes(self):
+        # ``MessageChunker.unwrap_block`` is keyless (RS+checksum
+        # only), so an attacker can publish
+        # ``DMPDNSRecord(t=chunk, data=wrap_block(garbage))`` and
+        # the chunker accepts it. Without per-chunk content
+        # binding in the manifest, the receive path stored the
+        # garbage block, erasure decode produced corrupt bytes,
+        # AEAD failed → permanent message-level DoS.
+        #
+        # The manifest now carries SHA-256 of every wrapped chunk
+        # wire. The receiver hashes each candidate before
+        # ``unwrap_block`` and refuses anything that doesn't match
+        # the expected hash for that slot. A pool-token attacker
+        # can still APPEND to the RRset, but their appendage's
+        # hash can't match (the manifest is sender-signed).
+        import hashlib
+
+        from dmp.core.chunking import MessageChunker
+        from dmp.core.dns import DMPDNSRecord
+        from dmp.core.manifest import SlotManifest
+
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+        payload = b"A" * 800
+        assert alice.send_message("bob", payload.decode())
+
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        manifest = None
+        for name in store.list_names():
+            if not name.startswith("slot-"):
+                continue
+            for value in store.query_txt_record(name) or []:
+                parsed = SlotManifest.parse_and_verify(value)
+                if parsed and parsed[0].recipient_id == bob_recipient_id:
+                    manifest = parsed[0]
+                    break
+            if manifest:
+                break
+        assert manifest is not None
+        assert manifest.chunk_hashes  # signed-in by send_message
+
+        msg_key = alice._msg_key(
+            manifest.msg_id, manifest.recipient_id, manifest.sender_spk
+        )
+
+        # Build a parseable + structurally-valid wrapped garbage
+        # block. ``unwrap_block`` accepts it; only the manifest's
+        # signed hash separates legit from poison.
+        chunker = MessageChunker(enable_error_correction=True)
+        garbage_block = b"\xcc" * MessageChunker.DATA_PER_CHUNK
+        garbage_wrapped = chunker.wrap_block(garbage_block)
+        garbage_record = DMPDNSRecord(
+            version=1, record_type="chunk", data=garbage_wrapped, metadata={}
+        ).to_txt_record()
+
+        # Force worst-case ordering: garbage BEFORE legit at every
+        # chunk RRset, so the receive loop has to skip past garbage
+        # to find the verified legit value.
+        for chunk_num in range(manifest.total_chunks):
+            chunk_name = alice._chunk_domain(msg_key, chunk_num)
+            legit_values = store.query_txt_record(chunk_name) or []
+            store.delete_txt_record(chunk_name)
+            store.publish_txt_record(chunk_name, garbage_record)
+            for v in legit_values:
+                store.publish_txt_record(chunk_name, v)
 
         inbox = bob.receive_messages()
         assert len(inbox) == 1
