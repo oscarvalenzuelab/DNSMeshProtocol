@@ -647,6 +647,73 @@ class TestSendReceive:
         assert len(inbox) == 1
         assert inbox[0].plaintext == payload
 
+    def test_chunk_rrset_appended_garbage_does_not_poison_delivery(self):
+        # A shared-pool writer (anyone with a valid pool token in
+        # multi-tenant mode) can APPEND a parseable-but-undecodable
+        # ``v=dmp1;t=chunk;d=...`` value into a chunk RRset without
+        # any DELETE access. The fetch loop used to break on the
+        # first parseable record; if the garbage sorted ahead of
+        # the real one, the slot was poisoned and that share lost.
+        # Enough poisoned slots → erasure can't reconstruct →
+        # permanent DoS for that message. The fix iterates every
+        # parseable candidate and stops only on a successful
+        # ``unwrap_block``, so a single bad sibling is harmless.
+        import base64
+        import hashlib
+
+        from dmp.core.dns import DMPDNSRecord
+        from dmp.core.manifest import SlotManifest
+
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+        payload = b"A" * 800
+        assert alice.send_message("bob", payload.decode())
+
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        manifest = None
+        for name in store.list_names():
+            if not name.startswith("slot-"):
+                continue
+            for value in store.query_txt_record(name) or []:
+                parsed = SlotManifest.parse_and_verify(value)
+                if parsed and parsed[0].recipient_id == bob_recipient_id:
+                    manifest = parsed[0]
+                    break
+            if manifest:
+                break
+        assert manifest is not None
+
+        msg_key = alice._msg_key(
+            manifest.msg_id, manifest.recipient_id, manifest.sender_spk
+        )
+
+        # Build a parseable garbage chunk record. ``unwrap_block``
+        # rejects payloads <= 8 bytes (no room for the checksum +
+        # encoded body), so 4 bytes is a guaranteed-bad share that
+        # still parses as a DMPDNSRecord with type=chunk.
+        garbage = DMPDNSRecord(
+            version=1, record_type="chunk", data=b"\x00" * 4, metadata={}
+        ).to_txt_record()
+
+        # Force the worst-case ordering: garbage BEFORE legit in
+        # the RRset. ``query_txt_record`` ordering on a multi-value
+        # RRset is implementation-defined on the wire, so the fix
+        # has to survive any order. The buggy break-on-first-parse
+        # only fails when the garbage sorts first.
+        for chunk_num in range(manifest.total_chunks):
+            chunk_name = alice._chunk_domain(msg_key, chunk_num)
+            legit_values = store.query_txt_record(chunk_name) or []
+            store.delete_txt_record(chunk_name)
+            store.publish_txt_record(chunk_name, garbage)
+            for v in legit_values:
+                store.publish_txt_record(chunk_name, v)
+
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == payload
+
     def test_forged_manifest_msg_id_rejected(self):
         """A sender who puts one msg_id in the manifest and a different one
         in the inner header is caught by the cross-check on receive.

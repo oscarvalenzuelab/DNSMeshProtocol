@@ -1683,20 +1683,28 @@ class DMPClient:
             )
             if not records:
                 continue
-            dmp_record: Optional[DMPDNSRecord] = None
+            # Try EVERY parseable chunk record at this RRset, not just
+            # the first one. A shared-pool writer (any user with a
+            # valid pool token) can append a parseable-but-garbage
+            # ``v=dmp1;t=chunk;d=...`` value alongside the real
+            # chunk; if we broke on first parse the garbage would
+            # win whenever it sorted ahead in the answer, blocking
+            # this share permanently. Stop on first SUCCESSFUL
+            # decode so a single bad sibling can't poison the slot.
             for txt in records:
-                if txt.startswith("v=dmp"):
-                    try:
-                        dmp_record = DMPDNSRecord.from_txt_record(txt)
-                        break
-                    except Exception:
-                        continue
-            if dmp_record is None or dmp_record.record_type != "chunk":
-                continue
-            block = self.chunker.unwrap_block(dmp_record.data)
-            if block is None:
-                continue
-            shares[chunk_num] = block
+                if not txt.startswith("v=dmp"):
+                    continue
+                try:
+                    dmp_record = DMPDNSRecord.from_txt_record(txt)
+                except Exception:
+                    continue
+                if dmp_record.record_type != "chunk":
+                    continue
+                block = self.chunker.unwrap_block(dmp_record.data)
+                if block is None:
+                    continue
+                shares[chunk_num] = block
+                break
 
         if len(shares) < manifest.data_chunks:
             return None
