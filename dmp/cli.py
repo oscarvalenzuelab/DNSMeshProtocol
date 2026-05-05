@@ -3706,6 +3706,29 @@ def cmd_tsig_register(args: argparse.Namespace) -> int:
     )
     signature_hex = crypto.sign_data(payload).hex()
 
+    # X25519 proof-of-possession: prove we hold the X25519 private
+    # half corresponding to ``x25519_pub`` so the server is willing to
+    # scope the minted TSIG key to the literal ``mb-{hash}.{zone}``
+    # owner. Without this, the registration flow would let an attacker
+    # claim a victim's published X25519 pubkey and have the server
+    # mint a TSIG key for the victim's mailbox.
+    server_x25519_pub_hex = ch.get("server_x25519_pub", "")
+    x25519_pop_hex = ""
+    if server_x25519_pub_hex:
+        try:
+            from dmp.core.crypto import build_x25519_registration_pop
+
+            x25519_priv = crypto.get_private_key_bytes()
+            x25519_pop_hex = build_x25519_registration_pop(
+                server_eph_pub=bytes.fromhex(server_x25519_pub_hex),
+                x25519_priv=x25519_priv,
+                challenge_hex=challenge_hex,
+                subject=subject,
+                claimed_x25519_pub=bytes.fromhex(x25519_pub_hex),
+            ).hex()
+        except Exception as exc:
+            _die(2, f"x25519 proof-of-possession failed locally: {exc}")
+
     try:
         r2 = requests.post(
             f"{base}/v1/registration/tsig-confirm",
@@ -3717,6 +3740,7 @@ def cmd_tsig_register(args: argparse.Namespace) -> int:
                 # M9.2.3 + M9.2.5: shipping the X25519 public key extends
                 # the minted scope to mailbox / claim records.
                 "x25519_pub": x25519_pub_hex,
+                "x25519_pop": x25519_pop_hex,
             },
             timeout=10,
         )

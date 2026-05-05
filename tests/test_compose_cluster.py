@@ -248,8 +248,13 @@ class TestComposeCluster:
         """Publish at node-a; node-b and node-c catch up via anti-entropy."""
         # Sync interval is 2s (see docker/cluster/node-*.env). Give the
         # worker a handful of ticks to propagate.
+        # Non-DMP value at a non-reserved owner name — exercises the
+        # anti-entropy convergence path without tripping the chunk
+        # structural-validation that #60 added (chunks need a real
+        # ``wrap_block`` payload, which this convergence test doesn't
+        # care about).
         name = "converge.mesh.test"
-        value = "v=dmp1;t=chunk;d=test-converge-abc"
+        value = "test-converge-abc"
         assert _publish(compose_cluster["http_ports"]["node-a"], name, value) == 201
 
         # node-a should already have it (direct write).
@@ -266,9 +271,11 @@ class TestComposeCluster:
 
     def test_kill_and_rejoin_node_catches_up(self, compose_cluster):
         """Stop node-b, write to node-a, restart node-b; it backfills."""
+        # See test_all_three_nodes_converge_on_publish for why the
+        # values are non-DMP shape.
         name = "rejoin.mesh.test"
-        value_before = "v=dmp1;t=chunk;d=written-while-b-was-up"
-        value_during = "v=dmp1;t=chunk;d=written-while-b-was-DOWN"
+        value_before = "written-while-b-was-up"
+        value_during = "written-while-b-was-DOWN"
 
         # Seed a record so node-b has the baseline.
         assert (

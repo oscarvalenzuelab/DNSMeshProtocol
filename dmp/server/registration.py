@@ -108,6 +108,17 @@ class PendingChallenge:
     challenge_hex: str
     node: str
     expires_at: int
+    # Server-side ephemeral X25519 keypair issued alongside the
+    # nonce. The TSIG-mint flow uses these for the X25519 proof-of-
+    # possession check that closes the ``mb-{hash(victim_x25519_pub)}``
+    # forgery surface: the registrant computes
+    # ``HMAC(DH(server_x25519_eph_pub, x25519_priv), nonce||subject||claimed_pub)``
+    # and the server recomputes the same with its private half.
+    # Zero-length bytes indicate "challenge predates the PoP flow"
+    # (only used by tests that pre-construct PendingChallenge
+    # directly without going through ``issue``).
+    server_x25519_eph_priv: bytes = b""
+    server_x25519_eph_pub: bytes = b""
 
 
 class ChallengeStore:
@@ -130,12 +141,34 @@ class ChallengeStore:
         self._max_pending = max_pending
 
     def issue(self, node: str, now: Optional[int] = None) -> PendingChallenge:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import (
+            X25519PrivateKey,
+        )
+
         now = now if now is not None else int(time.time())
         challenge_hex = secrets.token_bytes(32).hex()
+        # Server-side ephemeral X25519 keypair for the registration
+        # PoP check on the TSIG-mint path. Stored alongside the nonce
+        # so the consume() path can recover the private half. Public
+        # half is sent in the challenge response and used by the
+        # client to compute their DH side.
+        eph = X25519PrivateKey.generate()
+        eph_priv = eph.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        eph_pub = eph.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
         pc = PendingChallenge(
             challenge_hex=challenge_hex,
             node=node,
             expires_at=now + CHALLENGE_TTL_SECONDS,
+            server_x25519_eph_priv=eph_priv,
+            server_x25519_eph_pub=eph_pub,
         )
         with self._lock:
             self._pending[challenge_hex] = pc
@@ -176,6 +209,63 @@ class ChallengeStore:
 
 
 # ---------------------------------------------------------------------------
+# X25519 proof-of-possession for the TSIG-mint flow.
+#
+# Without this, the registrant could claim ANY ``x25519_pub`` (even a
+# victim's, which is published in their identity record) and have the
+# minted TSIG key scoped to ``mb-{hash12(victim_x25519_pub)}.{zone}``.
+# Under DMP_TSIG_TIGHT_SCOPE that's a direct write into the victim's
+# mailbox; under loose scope the wildcards already grant the same, but
+# the literal mailbox suffix is still privilege the attacker shouldn't
+# have. The proof binds the registrant to (challenge, subject, claimed
+# pubkey) and requires possession of the matching X25519 private key.
+# ---------------------------------------------------------------------------
+
+
+_X25519_POP_LEN = 32
+
+
+# The PoP builder lives in ``dmp.core.crypto`` so the CLI can compute
+# it without importing server modules (codex layering nit on PR #61).
+# Re-exported here under the original name for existing call sites.
+from dmp.core.crypto import build_x25519_registration_pop as build_x25519_pop
+
+
+def verify_x25519_pop(
+    pc: PendingChallenge,
+    claimed_x25519_pub: bytes,
+    pop: bytes,
+    subject: str,
+) -> bool:
+    """True iff ``pop`` proves the registrant holds the X25519 private
+    half corresponding to ``claimed_x25519_pub``.
+
+    Constant-time compare so an attacker can't binary-search the proof
+    via timing. Returns False on any internal error to fail closed.
+    """
+    import hashlib
+    import hmac
+
+    if len(pop) != _X25519_POP_LEN:
+        return False
+    if not pc.server_x25519_eph_priv:
+        # Pre-PoP challenge (only happens in tests that hand-craft
+        # PendingChallenge). Fail closed.
+        return False
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import (
+            X25519PrivateKey,
+            X25519PublicKey,
+        )
+
+        eph_priv = X25519PrivateKey.from_private_bytes(pc.server_x25519_eph_priv)
+        client_pub = X25519PublicKey.from_public_bytes(claimed_x25519_pub)
+        shared = eph_priv.exchange(client_pub)
+    except Exception:
+        return False
+    msg = bytes.fromhex(pc.challenge_hex) + subject.encode("utf-8") + claimed_x25519_pub
+    expected = hmac.new(shared, msg, hashlib.sha256).digest()
+    return hmac.compare_digest(expected, pop)
 
 
 def _parse_hex(value: str, expected_bytes: int, field: str) -> bytes:
@@ -745,6 +835,34 @@ def mint_tsig_via_registration(
     # server. Documented limitation; CLI passes the pubkey by default.
     x_pub_raw = body.get("x25519_pub")
     x_pub_hex = x_pub_raw.strip().lower() if isinstance(x_pub_raw, str) else ""
+    # Proof-of-possession check. If the registrant claims an
+    # ``x25519_pub`` they MUST also include ``x25519_pop`` proving
+    # they hold the matching private key — otherwise an attacker can
+    # claim a victim's published X25519 pub and have the minted key
+    # scoped to the victim's mailbox.
+    #   - pop missing: legacy client. Drop ``x25519_pub`` from scope
+    #     derivation (still mints with wildcard scope; the literal
+    #     ``mb-{hash}.{zone}`` is the only thing the pubkey gates).
+    #   - pop present + invalid: active forgery attempt. Reject 401.
+    #   - pop present + valid: keep ``x25519_pub`` for scope.
+    pop_raw = body.get("x25519_pop")
+    if x_pub_hex:
+        try:
+            x_pub_bytes = _parse_hex(x_pub_hex, 32, "x25519_pub")
+        except RegistrationError:
+            raise
+        if isinstance(pop_raw, str) and pop_raw:
+            pop_bytes = _parse_hex(pop_raw, 32, "x25519_pop")
+            if not verify_x25519_pop(pc, x_pub_bytes, pop_bytes, subject):
+                raise SignatureInvalid(
+                    "x25519_pop verification failed: registrant did not "
+                    "prove possession of the claimed X25519 key"
+                )
+        else:
+            # Legacy client without proof. Drop the claimed pubkey so
+            # the minted scope can't include the literal mailbox
+            # suffix the attacker would otherwise inject.
+            x_pub_hex = ""
     suffixes = _suffixes_for(
         subject, local_part, spk_hex, zone, x25519_pub_hex=x_pub_hex
     )
