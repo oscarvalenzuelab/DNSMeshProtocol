@@ -112,11 +112,170 @@ class TestVerifyRecord:
         wire, _ = _signed_cluster()
         assert verify_record(wire) is True  # structural-only accepts valid wire
 
-    def test_chunk_accepted_as_opaque(self):
-        assert verify_record("v=dmp1;t=chunk;d=YWJj") is True
+    def test_chunk_structurally_validated(self):
+        # Anti-entropy structurally validates chunks (RS+checksum
+        # via ``unwrap_block``) as defense in depth before the
+        # planned v0.7 manifest-side content binding lands.
+        # Raw garbage in the base64 payload is rejected.
+        from dmp.core.chunking import MessageChunker
 
-    def test_unknown_prefix_accepted(self):
+        # 3-byte payload — fails the ``len(wire) > 8`` check inside
+        # unwrap_block → refused.
+        assert verify_record("v=dmp1;t=chunk;d=YWJj") is False
+        # A real wrapped block decodes successfully.
+        chunker = MessageChunker(enable_error_correction=True)
+        block = b"\xaa" * MessageChunker.DATA_PER_CHUNK
+        wrapped_b64 = base64.b64encode(chunker.wrap_block(block)).decode("ascii")
+        assert verify_record(f"v=dmp1;t=chunk;d={wrapped_b64}") is True
+        # Bad base64 → refused.
+        assert verify_record("v=dmp1;t=chunk;d=$$$") is False
+
+    def test_non_dmp_at_dmp_reserved_owner_refused(self):
+        # A peer trying to alias arbitrary TXT into a DMP-reserved
+        # owner name (slot/chunk/mailbox/identity/etc.) MUST be
+        # refused — anti-entropy used to write the value through
+        # without checking the owner shape, letting an attacker
+        # poison a victim's mailbox slot with e.g. SPF text.
+        # Covers every owner pattern in ``_DMP_RESERVED_NAME_RES``.
+        for reserved in [
+            "slot-0.mb-abcdef012345.example.com",
+            "chunk-0001-abcdef012345.example.com",
+            "mb-abcdef012345.example.com",
+            "id-1234567890abcdef.example.com",
+            "prekeys.id-abcdef012345.example.com",
+            "_dnsmesh-claim-abc123.example.com",
+            "_dnsmesh-heartbeat.example.com",
+            "claim-3.mb-abcdef012345.example.com",
+            "cluster.example.com",
+            "_dmp.example.com",
+            "dmp.example.com",
+            "dmp.abcdef012345.example.com",
+            "rotate.dmp.abcdef012345.example.com",
+            "rotate._dmp.example.com",
+            "rotate.cluster.example.com",
+        ]:
+            assert (
+                verify_record("v=spf1 -all", name=reserved) is False
+            ), f"non-DMP value at reserved {reserved!r} should be refused"
+        # A non-reserved owner — operator's apex DMARC record,
+        # generic A-record companion, etc. — keeps replicating.
+        for ok in [
+            "_dmarc.example.com",
+            "example.com",
+            "_acme-challenge.example.com",
+            "www.example.com",
+        ]:
+            assert (
+                verify_record("v=spf1 -all", name=ok) is True
+            ), f"non-DMP value at non-reserved {ok!r} should still replicate"
+
+    def test_non_dmp_record_accepted_as_zone_hygiene(self):
+        # Operator-hosted records that share the cluster zone with
+        # DMP records (SPF, DKIM, A/MX, etc.) must replicate so all
+        # cluster nodes serve a consistent zone view.
         assert verify_record("random-string") is True
+        assert verify_record("v=spf1 -all") is True
+        assert verify_record('"v=DMARC1; p=reject"') is True
+
+    def test_unknown_dmp_prefix_refused(self):
+        # A ``v=dmp...`` record this binary doesn't recognize is a
+        # future-protocol payload that must NOT replicate. Anti-
+        # entropy used to accept it as opaque "future-proofing",
+        # which let a malicious peer push any DMP-shaped TXT into
+        # the local store. New types must be wired into
+        # ``_classify_record`` and ``verify_record`` first.
+        assert verify_record("v=dmp1;t=futuretype;d=AAAA") is False
+        assert verify_record("v=dmp2;t=manifest;d=AAAA") is False
+        # Prefix-only — no body at all — also refused.
+        assert verify_record("v=dmp") is False
+
+    def test_valid_rotation_passes(self):
+        # Anti-entropy needs to replicate rotation records so the
+        # cluster's chain-walker can see them on any node. Verify
+        # the self-verifying parse path accepts a real rotation.
+        from dmp.core.rotation import (
+            RECORD_PREFIX_ROTATION,
+            RotationRecord,
+            SUBJECT_TYPE_USER_IDENTITY,
+        )
+        import time as _time
+
+        old = DMPCrypto()
+        new = DMPCrypto()
+        now = int(_time.time())
+        wire = RotationRecord(
+            subject_type=SUBJECT_TYPE_USER_IDENTITY,
+            subject="alice@mesh.test",
+            old_spk=old.get_signing_public_key_bytes(),
+            new_spk=new.get_signing_public_key_bytes(),
+            seq=1,
+            ts=now,
+            exp=now + 86400,
+        ).sign(old, new)
+        assert wire.startswith(RECORD_PREFIX_ROTATION)
+        assert verify_record(wire) is True
+
+    def test_tampered_rotation_refused(self):
+        # A forged rotation that flips the body must not replicate.
+        from dmp.core.rotation import (
+            RotationRecord,
+            SUBJECT_TYPE_USER_IDENTITY,
+        )
+        import time as _time
+
+        old = DMPCrypto()
+        new = DMPCrypto()
+        now = int(_time.time())
+        wire = RotationRecord(
+            subject_type=SUBJECT_TYPE_USER_IDENTITY,
+            subject="alice@mesh.test",
+            old_spk=old.get_signing_public_key_bytes(),
+            new_spk=new.get_signing_public_key_bytes(),
+            seq=1,
+            ts=now,
+            exp=now + 86400,
+        ).sign(old, new)
+        tampered = wire[:-5] + "AAAAA"
+        assert verify_record(tampered) is False
+
+    def test_valid_revocation_passes(self):
+        from dmp.core.rotation import (
+            RECORD_PREFIX_REVOCATION,
+            RevocationRecord,
+            SUBJECT_TYPE_USER_IDENTITY,
+        )
+        import time as _time
+
+        revoked = DMPCrypto()
+        now = int(_time.time())
+        wire = RevocationRecord(
+            subject_type=SUBJECT_TYPE_USER_IDENTITY,
+            subject="alice@mesh.test",
+            revoked_spk=revoked.get_signing_public_key_bytes(),
+            reason_code=1,
+            ts=now,
+        ).sign(revoked)
+        assert wire.startswith(RECORD_PREFIX_REVOCATION)
+        assert verify_record(wire) is True
+
+    def test_tampered_revocation_refused(self):
+        from dmp.core.rotation import (
+            RevocationRecord,
+            SUBJECT_TYPE_USER_IDENTITY,
+        )
+        import time as _time
+
+        revoked = DMPCrypto()
+        now = int(_time.time())
+        wire = RevocationRecord(
+            subject_type=SUBJECT_TYPE_USER_IDENTITY,
+            subject="alice@mesh.test",
+            revoked_spk=revoked.get_signing_public_key_bytes(),
+            reason_code=1,
+            ts=now,
+        ).sign(revoked)
+        tampered = wire[:-5] + "AAAAA"
+        assert verify_record(tampered) is False
 
     def test_valid_claim_passes(self):
         """M8.4 — anti-entropy gossip must accept signed claims."""
