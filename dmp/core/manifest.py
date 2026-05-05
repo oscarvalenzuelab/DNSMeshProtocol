@@ -47,9 +47,22 @@ from typing import Dict, Optional, Tuple
 from dmp.core.crypto import DMPCrypto
 
 RECORD_PREFIX = "v=dmp1;t=manifest;d="
-_BODY_LEN = 16 + 32 + 32 + 4 + 4 + 4 + 8 + 8  # 108 bytes (adds prekey_id)
+# Header layout (fixed 108 bytes): msg_id, sender_spk, recipient_id,
+# total_chunks, data_chunks, prekey_id, ts, exp.
+_HEADER_LEN = 16 + 32 + 32 + 4 + 4 + 4 + 8 + 8  # 108 bytes
+# Per-chunk content-binding hashes are appended after the header, one
+# 32-byte SHA-256 per chunk (length = 32 * total_chunks). Optional for
+# backward compatibility with v0.6 manifests that have no hashes —
+# recipients that find chunk_hashes empty fall back to the previous
+# best-effort decode and may be poisoned by ``wrap_block(garbage)``
+# from any pool-token holder; recipients that find chunk_hashes
+# populated verify each fetched chunk against its expected hash before
+# adding it to the erasure share set, closing the poison vector.
+_CHUNK_HASH_LEN = 32
+# Legacy alias kept for the few external callers that imported it.
+_BODY_LEN = _HEADER_LEN
 _SIG_LEN = 64
-_WIRE_LEN = _BODY_LEN + _SIG_LEN  # 172 bytes
+_WIRE_LEN = _BODY_LEN + _SIG_LEN  # 172 bytes (legacy minimum)
 DEFAULT_MANIFEST_TTL = 300
 
 # Upper bound on how far in the future a manifest's signed `exp`
@@ -89,6 +102,16 @@ class SlotManifest:
     prekey_id: int  # recipient prekey used for ECDH; 0 = long-term key
     ts: int  # unix seconds when the sender published
     exp: int  # unix seconds after which recipient should drop
+    # Per-chunk SHA-256 of the wrapped chunk wire bytes (the same
+    # bytes ``MessageChunker.wrap_block`` produces and DMPDNSRecord
+    # carries in ``data``). Length must equal ``total_chunks`` when
+    # populated. Empty tuple on legacy manifests parsed from old
+    # senders. Receivers that see populated hashes hard-verify each
+    # fetched chunk against its expected hash before adding to the
+    # erasure share set; receivers that see empty hashes fall back
+    # to the legacy best-effort decode and remain susceptible to
+    # ``wrap_block(garbage)`` poisoning from pool-token holders.
+    chunk_hashes: Tuple[bytes, ...] = ()
 
     def to_body_bytes(self) -> bytes:
         """Binary representation of the manifest fields, used as the signed payload."""
@@ -107,7 +130,18 @@ class SlotManifest:
             )
         if not (0 <= self.prekey_id < (1 << 32)):
             raise ValueError("prekey_id out of range")
-        return (
+        # When chunk_hashes are present they MUST cover every chunk;
+        # a partial set would leave gaps the receiver couldn't
+        # distinguish from poisoning.
+        if self.chunk_hashes and len(self.chunk_hashes) != self.total_chunks:
+            raise ValueError(
+                "chunk_hashes length must equal total_chunks "
+                f"({len(self.chunk_hashes)} vs {self.total_chunks})"
+            )
+        for h in self.chunk_hashes:
+            if len(h) != _CHUNK_HASH_LEN:
+                raise ValueError(f"each chunk hash must be {_CHUNK_HASH_LEN} bytes")
+        header = (
             self.msg_id
             + self.sender_spk
             + self.recipient_id
@@ -117,12 +151,14 @@ class SlotManifest:
             + self.ts.to_bytes(8, "big")
             + self.exp.to_bytes(8, "big")
         )
+        return header + b"".join(self.chunk_hashes)
 
     @classmethod
     def from_body_bytes(cls, body: bytes) -> "SlotManifest":
-        if len(body) != _BODY_LEN:
+        if len(body) < _HEADER_LEN:
             raise ValueError(
-                f"manifest body must be {_BODY_LEN} bytes, got {len(body)}"
+                f"manifest body must be at least {_HEADER_LEN} bytes, "
+                f"got {len(body)}"
             )
         total_chunks = int.from_bytes(body[80:84], "big")
         data_chunks = int.from_bytes(body[84:88], "big")
@@ -134,6 +170,28 @@ class SlotManifest:
                 f"total_chunks {total_chunks} exceeds protocol max "
                 f"{MAX_TOTAL_CHUNKS}"
             )
+        # Body length must be either the legacy header-only shape OR
+        # header + 32 * total_chunks. Anything else is malformed —
+        # ambiguous trailing bytes could otherwise mask a tampered
+        # manifest.
+        if len(body) == _HEADER_LEN:
+            chunk_hashes: Tuple[bytes, ...] = ()
+        else:
+            expected = _HEADER_LEN + _CHUNK_HASH_LEN * total_chunks
+            if len(body) != expected:
+                raise ValueError(
+                    f"manifest body length {len(body)} does not match "
+                    f"either legacy ({_HEADER_LEN}) or content-bound "
+                    f"({expected}) layout"
+                )
+            chunk_hashes = tuple(
+                body[
+                    _HEADER_LEN
+                    + i * _CHUNK_HASH_LEN : _HEADER_LEN
+                    + (i + 1) * _CHUNK_HASH_LEN
+                ]
+                for i in range(total_chunks)
+            )
         return cls(
             msg_id=body[0:16],
             sender_spk=body[16:48],
@@ -143,6 +201,7 @@ class SlotManifest:
             prekey_id=prekey_id,
             ts=int.from_bytes(body[92:100], "big"),
             exp=int.from_bytes(body[100:108], "big"),
+            chunk_hashes=chunk_hashes,
         )
 
     def sign(self, sender_crypto: DMPCrypto) -> str:
@@ -167,16 +226,29 @@ class SlotManifest:
             wire = base64.b64decode(record[len(RECORD_PREFIX) :])
         except Exception:
             return None
-        if len(wire) != _WIRE_LEN:
+        # Wire layout is variable-length now: header (108) + N×32
+        # chunk hashes + 64-byte signature. The signature comes
+        # after the variable-length body, so we recover total_chunks
+        # from the header to compute where the body ends.
+        if len(wire) < _HEADER_LEN + _SIG_LEN:
             return None
-
-        body = wire[:_BODY_LEN]
-        signature = wire[_BODY_LEN:]
-        try:
-            manifest = cls.from_body_bytes(body)
-        except ValueError:
-            return None
-        if not DMPCrypto.verify_signature(body, signature, manifest.sender_spk):
+        total_chunks = int.from_bytes(wire[80:84], "big")
+        # Two valid body shapes: legacy header-only, or header + N×32.
+        # Anything else fails ``from_body_bytes`` below.
+        body_candidates = (_HEADER_LEN, _HEADER_LEN + _CHUNK_HASH_LEN * total_chunks)
+        for body_len in body_candidates:
+            if len(wire) != body_len + _SIG_LEN:
+                continue
+            body = wire[:body_len]
+            signature = wire[body_len:]
+            try:
+                manifest = cls.from_body_bytes(body)
+            except ValueError:
+                return None
+            if not DMPCrypto.verify_signature(body, signature, manifest.sender_spk):
+                return None
+            break
+        else:
             return None
         # Refuse manifests whose expiry is too far in the future. A
         # legitimate sender publishes messages with TTLs of minutes to

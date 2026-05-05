@@ -787,8 +787,17 @@ class DMPClient:
         # erasure layer runs. Drop the metadata dict from the wire record
         # — chunk_num and msg_key are already in the domain name and
         # encoding them again would push us over the 255-byte TXT limit.
+        # Collect SHA-256 of each wrapped chunk so the manifest can
+        # commit to the chunk contents — receivers verify each fetched
+        # candidate against its expected hash, refusing
+        # ``wrap_block(garbage)`` poison values appended to a chunk
+        # RRset by any pool-token holder.
+        import hashlib as _hashlib
+
+        chunk_hashes: List[bytes] = []
         for chunk_num, share in enumerate(shares):
             wire_chunk = self.chunker.wrap_block(share)
+            chunk_hashes.append(_hashlib.sha256(wire_chunk).digest())
             record = DMPDNSRecord(
                 version=1,
                 record_type="chunk",
@@ -812,6 +821,7 @@ class DMPClient:
             prekey_id=prekey_id,
             ts=now,
             exp=now + ttl,
+            chunk_hashes=tuple(chunk_hashes),
         )
         slot_record = manifest.sign(self.crypto)
         # Append semantics in the store make slot choice effectively cosmetic:
@@ -1674,6 +1684,17 @@ class DMPClient:
         # Walk every chunk position up to total_chunks, collecting valid
         # shares into a dict keyed by share_id. Stop early once we have k
         # shares — erasure.decode only needs k of n.
+        import hashlib as _hashlib
+
+        # Manifest-bound chunk hashes (v0.7+ senders). When present,
+        # each fetched candidate must SHA-256-match the expected
+        # hash before being added to the share set — closes the
+        # ``wrap_block(garbage)`` poison vector where a pool-token
+        # holder appends a parseable-but-bad block to a chunk RRset.
+        # Empty tuple = legacy manifest from a pre-0.7 sender; fall
+        # back to first-decodable behavior (still vulnerable, no
+        # better than the old code path).
+        expected_hashes: Tuple[bytes, ...] = manifest.chunk_hashes
         shares: Dict[int, bytes] = {}
         for chunk_num in range(manifest.total_chunks):
             if len(shares) >= manifest.data_chunks:
@@ -1683,20 +1704,28 @@ class DMPClient:
             )
             if not records:
                 continue
-            dmp_record: Optional[DMPDNSRecord] = None
             for txt in records:
-                if txt.startswith("v=dmp"):
-                    try:
-                        dmp_record = DMPDNSRecord.from_txt_record(txt)
-                        break
-                    except Exception:
+                if not txt.startswith("v=dmp"):
+                    continue
+                try:
+                    dmp_record = DMPDNSRecord.from_txt_record(txt)
+                except Exception:
+                    continue
+                if dmp_record.record_type != "chunk":
+                    continue
+                # Manifest-bound hash check first — refuses poison
+                # before the cost of an unwrap_block call.
+                if expected_hashes:
+                    if (
+                        _hashlib.sha256(dmp_record.data).digest()
+                        != expected_hashes[chunk_num]
+                    ):
                         continue
-            if dmp_record is None or dmp_record.record_type != "chunk":
-                continue
-            block = self.chunker.unwrap_block(dmp_record.data)
-            if block is None:
-                continue
-            shares[chunk_num] = block
+                block = self.chunker.unwrap_block(dmp_record.data)
+                if block is None:
+                    continue
+                shares[chunk_num] = block
+                break
 
         if len(shares) < manifest.data_chunks:
             return None

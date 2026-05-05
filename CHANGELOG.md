@@ -9,6 +9,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- `SlotManifest` commits to per-chunk content via SHA-256 hashes
+  signed alongside the rest of the manifest body. Receivers verify
+  each fetched chunk record against its expected hash before adding
+  the unwrapped block to the erasure share set, refusing
+  `wrap_block(garbage)` poison values appended to a chunk RRset by
+  any pool-token holder. Wire-format change is backward-compatible:
+  manifests with empty `chunk_hashes` parse as v0.6 and trigger the
+  legacy best-effort decode (still vulnerable to poison until the
+  sender upgrades). Manifest size grows by 32 bytes per chunk;
+  multi-chunk manifests now span multiple TXT character-strings on
+  the wire and are split at publish time by `_split_txt_value` (no
+  per-string is over 255 bytes).
 - Self-service TSIG registration requires X25519 proof-of-possession.
   The challenge response now carries a server-issued ephemeral X25519
   pubkey; the registrant computes a DH against it with their X25519
