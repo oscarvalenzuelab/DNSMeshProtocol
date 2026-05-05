@@ -323,6 +323,19 @@ The keystore enforces these via wildcard suffix matching at
 authorization time. Operator caps (`max_ttl`, `max_value_bytes`,
 `max_values_per_name`) apply identically to UPDATE writes.
 
+**Wildcard suffixes are ADD-only.** `DELETE` through DNS UPDATE is
+refused for any owner name that matches only via a wildcard
+suffix — the shared namespaces have no per-record ownership, so
+allowing delete through them would let one user wipe another
+user's chunks or slots. The user's own literal `mb-<hash>.<zone>`
+(and `_dnsmesh-claim-<spk16>.<zone>`) authorizes delete of the
+user's own records, which is the intended path for republishing
+a rotated slot. `DMP_TSIG_LOOSE_SCOPE=1` admin-issued keys with
+bare-zone scope retain full delete authority.
+`DMP_TSIG_TIGHT_SCOPE=1` deployments are unchanged — tight scope
+drops the wildcards at mint time so every covering suffix is
+already literal and delete-capable.
+
 **The un-TSIG'd UPDATE exception:**
 
 Cross-zone first-contact claim publishes

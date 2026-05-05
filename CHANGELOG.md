@@ -7,6 +7,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Security
+
+- TSIG authorizer refuses DNS UPDATE `DELETE` through wildcard
+  suffixes. Self-service registration grants every user wildcard
+  scopes for the shared namespaces (`slot-*.mb-*`, `chunk-*-*`,
+  `claim-*.mb-*`, `_dnsmesh-claim-*`) so anyone can deliver to
+  anyone — but the same wildcards previously also let one user's
+  TSIG key delete other users' chunks or mailbox slots over DNS
+  UPDATE. `ADD` operations are unchanged. Literal-suffix `DELETE`
+  is still allowed: the user's own `mb-{hash}.{zone}` and
+  `_dnsmesh-claim-{spk16}.{zone}` continue to authorize delete of
+  the user's own records, and `DMP_TSIG_LOOSE_SCOPE=1` admin keys
+  with bare-zone scope retain full delete authority.
+  `DMP_TSIG_TIGHT_SCOPE=1` deployments are unaffected — tight
+  scope already drops the wildcards at mint time.
+
 ## [0.6.6] — 2026-05-01 — DNS 0x20 + free port 53 in installer
 
 Fourth and (genuinely this time) final round of strict-resolver
