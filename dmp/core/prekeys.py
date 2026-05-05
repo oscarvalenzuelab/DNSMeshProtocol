@@ -464,6 +464,25 @@ class PrekeyStore:
         wire_str = str(wire) if wire else None
         return X25519PrivateKey.from_private_bytes(sk_bytes), wire_str
 
+    def get_wire_record(self, prekey_id: int) -> Optional[str]:
+        """Return the published wire_record for a prekey_id, or None.
+
+        Used by the receive path's two-step claim — after a
+        successful AEAD verify, the caller passes this back to
+        ``_delete_published_prekey`` to tear down the prekey_pub
+        record from DNS.
+        """
+        if prekey_id == 0:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT wire_record FROM prekeys WHERE prekey_id = ? AND exp > ?",
+                (prekey_id, int(time.time())),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]) if row[0] else None
+
     def get_private_key(self, prekey_id: int) -> Optional[X25519PrivateKey]:
         """Return the sk for a given prekey_id, or None if absent / expired."""
         # Refuse the reserved sentinel even if a legacy/imported db

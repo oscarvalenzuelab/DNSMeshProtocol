@@ -37,14 +37,45 @@ front it with nginx or caddy if you care about performance or TLS.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
+import os
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlsplit
+
+
+def _is_public_bind(host: str) -> bool:
+    """True iff ``host`` binds the HTTP server outside loopback.
+
+    Loopback (127.x, ::1) and ``localhost`` are local-only.
+    Everything else — including the empty string, ``"0"``, and the
+    all-zeros wildcards (0.0.0.0, ::) — counts as public. Python's
+    socket layer treats ``""`` and ``"0"`` as wildcard binds,
+    accepting connections on every interface; the guard must catch
+    both rather than silently waving them through as "local".
+    """
+    if host is None:
+        return False
+    h = host.strip().lower()
+    if h == "localhost":
+        return False
+    try:
+        addr = ipaddress.ip_address(h)
+    except ValueError:
+        # Anything that doesn't parse as an IP literal — including
+        # ``""`` and ``"0"`` — falls through as public. The only
+        # local-only escape is the explicit ``localhost`` literal
+        # handled above.
+        return True
+    if addr.is_loopback:
+        return False
+    return True
+
 
 from dmp.network.base import DNSRecordReader, DNSRecordStore, DNSRecordWriter
 from dmp.server.metrics import REGISTRY
@@ -1628,13 +1659,34 @@ class DMPHttpApi:
         self.port = port
         self.bearer_token = bearer_token
         self.operator_token = bearer_token
-        # Default auth mode derivation, preserving pre-M5.5 behavior:
-        #   no bearer_token  -> "open"   (the old unauthenticated path)
+        # Default auth mode derivation:
+        #   no bearer_token  -> "open"   (dev / trusted-LAN only)
         #   bearer_token set -> "legacy" (the old shared-token path)
         # Callers who want multi-tenant pass it explicitly.
         if auth_mode is None:
             auth_mode = "open" if not bearer_token else "legacy"
         self.auth_mode = auth_mode
+        # Refuse to start ``auth_mode="open"`` (no auth at all) on a
+        # non-loopback bind. Operators who run on 0.0.0.0 / a public
+        # IP without a bearer token would expose ``/v1/records/*``
+        # publish + delete to the internet without authentication.
+        # Loopback / 127.x / ::1 / "" (default) is allowed for local
+        # dev. Operators who genuinely want world-writable records
+        # for testing can opt in via ``DMP_ALLOW_OPEN_PUBLIC_BIND=1``.
+        if self.auth_mode == "open" and _is_public_bind(host):
+            if os.environ.get("DMP_ALLOW_OPEN_PUBLIC_BIND", "").strip().lower() not in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                raise ValueError(
+                    f"refusing to start auth_mode='open' on a non-loopback "
+                    f"bind {host!r}: would expose /v1/records/* without "
+                    f"authentication. Set bearer_token + auth_mode='legacy' "
+                    f"or 'multi-tenant', or opt in to the unsafe config "
+                    f"via DMP_ALLOW_OPEN_PUBLIC_BIND=1."
+                )
         self.rate_limiter = (
             TokenBucketLimiter(rate_limit)
             if rate_limit and rate_limit.enabled

@@ -1686,15 +1686,17 @@ class DMPClient:
         # shares — erasure.decode only needs k of n.
         import hashlib as _hashlib
 
-        # Manifest-bound chunk hashes (v0.7+ senders). When present,
-        # each fetched candidate must SHA-256-match the expected
-        # hash before being added to the share set — closes the
-        # ``wrap_block(garbage)`` poison vector where a pool-token
-        # holder appends a parseable-but-bad block to a chunk RRset.
-        # Empty tuple = legacy manifest from a pre-0.7 sender; fall
-        # back to first-decodable behavior (still vulnerable, no
-        # better than the old code path).
+        # Manifest-bound chunk hashes are mandatory on the receive
+        # path. Any manifest with an empty ``chunk_hashes`` is from a
+        # pre-#62 sender that hasn't upgraded — accepting it preserves
+        # the ``wrap_block(garbage)`` poison vector for those flows,
+        # which is exactly what #62 set out to close. Refuse here so
+        # legacy senders are forced to upgrade. The brief window
+        # where in-flight v0.6 manifests existed during #62's roll-out
+        # is over; a hard cut closes the bypass.
         expected_hashes: Tuple[bytes, ...] = manifest.chunk_hashes
+        if not expected_hashes:
+            return None
         shares: Dict[int, bytes] = {}
         for chunk_num in range(manifest.total_chunks):
             if len(shares) >= manifest.data_chunks:
@@ -1786,27 +1788,45 @@ class DMPClient:
         prekey_private: Optional[Any] = None
         prekey_wire: Optional[str] = None
         if manifest.prekey_id != NO_PREKEY:
-            claim = self.prekey_store.claim_sk(manifest.prekey_id)
-            if claim is None:
-                # Prekey was deleted, expired, or never existed. Either
-                # a transient race (replay cache will catch the retry)
-                # or a sender mismatch — drop silently.
+            # Two-step: read the sk WITHOUT consuming, attempt decrypt,
+            # delete only on success. The earlier ``claim_sk`` shape
+            # deleted the row before AEAD verified, so a malformed-but-
+            # signature-valid manifest from any contact would burn the
+            # recipient's published one-time prekey permanently — every
+            # OTHER legitimate sender that picked the same prekey_id
+            # would also lose decrypt because the recipient already
+            # consumed the key for an unrelated bogus delivery. Concurrent
+            # legitimate decrypts of the same prekey_id are protected by
+            # the replay cache (msg_id, sender_spk) deduplication, not
+            # by the prekey-store atomicity. The FS-guarantee weakens —
+            # the sk lives on disk between read and consume — but the
+            # disk-compromise threat the old shape defended against is
+            # narrower than the prekey-burn DoS the bug enabled.
+            sk = self.prekey_store.get_private_key(manifest.prekey_id)
+            if sk is None:
+                # Prekey was already consumed, expired, or never
+                # existed. Drop silently.
                 return None
-            prekey_private, prekey_wire = claim
+            prekey_private = sk
+            prekey_wire = self.prekey_store.get_wire_record(manifest.prekey_id)
         try:
             plaintext = self.encryption.decrypt_with_header(
                 encrypted, aad_bytes, private_key=prekey_private
             )
         except Exception:
-            # The sk has already been wiped from disk by claim_sk,
-            # so a failed decrypt can't be retried with the same key.
-            # Still tear down the published prekey_pub record so a
-            # future sender doesn't pick a prekey whose sk is gone.
-            if prekey_wire is not None:
-                self._delete_published_prekey(prekey_wire)
+            # AEAD failed. Leave the prekey row intact so a later
+            # legitimate sender that picked the same prekey_id can
+            # still decrypt. Don't delete the published prekey_pub
+            # either — the sk is still usable.
             return None
-        if prekey_wire is not None:
-            # Decrypt succeeded — finalize the cross-side cleanup by
-            # deleting the published prekey_pub from DNS. Best-effort.
-            self._delete_published_prekey(prekey_wire)
+        if manifest.prekey_id != NO_PREKEY:
+            # Decrypt succeeded — NOW consume the sk and tear down
+            # the published prekey_pub. Both best-effort: a crash
+            # between consume and the DNS delete leaves a dead
+            # prekey_pub published, harmless because future senders
+            # picking it will fail decrypt and the next pool refresh
+            # rotates it out.
+            self.prekey_store.consume(manifest.prekey_id)
+            if prekey_wire:
+                self._delete_published_prekey(prekey_wire)
         return plaintext, outer.header.timestamp, outer.header.message_id

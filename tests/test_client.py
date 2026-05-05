@@ -726,6 +726,72 @@ class TestSendReceive:
         assert len(inbox) == 1
         assert inbox[0].plaintext == payload
 
+    def test_legacy_manifest_without_chunk_hashes_refused(self):
+        # A sender on a pre-v0.7 binary publishes manifests with no
+        # ``chunk_hashes``. Receive path used to accept those and
+        # fall back to first-decodable chunk handling — which left
+        # the ``wrap_block(garbage)`` poison vector open. Hard-refuse
+        # now: legacy senders MUST upgrade.
+        #
+        # End-to-end: send via alice (which produces v0.7 manifest
+        # WITH hashes), then PATCH the published manifest into a
+        # legacy shape (chunk_hashes=()) and confirm bob's recv
+        # silently drops it. This exercises the chunk_hashes guard
+        # specifically — chunks are still on the wire, so a
+        # mutation that removes the guard would deliver the
+        # plaintext.
+        import hashlib
+
+        from dmp.core.manifest import SlotManifest
+
+        store = InMemoryDNSStore()
+        alice, bob = _pair(store)
+        payload = b"hello legacy" + b"X" * 800  # multi-chunk
+        assert alice.send_message("bob", payload.decode())
+
+        bob_recipient_id = hashlib.sha256(
+            bytes.fromhex(bob.get_public_key_hex())
+        ).digest()
+        # Find alice's published v0.7 manifest, swap it for a legacy
+        # version (signed) with the same identity fields but empty
+        # chunk_hashes.
+        slot_name = None
+        original = None
+        for name in store.list_names():
+            if not name.startswith("slot-"):
+                continue
+            for value in store.query_txt_record(name) or []:
+                parsed = SlotManifest.parse_and_verify(value)
+                if parsed and parsed[0].recipient_id == bob_recipient_id:
+                    slot_name = name
+                    original = parsed[0]
+                    break
+            if original:
+                break
+        assert original is not None and slot_name is not None
+        assert original.chunk_hashes  # alice's v0.7 manifest
+
+        legacy = SlotManifest(
+            msg_id=original.msg_id,
+            sender_spk=original.sender_spk,
+            recipient_id=original.recipient_id,
+            total_chunks=original.total_chunks,
+            data_chunks=original.data_chunks,
+            prekey_id=original.prekey_id,
+            ts=original.ts,
+            exp=original.exp,
+            chunk_hashes=(),  # downgrade
+        )
+        legacy_wire = legacy.sign(alice.crypto)
+        store.delete_txt_record(slot_name)
+        store.publish_txt_record(slot_name, legacy_wire)
+
+        # Without the guard, the chunks are still in the store and
+        # the receive path would decrypt successfully → inbox has
+        # the plaintext. With the guard, the manifest is refused
+        # before chunk fetch → inbox empty.
+        assert bob.receive_messages() == []
+
     def test_forged_manifest_msg_id_rejected(self):
         """A sender who puts one msg_id in the manifest and a different one
         in the inner header is caught by the cross-check on receive.
