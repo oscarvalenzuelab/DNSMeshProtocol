@@ -7,6 +7,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-05-06 — TSIG UPDATE fix
+
+Operator-visible bug fix: TSIG-based DNS UPDATEs (the path
+`dnsmesh identity publish` uses when the config has a TSIG block)
+silently failed because the DNS server's TCP request handler crashed
+on the response-building path. Caught while debugging a real publish
+failure on a v0.6.6 deployed node; same bug in main.
+
 ### Fixed
 
 - TSIG DNS UPDATEs (and any TCP-fallback query) crashed the DNS
@@ -18,11 +26,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the crash into a SERVFAIL; for UPDATEs that surfaced as a 0-byte
   UDP packet, which dnspython rejects with `ShortHeader`. Symptom on
   the client side was a publish failure with no useful diagnostic.
-  Aliased the helpers and added a TCP NXDOMAIN regression test.
+  Aliased the helpers and added a TCP NXDOMAIN regression test
+  (#68).
 - `dnsmesh identity publish` on the TSIG-based writer raised
   `AttributeError: 'last_status'` from `_publish_failure_msg` instead
   of printing a clean error. The helper now uses `getattr` with
-  defaults so any `DNSRecordWriter` backend produces a usable message.
+  defaults so any `DNSRecordWriter` backend produces a usable message
+  (#68).
+
+### Tests
+
+- Added a docker-compose harness for cross-zone end-to-end validation
+  (`docker-compose.cross-zone.yml` + `tests/test_cross_zone_v07.py`).
+  The harness runs two nodes in distinct zones and exercises the
+  send/receive path operators actually deploy, plus a structural
+  check that v0.7.0's per-chunk `chunk_hashes` round-trip through the
+  manifest. Skipped automatically when the compose project isn't up,
+  so default CI behavior is unchanged (#69).
 
 ## [0.7.0] — 2026-05-05 — security audit roundup
 
