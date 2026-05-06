@@ -7,6 +7,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-05-06 — TSIG signature mismatch returns NOTAUTH
+
+Operator-visible follow-up to 0.7.1. Caught while debugging a real
+TSIG secret mismatch on a deployed node — same family of "no
+diagnostic on a publish failure" bug we fixed in 0.7.1, different
+exception path.
+
 ### Fixed
 
 - TSIG signature mismatches now return a clean NOTAUTH instead of
@@ -22,7 +29,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   failure with no clue it was an auth failure. Added the bare
   `dns.tsig.BadSignature` / `BadTime` / `BadKey` to the catch list
   and a regression test that reproduces the exact `ShortHeader`
-  symptom without the fix.
+  symptom without the fix (#71).
 
 ## [0.7.1] — 2026-05-06 — TSIG UPDATE fix
 
