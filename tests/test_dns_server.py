@@ -319,6 +319,50 @@ class TestDMPDnsServerApexAddressRecords:
         assert len(response.answer) == 1
         assert str(response.answer[0][0]) == "203.0.113.42"
 
+    def test_tcp_handler_aliases_negative_authority_helpers(self):
+        """A TCP query for a non-existent name must produce a clean
+        response, not crash. The TCP handler aliases ``_build_response``
+        from the UDP handler, so it has to also alias every helper that
+        ``_build_response`` calls — including ``_attach_negative_authority``
+        and ``_build_apex_soa_rrset``. A regression where only
+        ``_build_response`` was aliased (and not its transitive deps)
+        crashed the response builder mid-flight, leaving the listener
+        emitting 0-byte UDP / empty TCP frames. TSIG UPDATEs are the
+        canary because they're typically too large for UDP and fall back
+        to TCP for the actual write.
+        """
+        store = InMemoryDNSStore()
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            apex_zone="dmp.mesh.test",
+            apex_a="203.0.113.42",
+            apex_ns="ns1.dmp.mesh.test",
+            apex_soa_rname="hostmaster.dmp.mesh.test",
+        ):
+            # An owner name that doesn't exist — exercises the
+            # NXDOMAIN / empty-answer path that calls
+            # ``_attach_negative_authority``.
+            request = dns.message.make_query("no-such.dmp.mesh.test", dns.rdatatype.TXT)
+            response = dns.query.tcp(request, "127.0.0.1", port=port, timeout=2.0)
+
+        # The handler must complete the negative response normally.
+        # Pre-fix, the AttributeError on ``self._attach_negative_authority``
+        # was caught by the dispatcher's blanket ``except Exception`` and
+        # converted to SERVFAIL — so a SERVFAIL on a clearly-NXDOMAIN
+        # query is the smoking gun for the missing alias.
+        assert response.rcode() != dns.rcode.SERVFAIL, (
+            "TCP handler returned SERVFAIL on NXDOMAIN — likely missing a "
+            "method alias from _DMPRequestHandler"
+        )
+        # And the apex SOA must be in AUTHORITY per RFC 2308 §3, which
+        # only happens if ``_attach_negative_authority`` actually ran.
+        assert any(
+            rrset.rdtype == dns.rdatatype.SOA for rrset in response.authority
+        ), "expected apex SOA in AUTHORITY section of negative response"
+
 
 class TestDMPDnsServerApexSoaNs:
     """Strict recursive resolvers (Google 8.8.8.8, Level3 4.2.2.x)
