@@ -431,11 +431,17 @@ class _HttpWriter(DNSRecordWriter):
         return r.status_code == 204
 
 
-def _publish_failure_msg(writer: "_HttpWriter", name: str) -> str:
+def _publish_failure_msg(writer: DNSRecordWriter, name: str) -> str:
     """Build a one-line failure message that surfaces the actual HTTP
-    status + server-side reason instead of "see node logs"."""
-    status = writer.last_status
-    err = writer.last_error or ""
+    status + server-side reason instead of "see node logs".
+
+    Only ``_HttpWriter`` records ``last_status`` / ``last_error``; the
+    TSIG-based ``_DnsUpdateWriter`` and other backends don't, so guard
+    the attribute access. Without this, a publish failure on the TSIG
+    path crashed the CLI with AttributeError instead of a clean error.
+    """
+    status = getattr(writer, "last_status", None)
+    err = getattr(writer, "last_error", None) or ""
     base = f"publish to {name} failed"
     if status is None:
         return f"{base} — no response captured"

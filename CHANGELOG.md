@@ -7,6 +7,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- TSIG DNS UPDATEs (and any TCP-fallback query) crashed the DNS
+  server's response builder with `AttributeError` because
+  `_DMPTCPRequestHandler` aliased `_build_response` /
+  `_build_update_response` from the UDP handler but not the helper
+  methods they call (`_attach_negative_authority`,
+  `_build_apex_soa_rrset`). The dispatcher's blanket `except` turned
+  the crash into a SERVFAIL; for UPDATEs that surfaced as a 0-byte
+  UDP packet, which dnspython rejects with `ShortHeader`. Symptom on
+  the client side was a publish failure with no useful diagnostic.
+  Aliased the helpers and added a TCP NXDOMAIN regression test.
+- `dnsmesh identity publish` on the TSIG-based writer raised
+  `AttributeError: 'last_status'` from `_publish_failure_msg` instead
+  of printing a clean error. The helper now uses `getattr` with
+  defaults so any `DNSRecordWriter` backend produces a usable message.
+
 ## [0.7.0] — 2026-05-05 — security audit roundup
 
 Multi-pass security audit cycle with fifteen merged PRs (#52–#66)

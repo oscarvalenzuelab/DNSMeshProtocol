@@ -992,6 +992,13 @@ class _DMPTCPRequestHandler(socketserver.BaseRequestHandler):
     # like normal methods when called on an instance.
     _build_response = _DMPRequestHandler._build_response
     _build_update_response = _DMPRequestHandler._build_update_response
+    # Helpers transitively called from ``_build_response`` —
+    # ``_build_apex_soa_rrset`` for positive-answer SOA assembly and
+    # ``_attach_negative_authority`` for NXDOMAIN / NoData responses.
+    # Without these aliases, a TCP-fallback query (e.g. a TSIG UPDATE
+    # too large for UDP) crashes with AttributeError mid-response.
+    _attach_negative_authority = _DMPRequestHandler._attach_negative_authority
+    _build_apex_soa_rrset = _DMPRequestHandler._build_apex_soa_rrset
 
     # Bound the per-connection read so a slow / hostile client can't
     # tie up a worker thread waiting for bytes that never come.
