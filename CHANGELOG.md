@@ -7,6 +7,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- TSIG signature mismatches now return a clean NOTAUTH instead of
+  silence. dnspython raises `dns.tsig.BadSignature` (a direct
+  subclass of `DNSException`, not of `PeerError`) when an incoming
+  UPDATE's TSIG verifies against a known keyring entry but the
+  signature itself doesn't match. The dispatcher's catch list only
+  covered `dns.tsig.PeerError`, so `BadSignature` (plus the parallel
+  `BadTime` and `BadKey` classes) fell into the generic "unparseable"
+  branch and `_process_dns_query` returned `None`. Result: no wire
+  bytes sent, requester saw a 0-byte UDP datagram, dnspython raised
+  `ShortHeader` on the receive side, and the operator got a publish
+  failure with no clue it was an auth failure. Added the bare
+  `dns.tsig.BadSignature` / `BadTime` / `BadKey` to the catch list
+  and a regression test that reproduces the exact `ShortHeader`
+  symptom without the fix.
+
 ## [0.7.1] — 2026-05-06 — TSIG UPDATE fix
 
 Operator-visible bug fix: TSIG-based DNS UPDATEs (the path

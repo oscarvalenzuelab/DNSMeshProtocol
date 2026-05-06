@@ -1208,6 +1208,54 @@ class TestDnsUpdate:
         assert response.rcode() == dns.rcode.NOTAUTH
         assert store.query_txt_record("foo.example.com") is None
 
+    def test_known_key_wrong_secret_is_notauth(self):
+        """A known key NAME with a mismatched secret must produce a
+        clean NOTAUTH response, not silence.
+
+        dnspython raises ``dns.tsig.BadSignature`` on signature
+        mismatch — a direct subclass of ``DNSException`` that does
+        NOT inherit from ``PeerError``. Pre-fix, the dispatcher only
+        caught the ``PeerError`` family + ``UnknownTSIGKey`` /
+        ``BadTSIG``, so ``BadSignature`` fell into the generic
+        "unparseable" branch and the handler returned ``None`` (no
+        wire bytes sent). The requester saw a 0-byte UDP datagram
+        and dnspython raised ``ShortHeader`` on the receive side,
+        masking what was really an auth failure.
+        """
+        store = InMemoryDNSStore()
+        # Server's keyring has the canonical secret for "alice.".
+        server_keyring = _keyring(name="alice.", secret=b"\x11" * 32)
+        port = _free_port()
+        with DMPDnsServer(
+            store,
+            host="127.0.0.1",
+            port=port,
+            writer=store,
+            tsig_keyring=server_keyring,
+            allowed_zones=("example.com",),
+        ):
+            # Client signs with the SAME key name but a DIFFERENT
+            # secret — the on-wire signature won't match what the
+            # server's HMAC computes.
+            upd = dns.update.UpdateMessage("example.com")
+            upd.add(
+                dns.name.from_text("foo.example.com."),
+                300,
+                "TXT",
+                '"intruder"',
+            )
+            upd.use_tsig(
+                _keyring(name="alice.", secret=b"\x22" * 32),
+                keyname=dns.name.from_text("alice."),
+            )
+            response = _send_update(upd, port)
+
+        assert response.rcode() == dns.rcode.NOTAUTH, (
+            "expected NOTAUTH on signature mismatch; pre-fix the server "
+            "returned no bytes and the client raised ShortHeader"
+        )
+        assert store.query_txt_record("foo.example.com") is None
+
     def test_zone_outside_allowed_list_is_notauth(self):
         """A signed UPDATE for a zone we don't claim authority for
         must be rejected even when the TSIG key is valid."""
