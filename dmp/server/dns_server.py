@@ -859,12 +859,25 @@ def _process_dns_query(
         return None
 
     # Pass the keyring into ``from_wire`` so any TSIG signature on
-    # the incoming message is verified at parse time. dnspython raises:
-    #   - dns.tsig.PeerError (bad signature / time / truncation)
-    #   - dns.message.UnknownTSIGKey (key name not in keyring)
-    #   - dns.message.BadTSIG (malformed TSIG record)
-    # All three map to NOTAUTH — the request was authenticated by
-    # someone we can't or won't trust.
+    # the incoming message is verified at parse time. dnspython has
+    # two parallel TSIG-error hierarchies and we have to catch both:
+    #
+    #   - ``dns.tsig.PeerError`` family (PeerBadSignature, PeerBadKey,
+    #     PeerBadTime, PeerBadTruncation) — typically raised when WE
+    #     are validating a response we received. Subclasses of PeerError.
+    #   - ``dns.tsig.BadSignature`` / ``BadTime`` / ``BadKey`` — direct
+    #     subclasses of ``DNSException`` (NOT PeerError). Raised when
+    #     verifying an incoming UPDATE's TSIG against a known keyring
+    #     key whose secret doesn't match. Catching only ``PeerError``
+    #     misses these and the request falls into the generic
+    #     "unparseable" branch which returns ``None``: the requester
+    #     gets a 0-byte UDP datagram (dnspython surfaces it as
+    #     ``ShortHeader``) with no clue it was an auth failure.
+    #   - ``dns.message.UnknownTSIGKey`` — key name not in keyring.
+    #   - ``dns.message.BadTSIG`` — malformed TSIG record.
+    #
+    # All of these map to NOTAUTH: we authenticated the requester and
+    # don't (or can't) trust them.
     #
     # When a keystore is wired in, build a fresh keyring per packet
     # so newly-minted keys authorize without restarting the server.
@@ -877,6 +890,9 @@ def _process_dns_query(
         query = dns.message.from_wire(data, keyring=keyring)
     except (
         dns.tsig.PeerError,
+        dns.tsig.BadSignature,
+        dns.tsig.BadTime,
+        dns.tsig.BadKey,
         dns.message.UnknownTSIGKey,
         dns.message.BadTSIG,
     ) as e:
