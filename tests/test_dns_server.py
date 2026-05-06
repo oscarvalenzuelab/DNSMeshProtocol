@@ -130,6 +130,46 @@ class TestDMPDnsServer:
             assert len(s) <= 255
         assert b"".join(rdata.strings) == long_value.encode("utf-8")
 
+    def test_udp_response_emits_exactly_one_datagram(self):
+        """The UDP handler must answer with one datagram, not two.
+
+        Pre-fix, ``handle()`` called ``sock.sendto`` directly while the
+        ``DatagramRequestHandler`` framework's ``finish()`` ALSO called
+        ``sock.sendto(self.wfile.getvalue(), ...)`` with an empty
+        buffer. The result was a valid response followed by a 0-byte
+        UDP packet on every query — visible in tcpdump as
+        ``domain [length 0 < 12] (invalid)``. Read once with a short
+        timeout, then peek for a second datagram and fail if anything
+        further arrived.
+        """
+        store = InMemoryDNSStore()
+        store.publish_txt_record("solo.mesh.test", "value")
+        port = _free_port()
+
+        with DMPDnsServer(store, host="127.0.0.1", port=port):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(2.0)
+            try:
+                request = dns.message.make_query("solo.mesh.test", dns.rdatatype.TXT)
+                sock.sendto(request.to_wire(), ("127.0.0.1", port))
+                first, _ = sock.recvfrom(4096)
+                assert len(first) >= 12, "first datagram is the DNS response"
+                # Anything queued after the response is the duplicate
+                # empty datagram bug. Use a tight non-blocking poll so
+                # the test stays fast in the happy path.
+                sock.settimeout(0.5)
+                trailer = None
+                try:
+                    trailer, _ = sock.recvfrom(4096)
+                except socket.timeout:
+                    pass
+                assert trailer is None, (
+                    f"unexpected trailing UDP datagram of {len(trailer)} bytes "
+                    "after the legitimate response"
+                )
+            finally:
+                sock.close()
+
     def test_server_is_restartable(self):
         store = InMemoryDNSStore()
         store.publish_txt_record("r.mesh.test", "value")

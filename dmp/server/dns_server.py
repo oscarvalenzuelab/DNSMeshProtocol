@@ -210,11 +210,34 @@ class _DMPRequestHandler(socketserver.DatagramRequestHandler):
         # Thin: framing-specific (UDP datagram → bytes). Heavy
         # lifting (rate-limit, TSIG verify, response building) is in
         # ``_process_dns_query`` so the TCP handler can share it.
-        data, sock = self.request
+        #
+        # Write through ``self.wfile`` rather than calling
+        # ``sock.sendto`` directly. ``DatagramRequestHandler.finish()``
+        # (overridden below) emits a single ``sendto`` from wfile.
+        # The previous approach (direct sendto + empty wfile) caused
+        # finish() to ship a 0-byte UDP packet right after every
+        # legitimate response. dnspython on the receive side ignored
+        # the duplicate (it accepts the first valid datagram), but
+        # tcpdump flagged it as malformed and the empty trailer
+        # wasted a round-trip's worth of NIC + kernel time on every
+        # query.
+        data, _sock = self.request
         client_ip = self.client_address[0]
         response_bytes = _process_dns_query(self, data, client_ip, transport="udp")
         if response_bytes is not None:
-            sock.sendto(response_bytes, self.client_address)
+            self.wfile.write(response_bytes)
+
+    def finish(self) -> None:
+        # Override ``DatagramRequestHandler.finish`` so silent-drop
+        # paths (rate-limited query, unparseable wire, etc.) don't
+        # emit a 0-byte UDP packet. The base class unconditionally
+        # ``sendto(self.wfile.getvalue(), ...)`` regardless of whether
+        # the handler wrote anything, which surfaced as malformed
+        # trailer datagrams that waste bandwidth and reveal a live
+        # listener for queries that should look ignored.
+        payload = self.wfile.getvalue()
+        if payload:
+            self.socket.sendto(payload, self.client_address)
 
     @staticmethod
     def _stub_response(data: bytes, rcode_value: int) -> Optional[bytes]:
