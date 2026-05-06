@@ -1,0 +1,62 @@
+services:
+  # Alice's home node — authoritative for alice.test.
+  alice-node:
+    build: .
+    image: dnsmesh-node:latest
+    container_name: dnsmesh-alice
+    ports:
+      # Host-side ports for the test harness to talk to. UDP 53 is
+      # mapped to host port 15301 so the test can reach Alice's DNS
+      # without needing to chase Docker's internal IPs.
+      - "127.0.0.1:15301:5353/udp"
+      - "127.0.0.1:15301:5353/tcp"
+      - "127.0.0.1:18101:8053/tcp"
+    environment:
+      DMP_DOMAIN: alice.test
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      # Required for the security guard added in #66.
+      DMP_ALLOW_OPEN_PUBLIC_BIND: "1"
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_LOG_LEVEL: WARNING
+    volumes:
+      - alice-data:/var/lib/dmp
+    networks:
+      dnsmesh:
+        aliases:
+          - alice.test
+
+  # Bob's home node — authoritative for bob.test.
+  bob-node:
+    build: .
+    image: dnsmesh-node:latest
+    container_name: dnsmesh-bob
+    ports:
+      - "127.0.0.1:15302:5353/udp"
+      - "127.0.0.1:15302:5353/tcp"
+      - "127.0.0.1:18102:8053/tcp"
+    environment:
+      DMP_DOMAIN: bob.test
+      DMP_DNS_HOST: 0.0.0.0
+      DMP_DNS_PORT: "5353"
+      DMP_HTTP_HOST: 0.0.0.0
+      DMP_HTTP_PORT: "8053"
+      DMP_ALLOW_OPEN_PUBLIC_BIND: "1"
+      DMP_DB_PATH: /var/lib/dmp/dmp.db
+      DMP_LOG_LEVEL: WARNING
+    volumes:
+      - bob-data:/var/lib/dmp
+    networks:
+      dnsmesh:
+        aliases:
+          - bob.test
+
+volumes:
+  alice-data:
+  bob-data:
+
+networks:
+  dnsmesh:
+    driver: bridge
