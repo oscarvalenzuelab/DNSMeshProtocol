@@ -345,9 +345,7 @@ class TestDMPDnsServerApexAddressRecords:
             # An owner name that doesn't exist — exercises the
             # NXDOMAIN / empty-answer path that calls
             # ``_attach_negative_authority``.
-            request = dns.message.make_query(
-                "no-such.dmp.mesh.test", dns.rdatatype.TXT
-            )
+            request = dns.message.make_query("no-such.dmp.mesh.test", dns.rdatatype.TXT)
             response = dns.query.tcp(request, "127.0.0.1", port=port, timeout=2.0)
 
         # The handler must complete the negative response normally.
