@@ -7,6 +7,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.3] — 2026-05-06 — drop trailing empty UDP datagrams
+
+Operator-visible cleanup. No correctness change, but every UDP query
+on every node was costing twice the kernel/NIC work it should and
+silent-drop paths were leaking a "listener present" signal via
+malformed trailer datagrams.
+
 ### Fixed
 
 - DNS server stops emitting a 0-byte trailing UDP datagram after every
@@ -16,12 +23,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   wfile empty, finish() shipped a `b""` datagram right after every
   legitimate response. dnspython on the receive side ignored the
   duplicate (it accepts the first valid datagram), so this didn't
-  break clients, but tcpdump and any strict packet inspection flagged
-  it as `domain [length 0 < 12] (invalid)`. Wasted one full
-  send/receive on every query and on every silent-drop path.
+  break clients, but tcpdump flagged it as
+  `domain [length 0 < 12] (invalid)`. Silent-drop paths
+  (rate-limited, unparseable wire, TSIG mismatch) had the same issue
+  and leaked "listener is here" via a single empty datagram.
   Fixed by writing the response through `self.wfile` and overriding
   `finish()` to skip the send when wfile is empty. Regression test
-  asserts exactly one UDP datagram is emitted per query.
+  asserts exactly one UDP datagram is emitted per query (#73).
 
 ## [0.7.2] — 2026-05-06 — TSIG signature mismatch returns NOTAUTH
 
