@@ -7,6 +7,37 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.4] — 2026-05-07 — TSIG-sign UPDATE responses per RFC 8945 §5.4.1
+
+Strict-client correctness fix. Long-latent bug surfaced when the Rust
+port's hickory-based client started talking to deployed Python nodes
+and rejected every publish with `missing tsig from response that must
+be authenticated`. Python clients kept working throughout because
+dnspython on the receive side is permissive about response signing.
+
+### Fixed
+
+- DNS server now signs UPDATE responses when the request carried
+  verified TSIG. The handler built responses with
+  `dns.message.make_response()` and serialized via `response.to_wire()`
+  without ever calling `response.use_tsig()` — dnspython does not
+  auto-inherit the request's TSIG, so responses went out unsigned.
+  RFC 8945 §5.4.1 requires that a response to a TSIG-signed request
+  itself be TSIG-signed; strict clients (hickory-dns, BIND
+  `nsupdate -y`, miekg/dns strict mode) reject the response and the
+  publish surfaces as a generic failure with no diagnostic. Now we
+  apply `use_tsig` + `request_mac` chaining (per §5.4.2) on every
+  response that came out of an authenticated request — including the
+  FORMERR / NOTAUTH / NOTZONE / REFUSED / SERVFAIL rejection paths,
+  since all of them are answers to an already-authenticated peer and
+  equally in scope. The `_stub_response` NOTAUTH for un-parseable
+  TSIG packets stays unsigned per §5.3 (verification could not
+  complete, so there is no key to sign with). Two regression tests
+  in `TestDnsUpdate`: NOERROR happy path with TSIG present + algorithm
+  cross-check, and a NOTZONE rejection path that pins the contract on
+  the policy-rejection edges (a "sign only on success" regression
+  would still break strict clients) (#75).
+
 ## [0.7.3] — 2026-05-06 — drop trailing empty UDP datagrams
 
 Operator-visible cleanup. No correctness change, but every UDP query
