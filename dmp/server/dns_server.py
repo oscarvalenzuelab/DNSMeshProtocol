@@ -946,6 +946,32 @@ def _process_dns_query(
         response = dns.message.make_response(query)
         response.set_rcode(dns.rcode.SERVFAIL)
 
+    # RFC 8945 §5.4.1: a response to a TSIG-signed request MUST itself be
+    # TSIG-signed. dnspython's ``make_response`` does not auto-inherit the
+    # request's TSIG, so we apply it here. Strict clients (hickory-dns,
+    # BIND nsupdate with -y) reject unsigned responses with
+    # ``missing tsig from response that must be authenticated``; only
+    # dnspython on the receive side is permissive enough to tolerate the
+    # omission, which is why this latent server bug only surfaced once
+    # the Rust port shipped. Applies to every response that came out of
+    # an authenticated request — including FORMERR/NOTAUTH/NOTZONE/
+    # REFUSED/SERVFAIL from the build path, which are still answers to
+    # an authenticated peer and therefore in scope for §5.4.1.
+    if getattr(query, "had_tsig", False) and query.keyname is not None:
+        # ``query.tsig`` is the TSIG RRset; the rdata (carrying the
+        # algorithm Name) is at index 0. Single-RR by construction —
+        # dnspython rejects multi-RR TSIG sets at parse time.
+        algorithm = query.tsig[0].algorithm
+        response.use_tsig(
+            keyring=keyring,
+            keyname=query.keyname,
+            algorithm=algorithm,
+        )
+        # MAC chaining per RFC 8945 §5.4.2: the response MAC includes
+        # the request's MAC as a prefix, binding the pair so an
+        # in-flight rcode swap can't go undetected.
+        response.request_mac = query.mac
+
     rcode_name = dns.rcode.to_text(response.rcode())
     REGISTRY.counter(
         "dmp_dns_queries_total",

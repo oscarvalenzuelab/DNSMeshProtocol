@@ -1216,6 +1216,63 @@ class TestDnsUpdate:
         assert response.rcode() == dns.rcode.NOERROR
         assert store.query_txt_record("foo.example.com") == ["v=dmp1;t=test"]
 
+    def test_signed_update_response_carries_tsig(self):
+        """RFC 8945 §5.4.1: a response to a TSIG-signed request MUST be
+        TSIG-signed itself. dnspython's ``make_response`` does NOT
+        auto-inherit the request's TSIG, so the server has to apply
+        ``use_tsig`` on the response before serialization. Strict
+        clients (hickory-dns, BIND nsupdate -y, miekg/dns strict mode)
+        reject unsigned responses with ``missing tsig from response
+        that must be authenticated``; only dnspython on the receive
+        side is permissive enough to tolerate an unsigned response,
+        which is why the bug only surfaced once a non-dnspython client
+        appeared. Asserts on every rcode shape — NOERROR (happy path)
+        and the rejection codes (NOTAUTH/NOTZONE/REFUSED) are all
+        responses to an authenticated peer and equally in scope.
+        """
+        store = InMemoryDNSStore()
+        server, port = self._server(store)
+        with server:
+            response = _send_update(
+                self._build_add("foo.example.com", "v=dmp1;t=test"), port
+            )
+        # dnspython sets ``had_tsig`` to True on a parsed response when
+        # the wire carried a verifiable TSIG record — that's the
+        # operational signal a strict client checks. ``response.tsig``
+        # holds the rdata and lets us cross-check the algorithm.
+        assert response.had_tsig is True, (
+            "response to TSIG-signed UPDATE must itself carry TSIG " "(RFC 8945 §5.4.1)"
+        )
+        # ``response.tsig`` is an RRset; the algorithm lives on the
+        # rdata at index 0. Single-RR by construction.
+        assert response.tsig[0].algorithm == dns.name.from_text("hmac-sha256.")
+
+    def test_signed_update_rejection_response_carries_tsig(self):
+        """Rejections (NOTZONE, REFUSED, etc.) of a TSIG-signed request
+        must also be signed — the request was authenticated, the
+        response is a peer-bound answer, RFC 8945 §5.4.1 doesn't carve
+        out a "but only on success" exception. Codifies the contract
+        for the rcode-carrying paths; a regression that signs only
+        NOERROR responses would still break strict clients on the
+        server's policy-rejection edges.
+        """
+        store = InMemoryDNSStore()
+        server, port = self._server(store)
+        # Owner outside the declared zone → NOTZONE. The request is
+        # validly TSIG-signed, only the payload is policy-rejected.
+        upd = dns.update.UpdateMessage("example.com")
+        upd.add(
+            dns.name.from_text("foo.other.com."),
+            300,
+            "TXT",
+            '"x"',
+        )
+        upd.use_tsig(_keyring(), keyname=dns.name.from_text("client."))
+        with server:
+            response = _send_update(upd, port)
+        assert response.rcode() == dns.rcode.NOTZONE
+        assert response.had_tsig is True
+
     def test_unsigned_update_is_refused(self):
         """An UPDATE that doesn't carry TSIG must not write anything."""
         store = InMemoryDNSStore()
