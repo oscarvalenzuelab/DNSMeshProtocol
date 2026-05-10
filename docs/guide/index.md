@@ -10,6 +10,11 @@ permalink: /guide
 
 Day-to-day use of the `dnsmesh` CLI and the `dmp` Python library.
 
+- [Clients]({{ site.baseurl }}/guide/clients) — the Python CLI, the
+  desktop + Android GUI ([`dnsmesh-app`](https://github.com/oscarvalenzuelab/dnsmesh-app),
+  alpha), and the Rust SDK + CLI
+  ([`dnsmesh-rs`](https://github.com/oscarvalenzuelab/dnsmesh-rs),
+  alpha). Pick the one that matches how you want to use the protocol.
 - [CLI reference]({{ site.baseurl }}/guide/cli) — every subcommand,
   flag, and env var. Includes the `dnsmesh tsig register` flow that
   mints the per-user DNS UPDATE credential after M9.
