@@ -10,6 +10,13 @@ nav_order: 3
 End-to-end in seven steps: install the CLI, register on a public node,
 publish your identity, add a friend, send a message. ~5 minutes.
 
+{: .note }
+Prefer a GUI? An alpha desktop + Android app ships installers for
+macOS, Linux, Windows, and Android — see the
+[clients page]({{ site.baseurl }}/guide/clients). Same protocol,
+same DNS plumbing; the rest of this walkthrough sticks with the
+Python CLI.
+
 1. TOC
 {:toc}
 

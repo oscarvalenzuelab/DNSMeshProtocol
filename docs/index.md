@@ -15,6 +15,7 @@ internet already runs on.
 [How it works]({{ site.baseurl }}/how-it-works){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [Slide deck]({{ site.baseurl }}/how-resolution-works.html){: .btn .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [Try it in 5 minutes]({{ site.baseurl }}/getting-started){: .btn .fs-5 .mb-4 .mb-md-0 .mr-2 }
+[Get a client]({{ site.baseurl }}/guide/clients){: .btn .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [Deploy a node]({{ site.baseurl }}/deployment){: .btn .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [GitHub](https://github.com/oscarvalenzuelab/DNSMeshProtocol){: .btn .fs-5 .mb-4 .mb-md-0 }
 
@@ -193,6 +194,14 @@ Actively shipping:
 
 - **Command-line client** (`pip install dnsmesh`) and Dockerized node
   with sqlite storage, metrics, rate limiting.
+- **Desktop + Android GUI** ([`dnsmesh-app`](https://github.com/oscarvalenzuelab/dnsmesh-app),
+  alpha) — Tauri 2 app shipping `.dmg` / `.msi` / `.deb` / `.rpm` /
+  `.AppImage` / `.apk` installers off every tag, covering macOS,
+  Linux, Windows, and Android off one codebase.
+- **Rust SDK + CLI** ([`dnsmesh-rs`](https://github.com/oscarvalenzuelab/dnsmesh-rs),
+  alpha) — embeddable client SDK plus a standalone static-binary CLI
+  for terminals and Maildir-aware MUAs. Powers the GUI above and
+  opens the door to native iOS / Android consumers via UniFFI.
 - **End-to-end via DNS UPDATE + TSIG** — every protocol write is
   RFC 2136 DNS UPDATE signed with RFC 8945 TSIG. Forward secrecy
   via one-time prekeys; Ed25519 signatures pinned to contacts.
@@ -215,7 +224,9 @@ Certification backlog — work on the path to `v1.0`, tracked as [GitHub issues]
 - **External cryptographic audit** (M4.2–M4.4). The gate for tagging
   `v0.2.0-beta` and for treating DMP as anything other than
   non-certified software.
-- **Mobile client** (M5.2), **web/WASM client** (M5.3).
+- **Mobile client** (M5.2) — Android sideload alpha shipped via
+  [`dnsmesh-app`](https://github.com/oscarvalenzuelab/dnsmesh-app);
+  iOS still pending. **Web/WASM client** (M5.3) still pending.
 - **Traffic-analysis resistance** (M6) — random publish delays, dummy
   chunks, chunk-order randomization. Best-effort research track.
 
@@ -225,6 +236,11 @@ New to DMP? Take the
 [five-minute Getting Started walkthrough]({{ site.baseurl }}/getting-started).
 You'll stand up a local node, exchange keys between two identities, and
 deliver your first end-to-end encrypted message.
+
+Prefer a GUI to a terminal? Grab an installer for macOS, Linux,
+Windows, or Android from the
+[clients page]({{ site.baseurl }}/guide/clients) — same protocol,
+same DNS plumbing, alpha-quality but usable.
 
 Running a public node? Start with
 [Deployment → Docker]({{ site.baseurl }}/deployment/docker) and then
