@@ -88,13 +88,50 @@ dmp.<identity_domain>
 
 Body (variable length, capped):
 
-| Field | Size |
-|---|---|
-| `username_len` | 1 byte |
-| `username` | up to 64 utf-8 bytes |
-| `x25519_pk` | 32 bytes |
-| `ed25519_spk` | 32 bytes |
-| `ts` | 8 bytes |
+| Field | Size | Required |
+|---|---|---|
+| `username_len` | 1 byte | yes |
+| `username` | up to 64 utf-8 bytes | yes |
+| `x25519_pk` | 32 bytes | yes |
+| `ed25519_spk` | 32 bytes | yes |
+| `ts` | 8 bytes | yes |
+| `versions_len` | 1 byte | optional (see below) |
+| `versions` | `versions_len` × 1 byte | optional |
+
+The optional `versions` suffix advertises the protocol versions the
+publishing client supports as a **receiver**. Each byte is a single
+protocol version number; the writer sorts and deduplicates them so
+the encoding is deterministic.
+
+**Compatibility rules:**
+
+- **Suffix absent** ⇒ treat as `versions = [1]`. Records published
+  before this field existed continue to parse and are correctly
+  interpreted as v1-only. A new client that publishes `versions =
+  [1]` MUST also omit the suffix entirely so the bytes are
+  bit-identical to the pre-versions historical form (preserves
+  cached body hashes).
+- **Suffix present** ⇒ `versions_len ≥ 1` and the encoded list
+  MUST be sorted and unique. Non-canonical encodings reject.
+
+Senders consult the recipient's `versions` field before emitting
+any wire feature beyond v1 (e.g. the DMPv2 plaintext envelope
+below). If a recipient hasn't published v2 yet, the sender stays
+on v1 — automatic, safe rollout without a config flag.
+
+**Publishing v2 capability:** the CLI defaults to publishing
+v1-only identity records so pre-this-release clients can still
+parse them (their strict length check rejects any trailing
+suffix). To opt in once your peers have updated, run:
+
+```
+dnsmesh identity publish --advertise-v2
+dnsmesh identity rotate --advertise-v2 [...]
+```
+
+Once a peer's record advertises v2, every upgraded sender starts
+emitting the DMPv2 envelope to them, populating a verified
+`sender_label` on first-contact messages.
 
 Signed by the identity's Ed25519 key. The fetcher verifies the
 signature against the embedded `ed25519_spk` (the record is

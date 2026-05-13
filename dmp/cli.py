@@ -1127,6 +1127,7 @@ def _make_client(
             config.username,
             passphrase,
             domain=effective_domain,
+            identity_domain=config.identity_domain or None,
             writer=writer,
             reader=reader,
             replay_cache_path=replay_path,
@@ -1884,6 +1885,7 @@ def cmd_identity_show(args: argparse.Namespace) -> int:
 def cmd_identity_publish(args: argparse.Namespace) -> int:
     """Publish a signed identity record to DNS so contacts can resolve us."""
     from dmp.core.identity import (
+        SUPPORTED_VERSIONS,
         identity_domain,
         make_record,
         zone_anchored_identity_name,
@@ -1893,7 +1895,15 @@ def cmd_identity_publish(args: argparse.Namespace) -> int:
     passphrase = _load_passphrase(cfg)
     client = _make_client(cfg, passphrase)
     try:
-        record = make_record(client.crypto, cfg.username)
+        # ``--advertise-v2`` opt-in: when set, the record carries the
+        # optional ``versions`` suffix advertising the protocol
+        # versions this client supports as a receiver. Senders that
+        # see ``2 ∈ versions`` enable the DMPv2 envelope and a verified
+        # sender_label on first contact. Default stays v1-only so
+        # pre-this-PR clients can still parse the wire (their strict
+        # length check rejects any trailing suffix).
+        versions = SUPPORTED_VERSIONS if args.advertise_v2 else (1,)
+        record = make_record(client.crypto, cfg.username, versions=versions)
         wire = record.sign(client.crypto)
 
         if cfg.identity_domain:
@@ -2198,8 +2208,13 @@ def cmd_identity_rotate(args: argparse.Namespace) -> int:
 
         # Also publish a fresh IdentityRecord for the NEW key so that
         # non-rotation-aware contacts still see the new key pinned
-        # correctly on a plain `dnsmesh identity fetch`.
-        new_identity = make_record(new_crypto, cfg.username)
+        # correctly on a plain `dnsmesh identity fetch`. ``--advertise-v2``
+        # is plumbed through so a rotation preserves the user's chosen
+        # v2 advertisement instead of silently reverting to v1-only.
+        from dmp.core.identity import SUPPORTED_VERSIONS
+
+        rotated_versions = SUPPORTED_VERSIONS if args.advertise_v2 else (1,)
+        new_identity = make_record(new_crypto, cfg.username, versions=rotated_versions)
         ok = client.writer.publish_txt_record(
             identity_rrset, new_identity.sign(new_crypto), ttl=int(args.ttl)
         )
@@ -4923,6 +4938,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=86400,
         help="TXT record TTL in seconds (default: 86400 = 1 day)",
     )
+    p_id_pub.add_argument(
+        "--advertise-v2",
+        action="store_true",
+        help=(
+            "advertise DMPv2 envelope support in the identity record "
+            "(adds the optional `versions` suffix). Default off so "
+            "pre-0.7.5 clients can still parse the record. Turn on once "
+            "everyone you correspond with has upgraded — peers will then "
+            "emit verified sender labels on first-contact messages "
+            "rather than `(unpinned sender)`."
+        ),
+    )
     p_id_pub.set_defaults(func=cmd_identity_publish)
 
     p_id_pk = sub_id.add_parser(
@@ -4993,6 +5020,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="required — acknowledges the feature is experimental and "
         "subject to revision after the external crypto audit.",
+    )
+    p_id_rotate.add_argument(
+        "--advertise-v2",
+        action="store_true",
+        help=(
+            "advertise DMPv2 envelope support in the fresh IdentityRecord "
+            "published for the new key. Mirrors `dnsmesh identity publish "
+            "--advertise-v2`; see its help for the rollout rationale."
+        ),
     )
     p_id_rotate.set_defaults(func=cmd_identity_rotate)
 

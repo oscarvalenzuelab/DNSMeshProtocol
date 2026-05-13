@@ -96,6 +96,98 @@ makes AEAD verification fail on receive.
 12. On success: record `(sender_spk, msg_id)` in the replay cache,
     consume the prekey_sk (delete locally + from DNS).
 
+## DMPv2 plaintext envelope
+
+The AEAD plaintext may carry an optional **versioned envelope** before
+the body, currently used to surface the sender's human-readable
+`user@host` address to the recipient on first contact.
+
+### Wire format (inside the AEAD ciphertext)
+
+```
+DMPV2_PREFIX(6) || canonical_json(header) || b"\n" || body
+```
+
+- `DMPV2_PREFIX = b"DMPV2:"` — discriminates a v1 plaintext (no
+  envelope, body bytes only) from a v2 plaintext (envelope present).
+- `header` is a JSON object serialized with `sort_keys=True` and
+  `separators=(",", ":")` (deterministic). Required key `from` carries
+  the sender's canonical `user@host`. Receivers MUST ignore unknown
+  keys so future fields don't break old receivers.
+- Header bytes are capped at 256 bytes total (`MAX_HEADER_BYTES`). A
+  larger header rejects.
+- The single `\n` byte terminates the header. Empty body is legal.
+
+### Confidentiality
+
+The envelope lives **inside** the ChaCha20-Poly1305 ciphertext bound
+to `DMPHeader` as AAD. An attacker who scrapes the erasure-coded DNS
+chunks sees only the AEAD blob; they cannot recover `from` without
+breaking the AEAD or the per-recipient X25519 ECDH. The DMPHeader
+itself (visible on the wire) is unchanged and still leaks
+`sender_id`, `recipient_id`, `timestamp`, `ttl` — same as v1.
+
+### Address canonicalization
+
+`from` is canonicalized both on encode and on decode. Rules:
+
+- ASCII only. Non-ASCII rejects.
+- Lowercased.
+- Trailing dots on host stripped.
+- Local-part: starts alphanumeric, then `a-z0-9_-.`, up to 64 chars.
+  Must not start or end with `.`, no `..`.
+- Host: dot-separated labels, each `a-z0-9-` not starting/ending with
+  `-`, label ≤63 chars, total ≤253 chars.
+
+Receivers MUST canonicalize before lookup AND before display. Never
+render the raw bytes the sender wrote — homograph/confusable
+defenses depend on the canonical form being stable.
+
+### Trust (the SPK-binding check)
+
+The `from` claim by itself is unauthenticated — the sender wrote
+whatever they wanted. Before populating `sender_label` (intro queue or
+inbox), the receiver:
+
+1. Canonicalizes `from`.
+2. Fetches the identity record at that address (zone-anchored name
+   first, then TOFU-hash fallback).
+3. Verifies the record's Ed25519 signature against the embedded
+   `ed25519_spk`.
+4. Compares the record's `ed25519_spk` to the manifest's `sender_spk`
+   (the AEAD signer, already trusted by every other receive-path
+   gate).
+5. Compares `record.username == address.user`.
+
+Match → `sender_label = canonical_from`. Mismatch / NXDOMAIN / parse
+failure → `sender_label = ""` (UI falls back to SPK fingerprint).
+
+Positive bindings are cached in memory (`(canonical_from, sender_spk)
+→ canonical_from`). Negative results are NOT cached — a transient
+DNS failure must not evict a previously-verified binding. Per codex
+consult 2026-05-13.
+
+### Capability gating (no leaked wrappers)
+
+Senders MUST consult the recipient's `IdentityRecord.versions` before
+emitting a wrapper. The wrapper is only emitted when `2 ∈ versions`.
+Receivers that haven't published `versions=[…2…]` are treated as
+v1-only (the missing-suffix default), so a wrapped plaintext never
+reaches a receiver that would render it as a literal `DMPV2:` prefix
+in the message body.
+
+### Cross-version matrix
+
+| Sender publishes | Recipient publishes | Sender emits | Receiver sees |
+|---|---|---|---|
+| versions=[1] | versions=[1] | v1 (no wrapper) | v1 body, no label |
+| versions=[1,2] | versions=[1] / missing | v1 (gated) | v1 body, no label |
+| versions=[1,2] | versions=[1,2] | v2 (wrapper) | clean body, verified label |
+| versions=[1] | versions=[1,2] | v2 (wrapper)* | clean body, verified label |
+
+\* The sender's own `versions` field advertises **receive** capability;
+it does not gate **send**. Codex-validated 2026-05-13.
+
 ## Forward secrecy (X3DH-style prekeys)
 
 See [the user guide]({{ site.baseurl }}/guide/forward-secrecy) for the
