@@ -343,6 +343,123 @@ class TestEnvelopeFirstContact:
         assert intro.plaintext == b"hi from real alice"
 
 
+class TestRRSetDisambiguation:
+    """The receive verifier MUST prefer a record whose ed25519_spk
+    matches the expected key even when an older sibling record
+    appears first in the RRset.
+
+    Append-semantics DNS publishers can leave a previous version of
+    a user's identity record alongside the live one (e.g. after key
+    rotation or a republish). If the lookup returns the first
+    signature-valid record by RRset order without filtering by SPK,
+    a stale tombstone would silently shadow the live record:
+
+    - ``_recipient_versions`` would read the old record's
+      ``versions`` and downgrade the send path to v1 even though the
+      live record advertises v2.
+    - ``_resolve_envelope_label`` would see the old record's SPK,
+      fail to match the manifest's ``sender_spk``, and refuse to
+      populate the verified label.
+
+    Codex review P2 (2026-05-13).
+    """
+
+    def test_resolve_envelope_label_picks_record_matching_sender_spk(self):
+        from dmp.core.crypto import DMPCrypto
+
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Publish alice's REAL identity first.
+        _publish_identity(alice, "alice.test")
+        # Then publish a SECOND record at the same name signed by a
+        # different identity (call it "stale"). Both records are
+        # signature-valid; the lookup should still match the
+        # caller-supplied expected_spk against alice's real SPK.
+        stale = DMPCrypto.from_passphrase("stale", salt=b"x" * 16)
+        stale_rec = IdentityRecord(
+            username="alice",
+            x25519_pk=stale.get_public_key_bytes(),
+            ed25519_spk=stale.get_signing_public_key_bytes(),
+            ts=1_700_000_000,
+            versions=SUPPORTED_VERSIONS,
+        )
+        alice.writer.publish_txt_record(
+            zone_anchored_identity_name("alice.test"),
+            stale_rec.sign(stale),
+            ttl=300,
+        )
+
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        alice_spk = alice.crypto.get_signing_public_key_bytes()
+        # The verifier MUST find alice's real record even if the stale
+        # one is iterated first.
+        label = bob._resolve_envelope_label("alice@alice.test", alice_spk)
+        assert label == "alice@alice.test"
+
+    def test_recipient_versions_picks_record_matching_pinned_spk(self):
+        from dmp.core.crypto import DMPCrypto
+
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Publish a STALE v1-only record FIRST, then alice's real
+        # record with versions=(1,2). RRset append semantics keeps both.
+        stale = DMPCrypto.from_passphrase("stale", salt=b"x" * 16)
+        stale_rec = IdentityRecord(
+            username="alice",
+            x25519_pk=stale.get_public_key_bytes(),
+            ed25519_spk=stale.get_signing_public_key_bytes(),
+            ts=1_700_000_000,
+            versions=(1,),
+        )
+        store.publish_txt_record(
+            zone_anchored_identity_name("alice.test"),
+            stale_rec.sign(stale),
+            ttl=300,
+        )
+        _publish_identity(alice, "alice.test")
+
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+            domain="alice.test",
+        )
+        # _recipient_versions has bob's pinned SPK for alice, so the
+        # lookup MUST prefer alice's real record (advertising v2) over
+        # the stale v1 one.
+        versions = bob._recipient_versions(bob.contacts["alice"])
+        assert versions == SUPPORTED_VERSIONS
+
+
 class TestEnvelopeCaches:
     """The receive-side label cache must survive transient DNS misses
     and the send-side versions cache must not be a positive cache for

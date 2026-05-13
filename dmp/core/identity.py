@@ -252,8 +252,21 @@ def make_record(
     username: str,
     ts: Optional[int] = None,
     *,
-    versions: Tuple[int, ...] = SUPPORTED_VERSIONS,
+    versions: Tuple[int, ...] = (1,),
 ) -> IdentityRecord:
+    """Build an unsigned identity record.
+
+    ``versions`` defaults to ``(1,)`` so the wire bytes produced by this
+    function are byte-identical to the pre-versions historical encoding.
+    A pre-versions client running on `main` validates an identity record
+    by comparing its body length to the exact v1 expected length — any
+    trailing suffix rejects, so silently flipping the default to
+    ``SUPPORTED_VERSIONS`` would break sends from un-upgraded peers
+    until they all upgraded too. Senders advertise v2 capability
+    explicitly: pass ``versions=SUPPORTED_VERSIONS`` (or a CLI flag
+    plumbed through to here) once the parser-relaxation in this commit
+    has had time to propagate through the alpha install base.
+    """
     return IdentityRecord(
         username=username,
         x25519_pk=crypto.get_public_key_bytes(),

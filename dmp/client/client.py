@@ -703,15 +703,31 @@ class DMPClient:
             return None
         return _envelope.canonicalize_address(f"{self.username}@{self.domain}")
 
-    def _lookup_identity_record(self, user: str, host: str) -> Optional[IdentityRecord]:
+    def _lookup_identity_record(
+        self,
+        user: str,
+        host: str,
+        *,
+        expected_spk: Optional[bytes] = None,
+    ) -> Optional[IdentityRecord]:
         """Best-effort identity-record fetch for ``user@host``.
 
         Tries the zone-anchored name (``dmp.<host>``) first, then the
-        TOFU-hash name (``id-<hash>.<host>``). Returns the first record
-        whose Ed25519 signature verifies. Returns ``None`` on any
-        failure — caller must treat that as "unknown" and apply
-        conservative defaults (no v2 emission on send, no verified
-        label on receive).
+        TOFU-hash name (``id-<hash>.<host>``). Walks all records under
+        the chosen name and signature-verifies each.
+
+        ``expected_spk`` is the caller-supplied disambiguator. DNS RRsets
+        with append semantics may carry multiple valid identity records
+        for the same username — typically a freshly-published v2 record
+        alongside an older v1 one a user republished from. Returning
+        the first signature-valid record by RRset order would let a
+        stale record shadow the live one and silently downgrade
+        ``_recipient_versions`` or fail ``_resolve_envelope_label``
+        even though a later record matches the trusted key. When
+        ``expected_spk`` is provided we prefer a record whose
+        ``ed25519_spk`` matches; we still fall back to the first
+        username-matching record so callers without an expected key
+        (early TOFU lookups, no pin yet) still get a usable result.
         """
         candidates = (
             zone_anchored_identity_name(host),
@@ -724,13 +740,20 @@ class DMPClient:
                 continue
             if not records:
                 continue
+            first_match: Optional[IdentityRecord] = None
             for record in records:
                 parsed = IdentityRecord.parse_and_verify(record)
                 if parsed is None:
                     continue
                 ident, _sig = parsed
-                if ident.username == user:
+                if ident.username != user:
+                    continue
+                if expected_spk is not None and ident.ed25519_spk == expected_spk:
                     return ident
+                if first_match is None:
+                    first_match = ident
+            if first_match is not None:
+                return first_match
         return None
 
     def _recipient_versions(self, contact: "Contact") -> Tuple[int, ...]:
@@ -743,6 +766,11 @@ class DMPClient:
         it). Cache stores positive AND default-on-miss results so we
         don't pay the DNS roundtrip for every send; a real refresh
         flow lives in the desktop client (see Piece 4).
+
+        When ``contact`` has a pinned signing key, the lookup prefers
+        a record whose ``ed25519_spk`` matches it — defends against an
+        older republish-tombstone record sitting in an append-semantics
+        RRset alongside the live one and shadowing it.
         """
         addr = _envelope.canonicalize_address(
             f"{contact.username}@{contact.domain or self.domain}"
@@ -753,7 +781,8 @@ class DMPClient:
         if cached is not None:
             return cached
         user, host = addr.split("@", 1)
-        record = self._lookup_identity_record(user, host)
+        expected_spk = contact.signing_key_bytes or None
+        record = self._lookup_identity_record(user, host, expected_spk=expected_spk)
         versions: Tuple[int, ...] = (1,) if record is None else record.versions
         # Defense-in-depth: if the contact pinned a signing key, only
         # trust the versions field when the fetched identity record
@@ -783,7 +812,9 @@ class DMPClient:
         1. ``claimed_from`` must already be canonicalized (the envelope
            decoder canonicalizes before returning it). Defensive
            re-canonicalize here too — never trust the wire bytes.
-        2. Look up the identity record at the canonical address.
+        2. Look up the identity record at the canonical address,
+           passing ``sender_spk`` as ``expected_spk`` so a stale
+           sibling RRset entry can't shadow the matching record.
         3. Compare the record's ``ed25519_spk`` to the manifest's
            ``sender_spk`` (the AEAD signer the rest of the receive
            path already trusts).
@@ -802,7 +833,7 @@ class DMPClient:
         if cached:
             return cached
         user, host = canonical.split("@", 1)
-        record = self._lookup_identity_record(user, host)
+        record = self._lookup_identity_record(user, host, expected_spk=sender_spk)
         if record is None or record.ed25519_spk != sender_spk:
             return ""
         self._envelope_label_cache[(canonical, sender_spk)] = canonical

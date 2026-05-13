@@ -87,13 +87,24 @@ class TestIdentityRecord:
 class TestIdentityRecordVersions:
     """Backward-compat + roundtrip for the optional `versions` suffix."""
 
-    def test_default_make_record_advertises_supported_versions(self):
+    def test_default_make_record_is_v1_compatible(self):
+        """``make_record`` defaults to ``versions=(1,)`` so the wire bytes
+        produced on disk are byte-identical to the pre-versions historical
+        encoding. Pre-this-PR parsers still reject any body with extra
+        trailing bytes, so silently flipping the default would break
+        every un-upgraded peer's ability to fetch the record. Senders
+        that want to advertise v2 must opt in explicitly via
+        ``versions=SUPPORTED_VERSIONS``."""
         crypto = DMPCrypto()
         rec = make_record(crypto, "alice")
+        assert rec.versions == (1,)
+        # SUPPORTED_VERSIONS is what an opt-in caller would pass.
+        assert 1 in SUPPORTED_VERSIONS and 2 in SUPPORTED_VERSIONS
+
+    def test_explicit_supported_versions_opts_in(self):
+        crypto = DMPCrypto()
+        rec = make_record(crypto, "alice", versions=SUPPORTED_VERSIONS)
         assert rec.versions == SUPPORTED_VERSIONS
-        # Sanity: the constant must include 2 once v2 is shippable.
-        assert 1 in rec.versions
-        assert 2 in rec.versions
 
     def test_v1_only_record_has_no_suffix_on_wire(self):
         """A record explicitly publishing versions=(1,) must be
