@@ -68,8 +68,8 @@
     }
   },
   {
-    "description": "malformed envelope: invalid JSON header strips wrapper, body delivered, no label",
-    "expected_decode_body_hex": "626f64792d7374696c6c2d68657265",
+    "description": "v1 collision: prefix + non-JSON header falls back to the full plaintext, body untouched",
+    "expected_decode_body_hex": "444d5056323a7b6e6f74206a736f6e7d0a626f64792d7374696c6c2d68657265",
     "expected_decode_from": null,
     "inputs": {
       "plaintext_hex": "444d5056323a7b6e6f74206a736f6e7d0a626f64792d7374696c6c2d68657265"

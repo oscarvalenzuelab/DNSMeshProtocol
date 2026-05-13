@@ -764,6 +764,54 @@ class TestFullAddressContact:
         assert inbox[0].sender_label == "alice@alice.test"
 
 
+class TestMixedCaseUsername:
+    """A legacy identity published with mixed-case username
+    (e.g. `dnsmesh init Alice`) MUST still match envelope lookups
+    even though the envelope canonicalizer lowercases addresses. The
+    record's stored username preserves the original case for display
+    + DNS, but the lookup compares case-insensitively to find the
+    matching record.
+
+    Codex review P2 (round 6, 2026-05-13).
+    """
+
+    def test_mixed_case_record_username_matches_lowercase_envelope_lookup(self):
+        from dmp.core.identity import make_record, zone_anchored_identity_name
+
+        store = InMemoryDNSStore()
+        # Publish "Alice" (capitalized) at alice.test.
+        alice = DMPClient(
+            "Alice",
+            "alice-pass",
+            domain="alice.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        record = make_record(alice.crypto, "Alice", versions=SUPPORTED_VERSIONS)
+        store.publish_txt_record(
+            zone_anchored_identity_name("alice.test"),
+            record.sign(alice.crypto),
+            ttl=300,
+        )
+
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # bob looks up alice via the canonicalized lowercase form
+        # because that's what the envelope decoder returns.
+        label = bob._resolve_envelope_label(
+            "alice@alice.test",  # lowercase, as canonicalize emits
+            alice.crypto.get_signing_public_key_bytes(),
+        )
+        assert label == "alice@alice.test"
+
+
 class TestLegacyPinX25519Disambiguation:
     """A legacy X25519-only pin must get the same RRset-shadow
     protection a modern Ed25519 pin gets. The lookup must keep

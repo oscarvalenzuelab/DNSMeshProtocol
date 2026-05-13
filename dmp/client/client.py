@@ -786,7 +786,14 @@ class DMPClient:
                 if parsed is None:
                     continue
                 ident, _sig = parsed
-                if ident.username != user:
+                # Case-insensitive match: the envelope canonicalizer
+                # lowercases `user`, but a legacy identity may have
+                # been published with mixed-case username
+                # (`dnsmesh init Alice`). Comparing the stored case
+                # directly would skip a perfectly valid match and
+                # silently downgrade the send path or the verified
+                # label. Codex review P2 (round 6).
+                if ident.username.lower() != user:
                     continue
                 if expected_spk is not None and ident.ed25519_spk == expected_spk:
                     return ident

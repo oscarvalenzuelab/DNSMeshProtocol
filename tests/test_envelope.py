@@ -182,17 +182,22 @@ class TestDecode:
         assert body == DMPV2_PREFIX + long_header + b"\nrest"
         assert sender is None
 
-    def test_bad_json_in_header_returns_body_with_none(self):
+    def test_bad_json_falls_back_to_v1_plaintext(self):
+        """A real v2 wrapper from this codebase always emits well-formed
+        canonical JSON, so a header that fails to parse is far more
+        likely a v1 message that happens to start with ``DMPV2:`` than
+        a genuine envelope. Decode MUST fall back to the full
+        plaintext so the legacy sender's body isn't truncated."""
         wrapped = DMPV2_PREFIX + b"{not json}" + b"\nbody"
         body, sender = decode(wrapped)
-        # Body is still cleanly extracted; sender is just unverifiable.
-        assert body == b"body"
+        assert body == wrapped
         assert sender is None
 
-    def test_json_not_a_dict_returns_body_with_none(self):
+    def test_json_not_a_dict_falls_back_to_v1_plaintext(self):
+        """A list-shaped header is not a real envelope — fall back to v1."""
         wrapped = DMPV2_PREFIX + b'["alice@example.com"]' + b"\nbody"
         body, sender = decode(wrapped)
-        assert body == b"body"
+        assert body == wrapped
         assert sender is None
 
     def test_missing_from_key_returns_body_with_none(self):
@@ -239,17 +244,28 @@ class TestDecode:
         assert body == b"body"
         assert sender == "a@b.c"
 
-    def test_decode_strips_envelope_even_when_from_unverifiable(self):
-        # Regression guard: an attacker who crafts a malformed envelope
-        # MUST NOT trick the receiver into surfacing the DMPV2 prefix
-        # as user-visible text. As soon as we find a newline within
-        # bounds we commit to the envelope structure.
-        wrapped = DMPV2_PREFIX + b'{"from":"bogus"}' + b"\nattacker body"
+    def test_decode_strips_envelope_when_header_is_valid_dict_but_from_unverifiable(
+        self,
+    ):
+        # A well-formed JSON dict header commits to the envelope. The
+        # from claim may be junk (not a real address) — in that case
+        # the body is returned cleanly without a label.
+        wrapped = DMPV2_PREFIX + b'{"from":"bogus"}' + b"\nbody"
         body, sender = decode(wrapped)
-        assert body == b"attacker body"
+        assert body == b"body"
         assert sender is None
         # Confirm no prefix leakage:
         assert DMPV2_PREFIX not in body
+
+    def test_legacy_message_starting_with_prefix_and_newline_preserved(self):
+        """Regression for codex P2 round 6: a v1 message whose first
+        few bytes happen to be ``DMPV2:`` followed by some text and a
+        newline within 256 bytes MUST be delivered intact, not
+        truncated. The decoder requires well-formed JSON to commit."""
+        legacy = DMPV2_PREFIX + b"actual first line\nrest of message"
+        body, sender = decode(legacy)
+        assert body == legacy  # full plaintext preserved
+        assert sender is None
 
 
 class TestEncodeDecodeRoundtrip:

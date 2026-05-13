@@ -150,21 +150,23 @@ def decode(plaintext: bytes) -> Tuple[bytes, Optional[str]]:
     - Prefix matches but no newline appears within ``MAX_HEADER_BYTES``
       → ``(plaintext, None)``. Safety valve for the implausible case
       where a v1 body happens to start with ``DMPV2:`` followed by
-      256 bytes without a newline. The probability is ~256⁻⁶ but the
-      safety valve keeps v1 fallback total.
-    - Prefix matches and a newline is found → committed v2 envelope.
-      Body is everything after the first newline. The header is
-      then parsed best-effort; any failure downgrades to
-      ``sender_label = None`` but the body is still returned cleanly.
-      Failure modes that yield ``(body, None)``:
-
-        * header bytes not valid ASCII / not valid JSON,
-        * JSON is not a dict,
-        * no ``from`` key,
-        * ``from`` value not a string,
-        * ``from`` fails canonicalization.
-
-      Successful canonicalization yields ``(body, canonical_from)``.
+      256 bytes without a newline.
+    - Prefix matches, newline found, but the header bytes are not
+      well-formed JSON OR the JSON is not a dict → ``(plaintext, None)``.
+      A real v2 wrapper from this codebase always emits well-formed
+      canonical JSON, so a header that fails to parse is far more
+      likely a v1 message that happens to start with ``DMPV2:`` than
+      a genuine but corrupted envelope. Falling back to the full
+      plaintext means a legacy v1 message whose first 256 bytes
+      happen to start with ``DMPV2:`` keeps its body intact instead
+      of losing everything up to the first newline. Codex review P2
+      (round 6).
+    - Prefix matches, newline found, header parses as a dict →
+      committed v2 envelope. Body is everything after the first
+      newline. Inside the envelope the ``from`` claim is parsed and
+      canonicalized; missing / non-string / non-canonicalizable
+      ``from`` returns ``(body, None)`` because the wrapper itself
+      is real but the metadata isn't trustworthy.
 
     The returned ``claimed_from`` is canonicalized. It is NOT yet
     trust-verified — the caller MUST resolve ``from`` via DNS and
@@ -178,13 +180,13 @@ def decode(plaintext: bytes) -> Tuple[bytes, Optional[str]]:
     if nl < 0:
         return plaintext, None
     header_bytes = rest[:nl]
-    body = rest[nl + 1 :]
     try:
         header = json.loads(header_bytes.decode("ascii"))
     except (UnicodeDecodeError, ValueError):
-        return body, None
+        return plaintext, None
     if not isinstance(header, dict):
-        return body, None
+        return plaintext, None
+    body = rest[nl + 1 :]
     raw_from = header.get("from")
     if not isinstance(raw_from, str):
         return body, None

@@ -1080,15 +1080,18 @@ def gen_dmpv2_envelope_cases() -> list[dict[str, Any]]:
         }
     )
 
-    # 8. Decode-only: malformed JSON in envelope — body still
-    #    extracted, label drops to None.
+    # 8. Decode-only: a v1-shape plaintext that happens to start with
+    #    the DMPV2 prefix and contain a newline within 256 bytes.
+    #    Because the header isn't well-formed JSON, decode MUST fall
+    #    back to the full plaintext so the legacy sender's body
+    #    isn't truncated. Codex review P2 (round 6).
     bad_json_plaintext = b"DMPV2:{not json}\nbody-still-here"
     decoded_body, decoded_addr = envelope.decode(bad_json_plaintext)
     cases.append(
         {
             "description": (
-                "malformed envelope: invalid JSON header strips wrapper, "
-                "body delivered, no label"
+                "v1 collision: prefix + non-JSON header falls back to "
+                "the full plaintext, body untouched"
             ),
             "inputs": {
                 "plaintext_hex": bad_json_plaintext.hex(),
