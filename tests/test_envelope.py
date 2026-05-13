@@ -258,10 +258,10 @@ class TestDecode:
         assert DMPV2_PREFIX not in body
 
     def test_legacy_message_starting_with_prefix_and_newline_preserved(self):
-        """Regression for codex P2 round 6: a v1 message whose first
-        few bytes happen to be ``DMPV2:`` followed by some text and a
-        newline within 256 bytes MUST be delivered intact, not
-        truncated. The decoder requires well-formed JSON to commit."""
+        """A v1 message whose first few bytes happen to be ``DMPV2:``
+        followed by some text and a newline within 256 bytes MUST be
+        delivered intact, not truncated. The decoder requires
+        well-formed JSON to commit."""
         legacy = DMPV2_PREFIX + b"actual first line\nrest of message"
         body, sender = decode(legacy)
         assert body == legacy  # full plaintext preserved

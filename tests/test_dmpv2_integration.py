@@ -121,7 +121,7 @@ class TestEnvelopeRoundtrip:
         not the sender's. Alice's identity record can say versions=(1,)
         — that's a statement about what she can RECEIVE — and she
         still emits v2 envelopes when sending to a v2-capable peer.
-        This is the codex-validated design: senders never need to
+        This is the designed behavior: senders never need to
         consult their own identity record to decide what to emit."""
         store = InMemoryDNSStore()
         alice, bob = _make_pair(store, alice_versions=(1,))
@@ -360,8 +360,6 @@ class TestRRSetDisambiguation:
     - ``_resolve_envelope_label`` would see the old record's SPK,
       fail to match the manifest's ``sender_spk``, and refuse to
       populate the verified label.
-
-    Codex review P2 (2026-05-13).
     """
 
     def test_resolve_envelope_label_picks_record_matching_sender_spk(self):
@@ -466,8 +464,6 @@ class TestFallbackNameSearch:
     A premature early-return at the first username-matching record
     would silently break v2 emission and label verification in any
     deployment that's gone through a republish/migration.
-
-    Codex review P2 (round 2, 2026-05-13).
     """
 
     def test_recipient_versions_falls_through_to_hash_named_record(self):
@@ -594,8 +590,6 @@ class TestIdentityDomainOverride:
     domain (where the identity record is actually published), not at
     the mailbox domain. Otherwise receivers look up the wrong address
     and never produce a verified sender_label.
-
-    Codex review P2 (round 3, 2026-05-13).
     """
 
     def test_envelope_uses_identity_domain_when_configured(self):
@@ -650,8 +644,6 @@ class TestVersionsCacheRespectsPinChange:
     a different key at the same address inherits the previous pin's
     cached v2-OK verdict — and the send path emits a wrapper to a
     recipient that the new pin says is v1-only or unrelated.
-
-    Codex review P2 (round 3, 2026-05-13).
     """
 
     def test_repinning_invalidates_versions_cache(self):
@@ -710,8 +702,6 @@ class TestFullAddressContact:
     `user@host` from the localpart, not from the already-full
     string — or canonicalization fails and v2 emission silently
     downgrades.
-
-    Codex review P2 (round 4, 2026-05-13).
     """
 
     def test_full_address_username_still_emits_v2(self):
@@ -771,8 +761,6 @@ class TestMixedCaseUsername:
     record's stored username preserves the original case for display
     + DNS, but the lookup compares case-insensitively to find the
     matching record.
-
-    Codex review P2 (round 6, 2026-05-13).
     """
 
     def test_mixed_case_record_username_matches_lowercase_envelope_lookup(self):
@@ -818,7 +806,7 @@ class TestMixedCaseHashName:
     `identity_domain`) has its record at `identity_domain("Alice",
     host)` — a different hash than `identity_domain("alice", host)`.
     The send path must look up under the ORIGINAL case to find the
-    record. Codex review P2 (round 7, 2026-05-13).
+    record.
     """
 
     def test_recipient_versions_finds_mixed_case_hash_named_record(self):
@@ -869,8 +857,6 @@ class TestLegacyPinX25519Disambiguation:
     protection a modern Ed25519 pin gets. The lookup must keep
     searching past a stale record whose X25519 key doesn't match the
     pinned encryption key.
-
-    Codex review P2 (round 4, 2026-05-13).
     """
 
     def test_legacy_pin_finds_matching_record_past_stale(self):
@@ -932,8 +918,6 @@ class TestLegacyContactDoesNotTrustSquattedVersions:
     address (advertising v2) would trick the send path into wrapping
     plaintext destined for a v1-only legacy contact, leaking the
     `DMPV2:` prefix into their message body.
-
-    Codex review P2 (round 2, 2026-05-13).
     """
 
     def test_squatted_v2_record_does_not_upgrade_legacy_contact(self):
@@ -1013,8 +997,8 @@ class TestEnvelopeCaches:
         # Cached.
         assert (addr, spk) in bob._envelope_label_cache
         # Mutate the store to break the lookup — the cache must not
-        # forget the previously-verified binding (codex consult
-        # 2026-05-13: a transient NXDOMAIN must not evict).
+        # forget the previously-verified binding (transient NXDOMAIN
+        # must not evict).
         store._records.clear()  # type: ignore[attr-defined]
         cached = bob._resolve_envelope_label(addr, spk)
         assert cached == addr

@@ -164,8 +164,7 @@ failure → `sender_label = ""` (UI falls back to SPK fingerprint).
 
 Positive bindings are cached in memory (`(canonical_from, sender_spk)
 → canonical_from`). Negative results are NOT cached — a transient
-DNS failure must not evict a previously-verified binding. Per codex
-consult 2026-05-13.
+DNS failure must not evict a previously-verified binding.
 
 ### Capability gating (no leaked wrappers)
 
@@ -186,7 +185,7 @@ in the message body.
 | versions=[1] | versions=[1,2] | v2 (wrapper)* | clean body, verified label |
 
 \* The sender's own `versions` field advertises **receive** capability;
-it does not gate **send**. Codex-validated 2026-05-13.
+it does not gate **send**.
 
 ## Forward secrecy (X3DH-style prekeys)
 

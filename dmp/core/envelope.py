@@ -159,8 +159,7 @@ def decode(plaintext: bytes) -> Tuple[bytes, Optional[str]]:
       a genuine but corrupted envelope. Falling back to the full
       plaintext means a legacy v1 message whose first 256 bytes
       happen to start with ``DMPV2:`` keeps its body intact instead
-      of losing everything up to the first newline. Codex review P2
-      (round 6).
+      of losing everything up to the first newline.
     - Prefix matches, newline found, header parses as a dict →
       committed v2 envelope. Body is everything after the first
       newline. Inside the envelope the ``from`` claim is parsed and
