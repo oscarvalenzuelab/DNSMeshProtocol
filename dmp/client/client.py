@@ -738,6 +738,7 @@ class DMPClient:
         *,
         expected_spk: Optional[bytes] = None,
         expected_x25519_pk: Optional[bytes] = None,
+        hash_user_variants: Sequence[str] = (),
     ) -> Optional[IdentityRecord]:
         """Best-effort identity-record fetch for ``user@host``.
 
@@ -768,11 +769,29 @@ class DMPClient:
         the lookup from reaching the matching hash-named record, and a
         legacy X25519-only pin MUST get the same shadow protection as
         a modern Ed25519 pin.
+
+        ``hash_user_variants`` provides additional username spellings
+        to use when computing the hash-name fallback. The TOFU-hash
+        name is ``identity_domain(username, host)`` =
+        ``id-<sha256(username)[:16]>.<host>``, so a record published
+        with a mixed-case username (`dnsmesh init Alice`) lives at a
+        DIFFERENT hash-name than the canonical lowercase form. The
+        envelope canonicalizer always lowercases addresses, so without
+        an extra variant the lookup misses the record entirely.
+        Callers that know the contact's original-case username pass
+        it here. Codex review P2 (round 7).
         """
-        candidates = (
-            zone_anchored_identity_name(host),
-            identity_domain(user, host),
-        )
+        hash_names = []
+        seen_hash_keys: set = set()
+        for variant in (user, *hash_user_variants):
+            if not variant:
+                continue
+            key = variant
+            if key in seen_hash_keys:
+                continue
+            seen_hash_keys.add(key)
+            hash_names.append(identity_domain(variant, host))
+        candidates = [zone_anchored_identity_name(host), *hash_names]
         first_match: Optional[IdentityRecord] = None
         for name in candidates:
             try:
@@ -856,11 +875,16 @@ class DMPClient:
             if not contact.signing_key_bytes and contact.public_key_bytes
             else None
         )
+        # Pass the original-case localpart as a hash-name variant so
+        # mixed-case identities (e.g. `dnsmesh init Alice`) publishing
+        # to the TOFU-hash form are still findable from the
+        # canonicalized lowercase lookup. Codex review P2 (round 7).
         record = self._lookup_identity_record(
             user,
             host,
             expected_spk=expected_spk,
             expected_x25519_pk=expected_x25519_pk,
+            hash_user_variants=(raw_user,),
         )
         versions: Tuple[int, ...] = (1,) if record is None else record.versions
         # Defense-in-depth: only trust the versions field when the

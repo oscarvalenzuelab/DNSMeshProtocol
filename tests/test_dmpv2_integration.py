@@ -812,6 +812,58 @@ class TestMixedCaseUsername:
         assert label == "alice@alice.test"
 
 
+class TestMixedCaseHashName:
+    """A contact whose identity was published under the TOFU-hash form
+    with a mixed-case username (`dnsmesh init Alice` without
+    `identity_domain`) has its record at `identity_domain("Alice",
+    host)` — a different hash than `identity_domain("alice", host)`.
+    The send path must look up under the ORIGINAL case to find the
+    record. Codex review P2 (round 7, 2026-05-13).
+    """
+
+    def test_recipient_versions_finds_mixed_case_hash_named_record(self):
+        from dmp.core.identity import identity_domain, make_record
+
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "Alice",
+            "alice-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Publish under the TOFU-hash name computed from "Alice" (the
+        # mixed-case publish path), with v2 advertised.
+        record = make_record(alice.crypto, "Alice", versions=SUPPORTED_VERSIONS)
+        store.publish_txt_record(
+            identity_domain("Alice", "mesh.test"),
+            record.sign(alice.crypto),
+            ttl=300,
+        )
+
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="mesh.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # bob pins alice with the original case (as it would be after
+        # a successful identity fetch).
+        bob.add_contact(
+            "Alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+            domain="mesh.test",
+        )
+        # _recipient_versions must hash against "Alice" (original case)
+        # so it hits the record at `id-<hash("Alice")[:16]>.mesh.test`.
+        versions = bob._recipient_versions(bob.contacts["Alice"])
+        assert versions == SUPPORTED_VERSIONS
+
+
 class TestLegacyPinX25519Disambiguation:
     """A legacy X25519-only pin must get the same RRset-shadow
     protection a modern Ed25519 pin gets. The lookup must keep
