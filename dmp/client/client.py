@@ -247,6 +247,7 @@ class DMPClient:
         passphrase: str,
         *,
         domain: str = "mesh.local",
+        identity_domain: Optional[str] = None,
         store: Optional[DNSRecordStore] = None,
         writer: Optional[DNSRecordWriter] = None,
         reader: Optional[DNSRecordReader] = None,
@@ -272,6 +273,18 @@ class DMPClient:
 
         self.username = username
         self.domain = domain
+        # The DMPv2 envelope advertises the sender at its **published**
+        # identity address. When the CLI publishes identity records at
+        # `dmp.<identity_domain>` (zone-anchored, squat-resistant
+        # form), the envelope's `from` claim has to point at THAT
+        # address so the recipient can verify it via DNS lookup. If
+        # `identity_domain` isn't configured we fall back to
+        # `self.domain` — the legacy shared-mesh layout where
+        # identity records live under the same zone as the mailbox.
+        # Codex review P2 (round 3): without this, identity-domain
+        # users can decrypt v2 messages but never see a verified
+        # `sender_label`.
+        self._identity_address_host = identity_domain or domain
         self.crypto = DMPCrypto.from_passphrase(passphrase, salt=kdf_salt)
         self.user_id = hashlib.sha256(self.crypto.get_public_key_bytes()).digest()
 
@@ -337,13 +350,18 @@ class DMPClient:
         # (codex consult 2026-05-13). Negative results are not
         # cached so the binding can recover on later receive passes.
         #
-        # ``_recipient_versions_cache`` maps a canonical
-        # ``user@host`` to the protocol versions advertised by that
-        # peer's identity record. ``send_message`` consults this
-        # before emitting a v2 envelope so a v1-only receiver
-        # (missing field → ``(1,)``) is never sent a wrapper.
+        # ``_recipient_versions_cache`` maps
+        # ``(canonical_addr, pin_material)`` to the protocol versions
+        # advertised by that peer's identity record. The pin material
+        # disambiguates re-pin / rotation at the same address: when a
+        # contact gets re-pinned to a different key, the new (addr,
+        # new_pin) tuple is a cache miss, so we re-fetch and re-apply
+        # the SPK-match guard. Codex review P2 (round 3): without
+        # this, a cached "v2 OK" from an old pin would skip the
+        # mismatch check and let the send path wrap plaintext bound
+        # for a v1-only or unrelated successor.
         self._envelope_label_cache: Dict[Tuple[str, bytes], str] = {}
-        self._recipient_versions_cache: Dict[str, Tuple[int, ...]] = {}
+        self._recipient_versions_cache: Dict[Tuple[str, bytes], Tuple[int, ...]] = {}
 
         # M10 — local DNS endpoint for SAME-ZONE recipient-zone claim
         # publishes. The CLI sets these (from ``cfg.tsig_dns_server``
@@ -694,14 +712,24 @@ class DMPClient:
         """Return the sender's own canonical ``user@host`` if it canonicalizes.
 
         Used at send time as the value of ``from`` in the v2 envelope.
-        Falls back to None when the client's username + domain are not
-        a valid envelope address — in which case the send path emits a
-        v1 plaintext (no wrapper) unconditionally, regardless of the
-        recipient's advertised support.
+        Falls back to None when the client's username or identity host
+        are not a valid envelope address — in which case the send path
+        emits a v1 plaintext (no wrapper) unconditionally, regardless
+        of the recipient's advertised support.
+
+        Uses ``self._identity_address_host`` (the configured
+        ``identity_domain`` if any, else ``self.domain``) so the
+        ``from`` claim points at wherever this user's identity record
+        is actually published. Otherwise an identity-domain
+        deployment's envelope would claim a different address than
+        the one the receiver can verify, and no first-contact would
+        ever surface a verified label.
         """
-        if not self.username or not self.domain:
+        if not self.username or not self._identity_address_host:
             return None
-        return _envelope.canonicalize_address(f"{self.username}@{self.domain}")
+        return _envelope.canonicalize_address(
+            f"{self.username}@{self._identity_address_host}"
+        )
 
     def _lookup_identity_record(
         self,
@@ -787,7 +815,12 @@ class DMPClient:
         )
         if addr is None:
             return (1,)
-        cached = self._recipient_versions_cache.get(addr)
+        # Cache key includes the pinned key material so a re-pin (or
+        # rotation to a different key at the same address) is a cache
+        # miss rather than a stale-trust hit.
+        pin_material = contact.signing_key_bytes or contact.public_key_bytes or b""
+        cache_key = (addr, bytes(pin_material))
+        cached = self._recipient_versions_cache.get(cache_key)
         if cached is not None:
             return cached
         user, host = addr.split("@", 1)
@@ -819,7 +852,7 @@ class DMPClient:
             elif contact.public_key_bytes:
                 if record.x25519_pk != contact.public_key_bytes:
                     versions = (1,)
-        self._recipient_versions_cache[addr] = versions
+        self._recipient_versions_cache[cache_key] = versions
         return versions
 
     def _resolve_envelope_label(

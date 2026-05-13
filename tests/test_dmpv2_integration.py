@@ -588,6 +588,121 @@ class TestFallbackNameSearch:
         assert label == "alice@alice.test"
 
 
+class TestIdentityDomainOverride:
+    """When the CLI configures `identity_domain` separately from the
+    mailbox domain, the envelope's `from` must point at the identity
+    domain (where the identity record is actually published), not at
+    the mailbox domain. Otherwise receivers look up the wrong address
+    and never produce a verified sender_label.
+
+    Codex review P2 (round 3, 2026-05-13).
+    """
+
+    def test_envelope_uses_identity_domain_when_configured(self):
+        store = InMemoryDNSStore()
+        # Alice runs with mailbox under cluster.test but publishes
+        # her identity at her own domain alice.example.
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="cluster.test",
+            identity_domain="alice.example",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        _publish_identity(alice, "alice.example")
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="cluster.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        _publish_identity(bob, "cluster.test")
+        alice.add_contact(
+            "bob",
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+            domain="cluster.test",
+        )
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+            domain="cluster.test",
+        )
+
+        assert alice.send_message("bob", "hello bob")
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        # `from` MUST resolve to alice's identity domain, not her
+        # mailbox domain. The receiver finds the record at
+        # dmp.alice.example, matches SPK, and surfaces the label.
+        assert inbox[0].plaintext == b"hello bob"
+        assert inbox[0].sender_label == "alice@alice.example"
+
+
+class TestVersionsCacheRespectsPinChange:
+    """The recipient-versions cache MUST be keyed by the pinned key
+    material, not just the address. Otherwise a contact re-pinned to
+    a different key at the same address inherits the previous pin's
+    cached v2-OK verdict — and the send path emits a wrapper to a
+    recipient that the new pin says is v1-only or unrelated.
+
+    Codex review P2 (round 3, 2026-05-13).
+    """
+
+    def test_repinning_invalidates_versions_cache(self):
+        from dmp.core.crypto import DMPCrypto
+
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        _publish_identity(alice, "alice.test")
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # First pin: alice's real keys.
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+            domain="alice.test",
+        )
+        versions1 = bob._recipient_versions(bob.contacts["alice"])
+        assert versions1 == SUPPORTED_VERSIONS
+
+        # Now re-pin "alice" to a different identity at the same
+        # address — simulates rotation or a manual re-trust step.
+        new_alice = DMPCrypto.from_passphrase("new-alice", salt=b"x" * 16)
+        bob.contacts["alice"] = type(bob.contacts["alice"])(
+            username="alice",
+            public_key_bytes=new_alice.get_public_key_bytes(),
+            signing_key_bytes=new_alice.get_signing_public_key_bytes(),
+            domain="alice.test",
+        )
+        # The identity record at alice.test still belongs to the OLD
+        # alice (advertising v2). With the cache properly keyed by
+        # pin material, the new pin is a cache miss → fresh lookup →
+        # SPK mismatch (new pin != record's old SPK) → downgrade
+        # to v1.
+        versions2 = bob._recipient_versions(bob.contacts["alice"])
+        assert versions2 == (1,)
+
+
 class TestLegacyContactDoesNotTrustSquattedVersions:
     """A legacy contact pinned only via X25519 (signing_key_bytes empty)
     must NOT have `versions` trusted unless the fetched identity

@@ -1127,6 +1127,7 @@ def _make_client(
             config.username,
             passphrase,
             domain=effective_domain,
+            identity_domain=config.identity_domain or None,
             writer=writer,
             reader=reader,
             replay_cache_path=replay_path,
