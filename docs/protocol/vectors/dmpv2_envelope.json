@@ -1,0 +1,78 @@
+[
+  {
+    "description": "round-trip: short ASCII body, alice@example.com",
+    "expected_decode_body_hex": "68656c6c6f20626f62",
+    "expected_decode_from": "alice@example.com",
+    "expected_plaintext_hex": "444d5056323a7b2266726f6d223a22616c696365406578616d706c652e636f6d227d0a68656c6c6f20626f62",
+    "inputs": {
+      "body_hex": "68656c6c6f20626f62",
+      "sender_addr": "alice@example.com"
+    }
+  },
+  {
+    "description": "edge case: empty body",
+    "expected_decode_body_hex": "",
+    "expected_decode_from": "alice@example.com",
+    "expected_plaintext_hex": "444d5056323a7b2266726f6d223a22616c696365406578616d706c652e636f6d227d0a",
+    "inputs": {
+      "body_hex": "",
+      "sender_addr": "alice@example.com"
+    }
+  },
+  {
+    "description": "edge case: binary body covering 0..255",
+    "expected_decode_body_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+    "expected_decode_from": "alice@example.com",
+    "expected_plaintext_hex": "444d5056323a7b2266726f6d223a22616c696365406578616d706c652e636f6d227d0a000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+    "inputs": {
+      "body_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "sender_addr": "alice@example.com"
+    }
+  },
+  {
+    "description": "canonicalization: mixed-case input normalizes",
+    "expected_decode_body_hex": "6869",
+    "expected_decode_from": "alice@example.com",
+    "expected_plaintext_hex": "444d5056323a7b2266726f6d223a22616c696365406578616d706c652e636f6d227d0a6869",
+    "inputs": {
+      "body_hex": "6869",
+      "sender_addr": "ALICE@Example.COM."
+    }
+  },
+  {
+    "description": "v1: sender_addr=None emits raw body, no wrapper",
+    "expected_decode_body_hex": "756e77726170706564206c6567616379",
+    "expected_decode_from": null,
+    "expected_plaintext_hex": "756e77726170706564206c6567616379",
+    "inputs": {
+      "body_hex": "756e77726170706564206c6567616379",
+      "sender_addr": null
+    }
+  },
+  {
+    "description": "reject path: non-canonical sender_addr falls back to v1",
+    "expected_decode_body_hex": "706c61696e",
+    "expected_decode_from": null,
+    "expected_plaintext_hex": "706c61696e",
+    "inputs": {
+      "body_hex": "706c61696e",
+      "sender_addr": "not-an-address"
+    }
+  },
+  {
+    "description": "forward-compat: extra header keys are ignored, from still parses",
+    "expected_decode_body_hex": "666f72776172642d636f6d70617420626f6479",
+    "expected_decode_from": "alice@example.com",
+    "inputs": {
+      "plaintext_hex": "444d5056323a7b2266726f6d223a22616c696365406578616d706c652e636f6d222c227265706c795f746f223a22626f62406578616d706c652e636f6d227d0a666f72776172642d636f6d70617420626f6479"
+    }
+  },
+  {
+    "description": "malformed envelope: invalid JSON header strips wrapper, body delivered, no label",
+    "expected_decode_body_hex": "626f64792d7374696c6c2d68657265",
+    "expected_decode_from": null,
+    "inputs": {
+      "plaintext_hex": "444d5056323a7b6e6f74206a736f6e7d0a626f64792d7374696c6c2d68657265"
+    }
+  }
+]

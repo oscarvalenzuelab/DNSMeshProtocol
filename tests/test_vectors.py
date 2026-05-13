@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+from dmp.core import envelope
 from dmp.core.bootstrap import BootstrapEntry, BootstrapRecord
 from dmp.core.cluster import ClusterManifest, ClusterNode
 from dmp.core.crypto import DMPCrypto
@@ -183,19 +184,37 @@ class TestIdentityRecordVectors:
             x25519_pk=bytes.fromhex(inputs["x25519_pk_hex"]),
             ed25519_spk=bytes.fromhex(inputs["ed25519_spk_hex"]),
             ts=inputs["ts"],
+            versions=tuple(inputs.get("versions", (1,))),
         )
         return rec.sign(crypto)
 
+    @staticmethod
+    def _find(cases, description: str) -> dict[str, Any]:
+        for c in cases:
+            if c["description"] == description:
+                return c
+        raise AssertionError(f"vector with description {description!r} not found")
+
     def test_round_trip_byte_identical(self, cases):
-        case = cases[0]
+        case = self._find(cases, "round-trip: minimal identity for alice")
         assert self._build(case) == _wire_from_hex(case)
 
     def test_boundary_username_max_byte_identical(self, cases):
-        case = cases[1]
+        case = self._find(cases, "boundary: 64-byte max username length")
         assert self._build(case) == _wire_from_hex(case)
 
+    def test_versions_suffix_byte_identical(self, cases):
+        case = self._find(cases, "versions suffix: identity advertises (1, 2)")
+        # Build + sign must match the recorded wire.
+        assert self._build(case) == _wire_from_hex(case)
+        # Parse + verify exposes the versions list.
+        parsed = IdentityRecord.parse_and_verify(_wire_from_hex(case))
+        assert parsed is not None
+        rec, _sig = parsed
+        assert list(rec.versions) == case["expected_parse_versions"]
+
     def test_signature_failure_corrupt_trailer(self, cases):
-        case = cases[2]
+        case = self._find(cases, "signature failure: last byte of signature flipped")
         wire = _wire_from_hex(case)
         assert IdentityRecord.parse_and_verify(wire) is None
 
@@ -395,6 +414,52 @@ class TestRevocationRecordVectors:
         )
 
 
+# --- DMPv2 envelope ---------------------------------------------------------
+
+
+class TestDMPv2EnvelopeVectors:
+    """Codec interop for the plaintext envelope.
+
+    Each vector is verified two ways:
+
+    1. Re-encode: run ``envelope.encode(body, sender_addr=...)`` against
+       the recorded inputs and assert the bytes match
+       ``expected_plaintext_hex``.
+    2. Decode: run ``envelope.decode(expected_plaintext_hex)`` and
+       assert the returned ``(body, from)`` matches
+       ``expected_decode_body_hex`` and ``expected_decode_from``.
+
+    Vectors with ``inputs.plaintext_hex`` (decode-only cases like
+    forward-compat extras and malformed envelopes) only run step 2.
+    """
+
+    @pytest.fixture(scope="class")
+    def cases(self) -> list[dict[str, Any]]:
+        return _load("dmpv2_envelope")
+
+    def test_every_case_decodes_as_recorded(self, cases):
+        assert cases, "envelope vectors missing"
+        for case in cases:
+            inputs = case["inputs"]
+            if "plaintext_hex" in inputs:
+                plaintext = bytes.fromhex(inputs["plaintext_hex"])
+            else:
+                plaintext = bytes.fromhex(case["expected_plaintext_hex"])
+            body, sender = envelope.decode(plaintext)
+            assert body.hex() == case["expected_decode_body_hex"], case["description"]
+            assert sender == case["expected_decode_from"], case["description"]
+
+    def test_encode_round_trips_for_input_cases(self, cases):
+        for case in cases:
+            inputs = case["inputs"]
+            if "plaintext_hex" in inputs:
+                # Decode-only case; nothing to re-encode.
+                continue
+            body = bytes.fromhex(inputs["body_hex"])
+            wrapped = envelope.encode(body, sender_addr=inputs["sender_addr"])
+            assert wrapped.hex() == case["expected_plaintext_hex"], case["description"]
+
+
 # --- Regen-sanity: make sure every JSON file can be parsed. -----------------
 
 
@@ -419,6 +484,22 @@ def test_vector_file_is_well_formed(name: str):
         # Round-tripping the hex back and forth catches corruption.
         hex_str = case["expected_wire_hex"]
         assert hex_str == bytes.fromhex(hex_str).hex()
+
+
+def test_dmpv2_envelope_vector_file_is_well_formed():
+    cases = _load("dmpv2_envelope")
+    assert isinstance(cases, list) and cases
+    for case in cases:
+        assert "description" in case
+        assert "expected_decode_body_hex" in case
+        # Decode-only cases carry the plaintext under inputs; encode
+        # roundtrip cases carry it as a top-level field.
+        plaintext_hex = case.get("expected_plaintext_hex") or case["inputs"].get(
+            "plaintext_hex"
+        )
+        assert plaintext_hex, case["description"]
+        for hex_str in (plaintext_hex, case["expected_decode_body_hex"]):
+            assert hex_str == bytes.fromhex(hex_str).hex()
 
 
 def test_generator_is_reproducible(tmp_path):

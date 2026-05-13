@@ -36,6 +36,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from dmp.core import envelope
 from dmp.core.bootstrap import BootstrapEntry, BootstrapRecord
 from dmp.core.cluster import ClusterManifest, ClusterNode
 from dmp.core.crypto import DMPCrypto
@@ -427,6 +428,35 @@ def gen_identity_record_cases() -> list[dict[str, Any]]:
             },
             "expected_wire_hex": wire_long.encode("utf-8").hex(),
             "expected_parse_username": long_name,
+        }
+    )
+
+    # 2b. Optional versions suffix: a record advertising (1, 2). The
+    # body gains a 1-byte versions_len followed by sorted version
+    # bytes. Implementers MUST parse the trailing suffix and default
+    # to (1,) when absent.
+    rec_v12 = IdentityRecord(
+        username="alice",
+        x25519_pk=alice.get_public_key_bytes(),
+        ed25519_spk=alice.get_signing_public_key_bytes(),
+        ts=TS_2030,
+        versions=(1, 2),
+    )
+    wire_v12 = rec_v12.sign(alice)
+    cases.append(
+        {
+            "description": "versions suffix: identity advertises (1, 2)",
+            "identity_seed_hex": alice_seed.hex(),
+            "inputs": {
+                "username": "alice",
+                "x25519_pk_hex": alice.get_public_key_bytes().hex(),
+                "ed25519_spk_hex": alice.get_signing_public_key_bytes().hex(),
+                "ts": TS_2030,
+                "versions": [1, 2],
+            },
+            "expected_wire_hex": wire_v12.encode("utf-8").hex(),
+            "expected_parse_username": "alice",
+            "expected_parse_versions": [1, 2],
         }
     )
 
@@ -948,6 +978,129 @@ def gen_revocation_record_cases() -> list[dict[str, Any]]:
 # --- driver -----------------------------------------------------------------
 
 
+def gen_dmpv2_envelope_cases() -> list[dict[str, Any]]:
+    """DMPv2 plaintext envelope: deterministic encode + decode vectors.
+
+    The envelope wraps the AEAD plaintext, so these are pure byte
+    transforms with no signatures involved — implementers cross-check
+    by re-running `encode(body, sender_addr=...)` against the
+    expected hex below and by feeding `expected_plaintext_hex` into
+    `decode` and asserting the returned `(body, claimed_from)`.
+    """
+    cases: list[dict[str, Any]] = []
+
+    def _case(
+        description: str,
+        body_hex: str,
+        sender_addr,
+        *,
+        expected_decode_addr=None,
+    ) -> None:
+        body = bytes.fromhex(body_hex)
+        wrapped = envelope.encode(body, sender_addr=sender_addr)
+        decoded_body, decoded_addr = envelope.decode(wrapped)
+        cases.append(
+            {
+                "description": description,
+                "inputs": {
+                    "body_hex": body_hex,
+                    "sender_addr": sender_addr,
+                },
+                "expected_plaintext_hex": wrapped.hex(),
+                "expected_decode_body_hex": decoded_body.hex(),
+                "expected_decode_from": (
+                    expected_decode_addr
+                    if expected_decode_addr is not None
+                    else decoded_addr
+                ),
+            }
+        )
+
+    # 1. Round-trip: standard short message.
+    _case(
+        "round-trip: short ASCII body, alice@example.com",
+        b"hello bob".hex(),
+        "alice@example.com",
+    )
+
+    # 2. Empty body.
+    _case(
+        "edge case: empty body",
+        "",
+        "alice@example.com",
+    )
+
+    # 3. Binary body (full 0..255 range).
+    _case(
+        "edge case: binary body covering 0..255",
+        bytes(range(256)).hex(),
+        "alice@example.com",
+    )
+
+    # 4. Canonicalization: mixed-case address normalizes on encode.
+    _case(
+        "canonicalization: mixed-case input normalizes",
+        b"hi".hex(),
+        "ALICE@Example.COM.",
+    )
+
+    # 5. v1 wire form: no envelope (sender_addr=None).
+    _case(
+        "v1: sender_addr=None emits raw body, no wrapper",
+        b"unwrapped legacy".hex(),
+        None,
+    )
+
+    # 6. Reject path: invalid sender_addr falls back to raw body
+    #    (canonicalization rejects → encode returns body unchanged).
+    _case(
+        "reject path: non-canonical sender_addr falls back to v1",
+        b"plain".hex(),
+        "not-an-address",
+        expected_decode_addr=None,
+    )
+
+    # 7. Decode-only: manually crafted envelope with extra header
+    #    fields (forward-compat — receivers MUST ignore unknown keys).
+    forward_compat_plaintext = (
+        b"DMPV2:" + b'{"from":"alice@example.com","reply_to":"bob@example.com"}'
+        b"\n" + b"forward-compat body"
+    )
+    decoded_body, decoded_addr = envelope.decode(forward_compat_plaintext)
+    cases.append(
+        {
+            "description": (
+                "forward-compat: extra header keys are ignored, from " "still parses"
+            ),
+            "inputs": {
+                "plaintext_hex": forward_compat_plaintext.hex(),
+            },
+            "expected_decode_body_hex": decoded_body.hex(),
+            "expected_decode_from": decoded_addr,
+        }
+    )
+
+    # 8. Decode-only: malformed JSON in envelope — body still
+    #    extracted, label drops to None.
+    bad_json_plaintext = b"DMPV2:{not json}\nbody-still-here"
+    decoded_body, decoded_addr = envelope.decode(bad_json_plaintext)
+    cases.append(
+        {
+            "description": (
+                "malformed envelope: invalid JSON header strips wrapper, "
+                "body delivered, no label"
+            ),
+            "inputs": {
+                "plaintext_hex": bad_json_plaintext.hex(),
+            },
+            "expected_decode_body_hex": decoded_body.hex(),
+            "expected_decode_from": decoded_addr,
+        }
+    )
+
+    return cases
+
+
 def write_vectors(name: str, cases: list[dict[str, Any]]) -> None:
     target = VECTORS_DIR / f"{name}.json"
     # sort_keys=True + indent=2 so diffs are minimal and reviewable.
@@ -964,6 +1117,7 @@ def main() -> None:
     write_vectors("prekey", gen_prekey_cases())
     write_vectors("rotation_record", gen_rotation_record_cases())
     write_vectors("revocation_record", gen_revocation_record_cases())
+    write_vectors("dmpv2_envelope", gen_dmpv2_envelope_cases())
 
 
 if __name__ == "__main__":
