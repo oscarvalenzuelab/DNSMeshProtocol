@@ -281,9 +281,8 @@ class DMPClient:
         # `identity_domain` isn't configured we fall back to
         # `self.domain` — the legacy shared-mesh layout where
         # identity records live under the same zone as the mailbox.
-        # Codex review P2 (round 3): without this, identity-domain
-        # users can decrypt v2 messages but never see a verified
-        # `sender_label`.
+        # Without this, identity-domain users can decrypt v2 messages
+        # but never see a verified `sender_label`.
         self._identity_address_host = identity_domain or domain
         self.crypto = DMPCrypto.from_passphrase(passphrase, salt=kdf_salt)
         self.user_id = hashlib.sha256(self.crypto.get_public_key_bytes()).digest()
@@ -346,9 +345,9 @@ class DMPClient:
         # ``_envelope_label_cache`` maps a verified
         # ``(claimed_from, sender_spk)`` tuple to its canonical form.
         # Only positive verifications are cached; a transient DNS
-        # failure must NOT evict a previously-verified binding
-        # (codex consult 2026-05-13). Negative results are not
-        # cached so the binding can recover on later receive passes.
+        # failure must NOT evict a previously-verified binding.
+        # Negative results are not cached so the binding can recover
+        # on later receive passes.
         #
         # ``_recipient_versions_cache`` maps
         # ``(canonical_addr, pin_material)`` to the protocol versions
@@ -356,10 +355,9 @@ class DMPClient:
         # disambiguates re-pin / rotation at the same address: when a
         # contact gets re-pinned to a different key, the new (addr,
         # new_pin) tuple is a cache miss, so we re-fetch and re-apply
-        # the SPK-match guard. Codex review P2 (round 3): without
-        # this, a cached "v2 OK" from an old pin would skip the
-        # mismatch check and let the send path wrap plaintext bound
-        # for a v1-only or unrelated successor.
+        # the SPK-match guard. Without this, a cached "v2 OK" from an
+        # old pin would skip the mismatch check and let the send path
+        # wrap plaintext bound for a v1-only or unrelated successor.
         self._envelope_label_cache: Dict[Tuple[str, bytes], str] = {}
         self._recipient_versions_cache: Dict[Tuple[str, bytes], Tuple[int, ...]] = {}
 
@@ -765,10 +763,10 @@ class DMPClient:
            (covers the early-TOFU case where the caller supplied a
            disambiguator defensively but hadn't actually pinned yet).
 
-        Codex review P2: a stale zone-anchored record MUST NOT prevent
-        the lookup from reaching the matching hash-named record, and a
-        legacy X25519-only pin MUST get the same shadow protection as
-        a modern Ed25519 pin.
+        A stale zone-anchored record MUST NOT prevent the lookup from
+        reaching the matching hash-named record, and a legacy
+        X25519-only pin MUST get the same shadow protection as a modern
+        Ed25519 pin.
 
         ``hash_user_variants`` provides additional username spellings
         to use when computing the hash-name fallback. The TOFU-hash
@@ -779,7 +777,7 @@ class DMPClient:
         envelope canonicalizer always lowercases addresses, so without
         an extra variant the lookup misses the record entirely.
         Callers that know the contact's original-case username pass
-        it here. Codex review P2 (round 7).
+        it here.
         """
         hash_names = []
         seen_hash_keys: set = set()
@@ -811,7 +809,7 @@ class DMPClient:
                 # (`dnsmesh init Alice`). Comparing the stored case
                 # directly would skip a perfectly valid match and
                 # silently downgrade the send path or the verified
-                # label. Codex review P2 (round 6).
+                # label.
                 if ident.username.lower() != user:
                     continue
                 if expected_spk is not None and ident.ed25519_spk == expected_spk:
@@ -848,7 +846,6 @@ class DMPClient:
         # falling back to (1,) — meaning zone-anchored CLI contacts
         # never get DMPv2 envelopes. Strip the host suffix from
         # username when it already includes one.
-        # Codex review P2 (round 4): handle full-address contacts.
         raw_user = contact.username
         if "@" in raw_user:
             raw_user = raw_user.split("@", 1)[0]
@@ -878,7 +875,7 @@ class DMPClient:
         # Pass the original-case localpart as a hash-name variant so
         # mixed-case identities (e.g. `dnsmesh init Alice`) publishing
         # to the TOFU-hash form are still findable from the
-        # canonicalized lowercase lookup. Codex review P2 (round 7).
+        # canonicalized lowercase lookup.
         record = self._lookup_identity_record(
             user,
             host,
@@ -904,7 +901,7 @@ class DMPClient:
         #      Without this check a squatted identity at the same
         #      address could trick us into emitting v2 to a v1-only
         #      legacy contact and leak the DMPV2 prefix into their
-        #      message body. Codex review P2.
+        #      message body.
         if record is not None:
             if contact.signing_key_bytes:
                 if record.ed25519_spk != contact.signing_key_bytes:
