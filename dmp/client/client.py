@@ -11,10 +11,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 
+from dmp.core import envelope as _envelope
 from dmp.core import erasure
 from dmp.core.chunking import MessageAssembler, MessageChunker
 from dmp.core.crypto import DMPCrypto, EncryptedMessage, MessageEncryption
 from dmp.core.dns import DMPDNSRecord
+from dmp.core.identity import (
+    IdentityRecord,
+    identity_domain,
+    parse_address,
+    zone_anchored_identity_name,
+)
 from dmp.core.manifest import NO_PREKEY, ReplayCache, SlotManifest
 from dmp.core.message import DMPHeader, DMPIdentity, DMPMessage, MessageType
 from dmp.core.prekeys import Prekey, PrekeyStore, prekey_rrset_name
@@ -193,6 +200,9 @@ class InboxMessage:
     plaintext: bytes
     timestamp: int
     msg_id: bytes
+    sender_label: str = (
+        ""  # canonical user@host from a verified DMPv2 envelope, else ""
+    )
 
 
 @dataclass
@@ -237,6 +247,7 @@ class DMPClient:
         passphrase: str,
         *,
         domain: str = "mesh.local",
+        identity_domain: Optional[str] = None,
         store: Optional[DNSRecordStore] = None,
         writer: Optional[DNSRecordWriter] = None,
         reader: Optional[DNSRecordReader] = None,
@@ -262,6 +273,18 @@ class DMPClient:
 
         self.username = username
         self.domain = domain
+        # The DMPv2 envelope advertises the sender at its **published**
+        # identity address. When the CLI publishes identity records at
+        # `dmp.<identity_domain>` (zone-anchored, squat-resistant
+        # form), the envelope's `from` claim has to point at THAT
+        # address so the recipient can verify it via DNS lookup. If
+        # `identity_domain` isn't configured we fall back to
+        # `self.domain` — the legacy shared-mesh layout where
+        # identity records live under the same zone as the mailbox.
+        # Codex review P2 (round 3): without this, identity-domain
+        # users can decrypt v2 messages but never see a verified
+        # `sender_label`.
+        self._identity_address_host = identity_domain or domain
         self.crypto = DMPCrypto.from_passphrase(passphrase, salt=kdf_salt)
         self.user_id = hashlib.sha256(self.crypto.get_public_key_bytes()).digest()
 
@@ -317,6 +340,28 @@ class DMPClient:
         from dmp.client.intro_queue import IntroQueue
 
         self.intro_queue = IntroQueue(intro_queue_path)
+
+        # DMPv2 — in-memory caches used by the envelope codec.
+        #
+        # ``_envelope_label_cache`` maps a verified
+        # ``(claimed_from, sender_spk)`` tuple to its canonical form.
+        # Only positive verifications are cached; a transient DNS
+        # failure must NOT evict a previously-verified binding
+        # (codex consult 2026-05-13). Negative results are not
+        # cached so the binding can recover on later receive passes.
+        #
+        # ``_recipient_versions_cache`` maps
+        # ``(canonical_addr, pin_material)`` to the protocol versions
+        # advertised by that peer's identity record. The pin material
+        # disambiguates re-pin / rotation at the same address: when a
+        # contact gets re-pinned to a different key, the new (addr,
+        # new_pin) tuple is a cache miss, so we re-fetch and re-apply
+        # the SPK-match guard. Codex review P2 (round 3): without
+        # this, a cached "v2 OK" from an old pin would skip the
+        # mismatch check and let the send path wrap plaintext bound
+        # for a v1-only or unrelated successor.
+        self._envelope_label_cache: Dict[Tuple[str, bytes], str] = {}
+        self._recipient_versions_cache: Dict[Tuple[str, bytes], Tuple[int, ...]] = {}
 
         # M10 — local DNS endpoint for SAME-ZONE recipient-zone claim
         # publishes. The CLI sets these (from ``cfg.tsig_dns_server``
@@ -661,6 +706,257 @@ class DMPClient:
         except Exception:
             pass
 
+    # ---- DMPv2 envelope helpers ---------------------------------------------
+
+    def _my_canonical_address(self) -> Optional[str]:
+        """Return the sender's own canonical ``user@host`` if it canonicalizes.
+
+        Used at send time as the value of ``from`` in the v2 envelope.
+        Falls back to None when the client's username or identity host
+        are not a valid envelope address — in which case the send path
+        emits a v1 plaintext (no wrapper) unconditionally, regardless
+        of the recipient's advertised support.
+
+        Uses ``self._identity_address_host`` (the configured
+        ``identity_domain`` if any, else ``self.domain``) so the
+        ``from`` claim points at wherever this user's identity record
+        is actually published. Otherwise an identity-domain
+        deployment's envelope would claim a different address than
+        the one the receiver can verify, and no first-contact would
+        ever surface a verified label.
+        """
+        if not self.username or not self._identity_address_host:
+            return None
+        return _envelope.canonicalize_address(
+            f"{self.username}@{self._identity_address_host}"
+        )
+
+    def _lookup_identity_record(
+        self,
+        user: str,
+        host: str,
+        *,
+        expected_spk: Optional[bytes] = None,
+        expected_x25519_pk: Optional[bytes] = None,
+        hash_user_variants: Sequence[str] = (),
+    ) -> Optional[IdentityRecord]:
+        """Best-effort identity-record fetch for ``user@host``.
+
+        Tries the zone-anchored name (``dmp.<host>``) first, then the
+        TOFU-hash name (``id-<hash>.<host>``). Walks all records under
+        each candidate name and signature-verifies each.
+
+        Two optional disambiguators handle the append-semantics RRset
+        case where multiple valid records coexist (typical after a
+        republish or migration):
+
+        - ``expected_spk`` (Ed25519) — modern pins have a signing key.
+          A record matches when ``record.ed25519_spk == expected_spk``.
+        - ``expected_x25519_pk`` (X25519) — legacy pins have only the
+          encryption key. A record matches when
+          ``record.x25519_pk == expected_x25519_pk``.
+
+        Search semantics when either disambiguator is provided:
+
+        1. Walk BOTH candidate names. The instant a record matches the
+           supplied disambiguator, return it — don't keep looking.
+        2. If we finish both names without a match, fall back to the
+           first username-matching record we saw across both names
+           (covers the early-TOFU case where the caller supplied a
+           disambiguator defensively but hadn't actually pinned yet).
+
+        Codex review P2: a stale zone-anchored record MUST NOT prevent
+        the lookup from reaching the matching hash-named record, and a
+        legacy X25519-only pin MUST get the same shadow protection as
+        a modern Ed25519 pin.
+
+        ``hash_user_variants`` provides additional username spellings
+        to use when computing the hash-name fallback. The TOFU-hash
+        name is ``identity_domain(username, host)`` =
+        ``id-<sha256(username)[:16]>.<host>``, so a record published
+        with a mixed-case username (`dnsmesh init Alice`) lives at a
+        DIFFERENT hash-name than the canonical lowercase form. The
+        envelope canonicalizer always lowercases addresses, so without
+        an extra variant the lookup misses the record entirely.
+        Callers that know the contact's original-case username pass
+        it here. Codex review P2 (round 7).
+        """
+        hash_names = []
+        seen_hash_keys: set = set()
+        for variant in (user, *hash_user_variants):
+            if not variant:
+                continue
+            key = variant
+            if key in seen_hash_keys:
+                continue
+            seen_hash_keys.add(key)
+            hash_names.append(identity_domain(variant, host))
+        candidates = [zone_anchored_identity_name(host), *hash_names]
+        first_match: Optional[IdentityRecord] = None
+        for name in candidates:
+            try:
+                records = self.reader.query_txt_record(name)
+            except Exception:
+                continue
+            if not records:
+                continue
+            for record in records:
+                parsed = IdentityRecord.parse_and_verify(record)
+                if parsed is None:
+                    continue
+                ident, _sig = parsed
+                # Case-insensitive match: the envelope canonicalizer
+                # lowercases `user`, but a legacy identity may have
+                # been published with mixed-case username
+                # (`dnsmesh init Alice`). Comparing the stored case
+                # directly would skip a perfectly valid match and
+                # silently downgrade the send path or the verified
+                # label. Codex review P2 (round 6).
+                if ident.username.lower() != user:
+                    continue
+                if expected_spk is not None and ident.ed25519_spk == expected_spk:
+                    return ident
+                if (
+                    expected_x25519_pk is not None
+                    and ident.x25519_pk == expected_x25519_pk
+                ):
+                    return ident
+                if first_match is None:
+                    first_match = ident
+        return first_match
+
+    def _recipient_versions(self, contact: "Contact") -> Tuple[int, ...]:
+        """Return the protocol versions advertised by ``contact``'s identity.
+
+        Memoized in ``_recipient_versions_cache``. A cache miss triggers
+        a DNS lookup; failure to fetch defaults to ``(1,)`` (the safe
+        "v1-only" assumption — the send path will skip the v2 envelope
+        rather than risk leaking the wrapper to a peer who can't strip
+        it). Cache stores positive AND default-on-miss results so we
+        don't pay the DNS roundtrip for every send; a real refresh
+        flow lives in the desktop client (see Piece 4).
+
+        When ``contact`` has a pinned signing key, the lookup prefers
+        a record whose ``ed25519_spk`` matches it — defends against an
+        older republish-tombstone record sitting in an append-semantics
+        RRset alongside the live one and shadowing it.
+        """
+        # CLI's `identity fetch user@host --add` saves the full
+        # address as the contact's username, with no `remote_username`
+        # resolved. Without normalization we'd build
+        # `bob@bob.example@bob.example` and fail canonicalization,
+        # falling back to (1,) — meaning zone-anchored CLI contacts
+        # never get DMPv2 envelopes. Strip the host suffix from
+        # username when it already includes one.
+        # Codex review P2 (round 4): handle full-address contacts.
+        raw_user = contact.username
+        if "@" in raw_user:
+            raw_user = raw_user.split("@", 1)[0]
+        addr = _envelope.canonicalize_address(
+            f"{raw_user}@{contact.domain or self.domain}"
+        )
+        if addr is None:
+            return (1,)
+        # Cache key includes the pinned key material so a re-pin (or
+        # rotation to a different key at the same address) is a cache
+        # miss rather than a stale-trust hit.
+        pin_material = contact.signing_key_bytes or contact.public_key_bytes or b""
+        cache_key = (addr, bytes(pin_material))
+        cached = self._recipient_versions_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        user, host = addr.split("@", 1)
+        expected_spk = contact.signing_key_bytes or None
+        # Legacy contacts (no signing-key pin) get the X25519 pubkey
+        # as a disambiguator so a stale/squat record sitting first in
+        # an append-semantics RRset can't shadow the live record.
+        expected_x25519_pk = (
+            contact.public_key_bytes
+            if not contact.signing_key_bytes and contact.public_key_bytes
+            else None
+        )
+        # Pass the original-case localpart as a hash-name variant so
+        # mixed-case identities (e.g. `dnsmesh init Alice`) publishing
+        # to the TOFU-hash form are still findable from the
+        # canonicalized lowercase lookup. Codex review P2 (round 7).
+        record = self._lookup_identity_record(
+            user,
+            host,
+            expected_spk=expected_spk,
+            expected_x25519_pk=expected_x25519_pk,
+            hash_user_variants=(raw_user,),
+        )
+        versions: Tuple[int, ...] = (1,) if record is None else record.versions
+        # Defense-in-depth: only trust the versions field when the
+        # fetched record's keys match what we've already pinned.
+        # Two pin shapes to handle:
+        #
+        #   1. Modern pin: ``contact.signing_key_bytes`` is set. The
+        #      record's ``ed25519_spk`` must match. A different key on
+        #      the same name might be a squatter who happens to
+        #      advertise v2; trusting that record would let them get
+        #      a wrapper into our send path toward a recipient who
+        #      can't strip it.
+        #
+        #   2. Legacy pin: ``signing_key_bytes`` is empty (pre-Ed25519
+        #      pins) but ``public_key_bytes`` is set. The record's
+        #      ``x25519_pk`` must match the pinned encryption key.
+        #      Without this check a squatted identity at the same
+        #      address could trick us into emitting v2 to a v1-only
+        #      legacy contact and leak the DMPV2 prefix into their
+        #      message body. Codex review P2.
+        if record is not None:
+            if contact.signing_key_bytes:
+                if record.ed25519_spk != contact.signing_key_bytes:
+                    versions = (1,)
+            elif contact.public_key_bytes:
+                if record.x25519_pk != contact.public_key_bytes:
+                    versions = (1,)
+        self._recipient_versions_cache[cache_key] = versions
+        return versions
+
+    def _resolve_envelope_label(
+        self, claimed_from: Optional[str], sender_spk: bytes
+    ) -> str:
+        """Verify a v2 envelope's ``from`` claim against ``sender_spk``.
+
+        Returns the canonical address on a positive binding, or ``""``
+        when the binding cannot be verified — the receive paths use the
+        empty string as "no verified label, fall back to SPK
+        fingerprint in the UI."
+
+        Verification chain:
+
+        1. ``claimed_from`` must already be canonicalized (the envelope
+           decoder canonicalizes before returning it). Defensive
+           re-canonicalize here too — never trust the wire bytes.
+        2. Look up the identity record at the canonical address,
+           passing ``sender_spk`` as ``expected_spk`` so a stale
+           sibling RRset entry can't shadow the matching record.
+        3. Compare the record's ``ed25519_spk`` to the manifest's
+           ``sender_spk`` (the AEAD signer the rest of the receive
+           path already trusts).
+
+        Positive results are cached in ``_envelope_label_cache`` so
+        repeated decrypts of the same sender don't repeat the DNS
+        lookup. Negative results are NOT cached — a transient NXDOMAIN
+        must be able to recover on the next receive pass.
+        """
+        if not claimed_from:
+            return ""
+        canonical = _envelope.canonicalize_address(claimed_from)
+        if canonical is None:
+            return ""
+        cached = self._envelope_label_cache.get((canonical, sender_spk))
+        if cached:
+            return cached
+        user, host = canonical.split("@", 1)
+        record = self._lookup_identity_record(user, host, expected_spk=sender_spk)
+        if record is None or record.ed25519_spk != sender_spk:
+            return ""
+        self._envelope_label_cache[(canonical, sender_spk)] = canonical
+        return canonical
+
     # ---- send --------------------------------------------------------------
 
     def send_message(
@@ -762,8 +1058,28 @@ class DMPClient:
             ttl=header.ttl,
         )
         aad_bytes = aad_header.to_bytes() + prekey_id.to_bytes(4, "big")
+
+        # DMPv2 envelope: wrap the body with a versioned header
+        # carrying our canonical user@host address, so the recipient
+        # can populate `sender_label` on first-contact (intro queue)
+        # delivery without an out-of-band introduction. Only emit when
+        # the recipient's identity record explicitly advertises v2
+        # support — a v1-only receiver decrypts the wrapper as literal
+        # text and the user sees `DMPV2:{"from":"..."}\n` in their
+        # message body, which is the UX hit we're avoiding. Missing
+        # versions suffix on the recipient's identity record defaults
+        # to (1,) (see ``IdentityRecord``), so old peers are correctly
+        # treated as v1-only without any explicit feature flag.
+        sender_addr = self._my_canonical_address()
+        recipient_versions = self._recipient_versions(contact)
+        if sender_addr is not None and 2 in recipient_versions:
+            body_bytes = _envelope.encode(
+                message.encode("utf-8"), sender_addr=sender_addr
+            )
+        else:
+            body_bytes = message.encode("utf-8")
         encrypted = self.encryption.encrypt_with_header(
-            message.encode("utf-8"),
+            body_bytes,
             recipient_pubkey,
             aad_bytes,
         )
@@ -1134,9 +1450,12 @@ class DMPClient:
                     if decoded is None:
                         self.replay_cache.release(manifest.sender_spk, manifest.msg_id)
                         continue
-                    plaintext, ts, msg_id = decoded
+                    plaintext, ts, msg_id, claimed_from = decoded
                     self.replay_cache.finalize(
                         manifest.sender_spk, manifest.msg_id, manifest.exp
+                    )
+                    sender_label = self._resolve_envelope_label(
+                        claimed_from, manifest.sender_spk
                     )
                     results.append(
                         InboxMessage(
@@ -1144,6 +1463,7 @@ class DMPClient:
                             plaintext=plaintext,
                             timestamp=ts,
                             msg_id=msg_id,
+                            sender_label=sender_label,
                         )
                     )
         # M8.3 — poll claim providers for first-contact pointers in
@@ -1459,9 +1779,12 @@ class DMPClient:
                         self.replay_cache.release(manifest.sender_spk, manifest.msg_id)
                         _drop("decrypt-failed")
                         continue
-                    plaintext, ts, msg_id = decoded
+                    plaintext, ts, msg_id, claimed_from = decoded
                     self.replay_cache.finalize(
                         manifest.sender_spk, manifest.msg_id, manifest.exp
+                    )
+                    sender_label = self._resolve_envelope_label(
+                        claimed_from, manifest.sender_spk
                     )
 
                     # Codex P2 final-review fix: a contact who rotated
@@ -1519,16 +1842,25 @@ class DMPClient:
                                 plaintext=plaintext,
                                 timestamp=ts,
                                 msg_id=msg_id,
+                                sender_label=sender_label,
                             )
                         )
                     else:
                         # Un-pinned sender → quarantine in intro queue.
+                        # When the envelope's `from` resolved against
+                        # the manifest spk, store the verified address
+                        # as the intro's sender_label so the desktop
+                        # UI can render "alice@dmp.dnsmesh.io" instead
+                        # of "(unpinned sender)". An unverified or
+                        # missing label leaves the existing empty
+                        # sender_label default in place.
                         intro_id = self.intro_queue.add_intro(
                             sender_spk=manifest.sender_spk,
                             msg_id=manifest.msg_id,
                             plaintext=plaintext,
                             sender_mailbox_domain=claim.sender_mailbox_domain,
                             msg_exp=manifest.exp,
+                            sender_label=sender_label,
                         )
                         if intro_id is not None:
                             quarantined_ids.append(intro_id)
@@ -1598,6 +1930,7 @@ class DMPClient:
             plaintext=intro.plaintext,
             timestamp=intro.received_at,
             msg_id=intro.msg_id,
+            sender_label=intro.sender_label,
         )
         self.intro_queue.remove_intro(intro_id)
         return msg
@@ -1660,8 +1993,15 @@ class DMPClient:
         manifest: SlotManifest,
         *,
         source_zone: Optional[str] = None,
-    ) -> Optional[Tuple[bytes, int, bytes]]:
-        """Return (plaintext, timestamp, msg_id) or None if assembly/decrypt fails.
+    ) -> Optional[Tuple[bytes, int, bytes, Optional[str]]]:
+        """Return (body, timestamp, msg_id, claimed_from) or None on failure.
+
+        ``body`` is the user-message bytes after stripping any DMPv2
+        envelope. ``claimed_from`` is the canonical user@host the
+        envelope advertised (or None for v1 wire plaintext / malformed
+        envelope). The claim is NOT yet trust-verified — callers MUST
+        run it through ``_resolve_envelope_label`` before populating
+        any user-visible label.
 
         `source_zone` MUST be the zone the manifest itself was fetched from.
         The chunk RRsets for this message live in the same zone the manifest
@@ -1829,4 +2169,10 @@ class DMPClient:
             self.prekey_store.consume(manifest.prekey_id)
             if prekey_wire:
                 self._delete_published_prekey(prekey_wire)
-        return plaintext, outer.header.timestamp, outer.header.message_id
+        # Strip the optional DMPv2 envelope. For v1 wire (no prefix)
+        # this returns ``(plaintext, None)`` and the body is unchanged
+        # — same semantics as before this commit, so v1 senders
+        # continue to deliver as a plain byte string with no
+        # sender_label.
+        body, claimed_from = _envelope.decode(plaintext)
+        return body, outer.header.timestamp, outer.header.message_id, claimed_from
