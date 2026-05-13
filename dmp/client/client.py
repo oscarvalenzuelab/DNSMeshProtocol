@@ -714,25 +714,38 @@ class DMPClient:
 
         Tries the zone-anchored name (``dmp.<host>``) first, then the
         TOFU-hash name (``id-<hash>.<host>``). Walks all records under
-        the chosen name and signature-verifies each.
+        each candidate name and signature-verifies each.
 
         ``expected_spk`` is the caller-supplied disambiguator. DNS RRsets
         with append semantics may carry multiple valid identity records
         for the same username — typically a freshly-published v2 record
         alongside an older v1 one a user republished from. Returning
-        the first signature-valid record by RRset order would let a
+        the first signature-valid record without filtering would let a
         stale record shadow the live one and silently downgrade
         ``_recipient_versions`` or fail ``_resolve_envelope_label``
-        even though a later record matches the trusted key. When
-        ``expected_spk`` is provided we prefer a record whose
-        ``ed25519_spk`` matches; we still fall back to the first
-        username-matching record so callers without an expected key
-        (early TOFU lookups, no pin yet) still get a usable result.
+        even though a later record matches the trusted key.
+
+        Search semantics when ``expected_spk`` is provided:
+
+        1. Walk BOTH names. The instant a record's ``ed25519_spk``
+           matches ``expected_spk``, return it — don't keep looking.
+        2. If we finish both names without an SPK match, fall back to
+           the first username-matching record we saw across both
+           names (covers the early-TOFU case where the caller
+           supplied ``expected_spk`` defensively but hadn't actually
+           pinned that key yet).
+
+        Codex review P2: a stale zone-anchored record with a wrong
+        SPK MUST NOT prevent the lookup from reaching the matching
+        hash-named record. Walking each name in isolation and
+        bailing on first_match-per-name (the previous shape) failed
+        that contract.
         """
         candidates = (
             zone_anchored_identity_name(host),
             identity_domain(user, host),
         )
+        first_match: Optional[IdentityRecord] = None
         for name in candidates:
             try:
                 records = self.reader.query_txt_record(name)
@@ -740,7 +753,6 @@ class DMPClient:
                 continue
             if not records:
                 continue
-            first_match: Optional[IdentityRecord] = None
             for record in records:
                 parsed = IdentityRecord.parse_and_verify(record)
                 if parsed is None:
@@ -752,9 +764,7 @@ class DMPClient:
                     return ident
                 if first_match is None:
                     first_match = ident
-            if first_match is not None:
-                return first_match
-        return None
+        return first_match
 
     def _recipient_versions(self, contact: "Contact") -> Tuple[int, ...]:
         """Return the protocol versions advertised by ``contact``'s identity.
@@ -784,16 +794,31 @@ class DMPClient:
         expected_spk = contact.signing_key_bytes or None
         record = self._lookup_identity_record(user, host, expected_spk=expected_spk)
         versions: Tuple[int, ...] = (1,) if record is None else record.versions
-        # Defense-in-depth: if the contact pinned a signing key, only
-        # trust the versions field when the fetched identity record
-        # advertises the same key. A different key on the same name
-        # might be a squat — fall back to v1.
-        if (
-            record is not None
-            and contact.signing_key_bytes
-            and record.ed25519_spk != contact.signing_key_bytes
-        ):
-            versions = (1,)
+        # Defense-in-depth: only trust the versions field when the
+        # fetched record's keys match what we've already pinned.
+        # Two pin shapes to handle:
+        #
+        #   1. Modern pin: ``contact.signing_key_bytes`` is set. The
+        #      record's ``ed25519_spk`` must match. A different key on
+        #      the same name might be a squatter who happens to
+        #      advertise v2; trusting that record would let them get
+        #      a wrapper into our send path toward a recipient who
+        #      can't strip it.
+        #
+        #   2. Legacy pin: ``signing_key_bytes`` is empty (pre-Ed25519
+        #      pins) but ``public_key_bytes`` is set. The record's
+        #      ``x25519_pk`` must match the pinned encryption key.
+        #      Without this check a squatted identity at the same
+        #      address could trick us into emitting v2 to a v1-only
+        #      legacy contact and leak the DMPV2 prefix into their
+        #      message body. Codex review P2.
+        if record is not None:
+            if contact.signing_key_bytes:
+                if record.ed25519_spk != contact.signing_key_bytes:
+                    versions = (1,)
+            elif contact.public_key_bytes:
+                if record.x25519_pk != contact.public_key_bytes:
+                    versions = (1,)
         self._recipient_versions_cache[addr] = versions
         return versions
 

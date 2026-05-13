@@ -460,6 +460,198 @@ class TestRRSetDisambiguation:
         assert versions == SUPPORTED_VERSIONS
 
 
+class TestFallbackNameSearch:
+    """When the zone-anchored name has only a stale record but the
+    TOFU-hash name has the live record, the lookup MUST keep searching.
+    A premature early-return at the first username-matching record
+    would silently break v2 emission and label verification in any
+    deployment that's gone through a republish/migration.
+
+    Codex review P2 (round 2, 2026-05-13).
+    """
+
+    def test_recipient_versions_falls_through_to_hash_named_record(self):
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.identity import identity_domain
+
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Stale record at the zone-anchored name (wrong SPK, but a
+        # valid signature so it can't just be discarded).
+        stale = DMPCrypto.from_passphrase("stale", salt=b"x" * 16)
+        stale_rec = IdentityRecord(
+            username="alice",
+            x25519_pk=stale.get_public_key_bytes(),
+            ed25519_spk=stale.get_signing_public_key_bytes(),
+            ts=1_700_000_000,
+            versions=(1,),
+        )
+        store.publish_txt_record(
+            zone_anchored_identity_name("alice.test"),
+            stale_rec.sign(stale),
+            ttl=300,
+        )
+        # Live record at the TOFU-hash name (alice's real key,
+        # advertising v2). Publish via _publish_identity but at the
+        # hashed name — go around the helper because the helper
+        # writes to the zone-anchored name.
+        live_rec = IdentityRecord(
+            username="alice",
+            x25519_pk=alice.crypto.get_public_key_bytes(),
+            ed25519_spk=alice.crypto.get_signing_public_key_bytes(),
+            ts=1_700_000_000,
+            versions=SUPPORTED_VERSIONS,
+        )
+        store.publish_txt_record(
+            identity_domain("alice", "alice.test"),
+            live_rec.sign(alice.crypto),
+            ttl=300,
+        )
+
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+            domain="alice.test",
+        )
+        # The verifier must look past the stale zone-anchored record
+        # and find alice's real key at the hash-named fallback.
+        versions = bob._recipient_versions(bob.contacts["alice"])
+        assert versions == SUPPORTED_VERSIONS
+
+    def test_resolve_envelope_label_falls_through_to_hash_named_record(self):
+        from dmp.core.crypto import DMPCrypto
+        from dmp.core.identity import identity_domain
+
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Stale at zone-anchored name.
+        stale = DMPCrypto.from_passphrase("stale", salt=b"x" * 16)
+        stale_rec = IdentityRecord(
+            username="alice",
+            x25519_pk=stale.get_public_key_bytes(),
+            ed25519_spk=stale.get_signing_public_key_bytes(),
+            ts=1_700_000_000,
+            versions=SUPPORTED_VERSIONS,
+        )
+        store.publish_txt_record(
+            zone_anchored_identity_name("alice.test"),
+            stale_rec.sign(stale),
+            ttl=300,
+        )
+        # Live at hash-name.
+        live_rec = IdentityRecord(
+            username="alice",
+            x25519_pk=alice.crypto.get_public_key_bytes(),
+            ed25519_spk=alice.crypto.get_signing_public_key_bytes(),
+            ts=1_700_000_000,
+            versions=SUPPORTED_VERSIONS,
+        )
+        store.publish_txt_record(
+            identity_domain("alice", "alice.test"),
+            live_rec.sign(alice.crypto),
+            ttl=300,
+        )
+
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        alice_spk = alice.crypto.get_signing_public_key_bytes()
+        label = bob._resolve_envelope_label("alice@alice.test", alice_spk)
+        assert label == "alice@alice.test"
+
+
+class TestLegacyContactDoesNotTrustSquattedVersions:
+    """A legacy contact pinned only via X25519 (signing_key_bytes empty)
+    must NOT have `versions` trusted unless the fetched identity
+    record's ``x25519_pk`` matches the pinned encryption key. Without
+    this gate, a squatter who publishes any identity record at the
+    address (advertising v2) would trick the send path into wrapping
+    plaintext destined for a v1-only legacy contact, leaking the
+    `DMPV2:` prefix into their message body.
+
+    Codex review P2 (round 2, 2026-05-13).
+    """
+
+    def test_squatted_v2_record_does_not_upgrade_legacy_contact(self):
+        from dmp.core.crypto import DMPCrypto
+
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Publish a SQUAT record at alice's address signed by a
+        # different identity, advertising v2.
+        squat = DMPCrypto.from_passphrase("squat", salt=b"x" * 16)
+        squat_rec = IdentityRecord(
+            username="alice",
+            x25519_pk=squat.get_public_key_bytes(),
+            ed25519_spk=squat.get_signing_public_key_bytes(),
+            ts=1_700_000_000,
+            versions=SUPPORTED_VERSIONS,
+        )
+        store.publish_txt_record(
+            zone_anchored_identity_name("alice.test"),
+            squat_rec.sign(squat),
+            ttl=300,
+        )
+
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Legacy pin: bob has alice's X25519 pubkey but NOT her
+        # Ed25519 signing key (the pre-Ed25519-pin contact shape).
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            # signing_key_hex omitted → contact.signing_key_bytes = b""
+            domain="alice.test",
+        )
+        # With only an X25519 pin available, the squatted v2 record
+        # must NOT cause v2 emission. The X25519 pubkey in the squat
+        # record doesn't match alice's real pubkey, so the
+        # _recipient_versions defense rejects it.
+        versions = bob._recipient_versions(bob.contacts["alice"])
+        assert versions == (1,)
+
+
 class TestEnvelopeCaches:
     """The receive-side label cache must survive transient DNS misses
     and the send-side versions cache must not be a positive cache for
