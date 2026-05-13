@@ -703,6 +703,127 @@ class TestVersionsCacheRespectsPinChange:
         assert versions2 == (1,)
 
 
+class TestFullAddressContact:
+    """The CLI's `identity fetch user@host --add` saves the full
+    address as the contact's username when no `remote_username` is
+    resolved. `_recipient_versions` must normalize this — build
+    `user@host` from the localpart, not from the already-full
+    string — or canonicalization fails and v2 emission silently
+    downgrades.
+
+    Codex review P2 (round 4, 2026-05-13).
+    """
+
+    def test_full_address_username_still_emits_v2(self):
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        _publish_identity(alice, "alice.test")
+        _publish_identity(bob, "bob.test")
+        # Simulate the CLI's full-address contact shape: username is
+        # the full address.
+        alice.add_contact(
+            "bob@bob.test",  # full address as username
+            bob.get_public_key_hex(),
+            signing_key_hex=bob.get_signing_public_key_hex(),
+            domain="bob.test",
+        )
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            signing_key_hex=alice.get_signing_public_key_hex(),
+            domain="alice.test",
+        )
+
+        # Even though the contact's username is "bob@bob.test",
+        # _recipient_versions strips the @host suffix before
+        # canonicalizing — so v2 emission survives.
+        versions = alice._recipient_versions(alice.contacts["bob@bob.test"])
+        assert versions == SUPPORTED_VERSIONS
+
+        # End-to-end send + receive still works, and bob gets
+        # the verified label.
+        assert alice.send_message("bob@bob.test", "hello")
+        inbox = bob.receive_messages()
+        assert len(inbox) == 1
+        assert inbox[0].plaintext == b"hello"
+        assert inbox[0].sender_label == "alice@alice.test"
+
+
+class TestLegacyPinX25519Disambiguation:
+    """A legacy X25519-only pin must get the same RRset-shadow
+    protection a modern Ed25519 pin gets. The lookup must keep
+    searching past a stale record whose X25519 key doesn't match the
+    pinned encryption key.
+
+    Codex review P2 (round 4, 2026-05-13).
+    """
+
+    def test_legacy_pin_finds_matching_record_past_stale(self):
+        from dmp.core.crypto import DMPCrypto
+
+        store = InMemoryDNSStore()
+        alice = DMPClient(
+            "alice",
+            "alice-pass",
+            domain="alice.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Stale record published FIRST under alice's address —
+        # different X25519 key, different SPK, advertising v1.
+        stale = DMPCrypto.from_passphrase("stale", salt=b"x" * 16)
+        stale_rec = IdentityRecord(
+            username="alice",
+            x25519_pk=stale.get_public_key_bytes(),
+            ed25519_spk=stale.get_signing_public_key_bytes(),
+            ts=1_700_000_000,
+            versions=(1,),
+        )
+        store.publish_txt_record(
+            zone_anchored_identity_name("alice.test"),
+            stale_rec.sign(stale),
+            ttl=300,
+        )
+        # Live record published SECOND — alice's real keys + v2.
+        _publish_identity(alice, "alice.test")
+
+        bob = DMPClient(
+            "bob",
+            "bob-pass",
+            domain="bob.test",
+            store=store,
+            intro_queue_path=":memory:",
+            prekey_store_path=":memory:",
+        )
+        # Legacy pin: only X25519, no signing key.
+        bob.add_contact(
+            "alice",
+            alice.get_public_key_hex(),
+            domain="alice.test",
+        )
+        # With the X25519 disambiguator, the lookup walks past the
+        # stale record (mismatched x25519_pk) to alice's real
+        # record (matching x25519_pk, advertising v2).
+        versions = bob._recipient_versions(bob.contacts["alice"])
+        assert versions == SUPPORTED_VERSIONS
+
+
 class TestLegacyContactDoesNotTrustSquattedVersions:
     """A legacy contact pinned only via X25519 (signing_key_bytes empty)
     must NOT have `versions` trusted unless the fetched identity

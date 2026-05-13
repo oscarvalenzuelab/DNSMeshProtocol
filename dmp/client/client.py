@@ -737,6 +737,7 @@ class DMPClient:
         host: str,
         *,
         expected_spk: Optional[bytes] = None,
+        expected_x25519_pk: Optional[bytes] = None,
     ) -> Optional[IdentityRecord]:
         """Best-effort identity-record fetch for ``user@host``.
 
@@ -744,30 +745,29 @@ class DMPClient:
         TOFU-hash name (``id-<hash>.<host>``). Walks all records under
         each candidate name and signature-verifies each.
 
-        ``expected_spk`` is the caller-supplied disambiguator. DNS RRsets
-        with append semantics may carry multiple valid identity records
-        for the same username — typically a freshly-published v2 record
-        alongside an older v1 one a user republished from. Returning
-        the first signature-valid record without filtering would let a
-        stale record shadow the live one and silently downgrade
-        ``_recipient_versions`` or fail ``_resolve_envelope_label``
-        even though a later record matches the trusted key.
+        Two optional disambiguators handle the append-semantics RRset
+        case where multiple valid records coexist (typical after a
+        republish or migration):
 
-        Search semantics when ``expected_spk`` is provided:
+        - ``expected_spk`` (Ed25519) — modern pins have a signing key.
+          A record matches when ``record.ed25519_spk == expected_spk``.
+        - ``expected_x25519_pk`` (X25519) — legacy pins have only the
+          encryption key. A record matches when
+          ``record.x25519_pk == expected_x25519_pk``.
 
-        1. Walk BOTH names. The instant a record's ``ed25519_spk``
-           matches ``expected_spk``, return it — don't keep looking.
-        2. If we finish both names without an SPK match, fall back to
-           the first username-matching record we saw across both
-           names (covers the early-TOFU case where the caller
-           supplied ``expected_spk`` defensively but hadn't actually
-           pinned that key yet).
+        Search semantics when either disambiguator is provided:
 
-        Codex review P2: a stale zone-anchored record with a wrong
-        SPK MUST NOT prevent the lookup from reaching the matching
-        hash-named record. Walking each name in isolation and
-        bailing on first_match-per-name (the previous shape) failed
-        that contract.
+        1. Walk BOTH candidate names. The instant a record matches the
+           supplied disambiguator, return it — don't keep looking.
+        2. If we finish both names without a match, fall back to the
+           first username-matching record we saw across both names
+           (covers the early-TOFU case where the caller supplied a
+           disambiguator defensively but hadn't actually pinned yet).
+
+        Codex review P2: a stale zone-anchored record MUST NOT prevent
+        the lookup from reaching the matching hash-named record, and a
+        legacy X25519-only pin MUST get the same shadow protection as
+        a modern Ed25519 pin.
         """
         candidates = (
             zone_anchored_identity_name(host),
@@ -790,6 +790,11 @@ class DMPClient:
                     continue
                 if expected_spk is not None and ident.ed25519_spk == expected_spk:
                     return ident
+                if (
+                    expected_x25519_pk is not None
+                    and ident.x25519_pk == expected_x25519_pk
+                ):
+                    return ident
                 if first_match is None:
                     first_match = ident
         return first_match
@@ -810,8 +815,19 @@ class DMPClient:
         older republish-tombstone record sitting in an append-semantics
         RRset alongside the live one and shadowing it.
         """
+        # CLI's `identity fetch user@host --add` saves the full
+        # address as the contact's username, with no `remote_username`
+        # resolved. Without normalization we'd build
+        # `bob@bob.example@bob.example` and fail canonicalization,
+        # falling back to (1,) — meaning zone-anchored CLI contacts
+        # never get DMPv2 envelopes. Strip the host suffix from
+        # username when it already includes one.
+        # Codex review P2 (round 4): handle full-address contacts.
+        raw_user = contact.username
+        if "@" in raw_user:
+            raw_user = raw_user.split("@", 1)[0]
         addr = _envelope.canonicalize_address(
-            f"{contact.username}@{contact.domain or self.domain}"
+            f"{raw_user}@{contact.domain or self.domain}"
         )
         if addr is None:
             return (1,)
@@ -825,7 +841,20 @@ class DMPClient:
             return cached
         user, host = addr.split("@", 1)
         expected_spk = contact.signing_key_bytes or None
-        record = self._lookup_identity_record(user, host, expected_spk=expected_spk)
+        # Legacy contacts (no signing-key pin) get the X25519 pubkey
+        # as a disambiguator so a stale/squat record sitting first in
+        # an append-semantics RRset can't shadow the live record.
+        expected_x25519_pk = (
+            contact.public_key_bytes
+            if not contact.signing_key_bytes and contact.public_key_bytes
+            else None
+        )
+        record = self._lookup_identity_record(
+            user,
+            host,
+            expected_spk=expected_spk,
+            expected_x25519_pk=expected_x25519_pk,
+        )
         versions: Tuple[int, ...] = (1,) if record is None else record.versions
         # Defense-in-depth: only trust the versions field when the
         # fetched record's keys match what we've already pinned.
