@@ -7,6 +7,44 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.5] — 2026-05-15 — DMPv2 plaintext envelope + identity-record versions
+
+Unblocks cross-zone first-contact delivery. Two unpinned identities
+on different mesh zones can now exchange a first message that lands
+in the recipient's intro queue with a verified `sender_label`
+attached, removing the previous "give someone your address and they
+can't write to you until you exchange keys out-of-band" gap. v1
+senders and v1 receivers continue to interoperate unchanged.
+
+### Added
+
+- `dmp.core.envelope` module: codec, strict ASCII-only address
+  canonicalizer (rejects homograph / confusable-character attacks),
+  256-byte header cap. Wire format inside the AEAD plaintext is
+  `DMPV2:` + canonical-JSON header + `\n` + body. Header carries an
+  optional `from = user@host` claim that the receiver resolves back
+  to a DNS IdentityRecord and binds against the manifest signing key
+  before surfacing as a trusted label.
+- `IdentityRecord.versions: Tuple[int, ...]` — optional binary
+  suffix advertising supported protocol versions. Missing suffix
+  defaults to `(1,)` so the wire stays byte-identical to pre-this-
+  release records and existing strict-length parsers accept it
+  unchanged.
+- `dnsmesh identity publish --advertise-v2` and `dnsmesh identity
+  rotate --advertise-v2` opt-in flags. Default stays v1-only.
+- Receive-side SPK-binding verifier with positive-only DNS cache —
+  transient NXDOMAIN does not evict a known-good label.
+- Send-side capability gate keyed on the recipient's published
+  `versions` (cached). A v2 wrapper never reaches a v1-only receiver.
+- 8-case `dmpv2_envelope.json` interop vector file in
+  `docs/protocol/vectors/` so the Rust port can prove byte-identical
+  agreement.
+
+### Changed
+
+- `InboxMessage` gains a `sender_label` field; intro-queue rows gain
+  the same. Both stay `None` for v1 traffic.
+
 ## [0.7.4] — 2026-05-07 — TSIG-sign UPDATE responses per RFC 8945 §5.4.1
 
 Strict-client correctness fix. Long-latent bug surfaced when the Rust
