@@ -530,6 +530,31 @@ def _load_heartbeat_from_env(
     # cap bit is set.
     advertised_zone = publish_zone
 
+    # Public-seed URLs (#79). Default is the canonical project
+    # seeds.txt — operators get federation growth without any per-node
+    # configuration. Override with a custom list:
+    #   DMP_HEARTBEAT_PUBLIC_SEED_URLS="https://a.example/seeds.txt,https://b.example/seeds.txt"
+    # Or disable the fetch entirely:
+    #   DMP_HEARTBEAT_PUBLIC_SEED_URLS_DISABLED=1
+    # The trust gate is "who has merge access to the URL's source" —
+    # see #79 for the governance discussion.
+    from dmp.server.heartbeat_worker import DEFAULT_PUBLIC_SEED_URL
+
+    public_seed_disabled_raw = (
+        os.environ.get("DMP_HEARTBEAT_PUBLIC_SEED_URLS_DISABLED", "").strip().lower()
+    )
+    public_seed_disabled = public_seed_disabled_raw in ("1", "true", "yes", "on")
+    if public_seed_disabled:
+        public_seed_urls: tuple = ()
+    else:
+        raw_urls = os.environ.get("DMP_HEARTBEAT_PUBLIC_SEED_URLS", "").strip()
+        if raw_urls:
+            public_seed_urls = tuple(
+                u.strip() for u in raw_urls.split(",") if u.strip()
+            )
+        else:
+            public_seed_urls = (DEFAULT_PUBLIC_SEED_URL,)
+
     cfg = HeartbeatWorkerConfig(
         self_endpoint=self_endpoint,
         version=version,
@@ -540,6 +565,7 @@ def _load_heartbeat_from_env(
         claim_provider_zone=advertised_zone,
         dns_zone=publish_zone,
         seed_zones=seed_zones,
+        public_seed_urls=public_seed_urls,
     )
     # Cluster peer harvest: when ``DMP_SYNC_PEERS`` is set the
     # operator already lists co-cluster peers as comma-separated

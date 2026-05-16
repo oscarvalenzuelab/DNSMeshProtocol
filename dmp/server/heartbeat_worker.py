@@ -65,6 +65,25 @@ DEFAULT_MAX_GOSSIP_PER_RESPONSE = 20
 # resolvers and doesn't grow unbounded when the directory does.
 DEFAULT_MAX_SEEN_PUBLISH = 50
 
+# Canonical project seed list. Operators can override via
+# ``DMP_HEARTBEAT_PUBLIC_SEED_URLS`` or disable the fetch entirely
+# with ``DMP_HEARTBEAT_PUBLIC_SEED_URLS_DISABLED=1``.
+DEFAULT_PUBLIC_SEED_URL = (
+    "https://raw.githubusercontent.com/oscarvalenzuelab/DNSMeshProtocol"
+    "/main/directory/seeds.txt"
+)
+# 6h cadence. The directory rebuilds on every PR merge; a 6h window
+# means new operators are picked up within at most that long after
+# the merge, without hammering GitHub for every heartbeat tick.
+DEFAULT_PUBLIC_SEED_REFRESH_SECONDS = 6 * 3600
+# 5s HTTP timeout per URL. The worker tick budget is in seconds, not
+# minutes — a slow CDN can't be allowed to stall it.
+DEFAULT_PUBLIC_SEED_FETCH_TIMEOUT = 5.0
+# 64 KB response cap per URL. ``seeds.txt`` is a few hundred bytes
+# today; the cap is generous enough to absorb a healthy growth path
+# while still bounding worker memory if a hostile URL serves a flood.
+DEFAULT_PUBLIC_SEED_MAX_BYTES = 65_536
+
 # DNS owner names the worker publishes / queries under.
 HEARTBEAT_RRSET_PREFIX = "_dnsmesh-heartbeat"
 SEEN_RRSET_PREFIX = "_dnsmesh-seen"
@@ -95,6 +114,85 @@ def _zone_from_seed(seed: str) -> str:
     if ":" in s and not s.startswith("["):
         s = s.split(":", 1)[0]
     return s.lower()
+
+
+def _parse_public_seed_body(body: bytes) -> List[str]:
+    """Pull candidate zones out of a ``seeds.txt``-format response body.
+
+    Same format the public directory consumes via the pages.yml
+    aggregator: one entry per line, ``#``-prefixed lines and blank
+    lines ignored. Non-UTF-8 bytes are dropped — the format is
+    documented as ASCII-friendly DNS zone labels.
+    """
+    try:
+        text = body.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        log.warning("public seed body is not valid UTF-8; skipping")
+        return []
+    zones: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        zones.append(stripped)
+    return zones
+
+
+def _default_public_seed_fetcher(
+    url: str, timeout_seconds: float, max_bytes: int
+) -> Optional[bytes]:
+    """HTTP GET ``url`` and return up to ``max_bytes`` of its body.
+
+    Defensive against the obvious failure modes: HTTP timeout, network
+    errors, non-2xx responses, body larger than ``max_bytes`` (we
+    truncate at the boundary rather than failing — a hostile URL
+    serving a flood would otherwise drag the worker into an unbounded
+    read). On any failure returns ``None``; the caller treats that
+    as a refresh miss and keeps the previous cache.
+
+    Imports ``requests`` lazily so the heartbeat module stays
+    importable in environments without the HTTP client (the worker
+    only needs it when ``public_seed_urls`` is non-empty).
+    """
+    try:
+        import requests  # type: ignore[import-not-found]
+    except ImportError:
+        log.warning(
+            "requests not installed; cannot fetch public seeds from %s", url
+        )
+        return None
+    try:
+        resp = requests.get(url, timeout=timeout_seconds, stream=True)
+    except Exception as exc:  # noqa: BLE001 — network failures are best-effort
+        log.warning("public seed fetch failed for %s: %s", url, exc)
+        return None
+    try:
+        if resp.status_code != 200:
+            log.warning(
+                "public seed fetch for %s returned HTTP %d; skipping",
+                url,
+                resp.status_code,
+            )
+            return None
+        # ``iter_content`` honors the connection-level chunking and lets
+        # us bail as soon as the cap is hit, instead of buffering the
+        # entire response first.
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=4096):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) >= max_bytes:
+                # Truncate; downstream parser tolerates the partial
+                # final line (it will just be ignored if it's not a
+                # complete entry).
+                return bytes(buf[:max_bytes])
+        return bytes(buf)
+    finally:
+        try:
+            resp.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def heartbeat_rrset_name(zone: str) -> str:
@@ -141,6 +239,17 @@ class HeartbeatWorkerConfig:
     # M9 — DNS-native publish/discover.
     dns_zone: str = ""
     seed_zones: tuple = ()
+    # Public-seed-URL refresh (#79). When ``public_seed_urls`` is
+    # non-empty the worker fetches each URL on a refresh cadence,
+    # parses ``# comments`` + blank lines like ``directory/seeds.txt``,
+    # normalizes each entry via ``_zone_from_seed``, and merges the
+    # result into the harvest list alongside env seeds + cluster
+    # peers. Wired from ``DMP_HEARTBEAT_PUBLIC_SEED_URLS`` in node.py.
+    # Empty tuple disables the fetch entirely.
+    public_seed_urls: tuple = ()
+    public_seed_refresh_seconds: int = DEFAULT_PUBLIC_SEED_REFRESH_SECONDS
+    public_seed_fetch_timeout: float = DEFAULT_PUBLIC_SEED_FETCH_TIMEOUT
+    public_seed_max_bytes: int = DEFAULT_PUBLIC_SEED_MAX_BYTES
 
 
 class HeartbeatWorker:
@@ -161,6 +270,7 @@ class HeartbeatWorker:
         record_writer: Optional[DNSRecordWriter] = None,
         dns_reader: Optional[DNSRecordReader] = None,
         cluster_peers_provider: Optional[Callable[[], Iterable[str]]] = None,
+        public_seed_fetcher: Optional[Callable[[str, float, int], Optional[bytes]]] = None,
     ) -> None:
         """Construct the worker.
 
@@ -178,6 +288,13 @@ class HeartbeatWorker:
         that returns cluster peer endpoints (for clustered nodes
         that want to harvest each peer's zone). Each entry is
         normalized via ``_zone_from_seed``. None in solo-node mode.
+
+        ``public_seed_fetcher`` is the HTTP fetcher used to refresh
+        ``DMP_HEARTBEAT_PUBLIC_SEED_URLS``. Signature is
+        ``(url, timeout_seconds, max_bytes) -> Optional[bytes]``.
+        Returning ``None`` (or raising) is treated as a refresh
+        miss — the worker keeps the previous cache. Defaults to a
+        ``requests``-backed implementation; tests inject a fake.
         """
         self._cfg = config
         self._crypto = operator_crypto
@@ -185,6 +302,14 @@ class HeartbeatWorker:
         self._record_writer = record_writer
         self._dns_reader = dns_reader
         self._cluster_peers_provider = cluster_peers_provider or (lambda: ())
+        self._public_seed_fetcher = public_seed_fetcher or _default_public_seed_fetcher
+        # Cache of normalized zones from the last successful public-seed
+        # refresh per URL. Failures preserve the prior cache so a
+        # transient outage doesn't drop everything we knew. List
+        # rather than set so iteration order matches URL order, which
+        # lets operators express priority via their URL list.
+        self._public_seed_zones: List[str] = []
+        self._public_seed_last_fetch: int = 0
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -765,6 +890,19 @@ class HeartbeatWorker:
             log.exception(
                 "cluster_peers_provider raised; continuing with seeds + gossip"
             )
+        # Public-seed URLs (#79). After cluster peers (which are
+        # operator-signed via the cluster manifest, so the highest
+        # trust input), before gossip-learned peers (lowest trust:
+        # transitively learned via signature-verified heartbeats but
+        # not vetted by anyone). The refresh is rate-limited so a
+        # fast tick interval doesn't translate into a fast fetch
+        # cadence — the GitHub raw endpoint sees one request per
+        # ``public_seed_refresh_seconds`` per operator, regardless of
+        # how often the worker ticks.
+        if self._cfg.public_seed_urls:
+            self._refresh_public_seeds_if_due(int(time.time()))
+            for zone in self._public_seed_zones:
+                _add(zone)
         # Gossip-learned: pull peer zones directly from the wires in
         # the seen-store. ``list_zones_for_harvest`` reads the
         # operator-advertised ``claim_provider_zone`` field
@@ -794,3 +932,50 @@ class HeartbeatWorker:
             log.exception("SeenStore.list_zones_for_harvest raised; continuing")
 
         return out[: self._cfg.max_peers]
+
+    def _refresh_public_seeds_if_due(self, now: int) -> None:
+        """Re-fetch ``DMP_HEARTBEAT_PUBLIC_SEED_URLS`` if the cache is stale.
+
+        Rate-limited by ``public_seed_refresh_seconds``: a fast worker
+        tick doesn't translate into a fast HTTP cadence. Each URL is
+        fetched independently; per-URL fetch failures preserve the
+        prior cache contents for that URL's zones (we keep the last
+        known good list rather than dropping everything on a transient
+        outage). The merged result replaces ``self._public_seed_zones``
+        wholesale only when at least one URL fetched successfully.
+        """
+        if not self._cfg.public_seed_urls:
+            return
+        last = self._public_seed_last_fetch
+        if last and (now - last) < self._cfg.public_seed_refresh_seconds:
+            return
+        merged: List[str] = []
+        seen: Set[str] = set()
+        any_success = False
+        for url in self._cfg.public_seed_urls:
+            try:
+                body = self._public_seed_fetcher(
+                    url,
+                    self._cfg.public_seed_fetch_timeout,
+                    self._cfg.public_seed_max_bytes,
+                )
+            except Exception:
+                log.exception("public seed fetch raised for %s; ignoring", url)
+                continue
+            if body is None:
+                continue
+            any_success = True
+            for raw_zone in _parse_public_seed_body(body):
+                zone = _zone_from_seed(raw_zone)
+                if not zone or zone in seen:
+                    continue
+                seen.add(zone)
+                merged.append(zone)
+        if any_success:
+            self._public_seed_zones = merged
+            self._public_seed_last_fetch = now
+            log.info(
+                "refreshed public seed cache from %d URL(s); %d unique zones",
+                len(self._cfg.public_seed_urls),
+                len(merged),
+            )

@@ -1306,3 +1306,217 @@ class TestLifecycle:
         worker.start()
         time.sleep(0.05)
         worker.stop(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# #79 — public-seed-URL refresh.
+# ---------------------------------------------------------------------------
+
+
+class TestPublicSeedFetch:
+    """Worker periodically fetches a public seeds.txt-format URL and
+    merges discovered zones into the harvest list. Failures preserve
+    the previous cache."""
+
+    @staticmethod
+    def _fake_fetcher(url_to_body: dict):
+        """Build a fetcher that returns ``url_to_body[url]`` (bytes) or
+        ``None`` when the URL maps to ``None`` (simulating a network
+        failure). Raises on truly missing URLs so misconfigured tests
+        surface loudly."""
+
+        def fetcher(url: str, _timeout: float, _max_bytes: int):
+            if url not in url_to_body:
+                raise AssertionError(f"unexpected URL fetched: {url}")
+            return url_to_body[url]
+
+        return fetcher
+
+    def test_fetched_zones_appear_in_harvest_list(self, store, transport, now) -> None:
+        body = b"# project seeds\nseedalpha.example\nseedbravo.example\n"
+        url = "https://public.example/seeds.txt"
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            seed_zones=(),
+            public_seed_urls=(url,),
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+            public_seed_fetcher=self._fake_fetcher({url: body}),
+        )
+        zones = worker._build_seed_zones()
+        assert "seedalpha.example" in zones
+        assert "seedbravo.example" in zones
+
+    def test_comments_and_blank_lines_ignored(self, store, transport, now) -> None:
+        body = b"# leading comment\n\nzone-a.example\n# inline comment\nzone-b.example\n\n"
+        url = "https://public.example/seeds.txt"
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            public_seed_urls=(url,),
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+            public_seed_fetcher=self._fake_fetcher({url: body}),
+        )
+        zones = worker._build_seed_zones()
+        assert "zone-a.example" in zones
+        assert "zone-b.example" in zones
+        # No bogus zones from the comment lines.
+        assert "leading" not in zones
+        assert "inline" not in zones
+
+    def test_legacy_url_form_normalized(self, store, transport, now) -> None:
+        # Pre-0.5.0 seeds.txt entries occasionally still carry a
+        # scheme prefix. `_zone_from_seed` strips it; verify the
+        # public-seed path uses the same normalizer the env-seed path does.
+        body = b"https://legacy.example:8443\n"
+        url = "https://public.example/seeds.txt"
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            public_seed_urls=(url,),
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+            public_seed_fetcher=self._fake_fetcher({url: body}),
+        )
+        zones = worker._build_seed_zones()
+        assert "legacy.example" in zones
+
+    def test_refresh_is_rate_limited(self, store, transport, now) -> None:
+        # Fetcher counts how many times it gets called. The first
+        # tick triggers a fetch; subsequent ticks within the refresh
+        # window must NOT re-fetch.
+        url = "https://public.example/seeds.txt"
+        body = b"rate-limit.example\n"
+        calls = {"n": 0}
+
+        def counting_fetcher(u, _t, _m):
+            calls["n"] += 1
+            return body
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            public_seed_urls=(url,),
+            public_seed_refresh_seconds=3600,
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+            public_seed_fetcher=counting_fetcher,
+        )
+        worker._build_seed_zones()
+        worker._build_seed_zones()
+        worker._build_seed_zones()
+        assert calls["n"] == 1
+
+    def test_fetch_failure_preserves_previous_cache(
+        self, store, transport, now
+    ) -> None:
+        # First fetch succeeds; verify the cache populates. Then a
+        # second refresh (forced by aging the cache timestamp) returns
+        # None for every URL; cache must persist with the prior zones.
+        url = "https://public.example/seeds.txt"
+        bodies = [b"keep.example\n", None]
+
+        def stepping_fetcher(u, _t, _m):
+            return bodies.pop(0) if bodies else None
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            public_seed_urls=(url,),
+            public_seed_refresh_seconds=1,
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+            public_seed_fetcher=stepping_fetcher,
+        )
+        worker._build_seed_zones()
+        assert "keep.example" in worker._public_seed_zones
+        # Force the next refresh by aging the cache timestamp.
+        worker._public_seed_last_fetch = 0
+        worker._build_seed_zones()
+        assert "keep.example" in worker._public_seed_zones
+
+    def test_self_zone_filtered_from_public_seeds(
+        self, store, transport, now
+    ) -> None:
+        # If the project seeds list happens to include this node's
+        # own zone, we must not harvest ourselves.
+        url = "https://public.example/seeds.txt"
+        body = b"self.example\nsomeoneelse.example\n"
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            public_seed_urls=(url,),
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+            public_seed_fetcher=self._fake_fetcher({url: body}),
+        )
+        zones = worker._build_seed_zones()
+        assert "self.example" not in zones
+        assert "someoneelse.example" in zones
+
+    def test_empty_public_seed_urls_skips_fetcher(
+        self, store, transport, now
+    ) -> None:
+        # Operator opted out (DMP_HEARTBEAT_PUBLIC_SEED_URLS_DISABLED=1):
+        # the worker must not invoke the fetcher at all, otherwise an
+        # explicit opt-out would still hit the network.
+        calls = {"n": 0}
+
+        def must_not_be_called(u, _t, _m):
+            calls["n"] += 1
+            return None
+
+        cfg = HeartbeatWorkerConfig(
+            self_endpoint="https://self.example.com",
+            version="0.1.0",
+            dns_zone="self.example",
+            public_seed_urls=(),
+        )
+        worker = HeartbeatWorker(
+            cfg,
+            _signer(),
+            store,
+            record_writer=transport,
+            dns_reader=transport,
+            public_seed_fetcher=must_not_be_called,
+        )
+        worker._build_seed_zones()
+        assert calls["n"] == 0
