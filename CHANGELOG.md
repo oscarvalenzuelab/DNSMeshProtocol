@@ -24,6 +24,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   transient outage at the seed host cannot orphan running nodes.
   Closes #79.
 
+### Security
+
+- Public-seed fetcher now refuses HTTP redirects. The SSRF screen
+  added in #79 only validates the original URL; without this fix
+  a hostile public HTTPS seed host could 302 to a private / loopback
+  / link-local target and `requests` would follow it, defeating the
+  screen. Redirects now return as a fetch miss and the operator
+  must reconfigure the URL to its final destination.
+
 ## [0.7.5] — 2026-05-15 — DMPv2 plaintext envelope + identity-record versions
 
 Unblocks cross-zone first-contact delivery. Two unpinned identities

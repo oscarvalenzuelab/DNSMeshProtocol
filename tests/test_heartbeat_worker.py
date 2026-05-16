@@ -1731,3 +1731,53 @@ class TestPublicSeedUrlSafety:
             max_bytes=1024,
         )
         assert out is None
+
+    def test_redirect_is_refused_so_ssrf_screen_holds(self, monkeypatch) -> None:
+        # The safety screen only validates the ORIGINAL URL. If
+        # ``requests.get`` followed redirects, a hostile public HTTPS
+        # seed host could 302 to ``http://169.254.169.254/...`` and
+        # bypass the screen. Confirm the fetcher disables redirects
+        # AND treats a 3xx response as a fetch miss.
+        import socket as _socket
+
+        from dmp.server.heartbeat_worker import _default_public_seed_fetcher
+
+        # Public IP for the original URL so the safety screen passes.
+        def fake_getaddrinfo(host, port, type=_socket.SOCK_STREAM):
+            return [(_socket.AF_INET, _socket.SOCK_STREAM, 0, "", ("1.1.1.1", 0))]
+
+        monkeypatch.setattr(
+            "dmp.server.heartbeat_worker.socket.getaddrinfo", fake_getaddrinfo
+        )
+
+        captured: dict = {}
+
+        class FakeResponse:
+            status_code = 302
+            headers = {"Location": "http://169.254.169.254/latest/meta-data/"}
+
+            def iter_content(self, chunk_size: int):  # pragma: no cover
+                raise AssertionError("redirect path must not read body")
+
+            def close(self) -> None:
+                pass
+
+        class FakeRequests:
+            @staticmethod
+            def get(url, **kwargs):
+                captured["url"] = url
+                captured["kwargs"] = kwargs
+                return FakeResponse()
+
+        monkeypatch.setitem(__import__("sys").modules, "requests", FakeRequests)
+
+        out = _default_public_seed_fetcher(
+            "https://public.example/seeds.txt",
+            timeout_seconds=1.0,
+            max_bytes=1024,
+        )
+        assert out is None
+        # The fetcher MUST pass ``allow_redirects=False`` — that's the
+        # whole point of this defense. A future refactor that drops
+        # the flag would silently re-open the SSRF bypass.
+        assert captured["kwargs"].get("allow_redirects") is False
