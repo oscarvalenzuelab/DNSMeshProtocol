@@ -95,6 +95,8 @@ docker run -d --name dnsmesh-node \
 | `DMP_HEARTBEAT_SELF_ENDPOINT` | *(required)* | Public HTTPS URL of this node. No trailing slash. |
 | `DMP_HEARTBEAT_OPERATOR_KEY_PATH` | *(required)* | File with Ed25519 seed (32 raw bytes OR 64-char hex). |
 | `DMP_HEARTBEAT_SEEDS` | *(empty)* | Comma-list of peer HTTPS URLs to bootstrap gossip from. Empty is valid (relies on cluster peers + inbound gossip). |
+| `DMP_HEARTBEAT_PUBLIC_SEED_URLS` | *(canonical project `directory/seeds.txt` on GitHub)* | Comma-list of HTTPS URLs serving a `seeds.txt`-format zone list. Refreshed every 6h; failures preserve the prior cache per URL. The default makes a fresh node discoverable on the federated mesh without operator-supplied peer lists. Override with your own aggregator URL if you don't want outbound traffic to GitHub. **HTTPS-only**, and the resolved host must be a routable public address — loopback / private / link-local / metadata IPs are refused without a network call. |
+| `DMP_HEARTBEAT_PUBLIC_SEED_URLS_DISABLED` | `0` | Truthy disables the public seed fetch entirely. Use for air-gapped or fully self-contained deployments where you only want operator-configured seeds + cluster peers + inbound gossip. |
 | `DMP_HEARTBEAT_INTERVAL_SECONDS` | `300` | Tick cadence. |
 | `DMP_HEARTBEAT_TTL_SECONDS` | `86400` | `exp - ts` on emitted heartbeats. |
 | `DMP_HEARTBEAT_MAX_PEERS` | `25` | Outbound fan-out cap per tick. |
