@@ -227,11 +227,32 @@ def _default_public_seed_fetcher(
         log.warning("requests not installed; cannot fetch public seeds from %s", url)
         return None
     try:
-        resp = requests.get(url, timeout=timeout_seconds, stream=True)
+        # ``allow_redirects=False`` is load-bearing. The SSRF screen
+        # in ``_is_safe_public_seed_url`` only validates the ORIGINAL
+        # URL; a hostile public HTTPS seed host could otherwise return
+        # ``302 Location: http://169.254.169.254/...`` and ``requests``
+        # would follow it, defeating the screen. Force the caller to
+        # configure the canonical URL directly.
+        resp = requests.get(
+            url, timeout=timeout_seconds, stream=True, allow_redirects=False
+        )
     except Exception as exc:  # noqa: BLE001 — network failures are best-effort
         log.warning("public seed fetch failed for %s: %s", url, exc)
         return None
     try:
+        if 300 <= resp.status_code < 400:
+            # Redirects are refused (see SSRF rationale above). Treat
+            # as a fetch miss so the per-URL cache slot is preserved;
+            # the operator should reconfigure the URL to point at the
+            # final destination.
+            log.warning(
+                "public seed fetch for %s returned redirect HTTP %d "
+                "(Location: %r); SSRF screen would be bypassed — refusing",
+                url,
+                resp.status_code,
+                resp.headers.get("Location", "<missing>"),
+            )
+            return None
         if resp.status_code != 200:
             log.warning(
                 "public seed fetch for %s returned HTTP %d; skipping",
