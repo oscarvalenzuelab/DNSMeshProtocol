@@ -7,6 +7,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Heartbeat worker can now refresh its seed-zone list from a public
+  URL on a slow schedule (default: every 6 hours, fetched lazily
+  alongside the regular harvest cycle). Operators can override the
+  source with `DMP_HEARTBEAT_PUBLIC_SEED_URLS` (comma-separated) or
+  disable entirely with `DMP_HEARTBEAT_PUBLIC_SEED_URLS_DISABLED=1`.
+  The default source is the curated `directory/seeds.txt` shipped
+  in this repository, so a fresh node bootstraps onto the federated
+  mesh without operator-supplied peer lists.
+- Fetched seed bodies are size-capped (64 KiB) and parsed
+  defensively: comments, blank lines, legacy `https://` entries, and
+  the node's own zone are all filtered out. A failed fetch preserves
+  the previous cache rather than wiping the harvest list, so a
+  transient outage at the seed host cannot orphan running nodes.
+  Closes #79.
+
 ## [0.7.5] — 2026-05-15 — DMPv2 plaintext envelope + identity-record versions
 
 Unblocks cross-zone first-contact delivery. Two unpinned identities

@@ -33,11 +33,13 @@ primitive — see M9 design notes).
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import socket
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Set
+from typing import Callable, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlsplit
 
 from dmp.core.crypto import DMPCrypto
@@ -64,6 +66,25 @@ DEFAULT_MAX_GOSSIP_PER_RESPONSE = 20
 # _dnsmesh-seen.<own-zone>. Bounded so the RRset stays tractable for
 # resolvers and doesn't grow unbounded when the directory does.
 DEFAULT_MAX_SEEN_PUBLISH = 50
+
+# Canonical project seed list. Operators can override via
+# ``DMP_HEARTBEAT_PUBLIC_SEED_URLS`` or disable the fetch entirely
+# with ``DMP_HEARTBEAT_PUBLIC_SEED_URLS_DISABLED=1``.
+DEFAULT_PUBLIC_SEED_URL = (
+    "https://raw.githubusercontent.com/oscarvalenzuelab/DNSMeshProtocol"
+    "/main/directory/seeds.txt"
+)
+# 6h cadence. The directory rebuilds on every PR merge; a 6h window
+# means new operators are picked up within at most that long after
+# the merge, without hammering GitHub for every heartbeat tick.
+DEFAULT_PUBLIC_SEED_REFRESH_SECONDS = 6 * 3600
+# 5s HTTP timeout per URL. The worker tick budget is in seconds, not
+# minutes — a slow CDN can't be allowed to stall it.
+DEFAULT_PUBLIC_SEED_FETCH_TIMEOUT = 5.0
+# 64 KB response cap per URL. ``seeds.txt`` is a few hundred bytes
+# today; the cap is generous enough to absorb a healthy growth path
+# while still bounding worker memory if a hostile URL serves a flood.
+DEFAULT_PUBLIC_SEED_MAX_BYTES = 65_536
 
 # DNS owner names the worker publishes / queries under.
 HEARTBEAT_RRSET_PREFIX = "_dnsmesh-heartbeat"
@@ -95,6 +116,148 @@ def _zone_from_seed(seed: str) -> str:
     if ":" in s and not s.startswith("["):
         s = s.split(":", 1)[0]
     return s.lower()
+
+
+def _parse_public_seed_body(body: bytes) -> List[str]:
+    """Pull candidate zones out of a ``seeds.txt``-format response body.
+
+    Same format the public directory consumes via the pages.yml
+    aggregator: one entry per line, ``#``-prefixed lines and blank
+    lines ignored. Non-UTF-8 bytes are dropped — the format is
+    documented as ASCII-friendly DNS zone labels.
+    """
+    try:
+        text = body.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        log.warning("public seed body is not valid UTF-8; skipping")
+        return []
+    zones: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        zones.append(stripped)
+    return zones
+
+
+def _is_safe_public_seed_url(url: str) -> bool:
+    """Reject URLs the worker must not fetch from.
+
+    The seed-URL list comes from an operator-controlled env var, but
+    we still gate it: ``https://`` only, hostname must resolve to a
+    routable public address. Any loopback / private / link-local /
+    multicast / reserved / unspecified address is rejected so an
+    accidentally-pointed URL can't be used to scan internal network
+    space or hit the cloud-provider metadata endpoint
+    (169.254.169.254 is link-local — already covered — but the IP
+    is famous enough to call out).
+
+    Returning ``False`` is a hard refusal: caller drops the URL for
+    this refresh cycle. It does NOT count as a transient failure, so
+    the per-URL cache is preserved unchanged.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        log.warning("public seed URL %r is not parseable; rejecting", url)
+        return False
+    if parts.scheme != "https":
+        log.warning("public seed URL %r rejected: only https:// is allowed", url)
+        return False
+    host = (parts.hostname or "").strip()
+    if not host:
+        log.warning("public seed URL %r has no hostname; rejecting", url)
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        log.warning(
+            "public seed URL %r DNS resolution failed (%s); rejecting", url, exc
+        )
+        return False
+    for info in infos:
+        sockaddr = info[4]
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except (ValueError, IndexError):
+            return False
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            log.warning(
+                "public seed URL %r resolves to non-public address %s; rejecting",
+                url,
+                ip,
+            )
+            return False
+    return True
+
+
+def _default_public_seed_fetcher(
+    url: str, timeout_seconds: float, max_bytes: int
+) -> Optional[bytes]:
+    """HTTP GET ``url`` and return up to ``max_bytes`` of its body.
+
+    Defensive against the obvious failure modes: HTTP timeout, network
+    errors, non-2xx responses, body larger than ``max_bytes`` (we
+    truncate at the boundary rather than failing — a hostile URL
+    serving a flood would otherwise drag the worker into an unbounded
+    read). On any failure returns ``None``; the caller treats that
+    as a refresh miss and keeps the previous cache.
+
+    The URL is screened by ``_is_safe_public_seed_url`` first:
+    HTTPS-only, and the resolved hostname must be a routable public
+    address. Anything else (``http://``, loopback, private/link-local,
+    metadata endpoints) is refused without a network call.
+
+    Imports ``requests`` lazily so the heartbeat module stays
+    importable in environments without the HTTP client (the worker
+    only needs it when ``public_seed_urls`` is non-empty).
+    """
+    if not _is_safe_public_seed_url(url):
+        return None
+    try:
+        import requests  # type: ignore[import-not-found]
+    except ImportError:
+        log.warning("requests not installed; cannot fetch public seeds from %s", url)
+        return None
+    try:
+        resp = requests.get(url, timeout=timeout_seconds, stream=True)
+    except Exception as exc:  # noqa: BLE001 — network failures are best-effort
+        log.warning("public seed fetch failed for %s: %s", url, exc)
+        return None
+    try:
+        if resp.status_code != 200:
+            log.warning(
+                "public seed fetch for %s returned HTTP %d; skipping",
+                url,
+                resp.status_code,
+            )
+            return None
+        # ``iter_content`` honors the connection-level chunking and lets
+        # us bail as soon as the cap is hit, instead of buffering the
+        # entire response first.
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=4096):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) >= max_bytes:
+                # Truncate; downstream parser tolerates the partial
+                # final line (it will just be ignored if it's not a
+                # complete entry).
+                return bytes(buf[:max_bytes])
+        return bytes(buf)
+    finally:
+        try:
+            resp.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def heartbeat_rrset_name(zone: str) -> str:
@@ -141,6 +304,17 @@ class HeartbeatWorkerConfig:
     # M9 — DNS-native publish/discover.
     dns_zone: str = ""
     seed_zones: tuple = ()
+    # Public-seed-URL refresh (#79). When ``public_seed_urls`` is
+    # non-empty the worker fetches each URL on a refresh cadence,
+    # parses ``# comments`` + blank lines like ``directory/seeds.txt``,
+    # normalizes each entry via ``_zone_from_seed``, and merges the
+    # result into the harvest list alongside env seeds + cluster
+    # peers. Wired from ``DMP_HEARTBEAT_PUBLIC_SEED_URLS`` in node.py.
+    # Empty tuple disables the fetch entirely.
+    public_seed_urls: tuple = ()
+    public_seed_refresh_seconds: int = DEFAULT_PUBLIC_SEED_REFRESH_SECONDS
+    public_seed_fetch_timeout: float = DEFAULT_PUBLIC_SEED_FETCH_TIMEOUT
+    public_seed_max_bytes: int = DEFAULT_PUBLIC_SEED_MAX_BYTES
 
 
 class HeartbeatWorker:
@@ -161,6 +335,9 @@ class HeartbeatWorker:
         record_writer: Optional[DNSRecordWriter] = None,
         dns_reader: Optional[DNSRecordReader] = None,
         cluster_peers_provider: Optional[Callable[[], Iterable[str]]] = None,
+        public_seed_fetcher: Optional[
+            Callable[[str, float, int], Optional[bytes]]
+        ] = None,
     ) -> None:
         """Construct the worker.
 
@@ -178,6 +355,13 @@ class HeartbeatWorker:
         that returns cluster peer endpoints (for clustered nodes
         that want to harvest each peer's zone). Each entry is
         normalized via ``_zone_from_seed``. None in solo-node mode.
+
+        ``public_seed_fetcher`` is the HTTP fetcher used to refresh
+        ``DMP_HEARTBEAT_PUBLIC_SEED_URLS``. Signature is
+        ``(url, timeout_seconds, max_bytes) -> Optional[bytes]``.
+        Returning ``None`` (or raising) is treated as a refresh
+        miss — the worker keeps the previous cache. Defaults to a
+        ``requests``-backed implementation; tests inject a fake.
         """
         self._cfg = config
         self._crypto = operator_crypto
@@ -185,6 +369,16 @@ class HeartbeatWorker:
         self._record_writer = record_writer
         self._dns_reader = dns_reader
         self._cluster_peers_provider = cluster_peers_provider or (lambda: ())
+        self._public_seed_fetcher = public_seed_fetcher or _default_public_seed_fetcher
+        # Cache of normalized zones from the last successful public-seed
+        # refresh, keyed by URL. Per-URL granularity matters: when
+        # one URL succeeds and another fails on the same refresh
+        # cycle, the failing URL keeps its last-known-good zones
+        # instead of being silently dropped. Order of iteration is
+        # the order of ``cfg.public_seed_urls`` so operators can
+        # express priority via their URL list.
+        self._public_seed_zones: Dict[str, List[str]] = {}
+        self._public_seed_last_fetch: int = 0
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -765,6 +959,23 @@ class HeartbeatWorker:
             log.exception(
                 "cluster_peers_provider raised; continuing with seeds + gossip"
             )
+        # Public-seed URLs (#79). After cluster peers (which are
+        # operator-signed via the cluster manifest, so the highest
+        # trust input), before gossip-learned peers (lowest trust:
+        # transitively learned via signature-verified heartbeats but
+        # not vetted by anyone). The refresh is rate-limited so a
+        # fast tick interval doesn't translate into a fast fetch
+        # cadence — the GitHub raw endpoint sees one request per
+        # ``public_seed_refresh_seconds`` per operator, regardless of
+        # how often the worker ticks.
+        if self._cfg.public_seed_urls:
+            self._refresh_public_seeds_if_due(int(time.time()))
+            # Iterate per URL in config order so the priority the
+            # operator expressed in ``DMP_HEARTBEAT_PUBLIC_SEED_URLS``
+            # is preserved (first URL's zones get harvested first).
+            for url in self._cfg.public_seed_urls:
+                for zone in self._public_seed_zones.get(url, ()):
+                    _add(zone)
         # Gossip-learned: pull peer zones directly from the wires in
         # the seen-store. ``list_zones_for_harvest`` reads the
         # operator-advertised ``claim_provider_zone`` field
@@ -794,3 +1005,73 @@ class HeartbeatWorker:
             log.exception("SeenStore.list_zones_for_harvest raised; continuing")
 
         return out[: self._cfg.max_peers]
+
+    def _refresh_public_seeds_if_due(self, now: int) -> None:
+        """Re-fetch ``DMP_HEARTBEAT_PUBLIC_SEED_URLS`` if the cache is stale.
+
+        Rate-limited by ``public_seed_refresh_seconds``: a fast worker
+        tick doesn't translate into a fast HTTP cadence, and a
+        persistent outage at the source URL does not retry every
+        tick either — the timestamp updates regardless of outcome,
+        so a failed attempt also has to wait the full refresh window
+        before retrying.
+
+        Per-URL granularity: each URL is fetched independently, and
+        the cache slot for a URL is overwritten ONLY when that URL's
+        fetch succeeds. A partial failure (URL A succeeds, URL B
+        returns ``None``) preserves URL B's last-known-good zones
+        instead of dropping them. URLs no longer in the config are
+        evicted so cache memory stays bounded.
+        """
+        if not self._cfg.public_seed_urls:
+            return
+        last = self._public_seed_last_fetch
+        if last and (now - last) < self._cfg.public_seed_refresh_seconds:
+            return
+        # Drop slots for URLs that are no longer in the config (e.g.
+        # operator removed one) so cache memory matches current intent.
+        configured = set(self._cfg.public_seed_urls)
+        for stale in [u for u in self._public_seed_zones if u not in configured]:
+            self._public_seed_zones.pop(stale, None)
+
+        success_count = 0
+        new_zone_total = 0
+        for url in self._cfg.public_seed_urls:
+            try:
+                body = self._public_seed_fetcher(
+                    url,
+                    self._cfg.public_seed_fetch_timeout,
+                    self._cfg.public_seed_max_bytes,
+                )
+            except Exception:
+                log.exception("public seed fetch raised for %s; ignoring", url)
+                continue
+            if body is None:
+                continue
+            zones: List[str] = []
+            seen_in_url: Set[str] = set()
+            for raw_zone in _parse_public_seed_body(body):
+                zone = _zone_from_seed(raw_zone)
+                if not zone or zone in seen_in_url:
+                    continue
+                seen_in_url.add(zone)
+                zones.append(zone)
+            self._public_seed_zones[url] = zones
+            success_count += 1
+            new_zone_total += len(zones)
+        # Update timestamp regardless of outcome — a failed refresh
+        # must also wait the refresh window before retrying, otherwise
+        # an outage at the source URL means we hammer it every tick.
+        self._public_seed_last_fetch = now
+        if success_count:
+            log.info(
+                "refreshed public seed cache: %d/%d URL(s) ok, %d zones cached",
+                success_count,
+                len(self._cfg.public_seed_urls),
+                new_zone_total,
+            )
+        else:
+            log.warning(
+                "all %d public seed URL(s) failed this refresh; keeping prior cache",
+                len(self._cfg.public_seed_urls),
+            )
