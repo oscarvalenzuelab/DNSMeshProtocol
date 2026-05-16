@@ -1355,7 +1355,9 @@ class TestPublicSeedFetch:
         assert "seedbravo.example" in zones
 
     def test_comments_and_blank_lines_ignored(self, store, transport, now) -> None:
-        body = b"# leading comment\n\nzone-a.example\n# inline comment\nzone-b.example\n\n"
+        body = (
+            b"# leading comment\n\nzone-a.example\n# inline comment\nzone-b.example\n\n"
+        )
         url = "https://public.example/seeds.txt"
         cfg = HeartbeatWorkerConfig(
             self_endpoint="https://self.example.com",
@@ -1467,9 +1469,7 @@ class TestPublicSeedFetch:
         worker._build_seed_zones()
         assert "keep.example" in worker._public_seed_zones
 
-    def test_self_zone_filtered_from_public_seeds(
-        self, store, transport, now
-    ) -> None:
+    def test_self_zone_filtered_from_public_seeds(self, store, transport, now) -> None:
         # If the project seeds list happens to include this node's
         # own zone, we must not harvest ourselves.
         url = "https://public.example/seeds.txt"
@@ -1492,9 +1492,7 @@ class TestPublicSeedFetch:
         assert "self.example" not in zones
         assert "someoneelse.example" in zones
 
-    def test_empty_public_seed_urls_skips_fetcher(
-        self, store, transport, now
-    ) -> None:
+    def test_empty_public_seed_urls_skips_fetcher(self, store, transport, now) -> None:
         # Operator opted out (DMP_HEARTBEAT_PUBLIC_SEED_URLS_DISABLED=1):
         # the worker must not invoke the fetcher at all, otherwise an
         # explicit opt-out would still hit the network.

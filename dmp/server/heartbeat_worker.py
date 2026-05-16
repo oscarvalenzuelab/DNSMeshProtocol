@@ -157,9 +157,7 @@ def _default_public_seed_fetcher(
     try:
         import requests  # type: ignore[import-not-found]
     except ImportError:
-        log.warning(
-            "requests not installed; cannot fetch public seeds from %s", url
-        )
+        log.warning("requests not installed; cannot fetch public seeds from %s", url)
         return None
     try:
         resp = requests.get(url, timeout=timeout_seconds, stream=True)
@@ -270,7 +268,9 @@ class HeartbeatWorker:
         record_writer: Optional[DNSRecordWriter] = None,
         dns_reader: Optional[DNSRecordReader] = None,
         cluster_peers_provider: Optional[Callable[[], Iterable[str]]] = None,
-        public_seed_fetcher: Optional[Callable[[str, float, int], Optional[bytes]]] = None,
+        public_seed_fetcher: Optional[
+            Callable[[str, float, int], Optional[bytes]]
+        ] = None,
     ) -> None:
         """Construct the worker.
 
