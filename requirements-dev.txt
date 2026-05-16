@@ -16,4 +16,4 @@ hypothesis>=6.100.0
 
 # Supply-chain: generate hashed lockfiles and audit for CVEs.
 pip-tools>=7.5.3
-pip-audit>=2.7.0
+pip-audit>=2.10.0
