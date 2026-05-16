@@ -4,7 +4,7 @@
 # live in requirements.lock and requirements-dev.lock; production
 # installs and CI should use those with `pip install --require-hashes`.
 cryptography>=48.0.0
-dnspython>=2.4.0
+dnspython>=2.8.0
 reedsolo>=1.7.0
 pyyaml>=6.0.3
 argon2-cffi>=25.1.0
