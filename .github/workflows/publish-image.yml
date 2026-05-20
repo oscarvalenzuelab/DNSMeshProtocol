@@ -101,7 +101,7 @@ jobs:
         # Keeps the Docker Hub repo page in sync with deploy/docker/README.md
         # (operator-focused) and a one-line short description. Uses the same
         # DOCKERHUB_TOKEN as the push step — no extra secret needed.
-        uses: peter-evans/dockerhub-description@v4
+        uses: peter-evans/dockerhub-description@v5
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
