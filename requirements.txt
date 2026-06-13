@@ -12,7 +12,7 @@ zfec>=1.6.0.0
 
 # DNS publisher backends
 requests>=2.34.2
-boto3>=1.43.24
+boto3>=1.43.29
 
 # Async support
 asyncio-throttle>=1.0.2
