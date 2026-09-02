@@ -1,0 +1,77 @@
+name: lockfile refresh
+
+# Dependabot keeps requirements.txt and requirements-dev.txt current, but it
+# cannot touch the lockfiles: its pip-compile support only recognises a
+# generated file whose name ends in .txt, and ours are named .lock. Nothing
+# else regenerates them, so the pins rot until pip-audit fails on a pull
+# request that had nothing to do with the package at fault.
+#
+# Rather than push commits onto Dependabot's own branches — a workflow it
+# triggers gets a read-only token, and a push made with GITHUB_TOKEN does not
+# start a new check run, so the pull request would sit with no results at all
+# — this recompiles on main and opens its own pull request. Full token, normal
+# checks, and the refresh is reviewable on its own.
+
+on:
+  schedule:
+    # 05:41 UTC on Mondays, an hour before the weekly security sweep, so a
+    # refresh that clears a finding lands before the audit reports it.
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: recompile lockfiles
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          # The lockfile headers record pip-compile running under 3.14.
+          # Recompiling under an older interpreter would rewrite the
+          # environment markers along with the pins.
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install pip-tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-tools
+
+      - name: Recompile runtime lockfile
+        run: |
+          pip-compile --upgrade --generate-hashes \
+            --output-file=requirements.lock requirements.txt
+
+      - name: Recompile dev lockfile
+        run: |
+          pip-compile --upgrade --allow-unsafe --generate-hashes \
+            --output-file=requirements-dev.lock requirements-dev.txt
+
+      - name: Open a pull request if anything moved
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: deps/lockfile-refresh
+          # Reuse the branch across runs so an unreviewed refresh is updated
+          # in place rather than accumulating a pull request every Monday.
+          delete-branch: true
+          title: "deps: refresh hashed lockfiles"
+          commit-message: "deps: refresh hashed lockfiles"
+          body: |
+            Recompiled `requirements.lock` and `requirements-dev.lock` from the
+            current `requirements.txt` and `requirements-dev.txt`.
+
+            Opened by the weekly `lockfile refresh` workflow. Dependabot cannot
+            maintain these files: its pip-compile support only recognises
+            generated files named `*.txt`, and ours end in `.lock`.
+
+            The `lockfiles match their requirements` check in the `security`
+            workflow fails when a pin falls below a declared floor, which is
+            the drift this refresh exists to clear.

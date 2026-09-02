@@ -20,6 +20,28 @@ permissions:
   contents: read
 
 jobs:
+  lockfile-drift:
+    name: lockfiles match their requirements
+    runs-on: ubuntu-latest
+    # Dependabot's pip-compile support only looks at generated files named
+    # *.txt, and ours are requirements.lock / requirements-dev.lock. So it
+    # bumps a floor in requirements*.txt and leaves the pin behind, and the
+    # first thing to notice is an unrelated PR failing pip-audit for a
+    # package it never touched. Catch the drift where it happens instead.
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install packaging
+        run: pip install packaging
+
+      - name: Check lockfiles against declared requirements
+        run: python scripts/check_lockfile_consistency.py
+
   pip-audit:
     name: pip-audit (lockfiles + environment)
     runs-on: ubuntu-latest
