@@ -56,6 +56,21 @@ Run `pip-audit -r requirements.lock --strict` before you push if your
 PR bumps a dependency — CI does the same thing on every PR, but
 catching it locally saves a round trip.
 
+Dependabot cannot do this for you. Its pip-compile support only
+recognises a generated file whose name ends in `.txt`, and ours are
+`.lock`, so it bumps a floor in `requirements.txt` and leaves the pin
+behind. Two things cover the gap:
+
+- `scripts/check_lockfile_consistency.py` runs on every PR as the
+  `lockfiles match their requirements` check and fails when a pinned
+  version falls below a floor its requirements file declares. Run it
+  locally the same way CI does.
+- The `lockfile refresh` workflow recompiles both lockfiles every
+  Monday and opens a PR when anything moved.
+
+So a Dependabot PR that bumps a floor will fail the drift check until
+you regenerate the lockfiles onto its branch with the commands above.
+
 ## Code style
 
 - Black is the formatter. CI runs `black --check dmp tests`. Run
