@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           # The lockfile headers record pip-compile running under 3.14.
           # Recompiling under an older interpreter would rewrite the
