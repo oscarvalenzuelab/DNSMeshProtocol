@@ -56,7 +56,7 @@ jobs:
             --output-file=requirements-dev.lock requirements-dev.txt
 
       - name: Open a pull request if anything moved
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: deps/lockfile-refresh
           # Reuse the branch across runs so an unreviewed refresh is updated
