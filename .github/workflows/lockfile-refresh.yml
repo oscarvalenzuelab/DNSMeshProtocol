@@ -94,7 +94,13 @@ jobs:
     # and both create one. `cancel-in-progress: false` because a cancelled
     # reporter files nothing, which is the state being fixed.
     concurrency:
-      group: report-ci-failure-${{ github.workflow }}
+      # Keyed on the workflow FILE, not the display name, for the same reason
+      # the issue marker is: a rename mid-flight would otherwise put two runs of
+      # one workflow in two different groups and let both file. Known limit:
+      # GitHub keeps at most one PENDING member per group, so a third reporter
+      # arriving can supersede a queued one even with cancel-in-progress false.
+      # On a weekly cron that needs three runs inside one run's lifetime.
+      group: report-ci-failure-${{ github.workflow_ref }}
       cancel-in-progress: false
     permissions:
       # Only what this job needs, and `contents: read` is one of them: naming a

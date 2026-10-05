@@ -86,6 +86,45 @@ def reporter_jobs(doc: dict[str, Any]) -> list[str]:
     return found
 
 
+def permission_leaks(path: Path, doc: dict[str, Any]) -> list[str]:
+    """Refuse any grant of `issues: write` outside a reporter job.
+
+    The repository-wide default is `read` and the point of the reporter's own
+    `permissions:` block is that it is the only thing holding write. A
+    workflow-level grant, a `write-all`, or the same scope on an ordinary job
+    hands it to everything in the file, which is the widening this change exists
+    to avoid — and it is invisible, because the reporter still works.
+    """
+    problems: list[str] = []
+    reporters = set(reporter_jobs(doc))
+
+    def names_issue_write(perms: Any) -> str | None:
+        if perms == "write-all":
+            return "write-all"
+        if isinstance(perms, dict) and perms.get("issues") == "write":
+            return "issues: write"
+        return None
+
+    leak = names_issue_write(doc.get("permissions"))
+    if leak:
+        problems.append(
+            f"{path}: workflow-level `permissions:` grants `{leak}`, so every job "
+            f"in the file can open issues. Only the reporter job needs it; move it "
+            f"there and leave the workflow default alone."
+        )
+
+    for name, job in (doc.get("jobs") or {}).items():
+        if name in reporters:
+            continue
+        leak = names_issue_write(job.get("permissions"))
+        if leak:
+            problems.append(
+                f"{path}: job `{name}` grants `{leak}` and is not a reporter job. "
+                f"Only the reporter needs to open issues."
+            )
+    return problems
+
+
 def check(path: Path) -> list[str]:
     """Return a list of problems with one workflow file. Empty means it is fine."""
     doc = yaml.safe_load(path.read_text())
@@ -95,24 +134,19 @@ def check(path: Path) -> list[str]:
     problems: list[str] = []
     jobs = doc.get("jobs") or {}
 
-    if "schedule" not in triggers(doc):
-        # Not unattended, so a failure already lands somewhere a person looks.
-        # Still refuse a half-wired reporter if somebody added one anyway.
-        if len(reporter_jobs(doc)) > 1:
-            problems.append(
-                f"{path}: more than one job uses {ACTION}. One run must produce "
-                f"one verdict, or the jobs race to open and close the same issue."
-            )
-        return problems
+    problems += permission_leaks(path, doc)
 
     reporters = reporter_jobs(doc)
-    if path.name in EXEMPT:
-        # An exemption is about not having a reporter. If somebody adds one
-        # anyway, check it properly rather than waving the file through.
-        if not reporters:
-            return problems
+    scheduled = "schedule" in triggers(doc)
 
     if not reporters:
+        if not scheduled:
+            # Not unattended, so a failure already lands on the pull request or
+            # push that caused it. Nothing to require here.
+            return problems
+        if path.name in EXEMPT:
+            # Deliberate, argued and printed on every run. It is a real hole.
+            return problems
         problems.append(
             f"{path}: has a `schedule:` trigger and no job using {ACTION}. "
             f"A weekly run that fails with nothing watching it is invisible; "
@@ -120,6 +154,9 @@ def check(path: Path) -> list[str]:
         )
         return problems
 
+    # From here on there IS a reporter, so it gets checked in full whether or
+    # not the workflow is scheduled and whether or not it is exempt. A
+    # half-wired reporter is worse than none: it looks like coverage.
     if len(reporters) > 1:
         problems.append(
             f"{path}: {len(reporters)} jobs use {ACTION} ({', '.join(sorted(reporters))}). "
@@ -151,24 +188,37 @@ def check(path: Path) -> list[str]:
             f"in `needs:`, which is not a job in this workflow."
         )
 
-    # A substring test, and it is honest about being one: it catches the
-    # accidental case (somebody forgets `always()`), and the two spellings that
-    # cancel it out. It cannot catch an `if:` written to look wired while never
-    # running — `${{ always() && inputs.enabled }}` with the input unset would
-    # pass here. That is a hostile case, not a careless one.
+    # Whitespace-insensitive, because `always()&&false` and `always() && false`
+    # are the same wiring error and only one of them contains "&& false".
     guard = str(job.get("if") or "")
-    if "always()" not in guard:
+    tight = "".join(guard.split())
+
+    if "always()" not in tight:
         problems.append(
             f"{path}: job `{name}` is missing `always()` in its `if:`. Without it "
             f"the reporter is skipped exactly when an upstream job failed — and a "
             f"failure is what it has most to say about."
         )
-    for cancels in ("!always()", "false &&", "&& false"):
-        if cancels in guard.replace(" ", " "):
+    for cancels in ("!always()", "false&&", "&&false"):
+        if cancels in tight:
             problems.append(
-                f"{path}: job `{name}` has `{cancels}` in its `if:`, which stops the "
-                f"reporter running while leaving the wiring looking correct."
+                f"{path}: job `{name}` has `{cancels.replace('&&', ' && ')}` in its "
+                f"`if:`, which stops the reporter running while leaving the wiring "
+                f"looking correct."
             )
+    if scheduled and "'schedule'" not in tight and '"schedule"' not in tight:
+        # `always() && github.event_name == 'push'` passes every check above and
+        # never runs on the cron — the exact silence this exists to remove.
+        problems.append(
+            f"{path}: job `{name}` has a `schedule:` trigger but its `if:` never "
+            f"names the `schedule` event, so the reporter cannot run on the cron. "
+            f"Guard it on the unattended events explicitly."
+        )
+
+    # The honest limit: these are substring tests over an expression language.
+    # They catch the careless cases above. An `if:` written to look wired while
+    # never running — `always() && inputs.enabled` with the input unset — would
+    # still pass, and no amount of substring matching fixes that.
 
     perms = job.get("permissions") or {}
     if not isinstance(perms, dict):
@@ -204,6 +254,26 @@ def check(path: Path) -> list[str]:
                 f"workflow file path is the issue's identity; the display name is "
                 f"mutable, so without it a rename orphans an open issue."
             )
+        if not str(with_.get("token") or "").strip():
+            # A composite action's `required: true` is not enforced by the
+            # runner, so an omitted token reaches `gh` as an empty string and
+            # every call fails — a reporter that files nothing, looking wired.
+            problems.append(
+                f"{path}: job `{name}` must pass a `token:` to {ACTION}. Without "
+                f"one `gh` is unauthenticated and files nothing; the action's "
+                f"`required: true` does not make the runner enforce it."
+            )
+
+    uses = [str(step.get("uses") or "") for step in job.get("steps") or []]
+    if not any(u.startswith("actions/checkout") for u in uses):
+        # The action lives in this repository, so the runner can only find it
+        # after a checkout. Without one the step fails to resolve and no issue
+        # is filed.
+        problems.append(
+            f"{path}: job `{name}` uses the local action {ACTION} but never runs "
+            f"`actions/checkout`, so the action is not on disk and the step cannot "
+            f"resolve. Nothing would be filed."
+        )
 
     return problems
 

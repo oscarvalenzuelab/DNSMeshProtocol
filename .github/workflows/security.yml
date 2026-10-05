@@ -168,7 +168,13 @@ jobs:
       (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     concurrency:
-      group: report-ci-failure-${{ github.workflow }}
+      # Keyed on the workflow FILE, not the display name, for the same reason
+      # the issue marker is: a rename mid-flight would otherwise put two runs of
+      # one workflow in two different groups and let both file. Known limit:
+      # GitHub keeps at most one PENDING member per group, so a third reporter
+      # arriving can supersede a queued one even with cancel-in-progress false.
+      # On a weekly cron that needs three runs inside one run's lifetime.
+      group: report-ci-failure-${{ github.workflow_ref }}
       cancel-in-progress: false
     permissions:
       # `contents: read` is required, not tidiness: a `permissions` block sets

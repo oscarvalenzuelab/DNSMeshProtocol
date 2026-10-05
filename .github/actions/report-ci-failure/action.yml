@@ -81,7 +81,11 @@ runs:
         # `github.workflow_ref` looks like
         #   owner/repo/.github/workflows/security.yml@refs/heads/main
         # Strip the owner/repo prefix and the @ref suffix to get the path.
-        wf_file=${WORKFLOW_REF%@*}
+        # `%%@*` strips from the FIRST `@`, not the last. A branch name may
+        # contain `@` — `refs/heads/release@2026` is legal — and the shortest-
+        # suffix form `%@*` would leave the ref glued to the path, giving the
+        # same workflow two identities on two refs.
+        wf_file=${WORKFLOW_REF%%@*}
         wf_file=${wf_file#*/*/}
         if [ -z "$wf_file" ] || [ "$wf_file" = "$WORKFLOW_REF" ]; then
           echo "::error::could not read a workflow file path out of" \
@@ -94,7 +98,27 @@ runs:
         # An empty `needs` object means this job could not see any result, not
         # that every job passed. Reporting green off an empty answer sheet is
         # the exact failure this action exists to prevent, so refuse instead.
+        #
+        # Every step of reading it has to refuse too. `jq` on empty input exits
+        # 0 and prints nothing, so `count` comes back as the empty string; and
+        # `[ "" -eq 0 ]` inside an `if` returns status 2, which `set -e` does
+        # NOT treat as fatal, so the guard silently does not fire and the run
+        # proceeds to the green path — closing a real failure issue. A count
+        # that is not a number is "I could not read this", so it is checked as
+        # a number before it is used as one.
+        if ! printf '%s' "$NEEDS" | jq -e 'type == "object"' >/dev/null 2>&1; then
+          echo "::error::the needs input is not a JSON object. Got: '${NEEDS}'." \
+               "The calling job must pass \`needs: \${{ toJSON(needs) }}\`; without" \
+               "it this run's outcome is unknown, which is not the same as passing."
+          exit 1
+        fi
         count=$(printf '%s' "$NEEDS" | jq -r 'length')
+        case "$count" in
+          ''|*[!0-9]*)
+            echo "::error::could not count the job results (got '${count}')." \
+                 "Refusing rather than reading an unreadable answer as a pass."
+            exit 1 ;;
+        esac
         if [ "$count" -eq 0 ]; then
           echo "::error::report-ci-failure got no job results. The calling job is" \
                "missing its needs: list, so this run's outcome is unknown — which" \
@@ -139,10 +163,25 @@ runs:
         # workflows sharing a display name.
         if listing=$(gh issue list --repo "$REPO" --label "$LABEL" --state open \
                        --limit "$LIST_LIMIT" --json number,body 2>&1); then
+          if ! printf '%s' "$listing" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "::error::the ${LABEL} listing is not a JSON array. Got:" \
+                 "'${listing}'. Refusing rather than reading it as 'no issues'."
+            exit 1
+          fi
+          # EVERY match, not the first. A lookup failure on an earlier run is
+          # allowed to leave a duplicate (filing beats silence), so the green
+          # path has to be able to clear more than one or the extra stays open
+          # for ever while the workflow is green.
           existing=$(printf '%s' "$listing" \
             | jq -r --arg m "$marker" 'map(select(.body != null and (.body | contains($m))))
-                                       | .[0].number // empty')
+                                       | .[].number')
           returned=$(printf '%s' "$listing" | jq -r 'length')
+          case "$returned" in
+            ''|*[!0-9]*)
+              echo "::error::could not count the ${LABEL} listing (got '${returned}')." \
+                   "Refusing rather than assuming it was short."
+              exit 1 ;;
+          esac
           if [ "$returned" -ge "$LIST_LIMIT" ]; then
             # A full page means our issue may be on the next one. That is "I
             # could not look" wearing a successful exit code.
@@ -188,8 +227,15 @@ runs:
             "<sub>Filed by \`.github/actions/report-ci-failure\` for \`${wf_file}\`.</sub>")
 
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body "$body"
-            echo "commented on #${existing}"
+            # Comment on the oldest match only — one report per run, whatever
+            # duplicates a past lookup failure left behind. The green path
+            # closes all of them.
+            first=$(printf '%s\n' "$existing" | head -n 1)
+            gh issue comment "$first" --repo "$REPO" --body "$body"
+            echo "commented on #${first}"
+            others=$(printf '%s\n' "$existing" | tail -n +2 | tr '\n' ' ')
+            [ -n "${others// /}" ] && echo "::warning::duplicate open issues for" \
+              "${wf_file}: ${others}— they will all be closed on the next green run."
           else
             # Triaged in the same command that creates it: an untriaged issue is
             # unreadable and inflates the count. No --milestone — a milestone
@@ -233,9 +279,12 @@ runs:
         fi
 
         if [ -n "$existing" ]; then
-          gh issue close "$existing" --repo "$REPO" \
-            --comment "Green again on ${RUN_URL}. Closed by \`.github/actions/report-ci-failure\`."
-          echo "closed #${existing}"
+          printf '%s\n' "$existing" | while read -r n; do
+            [ -n "$n" ] || continue
+            gh issue close "$n" --repo "$REPO" \
+              --comment "Green again on ${RUN_URL}. Closed by \`.github/actions/report-ci-failure\`."
+            echo "closed #${n}"
+          done
         else
           echo "green, and no open ${LABEL} issue for ${wf_file}. Nothing to do."
         fi
