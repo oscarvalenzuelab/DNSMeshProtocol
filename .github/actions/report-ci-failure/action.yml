@@ -6,18 +6,23 @@ description: >
 # Why this exists
 #
 # `lockfile refresh` ran weekly and failed on every run from 7 Sep 2026 to
-# 5 Oct 2026 — six consecutive runs. Nothing reported it. It was found by
-# sweeping failed runs across every repository by hand, four weeks later, and
-# by then the stale lockfiles it could not deliver had made two `security`
-# jobs red as well.
+# 5 Oct 2026 — six consecutive runs, which is every run it has ever had. Nothing
+# reported it. It was found by sweeping failed runs across every repository by
+# hand, four weeks later, and by then the stale lockfiles it could not deliver
+# had made two `security` jobs red as well.
 #
 # A scheduled run has no pull request to turn red and nobody watching the tab,
 # so its failure is indistinguishable from its success from anywhere a person
 # actually looks. This action moves that signal somewhere people read: an open
 # issue means a scheduled workflow is currently failing, and the issue closes
 # itself when the workflow goes green again. The issue IS the state, which is
-# why the success path matters as much as the failure path — a marker that only
-# ever goes on accumulates into a list nobody trusts.
+# why both outcomes do work here — a marker that only ever goes on accumulates
+# into a list nobody trusts.
+#
+# Identity is the workflow FILE, carried in an HTML comment in the issue body,
+# not the issue title. `github.workflow` is a mutable display name: renaming a
+# workflow with an issue open would otherwise orphan it, and two workflows
+# sharing a display name would open and close each other's.
 
 inputs:
   needs:
@@ -26,7 +31,12 @@ inputs:
       job whose outcome should count, and must itself run under `if: always()`.
     required: true
   workflow:
-    description: The workflow name the issue is about. Used as the issue's identity.
+    description: The workflow's display name. Used in the issue title, for humans.
+    required: true
+  workflow-ref:
+    description: >
+      `github.workflow_ref`. The file path inside it is the issue's real
+      identity, so a rename of the display name does not orphan an open issue.
     required: true
   token:
     description: "A token carrying `issues: write`."
@@ -38,6 +48,14 @@ inputs:
       step loudly rather than reporting nothing.
     required: false
     default: ci-failure
+  triage-labels:
+    description: >
+      Extra labels applied when the issue is first created, so it is triaged in
+      the same command. If any of them is missing or renamed the issue is still
+      filed, with only `label`, and a warning names what was dropped — filing
+      matters more than filing it tidily.
+    required: false
+    default: bug,P2
 
 runs:
   using: composite
@@ -47,7 +65,9 @@ runs:
       env:
         NEEDS: ${{ inputs.needs }}
         WORKFLOW: ${{ inputs.workflow }}
+        WORKFLOW_REF: ${{ inputs.workflow-ref }}
         LABEL: ${{ inputs.label }}
+        TRIAGE_LABELS: ${{ inputs.triage-labels }}
         GH_TOKEN: ${{ inputs.token }}
         REPO: ${{ github.repository }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -56,14 +76,49 @@ runs:
       run: |
         set -euo pipefail
 
+        LIST_LIMIT=100
+
+        # `github.workflow_ref` looks like
+        #   owner/repo/.github/workflows/security.yml@refs/heads/main
+        # Strip the owner/repo prefix and the @ref suffix to get the path.
+        wf_file=${WORKFLOW_REF%@*}
+        wf_file=${wf_file#*/*/}
+        if [ -z "$wf_file" ] || [ "$wf_file" = "$WORKFLOW_REF" ]; then
+          echo "::error::could not read a workflow file path out of" \
+               "workflow-ref '${WORKFLOW_REF}'. Without it this action cannot" \
+               "identify its own issue, and guessing would act on somebody else's."
+          exit 1
+        fi
+        marker="<!-- report-ci-failure: ${wf_file} -->"
+
         # An empty `needs` object means this job could not see any result, not
-        # that every job passed. Reporting "green" off an empty answer sheet is
+        # that every job passed. Reporting green off an empty answer sheet is
         # the exact failure this action exists to prevent, so refuse instead.
         count=$(printf '%s' "$NEEDS" | jq -r 'length')
         if [ "$count" -eq 0 ]; then
           echo "::error::report-ci-failure got no job results. The calling job is" \
                "missing its needs: list, so this run's outcome is unknown — which" \
                "is not the same as passing."
+          exit 1
+        fi
+
+        # Every entry must carry a result this action actually understands. A
+        # missing or unrecognised one is "I could not read this", and the one
+        # thing it must not become is a green verdict: that would close an open
+        # failure issue and report the workflow healthy.
+        unreadable=$(printf '%s' "$NEEDS" \
+          | jq -r '[ to_entries[]
+                     | if (.value | type) != "object" then
+                         "`" + .key + "` -> not an object (" + (.value | type) + ")"
+                       elif (.value.result | IN("success","failure","cancelled","skipped")) != true then
+                         "`" + .key + "` -> " + ((.value.result // "no result field") | tostring)
+                       else
+                         empty
+                       end ]
+                   | join(", ")')
+        if [ -n "$unreadable" ]; then
+          echo "::error::unrecognised job result(s): ${unreadable}. Refusing rather" \
+               "than treating a result this action cannot read as a pass."
           exit 1
         fi
 
@@ -79,14 +134,24 @@ runs:
 
         title="CI: \`${WORKFLOW}\` is failing on its unattended runs"
 
-        # Find the existing issue by exact title among our labelled open ones.
-        # A --search match is fuzzy and would eventually act on the wrong issue,
-        # so match the title in jq instead.
+        # Find our own open issue by the marker in its body. Title matching
+        # would break on a workflow rename and would collide between two
+        # workflows sharing a display name.
         if listing=$(gh issue list --repo "$REPO" --label "$LABEL" --state open \
-                       --limit 100 --json number,title 2>&1); then
+                       --limit "$LIST_LIMIT" --json number,body 2>&1); then
           existing=$(printf '%s' "$listing" \
-            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')
-          looked=yes
+            | jq -r --arg m "$marker" 'map(select(.body != null and (.body | contains($m))))
+                                       | .[0].number // empty')
+          returned=$(printf '%s' "$listing" | jq -r 'length')
+          if [ "$returned" -ge "$LIST_LIMIT" ]; then
+            # A full page means our issue may be on the next one. That is "I
+            # could not look" wearing a successful exit code.
+            echo "::warning::the open-${LABEL} listing filled its ${LIST_LIMIT}-row page," \
+                 "so an existing issue may not have been in it."
+            looked=no
+          else
+            looked=yes
+          fi
         else
           # "I could not look" is not "there is none". The failure path below
           # still files, because a visible duplicate is recoverable and silence
@@ -99,6 +164,8 @@ runs:
 
         if [ -n "$failed" ]; then
           body=$(printf '%s\n' \
+            "${marker}" \
+            "" \
             "The scheduled \`${WORKFLOW}\` workflow failed and no pull request carries" \
             "that signal, so this issue is the signal." \
             "" \
@@ -110,32 +177,49 @@ runs:
             "" \
             "**What to do:** open the run, read the first failing step, and either fix" \
             "it or reply here saying why it is expected. Do not close this by hand while" \
-            "the workflow is still red — the next green scheduled run closes it, and a" \
-            "hand-closed issue silently stops being the state." \
+            "the workflow is still red — the next green run closes it, and a hand-closed" \
+            "issue silently stops being the state." \
             "" \
             "**Who is affected and why now:** reason 3. A weekly job's failure is" \
             "invisible for a week at a time; the failure that produced this mechanism" \
             "went six runs and four weeks before a manual sweep found it, and by then it" \
             "had taken the dependency audit down with it." \
             "" \
-            "<sub>Filed by \`.github/actions/report-ci-failure\`.</sub>")
+            "<sub>Filed by \`.github/actions/report-ci-failure\` for \`${wf_file}\`.</sub>")
 
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" --body "$body"
             echo "commented on #${existing}"
           else
             # Triaged in the same command that creates it: an untriaged issue is
-            # unreadable and inflates the count. No --milestone on purpose — a
-            # milestone title hardcoded here breaks this notifier the day somebody
-            # renames or closes it, and a notifier that cannot file is the original
-            # bug wearing a different hat.
-            url=$(gh issue create --repo "$REPO" --title "$title" --body "$body" \
-                    --label "$LABEL" --label bug --label P2)
-            echo "opened ${url}"
+            # unreadable and inflates the count. No --milestone — a milestone
+            # title hardcoded here breaks this notifier the day somebody renames
+            # or closes it, and a notifier that cannot file is the original bug
+            # wearing a different hat.
+            extra=()
+            IFS=',' read -r -a parsed <<< "$TRIAGE_LABELS"
+            for l in "${parsed[@]}"; do
+              [ -n "$l" ] && extra+=(--label "$l")
+            done
+
+            if url=$(gh issue create --repo "$REPO" --title "$title" --body "$body" \
+                       --label "$LABEL" "${extra[@]}" 2>&1); then
+              echo "opened ${url}"
+            else
+              # The triage labels are secondary; the issue existing is not. Retry
+              # with only the marker label and say loudly what was dropped, so a
+              # renamed label cannot turn this back into silence.
+              echo "::warning::could not file with triage labels (${TRIAGE_LABELS}):" \
+                   "${url}. Retrying with only ${LABEL} — the issue needs triaging by hand."
+              url=$(gh issue create --repo "$REPO" --title "$title" --body "$body" \
+                      --label "$LABEL")
+              echo "opened ${url} (untriaged)"
+            fi
           fi
 
           if [ "$looked" = no ]; then
-            echo "::error::the report landed, but the duplicate check could not run."
+            echo "::error::the report landed, but the duplicate check could not run," \
+                 "so there may now be two open issues for this workflow."
             exit 1
           fi
           exit 0
@@ -153,5 +237,5 @@ runs:
             --comment "Green again on ${RUN_URL}. Closed by \`.github/actions/report-ci-failure\`."
           echo "closed #${existing}"
         else
-          echo "green, and no open ${LABEL} issue for ${WORKFLOW}. Nothing to do."
+          echo "green, and no open ${LABEL} issue for ${wf_file}. Nothing to do."
         fi

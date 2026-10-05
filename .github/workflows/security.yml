@@ -160,14 +160,21 @@ jobs:
       - pip-audit
       - fuzz-wire-parsers
       - fuzz-wire-parsers-nightly
-    # See the matching job in lockfile-refresh.yml. PR and push failures are
-    # already visible on the thing that caused them; only the unattended runs
-    # need somewhere to be seen.
+    # See the matching job in lockfile-refresh.yml, which carries the reasoning.
+    # PR and push failures are already visible on the thing that caused them;
+    # only the unattended runs need somewhere to be seen.
     if: >-
       always() &&
       (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    concurrency:
+      group: report-ci-failure-${{ github.workflow }}
+      cancel-in-progress: false
     permissions:
+      # `contents: read` is required, not tidiness: a `permissions` block sets
+      # every unlisted scope to `none`, which would strip `actions/checkout` of
+      # its token and stop the reporter running at all.
+      contents: read
       issues: write
     steps:
       - uses: actions/checkout@v7
@@ -176,4 +183,5 @@ jobs:
         with:
           needs: ${{ toJSON(needs) }}
           workflow: ${{ github.workflow }}
+          workflow-ref: ${{ github.workflow_ref }}
           token: ${{ secrets.GITHUB_TOKEN }}

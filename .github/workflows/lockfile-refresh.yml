@@ -79,18 +79,30 @@ jobs:
   report:
     name: report an unattended failure
     needs: [refresh]
-    # `always()` so this runs when `refresh` failed — which is the only time it
-    # has anything to say. Restricted to the unattended events: a
-    # `pull_request` failure already turns a pull request red, and filing an
-    # issue for that would teach everyone to ignore these issues.
-    # `workflow_dispatch` is included deliberately: it is the only way to prove
-    # this path works without waiting a week for the cron.
+    # `always()` so this job runs whatever `refresh` did. Both outcomes have
+    # work: a failure opens or updates the issue, and a success closes it, which
+    # is what makes an open issue mean "currently red" rather than "was red
+    # once". Restricted to the unattended events — a `pull_request` failure
+    # already turns a pull request red, and filing an issue for that would teach
+    # everyone to ignore these issues. `workflow_dispatch` is included
+    # deliberately: it is the only way to exercise this without waiting a week.
     if: >-
       always() &&
       (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    # Serialise the reporters so two overlapping runs cannot both find no issue
+    # and both create one. `cancel-in-progress: false` because a cancelled
+    # reporter files nothing, which is the state being fixed.
+    concurrency:
+      group: report-ci-failure-${{ github.workflow }}
+      cancel-in-progress: false
     permissions:
-      # Only what this job needs. The repository-wide default stays `read`.
+      # Only what this job needs, and `contents: read` is one of them: naming a
+      # `permissions` block sets every scope not listed to `none`, so without it
+      # `actions/checkout` loses its token and the reporter cannot even start —
+      # a reporter that fails to run is the silent failure all over again. The
+      # repository-wide default stays `read`.
+      contents: read
       issues: write
     steps:
       - uses: actions/checkout@v7
@@ -99,4 +111,5 @@ jobs:
         with:
           needs: ${{ toJSON(needs) }}
           workflow: ${{ github.workflow }}
+          workflow-ref: ${{ github.workflow_ref }}
           token: ${{ secrets.GITHUB_TOKEN }}

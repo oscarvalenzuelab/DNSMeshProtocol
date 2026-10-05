@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Fail when a scheduled workflow has no way to report its own failure.
 
+Except for the workflows in EXEMPT below, each of which carries its reason and
+is printed on every successful run. That is a real hole in this check and it is
+named rather than hidden: an exempted workflow can fail with nothing filed.
+
 `lockfile refresh` runs weekly. It failed on every run from 7 Sep 2026 to
 5 Oct 2026 — six consecutive runs — because it was not permitted to open the
 pull request that carries its result. Nothing reported that. A scheduled run
@@ -147,30 +151,58 @@ def check(path: Path) -> list[str]:
             f"in `needs:`, which is not a job in this workflow."
         )
 
+    # A substring test, and it is honest about being one: it catches the
+    # accidental case (somebody forgets `always()`), and the two spellings that
+    # cancel it out. It cannot catch an `if:` written to look wired while never
+    # running — `${{ always() && inputs.enabled }}` with the input unset would
+    # pass here. That is a hostile case, not a careless one.
     guard = str(job.get("if") or "")
     if "always()" not in guard:
         problems.append(
             f"{path}: job `{name}` is missing `always()` in its `if:`. Without it "
-            f"the reporter is skipped exactly when an upstream job failed, which "
-            f"is the only time it has anything to say."
+            f"the reporter is skipped exactly when an upstream job failed — and a "
+            f"failure is what it has most to say about."
         )
+    for cancels in ("!always()", "false &&", "&& false"):
+        if cancels in guard.replace(" ", " "):
+            problems.append(
+                f"{path}: job `{name}` has `{cancels}` in its `if:`, which stops the "
+                f"reporter running while leaving the wiring looking correct."
+            )
 
     perms = job.get("permissions") or {}
-    if not isinstance(perms, dict) or perms.get("issues") != "write":
+    if not isinstance(perms, dict):
+        perms = {}
+    if perms.get("issues") != "write":
         problems.append(
             f"{path}: job `{name}` needs `permissions: issues: write` of its own. "
             f"The repository-wide default is `read` and must stay that way."
+        )
+    if perms.get("contents") != "read":
+        problems.append(
+            f"{path}: job `{name}` needs `permissions: contents: read` as well. "
+            f"Naming a `permissions` block sets every scope not listed to `none`, "
+            f"so without it `actions/checkout` loses its token and the reporter "
+            f"never runs — which is the silent failure, not a fix for it."
         )
 
     for step in job.get("steps") or []:
         if step.get("uses") != ACTION:
             continue
-        passed = str((step.get("with") or {}).get("needs") or "")
+        with_ = step.get("with") or {}
+        passed = str(with_.get("needs") or "")
         if "toJSON(needs)" not in passed:
             problems.append(
                 f"{path}: job `{name}` must pass `needs: ${{{{ toJSON(needs) }}}}` "
                 f"to {ACTION}. Anything else leaves the action unable to see the "
                 f"results it is reporting on."
+            )
+        if "github.workflow_ref" not in str(with_.get("workflow-ref") or ""):
+            problems.append(
+                f"{path}: job `{name}` must pass "
+                f"`workflow-ref: ${{{{ github.workflow_ref }}}}` to {ACTION}. The "
+                f"workflow file path is the issue's identity; the display name is "
+                f"mutable, so without it a rename orphans an open issue."
             )
 
     return problems
