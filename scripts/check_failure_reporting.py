@@ -235,8 +235,9 @@ def check(path: Path) -> list[str]:
             problems.append(
                 f"{path}: job `{other}` sets `continue-on-error`, so "
                 f"`needs.{other}.result` reports `success` even when it fails. The "
-                f"reporter would see a green run and file nothing. Let the job fail, "
-                f"or take it out of the reporter's `needs:` deliberately and say why."
+                f"reporter would see a green run and file nothing. Let the job fail. "
+                f"Dropping it from the reporter's `needs:` is not an escape — that "
+                f"is refused above, because an unwatched job is the same silence."
             )
 
     if "concurrency" in job:
@@ -297,15 +298,17 @@ def check(path: Path) -> list[str]:
                 f"reaches the action as a value it cannot read, so it refuses and "
                 f"files nothing."
             )
-        if "".join(str(with_.get("default-branch") or "").split()) != (
-            "${{github.event.repository.default_branch}}"
-        ):
+        if "default-branch" in with_:
+            # Removed deliberately. `github.event.repository.default_branch` is a
+            # webhook-payload field, and a `schedule` run has no webhook behind
+            # it, so it can be empty on exactly the runs that matter — which
+            # would stop any scheduled run ever closing anything. The action asks
+            # the API instead, with the token it already holds.
             problems.append(
-                f"{path}: job `{name}` must pass "
-                f"`default-branch: ${{{{ github.event.repository.default_branch }}}}` "
-                f"to {ACTION}, exactly. Got `{with_.get('default-branch')!r}`. "
-                f"Without it a green run from any branch can close a report that "
-                f"belongs to the default branch, where the cron actually runs."
+                f"{path}: job `{name}` passes `default-branch` to {ACTION}, which "
+                f"no longer takes it. The action resolves the default branch from "
+                f"the API, because the payload field it used to read is absent on "
+                f"scheduled runs."
             )
         if "".join(str(with_.get("workflow-ref") or "").split()) != (
             "${{github.workflow_ref}}"
@@ -425,15 +428,18 @@ def main() -> int:
         f"Reporting their own failures: {', '.join(reporting) or 'none'}."
     )
     stale = sorted(set(EXEMPT) - set(scheduled))
+    spent: list[str] = []
     for name in sorted(EXEMPT):
         if name not in scheduled:
             continue
         doc = yaml.safe_load((WORKFLOWS / name).read_text())
         if reporter_jobs(doc):
             # It has one now, so the exemption is spent. Printing the old reason
-            # would describe a hole that has been filled.
+            # would describe a hole that has been filled. Kept apart from
+            # `stale`, because the loop below would otherwise ALSO report this
+            # file as unscheduled — two contradictory lines about one file.
             print(f"  {name} is in EXEMPT but now HAS a reporter. Remove the entry.")
-            stale.append(name)
+            spent.append(name)
         else:
             print(f"  exempt: {name} — {EXEMPT[name]}")
     if stale:
@@ -444,6 +450,7 @@ def main() -> int:
             print(
                 f"  {name} is in EXEMPT but has no `schedule:` trigger. Remove the entry."
             )
+    if stale or spent:
         return 1
     return 0
 

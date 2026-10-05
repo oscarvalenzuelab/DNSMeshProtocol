@@ -197,5 +197,4 @@ jobs:
           needs: ${{ toJSON(needs) }}
           workflow: ${{ github.workflow }}
           workflow-ref: ${{ github.workflow_ref }}
-          default-branch: ${{ github.event.repository.default_branch }}
           token: ${{ secrets.GITHUB_TOKEN }}

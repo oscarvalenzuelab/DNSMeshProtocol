@@ -38,29 +38,19 @@ inputs:
       `github.workflow_ref`. The file path inside it is the issue's real
       identity, so a rename of the display name does not orphan an open issue.
     required: true
-  default-branch:
-    description: >
-      `github.event.repository.default_branch`. Only a run on the default branch
-      may CLOSE a report: a green `workflow_dispatch` from a feature branch has a
-      higher run number than the default branch's failing scheduled run, and
-      would otherwise clear an issue while the default branch is still red.
-      Filing is not restricted — a failure anywhere is worth knowing about.
-    required: true
   token:
     description: "A token carrying `issues: write`."
     required: true
   label:
     description: >
-      The label that marks these issues. It must already exist on the
-      repository; this action does not create it, so a label deleted from the
-      repository makes the filing step fail loudly rather than quietly do
-      nothing.
+      The label that marks these issues. The action creates it if it is missing,
+      so a label deleted from the repository does not stop a report being filed.
 
-      Note what this does NOT cover: the label is also how the lookup is
-      scoped, so a label removed by hand from an open report makes that report
-      invisible to this action. It will not be commented on and it will not be
-      closed. The issue body says not to hand-close these; it says not to
-      unlabel them for the same reason.
+      Note what that does NOT cover: the label is also how the lookup is scoped,
+      so a label removed by hand from an open report makes that report invisible
+      to this action. It will not be commented on and it will not be closed. The
+      issue body says not to hand-close these, and not to unlabel them for the
+      same reason.
     required: false
     default: ci-failure
   triage-labels:
@@ -88,7 +78,6 @@ runs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         EVENT: ${{ github.event_name }}
         RUN_NUMBER: ${{ github.run_number }}
-        DEFAULT_BRANCH: ${{ inputs.default-branch }}
         REF: ${{ github.ref_name }}
       run: |
         set -euo pipefail
@@ -100,12 +89,22 @@ runs:
         # loudly here means a red job in the Actions tab, which is exactly the
         # signal this action exists because nobody reads. `--force` is
         # idempotent and needs only the `issues: write` this job already holds.
-        if ! gh label create "$LABEL" --repo "$REPO" --force \
-               --color b60205 \
-               --description "A scheduled workflow is currently failing" >/dev/null 2>&1; then
-          echo "::warning::could not ensure the ${LABEL} label exists. If it is" \
-               "missing, filing below will fail and this job will be the only" \
-               "signal — which is the signal nobody reads."
+        # Create it only when it is absent. `--force` unconditionally would
+        # rewrite the colour and description on every run, reverting anybody who
+        # had tuned them.
+        if have_label=$(gh label list --repo "$REPO" --limit 200 --json name \
+                          -q '.[].name' 2>&1); then
+          if ! printf '%s\n' "$have_label" | grep -qxF "$LABEL"; then
+            if ! out=$(gh label create "$LABEL" --repo "$REPO" --color b60205 \
+                         --description "A scheduled workflow is currently failing" 2>&1); then
+              echo "::warning::could not create the ${LABEL} label (${out}). If it" \
+                   "is missing, filing below will fail and a red job in the Actions" \
+                   "tab will be the only signal — which is the signal nobody reads."
+            fi
+          fi
+        else
+          echo "::warning::could not list labels (${have_label}), so this run" \
+               "cannot tell whether ${LABEL} exists."
         fi
 
         # `github.workflow_ref` looks like
@@ -169,12 +168,19 @@ runs:
         # that is not a number is "I could not read this", so it is checked as
         # a number before it is used as one.
         if ! printf '%s' "$NEEDS" | jq -e 'type == "object"' >/dev/null 2>&1; then
-          # Do NOT write the braced form of an Actions expression anywhere in this
-          # script. The runner substitutes `${…}`-brace expressions in the `run:`
-          # text before bash ever sees it, a backslash does not escape one, and
-          # `needs` is a JOB context that does not exist inside a composite
-          # action — so the braced spelling made this step fail to evaluate on
-          # EVERY run, red or green, and the reporter never filed anything.
+          # Do NOT write the braced form of an Actions expression anywhere in
+          # this script. The runner substitutes those in the `run:` text before
+          # bash ever sees it, and a backslash does not escape one.
+          #
+          # What was OBSERVED: an earlier version contained the braced spelling
+          # of a `toJSON(needs)` expression inside this message. What follows is
+          # inferred, not measured, and both outcomes are bad. If `needs` does
+          # not resolve in a composite-action context, template evaluation fails
+          # and the step dies on every run before any of it executes. If it does
+          # resolve, multi-line JSON is spliced into the script source and its
+          # own quotes unbalance the surrounding quoting — in the one job in the
+          # repository holding `issues: write`. Neither was reproduced on a
+          # runner; the braces were simply removed.
           echo "::error::the needs input is not a JSON object. Got: '${NEEDS}'." \
                "The calling job must pass the toJSON(needs) expression as the" \
                "needs input; without it this run's outcome is unknown, which is" \
@@ -318,12 +324,23 @@ runs:
             first=$(printf '%s\n' "$existing" | head -n 1)
             gh issue comment "$first" --repo "$REPO" --body "$body"
             echo "commented on #${first}"
-            # Advance the recorded run number — forwards only. Overwriting it
+            # Advance the recorded run number — forwards only, except that
+            # read-then-edit is not atomic: two red runs reading the same marker
+            # inside the same window can still land out of order. Overwriting it
             # unconditionally lets it go BACKWARDS: run 12 files marker 12, slow
             # run 10 then rewrites it to 10, and run 11's green path reads 10 < 11
             # and closes an issue whose newest verdict (12) is still red.
-            recorded=$(gh issue view "$first" --repo "$REPO" --json body -q .body 2>/dev/null \
-                       | sed -n "s|.*${run_marker_prefix}\([0-9]\{1,\}\) -->.*|\1|p" | head -n 1)
+            # Guarded for the same reason the close loop is: unguarded under
+            # `set -e` with `pipefail`, a transient API failure here would exit
+            # the step with no annotation, after the comment had landed.
+            if first_body=$(gh issue view "$first" --repo "$REPO" --json body -q .body 2>&1); then
+              recorded=$(printf '%s' "$first_body" \
+                         | sed -n "s|.*${run_marker_prefix}\([0-9]\{1,\}\) -->.*|\1|p" | head -n 1)
+            else
+              echo "::warning::could not read #${first} to compare run markers:" \
+                   "${first_body}. Treating it as unmarked."
+              recorded=""
+            fi
             case "$recorded" in
               ''|*[!0-9]*) recorded=0 ;;
             esac
@@ -373,10 +390,30 @@ runs:
         fi
 
         # Green.
-        if [ -z "${DEFAULT_BRANCH:-}" ]; then
-          echo "::error::default-branch is empty, so this run cannot tell whether" \
-               "it is allowed to close anything. Refusing rather than clearing a" \
-               "report that may belong to another branch."
+        #
+        # Only a run on the default branch may CLOSE a report: a green run off a
+        # feature branch carries a HIGHER run number than the default branch's
+        # failing scheduled run, so without this it would win the ordering
+        # comparison and clear a real failure. Filing is NOT restricted — a
+        # failure anywhere is worth knowing about.
+        #
+        # The branch is asked of the API rather than read from
+        # `github.event.repository.default_branch`. That field comes from a
+        # webhook payload, and a `schedule` run has no webhook behind it, so it
+        # may be empty on exactly the runs that matter most — which would have
+        # meant no scheduled run could ever close anything, and a red reporter on
+        # every green cron run. This lookup needs only the `contents: read` this
+        # job already holds and does not depend on a payload shape.
+        if ! DEFAULT_BRANCH=$(gh repo view "$REPO" --json defaultBranchRef \
+                                -q .defaultBranchRef.name 2>&1); then
+          echo "::error::could not read the default branch (${DEFAULT_BRANCH})." \
+               "Refusing rather than clearing a report that may belong to another" \
+               "branch."
+          exit 1
+        fi
+        if [ -z "$DEFAULT_BRANCH" ]; then
+          echo "::error::the default branch came back empty, so this run cannot" \
+               "tell whether it may close anything. Refusing."
           exit 1
         fi
         if [ "$REF" != "$DEFAULT_BRANCH" ]; then
@@ -425,6 +462,23 @@ runs:
                 # exiting zero afterwards would not be.
                 echo "::warning::#${n} carries no readable run marker, so this run" \
                      "cannot tell whether it is newer. Leaving it open."
+                # Say it on the issue too. An error in a reporter job's log sits
+                # in the Actions tab, which is the place this action exists
+                # because nobody reads it. A comment is where the reader is.
+                #
+                # Built with printf and indented: a bare multi-line string here
+                # leaves the YAML block scalar and breaks the whole file.
+                nudge=$(printf '%s\n' \
+                  "Run ${RUN_NUMBER} of \`${wf_file}\` was green, but could not order" \
+                  "itself against this issue: the issue carries no readable run" \
+                  "marker, so this run cannot tell whether its own verdict is the" \
+                  "current one. It has been left open deliberately." \
+                  "" \
+                  "If \`${wf_file}\` is green now, close this by hand. A later red run" \
+                  "would re-mark it and a green run could then close it, but nothing" \
+                  "else will close it as it stands.")
+                gh issue comment "$n" --repo "$REPO" --body "$nudge" >/dev/null 2>&1 \
+                  || echo "::warning::could not comment on #${n} either."
                 echo x >> "$unresolved_file"
                 continue ;;
             esac
@@ -451,9 +505,11 @@ runs:
           echo "::error::${unresolved} open issue(s) for ${wf_file} could not be" \
                "ordered against this run, so they were left open, and this run is" \
                "not reported as clean. WHAT TO DO: open each one, confirm the" \
-               "workflow is actually green now, and close it by hand. An issue" \
-               "with no readable run marker cannot be closed automatically and" \
-               "every later green run will report this same error until it is."
+               "workflow is actually green now, and close it by hand. A later RED" \
+               "run writes a marker onto the oldest unmarked issue, after which a" \
+               "green run can close that one itself — but anything this run could" \
+               "not read stays open until somebody looks. Each affected issue has" \
+               "a comment saying the same thing."
           exit 1
         fi
 
