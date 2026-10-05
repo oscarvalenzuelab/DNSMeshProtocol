@@ -79,6 +79,7 @@ runs:
         REPO: ${{ github.repository }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         EVENT: ${{ github.event_name }}
+        RUN_NUMBER: ${{ github.run_number }}
         REF: ${{ github.ref_name }}
       run: |
         set -euo pipefail
@@ -104,6 +105,15 @@ runs:
           exit 1
         fi
         marker="<!-- report-ci-failure: ${wf_file} -->"
+        # A second marker recording which run last found this workflow red.
+        # Serialisation was removed (see the note beside the reporter jobs), so
+        # two runs can overlap, and without an order an OLDER run reaching its
+        # green path can close the issue a NEWER red run just opened — leaving
+        # the latest state red with nothing open. `run_number` is monotonic per
+        # workflow, so it is the order. The failure path writes it; the green
+        # path refuses to close anything a higher-numbered run reported.
+        run_marker_prefix="<!-- report-ci-failure-run: "
+        run_marker="${run_marker_prefix}${RUN_NUMBER} -->"
 
         # An empty `needs` object means this job could not see any result, not
         # that every job passed. Reporting green off an empty answer sheet is
@@ -122,6 +132,14 @@ runs:
                "it this run's outcome is unknown, which is not the same as passing."
           exit 1
         fi
+        case "${RUN_NUMBER:-}" in
+          ''|*[!0-9]*)
+            echo "::error::run-number is not a number (got '${RUN_NUMBER:-}')." \
+                 "It is how two overlapping runs are ordered, so without it this" \
+                 "action cannot tell a stale verdict from a current one."
+            exit 1 ;;
+        esac
+
         count=$(printf '%s' "$NEEDS" | jq -r 'length')
         case "$count" in
           ''|*[!0-9]*)
@@ -214,6 +232,7 @@ runs:
         if [ -n "$failed" ]; then
           body=$(printf '%s\n' \
             "${marker}" \
+            "${run_marker}" \
             "" \
             "The scheduled \`${WORKFLOW}\` workflow failed and no pull request carries" \
             "that signal, so this issue is the signal." \
@@ -246,6 +265,12 @@ runs:
             first=$(printf '%s\n' "$existing" | head -n 1)
             gh issue comment "$first" --repo "$REPO" --body "$body"
             echo "commented on #${first}"
+            # Advance the recorded run number, so a slower older run cannot
+            # close this report on the strength of whoever opened it first.
+            if ! gh issue edit "$first" --repo "$REPO" --body "$body" >/dev/null; then
+              echo "::warning::could not update the run marker on #${first}. An" \
+                   "older overlapping run may now close this while it is still red."
+            fi
             others=$(printf '%s\n' "$existing" | tail -n +2 | tr '\n' ' ')
             [ -n "${others// /}" ] && echo "::warning::duplicate open issues for" \
               "${wf_file}: ${others}— they will all be closed on the next green run."
@@ -285,19 +310,63 @@ runs:
         fi
 
         # Green. Close the issue so an open one always means "currently red".
-        if [ "$looked" = no ]; then
-          echo "::error::this run was green, but the open-issue lookup failed, so a" \
-               "stale failure issue may still be open. Not reporting that as clean."
-          exit 1
-        fi
-
+        #
+        # Close what was actually found even when the lookup was partial. An
+        # earlier version exited here first, so a truncated listing left every
+        # match it HAD found open — while a comment two files away claimed the
+        # green path closes every matching issue. Do the work, then report that
+        # the sweep was incomplete.
+        unresolved=0
         if [ -n "$existing" ]; then
+          # The loop runs in a subshell because of the pipe, so it reports back
+          # through a file rather than a variable.
+          unresolved_file=$(mktemp)
           printf '%s\n' "$existing" | while read -r n; do
             [ -n "$n" ] || continue
+            # Refuse to close a report from a higher-numbered run: that run is
+            # newer than this one and its verdict is the current one.
+            opener=$(gh issue view "$n" --repo "$REPO" --json body -q .body 2>/dev/null \
+                     | sed -n "s|.*${run_marker_prefix}\([0-9]\{1,\}\) -->.*|\1|p" | head -n 1)
+            case "$opener" in
+              ''|*[!0-9]*)
+                # Not "leave it and call the run clean": this is the action
+                # unable to tell a current verdict from a stale one, on an issue
+                # it is supposed to own. Leaving it open is the safe direction;
+                # exiting zero afterwards would not be.
+                echo "::warning::#${n} carries no readable run marker, so this run" \
+                     "cannot tell whether it is newer. Leaving it open."
+                echo x >> "$unresolved_file"
+                continue ;;
+            esac
+            if [ "$opener" -gt "$RUN_NUMBER" ]; then
+              # Not an error: a newer run holding the verdict is the ordering
+              # working as designed.
+              echo "::notice::#${n} was reported by run ${opener}, newer than this" \
+                   "run ${RUN_NUMBER}. Leaving it open — that run's verdict is current."
+              continue
+            fi
             gh issue close "$n" --repo "$REPO" \
               --comment "Green again on ${RUN_URL}. Closed by \`.github/actions/report-ci-failure\`."
             echo "closed #${n}"
           done
-        else
+          unresolved=$(wc -l < "$unresolved_file" | tr -d ' ')
+          rm -f "$unresolved_file"
+        fi
+
+        if [ "${unresolved:-0}" -gt 0 ]; then
+          echo "::error::${unresolved} open issue(s) for ${wf_file} could not be" \
+               "ordered against this run, so they were left open. Not reporting" \
+               "this run as clean."
+          exit 1
+        fi
+
+        if [ "$looked" = no ]; then
+          echo "::error::this run was green and closed what it found, but the lookup" \
+               "was partial, so a stale failure issue may still be open. Not" \
+               "reporting that as clean."
+          exit 1
+        fi
+
+        if [ -z "$existing" ]; then
           echo "green, and no open ${LABEL} issue for ${wf_file}. Nothing to do."
         fi

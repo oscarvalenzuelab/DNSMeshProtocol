@@ -263,19 +263,28 @@ def check(path: Path) -> list[str]:
         if step.get("uses") != ACTION:
             continue
         with_ = step.get("with") or {}
-        passed = str(with_.get("needs") or "")
-        if "toJSON(needs)" not in passed:
+        # Exact literal, not "contains toJSON(needs)". `results=${{ toJSON(needs)
+        # }}` contains it and reaches the action as a string that is not JSON,
+        # so the action refuses and files nothing for a real failure. The
+        # documented substring limitation is about guard EXPRESSIONS; an input
+        # has one correct spelling and gets checked against it.
+        passed = "".join(str(with_.get("needs") or "").split())
+        if passed != "${{toJSON(needs)}}":
             problems.append(
                 f"{path}: job `{name}` must pass `needs: ${{{{ toJSON(needs) }}}}` "
-                f"to {ACTION}. Anything else leaves the action unable to see the "
-                f"results it is reporting on."
+                f"to {ACTION}, exactly. Got `{with_.get('needs')!r}`. Anything else "
+                f"reaches the action as a value it cannot read, so it refuses and "
+                f"files nothing."
             )
-        if "github.workflow_ref" not in str(with_.get("workflow-ref") or ""):
+        if "".join(str(with_.get("workflow-ref") or "").split()) != (
+            "${{github.workflow_ref}}"
+        ):
             problems.append(
                 f"{path}: job `{name}` must pass "
-                f"`workflow-ref: ${{{{ github.workflow_ref }}}}` to {ACTION}. The "
-                f"workflow file path is the issue's identity; the display name is "
-                f"mutable, so without it a rename orphans an open issue."
+                f"`workflow-ref: ${{{{ github.workflow_ref }}}}` to {ACTION}, "
+                f"exactly. Got `{with_.get('workflow-ref')!r}`. The workflow file "
+                f"path is the issue's identity; the display name is mutable, so "
+                f"without it a rename orphans an open issue."
             )
         token = "".join(str(with_.get("token") or "").split())
         # The exact literal, not "something non-empty". A composite action's
@@ -331,6 +340,23 @@ def check(path: Path) -> list[str]:
             f"after {ACTION} at step {action_at + 1}. The local action is not on "
             f"disk yet when it is reached."
         )
+
+    if action_at is not None:
+        # Every step carries an implicit `success()`, so ANY earlier step that
+        # fails skips the reporter and the scheduled failure goes unfiled — and
+        # a skipped reporter is not a red one, so nothing says so. A reporter
+        # job needs a checkout and the action and nothing else, which makes the
+        # rule simple enough to enforce: nothing may come first but checkout.
+        for i, step in enumerate(steps[:action_at]):
+            if not str(step.get("uses") or "").startswith("actions/checkout"):
+                label = step.get("name") or step.get("uses") or step.get("run") or "?"
+                problems.append(
+                    f"{path}: job `{name}` runs `{str(label)[:60]}` at step {i + 1}, "
+                    f"before {ACTION}. Any step that fails before the reporter skips "
+                    f"it under the implicit `success()`, and a skipped reporter files "
+                    f"nothing while showing as neither red nor missing. The reporter "
+                    f"job should hold a checkout and the action, nothing else."
+                )
 
     return problems
 

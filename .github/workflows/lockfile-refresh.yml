@@ -92,13 +92,20 @@ jobs:
     runs-on: ubuntu-latest
     # Deliberately NOT serialised with `concurrency:`. An earlier version was,
     # to stop two overlapping runs both finding no issue and both creating one.
-    # Two things make that the wrong trade. The green path now closes EVERY
-    # matching issue, so a duplicate reconciles itself on the next green run.
-    # And GitHub keeps at most one PENDING member per concurrency group, so a
-    # third run arriving can supersede a queued reporter even with
-    # `cancel-in-progress: false` — and a cancelled reporter files NOTHING.
-    # A duplicate issue is noise somebody can see; an unfiled failure is the
-    # bug this exists to remove, so the race is the safer side to be on.
+    # Two things make that the wrong trade. The green path closes every match it
+    # finds, so a duplicate reconciles itself on the next green run — it says so
+    # and exits non-zero when its sweep was partial, rather than claiming to
+    # have cleared everything. And GitHub keeps at most one PENDING member per
+    # concurrency group, so a third run arriving can supersede a queued reporter
+    # even with `cancel-in-progress: false` — and a cancelled reporter files
+    # NOTHING. A duplicate issue is noise somebody can see; an unfiled failure
+    # is the bug this exists to remove, so the race is the safer side.
+    #
+    # The ordering that removing the lock would otherwise lose is carried in the
+    # issue instead: the body records the run number that last found this
+    # workflow red, and a green run refuses to close a report from a
+    # higher-numbered run. So an older run finishing late cannot clear a newer
+    # run's failure.
     permissions:
       # Only what this job needs, and `contents: read` is one of them: naming a
       # `permissions` block sets every scope not listed to `none`, so without it
