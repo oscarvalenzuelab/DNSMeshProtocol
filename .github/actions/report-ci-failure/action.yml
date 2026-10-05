@@ -1,0 +1,157 @@
+name: Report an unattended CI failure
+description: >
+  Turn the outcome of an unattended workflow run into a single open issue, so a
+  red scheduled run is visible without anyone sweeping the Actions tab.
+
+# Why this exists
+#
+# `lockfile refresh` ran weekly and failed on every run from 7 Sep 2026 to
+# 5 Oct 2026 — six consecutive runs. Nothing reported it. It was found by
+# sweeping failed runs across every repository by hand, four weeks later, and
+# by then the stale lockfiles it could not deliver had made two `security`
+# jobs red as well.
+#
+# A scheduled run has no pull request to turn red and nobody watching the tab,
+# so its failure is indistinguishable from its success from anywhere a person
+# actually looks. This action moves that signal somewhere people read: an open
+# issue means a scheduled workflow is currently failing, and the issue closes
+# itself when the workflow goes green again. The issue IS the state, which is
+# why the success path matters as much as the failure path — a marker that only
+# ever goes on accumulates into a list nobody trusts.
+
+inputs:
+  needs:
+    description: >
+      `toJSON(needs)` from the calling job. The calling job must `needs:` every
+      job whose outcome should count, and must itself run under `if: always()`.
+    required: true
+  workflow:
+    description: The workflow name the issue is about. Used as the issue's identity.
+    required: true
+  token:
+    description: "A token carrying `issues: write`."
+    required: true
+  label:
+    description: >
+      The label that marks these issues. It must already exist on the
+      repository; this action does not create it, so a deleted label fails the
+      step loudly rather than reporting nothing.
+    required: false
+    default: ci-failure
+
+runs:
+  using: composite
+  steps:
+    - name: Open, update or close the failure issue
+      shell: bash
+      env:
+        NEEDS: ${{ inputs.needs }}
+        WORKFLOW: ${{ inputs.workflow }}
+        LABEL: ${{ inputs.label }}
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        EVENT: ${{ github.event_name }}
+        REF: ${{ github.ref_name }}
+      run: |
+        set -euo pipefail
+
+        # An empty `needs` object means this job could not see any result, not
+        # that every job passed. Reporting "green" off an empty answer sheet is
+        # the exact failure this action exists to prevent, so refuse instead.
+        count=$(printf '%s' "$NEEDS" | jq -r 'length')
+        if [ "$count" -eq 0 ]; then
+          echo "::error::report-ci-failure got no job results. The calling job is" \
+               "missing its needs: list, so this run's outcome is unknown — which" \
+               "is not the same as passing."
+          exit 1
+        fi
+
+        # `skipped` is not a failure: a job gated on github.event_name is
+        # legitimately absent on the other event. `cancelled` IS counted — a
+        # cancelled weekly run delivered nothing, which is the thing we are
+        # trying to stop being invisible.
+        failed=$(printf '%s' "$NEEDS" \
+          | jq -r 'to_entries
+                   | map(select(.value.result == "failure" or .value.result == "cancelled"))
+                   | map("- `" + .key + "` — " + .value.result)
+                   | join("\n")')
+
+        title="CI: \`${WORKFLOW}\` is failing on its unattended runs"
+
+        # Find the existing issue by exact title among our labelled open ones.
+        # A --search match is fuzzy and would eventually act on the wrong issue,
+        # so match the title in jq instead.
+        if listing=$(gh issue list --repo "$REPO" --label "$LABEL" --state open \
+                       --limit 100 --json number,title 2>&1); then
+          existing=$(printf '%s' "$listing" \
+            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')
+          looked=yes
+        else
+          # "I could not look" is not "there is none". The failure path below
+          # still files, because a visible duplicate is recoverable and silence
+          # is the thing being fixed, and the step then exits non-zero so the
+          # bad lookup is on record rather than absorbed.
+          echo "::warning::could not list existing ${LABEL} issues: ${listing}"
+          existing=""
+          looked=no
+        fi
+
+        if [ -n "$failed" ]; then
+          body=$(printf '%s\n' \
+            "The scheduled \`${WORKFLOW}\` workflow failed and no pull request carries" \
+            "that signal, so this issue is the signal." \
+            "" \
+            "**Failing jobs**" \
+            "" \
+            "${failed}" \
+            "" \
+            "**Run:** ${RUN_URL} (event \`${EVENT}\`, ref \`${REF}\`)" \
+            "" \
+            "**What to do:** open the run, read the first failing step, and either fix" \
+            "it or reply here saying why it is expected. Do not close this by hand while" \
+            "the workflow is still red — the next green scheduled run closes it, and a" \
+            "hand-closed issue silently stops being the state." \
+            "" \
+            "**Who is affected and why now:** reason 3. A weekly job's failure is" \
+            "invisible for a week at a time; the failure that produced this mechanism" \
+            "went six runs and four weeks before a manual sweep found it, and by then it" \
+            "had taken the dependency audit down with it." \
+            "" \
+            "<sub>Filed by \`.github/actions/report-ci-failure\`.</sub>")
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            echo "commented on #${existing}"
+          else
+            # Triaged in the same command that creates it: an untriaged issue is
+            # unreadable and inflates the count. No --milestone on purpose — a
+            # milestone title hardcoded here breaks this notifier the day somebody
+            # renames or closes it, and a notifier that cannot file is the original
+            # bug wearing a different hat.
+            url=$(gh issue create --repo "$REPO" --title "$title" --body "$body" \
+                    --label "$LABEL" --label bug --label P2)
+            echo "opened ${url}"
+          fi
+
+          if [ "$looked" = no ]; then
+            echo "::error::the report landed, but the duplicate check could not run."
+            exit 1
+          fi
+          exit 0
+        fi
+
+        # Green. Close the issue so an open one always means "currently red".
+        if [ "$looked" = no ]; then
+          echo "::error::this run was green, but the open-issue lookup failed, so a" \
+               "stale failure issue may still be open. Not reporting that as clean."
+          exit 1
+        fi
+
+        if [ -n "$existing" ]; then
+          gh issue close "$existing" --repo "$REPO" \
+            --comment "Green again on ${RUN_URL}. Closed by \`.github/actions/report-ci-failure\`."
+          echo "closed #${existing}"
+        else
+          echo "green, and no open ${LABEL} issue for ${WORKFLOW}. Nothing to do."
+        fi

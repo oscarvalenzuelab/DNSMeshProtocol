@@ -12,6 +12,10 @@ on:
     # 06:17 UTC every Monday. Slightly off the hour to avoid piling on
     # GitHub's cron runners at the top of the hour.
     - cron: "17 6 * * 1"
+  # So the weekly sweep can be re-run on demand after a fix lands, instead of
+  # waiting until Monday to find out — and so the failure reporter below has a
+  # path that can actually be exercised.
+  workflow_dispatch:
 
 # Minimum GITHUB_TOKEN perms. CodeQL flagged the absence as
 # `actions/missing-workflow-permissions`; every job in this workflow
@@ -145,3 +149,31 @@ jobs:
           # on the weekly cron run. PR CI leaves it unset → default 500.
           DMP_FUZZ_MAX_EXAMPLES: "5000"
         run: pytest tests/fuzz/ -v
+
+  report:
+    name: report an unattended failure
+    # Every job above, so one run produces one verdict. Putting the reporter
+    # inside each job instead would race: `fuzz` going green would close the
+    # issue `pip-audit` had just opened in the same run.
+    needs:
+      - lockfile-drift
+      - pip-audit
+      - fuzz-wire-parsers
+      - fuzz-wire-parsers-nightly
+    # See the matching job in lockfile-refresh.yml. PR and push failures are
+    # already visible on the thing that caused them; only the unattended runs
+    # need somewhere to be seen.
+    if: >-
+      always() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/report-ci-failure
+        with:
+          needs: ${{ toJSON(needs) }}
+          workflow: ${{ github.workflow }}
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -75,3 +75,28 @@ jobs:
             The `lockfiles match their requirements` check in the `security`
             workflow fails when a pin falls below a declared floor, which is
             the drift this refresh exists to clear.
+
+  report:
+    name: report an unattended failure
+    needs: [refresh]
+    # `always()` so this runs when `refresh` failed — which is the only time it
+    # has anything to say. Restricted to the unattended events: a
+    # `pull_request` failure already turns a pull request red, and filing an
+    # issue for that would teach everyone to ignore these issues.
+    # `workflow_dispatch` is included deliberately: it is the only way to prove
+    # this path works without waiting a week for the cron.
+    if: >-
+      always() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      # Only what this job needs. The repository-wide default stays `read`.
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/report-ci-failure
+        with:
+          needs: ${{ toJSON(needs) }}
+          workflow: ${{ github.workflow }}
+          token: ${{ secrets.GITHUB_TOKEN }}
