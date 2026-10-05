@@ -225,6 +225,20 @@ def check(path: Path) -> list[str]:
             f"fails to file reports success. Remove it."
         )
 
+    # And the same key on any job the reporter WATCHES is worse: GitHub reports
+    # `needs.<job>.result` as `success` for a failed job that sets it, so the
+    # reporter sees green and files nothing for a run that really failed.
+    for other, other_job in jobs.items():
+        if other == name or not isinstance(other_job, dict):
+            continue
+        if other_job.get("continue-on-error"):
+            problems.append(
+                f"{path}: job `{other}` sets `continue-on-error`, so "
+                f"`needs.{other}.result` reports `success` even when it fails. The "
+                f"reporter would see a green run and file nothing. Let the job fail, "
+                f"or take it out of the reporter's `needs:` deliberately and say why."
+            )
+
     if "concurrency" in job:
         # Deliberate: see the note beside the reporter jobs. GitHub keeps one
         # PENDING member per group, so serialising can cancel a queued reporter
@@ -242,6 +256,13 @@ def check(path: Path) -> list[str]:
     # They catch the careless cases above. An `if:` written to look wired while
     # never running — `always() && inputs.enabled` with the input unset — would
     # still pass, and no amount of substring matching fixes that.
+    #
+    # A second limit, in a different direction: a STEP that swallows its own
+    # failure (`run: ... || true`, or a `|| true` buried in a multi-line script)
+    # makes its job report success, and nothing in a YAML read can tell that
+    # apart from a step that genuinely succeeded. Job-level `continue-on-error`
+    # is refused above because it is declarative and therefore checkable; the
+    # step-level trick is not.
 
     perms = job.get("permissions") or {}
     if not isinstance(perms, dict):
@@ -275,6 +296,16 @@ def check(path: Path) -> list[str]:
                 f"to {ACTION}, exactly. Got `{with_.get('needs')!r}`. Anything else "
                 f"reaches the action as a value it cannot read, so it refuses and "
                 f"files nothing."
+            )
+        if "".join(str(with_.get("default-branch") or "").split()) != (
+            "${{github.event.repository.default_branch}}"
+        ):
+            problems.append(
+                f"{path}: job `{name}` must pass "
+                f"`default-branch: ${{{{ github.event.repository.default_branch }}}}` "
+                f"to {ACTION}, exactly. Got `{with_.get('default-branch')!r}`. "
+                f"Without it a green run from any branch can close a report that "
+                f"belongs to the default branch, where the cron actually runs."
             )
         if "".join(str(with_.get("workflow-ref") or "").split()) != (
             "${{github.workflow_ref}}"
@@ -395,7 +426,15 @@ def main() -> int:
     )
     stale = sorted(set(EXEMPT) - set(scheduled))
     for name in sorted(EXEMPT):
-        if name in scheduled:
+        if name not in scheduled:
+            continue
+        doc = yaml.safe_load((WORKFLOWS / name).read_text())
+        if reporter_jobs(doc):
+            # It has one now, so the exemption is spent. Printing the old reason
+            # would describe a hole that has been filled.
+            print(f"  {name} is in EXEMPT but now HAS a reporter. Remove the entry.")
+            stale.append(name)
+        else:
             print(f"  exempt: {name} — {EXEMPT[name]}")
     if stale:
         # An exemption for a workflow that is no longer scheduled (or no longer

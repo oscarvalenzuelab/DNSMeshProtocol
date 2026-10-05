@@ -38,6 +38,14 @@ inputs:
       `github.workflow_ref`. The file path inside it is the issue's real
       identity, so a rename of the display name does not orphan an open issue.
     required: true
+  default-branch:
+    description: >
+      `github.event.repository.default_branch`. Only a run on the default branch
+      may CLOSE a report: a green `workflow_dispatch` from a feature branch has a
+      higher run number than the default branch's failing scheduled run, and
+      would otherwise clear an issue while the default branch is still red.
+      Filing is not restricted — a failure anywhere is worth knowing about.
+    required: true
   token:
     description: "A token carrying `issues: write`."
     required: true
@@ -80,11 +88,25 @@ runs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         EVENT: ${{ github.event_name }}
         RUN_NUMBER: ${{ github.run_number }}
+        DEFAULT_BRANCH: ${{ inputs.default-branch }}
         REF: ${{ github.ref_name }}
       run: |
         set -euo pipefail
 
         LIST_LIMIT=100
+
+        # Create the marker label if it is missing. An earlier version relied on
+        # it existing and described a deleted label as "failing loudly" — but
+        # loudly here means a red job in the Actions tab, which is exactly the
+        # signal this action exists because nobody reads. `--force` is
+        # idempotent and needs only the `issues: write` this job already holds.
+        if ! gh label create "$LABEL" --repo "$REPO" --force \
+               --color b60205 \
+               --description "A scheduled workflow is currently failing" >/dev/null 2>&1; then
+          echo "::warning::could not ensure the ${LABEL} label exists. If it is" \
+               "missing, filing below will fail and this job will be the only" \
+               "signal — which is the signal nobody reads."
+        fi
 
         # `github.workflow_ref` looks like
         #   owner/repo/.github/workflows/security.yml@refs/heads/main
@@ -98,7 +120,19 @@ runs:
         # let a green run of one close the other's failure issue.
         wf_file=${WORKFLOW_REF%%@refs/*}
         wf_file=${wf_file#*/*/}
-        if [ -z "$wf_file" ] || [ "$wf_file" = "$WORKFLOW_REF" ]; then
+        # Assert the shape we actually require, rather than "the string changed":
+        # `#*/*/` rewrites any input with two slashes, so comparing against the
+        # original passed a ref with no `@refs/` in it at all.
+        case "$WORKFLOW_REF" in
+          */*/*@refs/*) ;;
+          *)
+            echo "::error::workflow-ref '${WORKFLOW_REF}' is not of the form" \
+                 "owner/repo/path@refs/..., so the workflow file path cannot be" \
+                 "read out of it. Without that this action cannot identify its own" \
+                 "issue, and guessing would act on somebody else's."
+            exit 1 ;;
+        esac
+        if [ -z "$wf_file" ]; then
           echo "::error::could not read a workflow file path out of" \
                "workflow-ref '${WORKFLOW_REF}'. Without it this action cannot" \
                "identify its own issue, and guessing would act on somebody else's."
@@ -106,6 +140,14 @@ runs:
         fi
         marker="<!-- report-ci-failure: ${wf_file} -->"
         # A second marker recording which run last found this workflow red.
+        #
+        # Known limit, stated because the ordering below does NOT cover it: a
+        # green run that finishes BEFORE an older red run files leaves an issue
+        # open while the workflow's newest verdict is green. A green run writes
+        # no marker, so there is nothing for the later red run to compare
+        # against. It self-corrects on the next green run — a week, on the cron.
+        # Closing it properly would mean recording the last green run too, which
+        # is more machinery than the window deserves.
         # Serialisation was removed (see the note beside the reporter jobs), so
         # two runs can overlap, and without an order an OLDER run reaching its
         # green path can close the issue a NEWER red run just opened — leaving
@@ -127,9 +169,16 @@ runs:
         # that is not a number is "I could not read this", so it is checked as
         # a number before it is used as one.
         if ! printf '%s' "$NEEDS" | jq -e 'type == "object"' >/dev/null 2>&1; then
+          # Do NOT write the braced form of an Actions expression anywhere in this
+          # script. The runner substitutes `${…}`-brace expressions in the `run:`
+          # text before bash ever sees it, a backslash does not escape one, and
+          # `needs` is a JOB context that does not exist inside a composite
+          # action — so the braced spelling made this step fail to evaluate on
+          # EVERY run, red or green, and the reporter never filed anything.
           echo "::error::the needs input is not a JSON object. Got: '${NEEDS}'." \
-               "The calling job must pass \`needs: \${{ toJSON(needs) }}\`; without" \
-               "it this run's outcome is unknown, which is not the same as passing."
+               "The calling job must pass the toJSON(needs) expression as the" \
+               "needs input; without it this run's outcome is unknown, which is" \
+               "not the same as passing."
           exit 1
         fi
         case "${RUN_NUMBER:-}" in
@@ -234,8 +283,9 @@ runs:
             "${marker}" \
             "${run_marker}" \
             "" \
-            "The scheduled \`${WORKFLOW}\` workflow failed and no pull request carries" \
-            "that signal, so this issue is the signal." \
+            "The \`${WORKFLOW}\` workflow failed on an unattended \`${EVENT}\` run of" \
+            "\`${REF}\`, and no pull request carries that signal, so this issue is the" \
+            "signal." \
             "" \
             "**Failing jobs**" \
             "" \
@@ -246,7 +296,10 @@ runs:
             "**What to do:** open the run, read the first failing step, and either fix" \
             "it or reply here saying why it is expected. Do not close this by hand while" \
             "the workflow is still red — the next green run closes it, and a hand-closed" \
-            "issue silently stops being the state. Do not remove the \`${LABEL}\` label" \
+            "issue silently stops being the state. The exception: if a green run reports" \
+            "that it could not order this issue against itself, it will never close it" \
+            "automatically, and closing it by hand is then the right thing to do." \
+            "Do not remove the \`${LABEL}\` label" \
             "either: it is how this issue is found, so without it the next green run" \
             "cannot close this and the next red one opens a second." \
             "" \
@@ -265,9 +318,19 @@ runs:
             first=$(printf '%s\n' "$existing" | head -n 1)
             gh issue comment "$first" --repo "$REPO" --body "$body"
             echo "commented on #${first}"
-            # Advance the recorded run number, so a slower older run cannot
-            # close this report on the strength of whoever opened it first.
-            if ! gh issue edit "$first" --repo "$REPO" --body "$body" >/dev/null; then
+            # Advance the recorded run number — forwards only. Overwriting it
+            # unconditionally lets it go BACKWARDS: run 12 files marker 12, slow
+            # run 10 then rewrites it to 10, and run 11's green path reads 10 < 11
+            # and closes an issue whose newest verdict (12) is still red.
+            recorded=$(gh issue view "$first" --repo "$REPO" --json body -q .body 2>/dev/null \
+                       | sed -n "s|.*${run_marker_prefix}\([0-9]\{1,\}\) -->.*|\1|p" | head -n 1)
+            case "$recorded" in
+              ''|*[!0-9]*) recorded=0 ;;
+            esac
+            if [ "$recorded" -gt "$RUN_NUMBER" ]; then
+              echo "::notice::#${first} already records run ${recorded}, newer than" \
+                   "this run ${RUN_NUMBER}. Leaving its marker alone."
+            elif ! gh issue edit "$first" --repo "$REPO" --body "$body" >/dev/null; then
               echo "::warning::could not update the run marker on #${first}. An" \
                    "older overlapping run may now close this while it is still red."
             fi
@@ -309,7 +372,23 @@ runs:
           exit 0
         fi
 
-        # Green. Close the issue so an open one always means "currently red".
+        # Green.
+        if [ -z "${DEFAULT_BRANCH:-}" ]; then
+          echo "::error::default-branch is empty, so this run cannot tell whether" \
+               "it is allowed to close anything. Refusing rather than clearing a" \
+               "report that may belong to another branch."
+          exit 1
+        fi
+        if [ "$REF" != "$DEFAULT_BRANCH" ]; then
+          # A green run off the default branch says nothing about the branch the
+          # weekly cron runs on, and it carries a HIGHER run number, so without
+          # this it would win the ordering comparison and clear a real failure.
+          echo "::notice::green, but this run is on '${REF}' and only" \
+               "'${DEFAULT_BRANCH}' may close a report. Leaving any open issue alone."
+          exit 0
+        fi
+
+        # Close the issue so an open one always means "currently red".
         #
         # Close what was actually found even when the lookup was partial. An
         # earlier version exited here first, so a truncated listing left every
@@ -325,7 +404,18 @@ runs:
             [ -n "$n" ] || continue
             # Refuse to close a report from a higher-numbered run: that run is
             # newer than this one and its verdict is the current one.
-            opener=$(gh issue view "$n" --repo "$REPO" --json body -q .body 2>/dev/null \
+            # Wrapped in `if`: `set -e` plus `pipefail` would otherwise kill the
+            # loop on a transient API failure, the outer pipeline would return
+            # non-zero, and the script would exit before printing anything or
+            # removing the temp file. "I could not read this one" belongs in the
+            # unresolved tally like any other unreadable marker.
+            if ! issue_body=$(gh issue view "$n" --repo "$REPO" --json body -q .body 2>&1); then
+              echo "::warning::could not read #${n} to order it against this run:" \
+                   "${issue_body}. Leaving it open."
+              echo x >> "$unresolved_file"
+              continue
+            fi
+            opener=$(printf '%s' "$issue_body" \
                      | sed -n "s|.*${run_marker_prefix}\([0-9]\{1,\}\) -->.*|\1|p" | head -n 1)
             case "$opener" in
               ''|*[!0-9]*)
@@ -345,8 +435,12 @@ runs:
                    "run ${RUN_NUMBER}. Leaving it open — that run's verdict is current."
               continue
             fi
-            gh issue close "$n" --repo "$REPO" \
-              --comment "Green again on ${RUN_URL}. Closed by \`.github/actions/report-ci-failure\`."
+            if ! out=$(gh issue close "$n" --repo "$REPO" \
+                 --comment "Green again on ${RUN_URL}. Closed by \`.github/actions/report-ci-failure\`." 2>&1); then
+              echo "::warning::could not close #${n}: ${out}. Leaving it open."
+              echo x >> "$unresolved_file"
+              continue
+            fi
             echo "closed #${n}"
           done
           unresolved=$(wc -l < "$unresolved_file" | tr -d ' ')
@@ -355,8 +449,11 @@ runs:
 
         if [ "${unresolved:-0}" -gt 0 ]; then
           echo "::error::${unresolved} open issue(s) for ${wf_file} could not be" \
-               "ordered against this run, so they were left open. Not reporting" \
-               "this run as clean."
+               "ordered against this run, so they were left open, and this run is" \
+               "not reported as clean. WHAT TO DO: open each one, confirm the" \
+               "workflow is actually green now, and close it by hand. An issue" \
+               "with no readable run marker cannot be closed automatically and" \
+               "every later green run will report this same error until it is."
           exit 1
         fi
 
