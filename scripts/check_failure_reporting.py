@@ -206,13 +206,36 @@ def check(path: Path) -> list[str]:
                 f"`if:`, which stops the reporter running while leaving the wiring "
                 f"looking correct."
             )
-    if scheduled and "'schedule'" not in tight and '"schedule"' not in tight:
-        # `always() && github.event_name == 'push'` passes every check above and
-        # never runs on the cron — the exact silence this exists to remove.
+    # Require an equality against the schedule event, not merely the word.
+    # `github.event_name != 'schedule'` contains `'schedule'` and is the exact
+    # opposite of what is wanted; `== 'push'` never runs on the cron at all.
+    if scheduled and not ("=='schedule'" in tight or '=="schedule"' in tight):
         problems.append(
-            f"{path}: job `{name}` has a `schedule:` trigger but its `if:` never "
-            f"names the `schedule` event, so the reporter cannot run on the cron. "
-            f"Guard it on the unattended events explicitly."
+            f"{path}: job `{name}` has a `schedule:` trigger but its `if:` does not "
+            f"test `github.event_name == 'schedule'`, so the reporter cannot be "
+            f"relied on to run on the cron. Guard it on the unattended events "
+            f"explicitly."
+        )
+
+    if job.get("continue-on-error"):
+        # The job would go green whatever the reporter did, so a failure to file
+        # would not even show up as a red reporter.
+        problems.append(
+            f"{path}: job `{name}` sets `continue-on-error`, so a reporter that "
+            f"fails to file reports success. Remove it."
+        )
+
+    if "concurrency" in job:
+        # Deliberate: see the note beside the reporter jobs. GitHub keeps one
+        # PENDING member per group, so serialising can cancel a queued reporter
+        # and a cancelled reporter files nothing. The duplicate it would prevent
+        # is reconciled by the green path instead.
+        problems.append(
+            f"{path}: job `{name}` declares `concurrency:`. A queued reporter can "
+            f"be superseded — GitHub keeps one pending member per group — and a "
+            f"cancelled reporter files nothing, which is worse than the duplicate "
+            f"it prevents. The green path closes every match, so the duplicate "
+            f"reconciles itself. See the note beside the job."
         )
 
     # The honest limit: these are substring tests over an expression language.
@@ -254,18 +277,44 @@ def check(path: Path) -> list[str]:
                 f"workflow file path is the issue's identity; the display name is "
                 f"mutable, so without it a rename orphans an open issue."
             )
-        if not str(with_.get("token") or "").strip():
-            # A composite action's `required: true` is not enforced by the
-            # runner, so an omitted token reaches `gh` as an empty string and
-            # every call fails — a reporter that files nothing, looking wired.
+        token = "".join(str(with_.get("token") or "").split())
+        # The exact literal, not "something non-empty". A composite action's
+        # `required: true` is not enforced by the runner, so an omitted token
+        # reaches `gh` as an empty string; and a misspelled secret name such as
+        # `secrets.GITHUB_T0KEN` also expands to empty, which is indistinguishable
+        # from a correct one by any looser test.
+        if token != "${{secrets.GITHUB_TOKEN}}":
             problems.append(
-                f"{path}: job `{name}` must pass a `token:` to {ACTION}. Without "
-                f"one `gh` is unauthenticated and files nothing; the action's "
-                f"`required: true` does not make the runner enforce it."
+                f"{path}: job `{name}` must pass "
+                f"`token: ${{{{ secrets.GITHUB_TOKEN }}}}` to {ACTION}, exactly. "
+                f"Got `{with_.get('token')!r}`. An absent or misspelled secret "
+                f"expands to an empty string, `gh` is then unauthenticated, and "
+                f"nothing is filed."
+            )
+        if "if" in step:
+            # There is no legitimate reason to gate the reporter step itself; the
+            # job's own `if:` does that, and a step-level one is a way to stop it
+            # running while leaving the wiring looking correct.
+            problems.append(
+                f"{path}: the {ACTION} step in job `{name}` has its own `if:` "
+                f"({step['if']!r}). Gate the job, not the step — a step-level "
+                f"condition can stop the reporter while the wiring still reads as "
+                f"correct."
+            )
+        if step.get("continue-on-error"):
+            problems.append(
+                f"{path}: the {ACTION} step in job `{name}` sets "
+                f"`continue-on-error`, so a failure to file would not even show as "
+                f"a red reporter."
             )
 
-    uses = [str(step.get("uses") or "") for step in job.get("steps") or []]
-    if not any(u.startswith("actions/checkout") for u in uses):
+    steps = job.get("steps") or []
+    uses = [str(step.get("uses") or "") for step in steps]
+    checkout_at = next(
+        (i for i, u in enumerate(uses) if u.startswith("actions/checkout")), None
+    )
+    action_at = next((i for i, u in enumerate(uses) if u == ACTION), None)
+    if checkout_at is None:
         # The action lives in this repository, so the runner can only find it
         # after a checkout. Without one the step fails to resolve and no issue
         # is filed.
@@ -273,6 +322,14 @@ def check(path: Path) -> list[str]:
             f"{path}: job `{name}` uses the local action {ACTION} but never runs "
             f"`actions/checkout`, so the action is not on disk and the step cannot "
             f"resolve. Nothing would be filed."
+        )
+    elif action_at is not None and checkout_at > action_at:
+        # Order matters and a listing that only asks "is checkout present?"
+        # cannot see this.
+        problems.append(
+            f"{path}: job `{name}` runs `actions/checkout` at step {checkout_at + 1}, "
+            f"after {ACTION} at step {action_at + 1}. The local action is not on "
+            f"disk yet when it is reached."
         )
 
     return problems

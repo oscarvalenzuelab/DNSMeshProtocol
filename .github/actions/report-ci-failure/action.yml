@@ -44,8 +44,15 @@ inputs:
   label:
     description: >
       The label that marks these issues. It must already exist on the
-      repository; this action does not create it, so a deleted label fails the
-      step loudly rather than reporting nothing.
+      repository; this action does not create it, so a label deleted from the
+      repository makes the filing step fail loudly rather than quietly do
+      nothing.
+
+      Note what this does NOT cover: the label is also how the lookup is
+      scoped, so a label removed by hand from an open report makes that report
+      invisible to this action. It will not be commented on and it will not be
+      closed. The issue body says not to hand-close these; it says not to
+      unlabel them for the same reason.
     required: false
     default: ci-failure
   triage-labels:
@@ -81,11 +88,14 @@ runs:
         # `github.workflow_ref` looks like
         #   owner/repo/.github/workflows/security.yml@refs/heads/main
         # Strip the owner/repo prefix and the @ref suffix to get the path.
-        # `%%@*` strips from the FIRST `@`, not the last. A branch name may
-        # contain `@` — `refs/heads/release@2026` is legal — and the shortest-
-        # suffix form `%@*` would leave the ref glued to the path, giving the
-        # same workflow two identities on two refs.
-        wf_file=${WORKFLOW_REF%%@*}
+        # Split at `@refs/`, which is the one delimiter that is always right.
+        # `workflow_ref` is `{owner}/{repo}/{path}@{ref}` and the ref always
+        # starts with `refs/`. Splitting at the LAST `@` breaks on a branch
+        # containing one (`refs/heads/release@2026` is legal); splitting at the
+        # FIRST `@` breaks on a filename containing one, which would give
+        # `audit@daily.yml` and `audit@weekly.yml` a single shared identity and
+        # let a green run of one close the other's failure issue.
+        wf_file=${WORKFLOW_REF%%@refs/*}
         wf_file=${wf_file#*/*/}
         if [ -z "$wf_file" ] || [ "$wf_file" = "$WORKFLOW_REF" ]; then
           echo "::error::could not read a workflow file path out of" \
@@ -173,8 +183,8 @@ runs:
           # path has to be able to clear more than one or the extra stays open
           # for ever while the workflow is green.
           existing=$(printf '%s' "$listing" \
-            | jq -r --arg m "$marker" 'map(select(.body != null and (.body | contains($m))))
-                                       | .[].number')
+            | jq -r --arg m "$marker" '[ .[] | select(.body != null and (.body | contains($m))) ]
+                                       | sort_by(.number) | .[].number')
           returned=$(printf '%s' "$listing" | jq -r 'length')
           case "$returned" in
             ''|*[!0-9]*)
@@ -217,7 +227,9 @@ runs:
             "**What to do:** open the run, read the first failing step, and either fix" \
             "it or reply here saying why it is expected. Do not close this by hand while" \
             "the workflow is still red — the next green run closes it, and a hand-closed" \
-            "issue silently stops being the state." \
+            "issue silently stops being the state. Do not remove the \`${LABEL}\` label" \
+            "either: it is how this issue is found, so without it the next green run" \
+            "cannot close this and the next red one opens a second." \
             "" \
             "**Who is affected and why now:** reason 3. A weekly job's failure is" \
             "invisible for a week at a time; the failure that produced this mechanism" \
@@ -229,7 +241,8 @@ runs:
           if [ -n "$existing" ]; then
             # Comment on the oldest match only — one report per run, whatever
             # duplicates a past lookup failure left behind. The green path
-            # closes all of them.
+            # closes all of them. "Oldest" needs the sort above: the listing
+            # arrives newest-first, so an unsorted `head -n 1` is the newest.
             first=$(printf '%s\n' "$existing" | head -n 1)
             gh issue comment "$first" --repo "$REPO" --body "$body"
             echo "commented on #${first}"
