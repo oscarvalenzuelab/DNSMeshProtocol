@@ -12,6 +12,10 @@ on:
     # 06:17 UTC every Monday. Slightly off the hour to avoid piling on
     # GitHub's cron runners at the top of the hour.
     - cron: "17 6 * * 1"
+  # So the weekly sweep can be re-run on demand after a fix lands, instead of
+  # waiting until Monday to find out — and so the failure reporter below has a
+  # path that can actually be exercised.
+  workflow_dispatch:
 
 # Minimum GITHUB_TOKEN perms. CodeQL flagged the absence as
 # `actions/missing-workflow-permissions`; every job in this workflow
@@ -145,3 +149,52 @@ jobs:
           # on the weekly cron run. PR CI leaves it unset → default 500.
           DMP_FUZZ_MAX_EXAMPLES: "5000"
         run: pytest tests/fuzz/ -v
+
+  report:
+    name: report an unattended failure
+    # Every job above, so one run produces one verdict. Putting the reporter
+    # inside each job instead would race: `fuzz` going green would close the
+    # issue `pip-audit` had just opened in the same run.
+    needs:
+      - lockfile-drift
+      - pip-audit
+      - fuzz-wire-parsers
+      - fuzz-wire-parsers-nightly
+    # See the matching job in lockfile-refresh.yml, which carries the reasoning.
+    # PR and push failures are already visible on the thing that caused them;
+    # only the unattended runs need somewhere to be seen.
+    if: >-
+      always() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    # Deliberately NOT serialised with `concurrency:`. An earlier version was,
+    # to stop two overlapping runs both finding no issue and both creating one.
+    # Two things make that the wrong trade. The green path closes every match it
+    # finds, so a duplicate reconciles itself on the next green run — it says so
+    # and exits non-zero when its sweep was partial, rather than claiming to
+    # have cleared everything. And GitHub keeps at most one PENDING member per
+    # concurrency group, so a third run arriving can supersede a queued reporter
+    # even with `cancel-in-progress: false` — and a cancelled reporter files
+    # NOTHING. A duplicate issue is noise somebody can see; an unfiled failure
+    # is the bug this exists to remove, so the race is the safer side.
+    #
+    # The ordering that removing the lock would otherwise lose is carried in the
+    # issue instead: the body records the run number that last found this
+    # workflow red, and a green run refuses to close a report from a
+    # higher-numbered run. So an older run finishing late cannot clear a newer
+    # run's failure.
+    permissions:
+      # `contents: read` is required, not tidiness: a `permissions` block sets
+      # every unlisted scope to `none`, which would strip `actions/checkout` of
+      # its token and stop the reporter running at all.
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/report-ci-failure
+        with:
+          needs: ${{ toJSON(needs) }}
+          workflow: ${{ github.workflow }}
+          workflow-ref: ${{ github.workflow_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}

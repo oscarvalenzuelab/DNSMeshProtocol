@@ -75,3 +75,51 @@ jobs:
             The `lockfiles match their requirements` check in the `security`
             workflow fails when a pin falls below a declared floor, which is
             the drift this refresh exists to clear.
+
+  report:
+    name: report an unattended failure
+    needs: [refresh]
+    # `always()` so this job runs whatever `refresh` did. Both outcomes have
+    # work: a failure opens or updates the issue, and a success closes it, which
+    # is what makes an open issue mean "currently red" rather than "was red
+    # once". Restricted to the unattended events — a `pull_request` failure
+    # already turns a pull request red, and filing an issue for that would teach
+    # everyone to ignore these issues. `workflow_dispatch` is included
+    # deliberately: it is the only way to exercise this without waiting a week.
+    if: >-
+      always() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    # Deliberately NOT serialised with `concurrency:`. An earlier version was,
+    # to stop two overlapping runs both finding no issue and both creating one.
+    # Two things make that the wrong trade. The green path closes every match it
+    # finds, so a duplicate reconciles itself on the next green run — it says so
+    # and exits non-zero when its sweep was partial, rather than claiming to
+    # have cleared everything. And GitHub keeps at most one PENDING member per
+    # concurrency group, so a third run arriving can supersede a queued reporter
+    # even with `cancel-in-progress: false` — and a cancelled reporter files
+    # NOTHING. A duplicate issue is noise somebody can see; an unfiled failure
+    # is the bug this exists to remove, so the race is the safer side.
+    #
+    # The ordering that removing the lock would otherwise lose is carried in the
+    # issue instead: the body records the run number that last found this
+    # workflow red, and a green run refuses to close a report from a
+    # higher-numbered run. So an older run finishing late cannot clear a newer
+    # run's failure.
+    permissions:
+      # Only what this job needs, and `contents: read` is one of them: naming a
+      # `permissions` block sets every scope not listed to `none`, so without it
+      # `actions/checkout` loses its token and the reporter cannot even start —
+      # a reporter that fails to run is the silent failure all over again. The
+      # repository-wide default stays `read`.
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/report-ci-failure
+        with:
+          needs: ${{ toJSON(needs) }}
+          workflow: ${{ github.workflow }}
+          workflow-ref: ${{ github.workflow_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}

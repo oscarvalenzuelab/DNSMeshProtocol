@@ -70,6 +70,13 @@ jobs:
         # Start permissive; tighten as the codebase's annotations stabilize.
         run: mypy --ignore-missing-imports dmp || true
 
+      - name: Every scheduled workflow reports its own failures
+        # A weekly job that fails with nothing watching it is invisible: see the
+        # docstring in the script. This keeps the reporter wired up as jobs and
+        # workflows are added, which a comment asking the next person to keep
+        # two lists in sync would not.
+        run: python scripts/check_failure_reporting.py
+
   docker:
     name: docker build + integration
     runs-on: ubuntu-latest
