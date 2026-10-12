@@ -1171,6 +1171,24 @@ def _send_update(update: dns.update.UpdateMessage, port: int):
     return dns.query.udp(update, "127.0.0.1", port=port, timeout=2.0)
 
 
+def _send_update_raw(update: dns.update.UpdateMessage, port: int) -> bytes:
+    """Send ``update`` and hand back the raw response datagram.
+
+    ``dns.query.udp`` parses the response against the keyring it signed
+    with, so on a TSIG rejection it raises instead of returning — which
+    is right for a client but useless for asserting what the server
+    actually put on the wire. This stays at the socket so a test can
+    read the RCODE and the TSIG error field itself.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(2.0)
+        sock.sendto(update.to_wire(), ("127.0.0.1", port))
+        return sock.recv(65535)
+    finally:
+        sock.close()
+
+
 class TestDnsUpdate:
     """End-to-end coverage of the UPDATE path: build a signed UPDATE on
     the client side, send it via UDP, assert the writer received the
@@ -1291,7 +1309,14 @@ class TestDnsUpdate:
 
     def test_wrong_key_is_notauth(self):
         """An UPDATE signed with a key the server doesn't know fails
-        TSIG verification at parse time → NOTAUTH, no write."""
+        TSIG verification at parse time → NOTAUTH carrying an unsigned
+        TSIG RR with error BADKEY (RFC 8945 §5.3.2), and no write.
+
+        The error RR is the part that matters. A bare NOTAUTH with no
+        TSIG is indistinguishable from a tampered or truncated reply,
+        so a requester cannot learn that its key was the problem; see
+        ``_tsig_error_response`` in the server for the long version.
+        """
         store = InMemoryDNSStore()
         server, port = self._server(store)
         upd = dns.update.UpdateMessage("example.com")
@@ -1301,8 +1326,39 @@ class TestDnsUpdate:
             keyname=dns.name.from_text("other."),
         )
         with server:
-            response = _send_update(upd, port)
+            wire = _send_update_raw(upd, port)
+
+        # keyring=False parses without TSIG processing, so the test can
+        # inspect the rejection rather than raise on it.
+        response = dns.message.from_wire(wire, keyring=False)
         assert response.rcode() == dns.rcode.NOTAUTH
+        assert response.had_tsig
+        assert response.keyname == dns.name.from_text("other.")
+        assert response.tsig[0].error == dns.rcode.BADKEY
+        # §5.3.2: the MAC is empty — we hold no secret for "other."
+        assert response.tsig[0].mac == b""
+        assert store.query_txt_record("foo.example.com") is None
+
+    def test_wrong_key_surfaces_as_badkey_to_a_dnspython_client(self):
+        """The companion to the wire-level assertions above: a normal
+        dnspython client raises ``PeerBadKey``, naming the actual
+        fault. Before the error RR was added it raised ``FormError``
+        ("response requires a TSIG but does not have one") on
+        dnspython ≥ 2.9.0 — an auth failure disguised as a parse
+        failure — and on 2.8.0 it silently returned a TSIG-less
+        NOTAUTH that a strict client had to reject anyway.
+        """
+        store = InMemoryDNSStore()
+        server, port = self._server(store)
+        upd = dns.update.UpdateMessage("example.com")
+        upd.add(dns.name.from_text("foo.example.com."), 300, "TXT", '"intruder"')
+        upd.use_tsig(
+            _keyring(name="other.", secret=b"\xff" * 32),
+            keyname=dns.name.from_text("other."),
+        )
+        with server:
+            with pytest.raises(dns.tsig.PeerBadKey):
+                _send_update(upd, port)
         assert store.query_txt_record("foo.example.com") is None
 
     def test_known_key_wrong_secret_is_notauth(self):
@@ -1318,6 +1374,11 @@ class TestDnsUpdate:
         wire bytes sent). The requester saw a 0-byte UDP datagram
         and dnspython raised ``ShortHeader`` on the receive side,
         masking what was really an auth failure.
+
+        The response now also carries the RFC 8945 §5.3.2 TSIG error
+        RR — BADSIG here, since the key name IS known and only the
+        signature failed — so the distinction between "unknown key"
+        and "wrong secret" survives to the requester.
         """
         store = InMemoryDNSStore()
         # Server's keyring has the canonical secret for "alice.".
@@ -1345,12 +1406,21 @@ class TestDnsUpdate:
                 _keyring(name="alice.", secret=b"\x22" * 32),
                 keyname=dns.name.from_text("alice."),
             )
-            response = _send_update(upd, port)
+            wire = _send_update_raw(upd, port)
 
+        response = dns.message.from_wire(wire, keyring=False)
         assert response.rcode() == dns.rcode.NOTAUTH, (
             "expected NOTAUTH on signature mismatch; pre-fix the server "
             "returned no bytes and the client raised ShortHeader"
         )
+        assert response.had_tsig
+        assert response.keyname == dns.name.from_text("alice.")
+        assert response.tsig[0].error == dns.rcode.BADSIG, (
+            "a known key name with a bad secret is BADSIG, not BADKEY — "
+            "the requester needs to tell 'rotate my secret' from "
+            "'I am not provisioned here'"
+        )
+        assert response.tsig[0].mac == b""
         assert store.query_txt_record("foo.example.com") is None
 
     def test_zone_outside_allowed_list_is_notauth(self):

@@ -52,6 +52,7 @@ import dns.rdataclass
 import dns.rdatatype
 import dns.rdtypes.ANY.NS
 import dns.rdtypes.ANY.SOA
+import dns.rdtypes.ANY.TSIG
 import dns.rdtypes.ANY.TXT
 import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
@@ -827,6 +828,94 @@ def _recv_exact(sock, n: int) -> Optional[bytes]:
     return b"".join(chunks)
 
 
+# Maps the dnspython TSIG-failure exceptions onto the RFC 8945 §4.3
+# extended RCODEs that belong in the TSIG error field.
+_TSIG_ERROR_CODES: Tuple[Tuple[type, int], ...] = (
+    (dns.tsig.PeerBadSignature, dns.rcode.BADSIG),
+    (dns.tsig.PeerBadKey, dns.rcode.BADKEY),
+    (dns.tsig.PeerBadTime, dns.rcode.BADTIME),
+    (dns.tsig.PeerBadTruncation, dns.rcode.BADTRUNC),
+    (dns.tsig.BadSignature, dns.rcode.BADSIG),
+    (dns.tsig.BadTime, dns.rcode.BADTIME),
+    (dns.tsig.BadKey, dns.rcode.BADKEY),
+    (dns.message.UnknownTSIGKey, dns.rcode.BADKEY),
+)
+
+
+def _tsig_error_code(exc: BaseException) -> Optional[int]:
+    """The TSIG error field value for a verification failure, or None
+    when the exception carries no specific TSIG error (a malformed
+    TSIG record, where there is nothing trustworthy to echo)."""
+    for exc_type, code in _TSIG_ERROR_CODES:
+        if isinstance(exc, exc_type):
+            return code
+    return None
+
+
+def _tsig_error_response(data: bytes, exc: BaseException) -> Optional[bytes]:
+    """Build the RFC 8945 §5.3.2 reply to an UPDATE whose TSIG did not
+    verify: RCODE NOTAUTH plus an *unsigned* TSIG RR (empty MAC) whose
+    error field names the reason — BADKEY when we don't hold the key,
+    BADSIG when we do and the signature didn't match.
+
+    Returns ``None`` when no such reply can be built, leaving the
+    caller on its bare-header NOTAUTH stub.
+
+    Why this exists: the stub alone carries no TSIG at all, and §5.4.1
+    obliges a response to a signed request to be authenticated. A
+    requester therefore cannot tell "your key is wrong" from a
+    tampered or truncated answer, so it has to treat the rejection as
+    a transport fault. dnspython ≥ 2.9.0 enforces this on the receive
+    side and raises ``FormError("response requires a TSIG but does not
+    have one")``, which masked an auth failure as a parse failure;
+    2.8.0 was permissive enough to hide it, the same way it hid the
+    §5.4.1 gap on the authenticated path until a strict client arrived.
+
+    The MAC is empty rather than computed. In the BADKEY case there is
+    no secret to sign with, and §5.3.2 specifies an empty MAC for both
+    codes so that one code path covers them. A verifier reads the error
+    field before it compares MACs (RFC 8945 §5.2), so an empty MAC is
+    what it expects here, not a signature it will reject.
+
+    The request is re-parsed with ``keyring=False`` — TSIG processing
+    disabled — purely to recover the key name and algorithm to echo
+    back. NOTHING else from that parse is trusted or acted on: the
+    message failed authentication, and this function only ever returns
+    a rejection. Echoing an unverified key name leaks nothing, as it
+    arrived in the clear in the request.
+    """
+    error_code = _tsig_error_code(exc)
+    if error_code is None:
+        return None
+    try:
+        unverified = dns.message.from_wire(data, keyring=False)
+        if not unverified.had_tsig or unverified.keyname is None:
+            return None
+        response = dns.message.make_response(unverified)
+        response.set_rcode(dns.rcode.NOTAUTH)
+        tsig_rdata = dns.rdtypes.ANY.TSIG.TSIG(
+            dns.rdataclass.ANY,
+            dns.rdatatype.TSIG,
+            algorithm=unverified.tsig[0].algorithm,
+            time_signed=int(time.time()),
+            fudge=300,
+            mac=b"",
+            original_id=unverified.id,
+            error=error_code,
+            other=b"",
+        )
+        # A TSIG RR lives in ADDITIONAL with TTL 0 (RFC 8945 §4.2) and
+        # is appended directly: ``use_tsig`` would try to sign, which
+        # needs a secret we may not hold and a MAC we must not send.
+        response.additional.append(
+            dns.rrset.from_rdata(unverified.keyname, 0, tsig_rdata)
+        )
+        return response.to_wire()
+    except Exception:
+        log.debug("could not build a TSIG error response", exc_info=True)
+        return None
+
+
 def _process_dns_query(
     handler, data: bytes, client_ip: str, *, transport: str = "udp"
 ) -> Optional[bytes]:
@@ -924,6 +1013,9 @@ def _process_dns_query(
             "dmp_dns_queries_total",
             labels={"outcome": "tsig_failed"},
         )
+        tsig_error_reply = _tsig_error_response(data, e)
+        if tsig_error_reply is not None:
+            return tsig_error_reply
         try:
             return _DMPRequestHandler._stub_response(data, dns.rcode.NOTAUTH)
         except Exception:
